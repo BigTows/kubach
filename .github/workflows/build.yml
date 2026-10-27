@@ -121,7 +121,17 @@ jobs:
           for dmg in target/dist/*.dmg; do
             xcrun notarytool submit "$dmg" --key "$RUNNER_TEMP/AuthKey.p8" \
               --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" --wait
-            xcrun stapler staple "$dmg"
+            # The ticket reaches CloudKit a little after "Accepted", and the
+            # lookup sometimes drops the connection: retry. An unstapled but
+            # notarized dmg still opens; Gatekeeper fetches the ticket online.
+            for attempt in 1 2 3 4 5; do
+              xcrun stapler staple "$dmg" && break
+              if [ "$attempt" = 5 ]; then
+                echo "::warning::stapling $dmg failed; it is notarized, Gatekeeper checks the ticket online"
+              else
+                sleep $((attempt * 20))
+              fi
+            done
           done
           rm "$RUNNER_TEMP/AuthKey.p8"
       - uses: actions/upload-artifact@v4

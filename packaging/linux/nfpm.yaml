@@ -28,14 +28,16 @@ contents:
   - src: ./usr/share/licenses/kubach/LICENSE
     dst: /usr/share/licenses/kubach/LICENSE
 
-# Libraries GPUI links or loads at runtime: xkbcommon, Wayland, fontconfig
-# and freetype, Vulkan. X11 goes through pure Rust x11rb.
+# Linked (ldd): libxcb, xkbcommon and xkbcommon-x11. Not linked, but
+# loaded at runtime (dlopen) or kept for desktop font setup: Wayland,
+# Vulkan, fontconfig and freetype.
 overrides:
   deb:
     depends:
       - libc6 (>= 2.35)
       - libxkbcommon0
       - libxkbcommon-x11-0
+      - libxcb1
       - libwayland-client0
       - libfontconfig1
       - libfreetype6
@@ -44,6 +46,7 @@ overrides:
     depends:
       - libxkbcommon
       - libxkbcommon-x11
+      - libxcb
       - libwayland-client
       - fontconfig
       - freetype
@@ -51,6 +54,7 @@ overrides:
   archlinux:
     depends:
       - libxkbcommon-x11
+      - libxcb
       - wayland
       - fontconfig
       - freetype2
