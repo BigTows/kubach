@@ -1,0 +1,203 @@
+# A typical app: Ingress → Services → Deployments → ConfigMap, Secrets, PVC.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: shop, namespace: shop}
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [shop.example.com]
+      secretName: shop-tls
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: web, port: {number: 80}}}
+          - path: /api
+            pathType: Prefix
+            backend: {service: {name: api, port: {name: http}}}
+status:
+  loadBalancer:
+    ingress: [{hostname: lb.example.net}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: shop, labels: {app: web}}
+spec:
+  type: LoadBalancer
+  clusterIP: 10.0.0.10
+  selector: {app: web}
+  ports: [{name: http, port: 80, targetPort: 8080, nodePort: 30080}]
+status:
+  loadBalancer:
+    ingress: [{ip: 203.0.113.10}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api, namespace: shop}
+spec:
+  selector: {app: api}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: web-abcde
+  namespace: shop
+  labels: {kubernetes.io/service-name: web}
+addressType: IPv4
+endpoints:
+  - addresses: [10.1.0.1]
+    conditions: {ready: true}
+    targetRef: {kind: Pod, name: web-5d4f-a, namespace: shop}
+  - addresses: [10.1.0.2]
+    conditions: {ready: false}
+    targetRef: {kind: Pod, name: web-5d4f-b, namespace: shop}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop, labels: {app: web}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      serviceAccountName: web
+      containers:
+        - name: web
+          image: nginx
+          envFrom: [{configMapRef: {name: web-config}}]
+      volumes:
+        - name: secret
+          secret: {secretName: web-secret}
+        - name: data
+          persistentVolumeClaim: {claimName: web-data}
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-5d4f
+  namespace: shop
+  ownerReferences: [{apiVersion: apps/v1, kind: Deployment, name: web, uid: d1, controller: true}]
+spec:
+  template:
+    metadata: {labels: {app: web, pod-template-hash: 5d4f}}
+    spec:
+      containers: [{name: web, image: nginx}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-5d4f-a
+  namespace: shop
+  labels: {app: web, pod-template-hash: 5d4f}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-5d4f, uid: r1, controller: true}]
+spec:
+  serviceAccountName: web
+  containers:
+    - name: web
+      image: nginx
+      envFrom: [{configMapRef: {name: web-config}}]
+  volumes:
+    - name: secret
+      secret: {secretName: web-secret}
+    - name: data
+      persistentVolumeClaim: {claimName: web-data}
+    - name: kube-api-access-x
+      projected:
+        sources:
+          - serviceAccountToken: {path: token}
+          - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
+status:
+  phase: Running
+  conditions: [{type: Ready, status: "True"}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-5d4f-b
+  namespace: shop
+  labels: {app: web, pod-template-hash: 5d4f}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-5d4f, uid: r1, controller: true}]
+spec:
+  serviceAccountName: web
+  containers:
+    - name: web
+      image: nginx
+      envFrom: [{configMapRef: {name: web-config}}]
+  volumes:
+    - name: secret
+      secret: {secretName: web-secret}
+    - name: data
+      persistentVolumeClaim: {claimName: web-data}
+status:
+  phase: Running
+  conditions: [{type: Ready, status: "False"}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: shop}
+spec:
+  selector: {matchLabels: {app: api}}
+  template:
+    metadata: {labels: {app: api}}
+    spec:
+      containers:
+        - name: api
+          image: api
+          env:
+            - name: TOKEN
+              valueFrom: {secretKeyRef: {name: api-secret, key: token}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-7c9-z
+  namespace: shop
+  labels: {app: api, pod-template-hash: 7c9}
+  # Its ReplicaSet is not in the list: found by pod-template-hash.
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: api-7c9, uid: r2, controller: true}]
+spec:
+  containers:
+    - name: api
+      image: api
+      env:
+        - name: TOKEN
+          valueFrom: {secretKeyRef: {name: api-secret, key: token}}
+status:
+  phase: Running
+  conditions: [{type: Ready, status: "True"}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: web-config, namespace: shop}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: kube-root-ca.crt, namespace: shop}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: unused, namespace: shop}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: web-secret, namespace: shop}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: api-secret, namespace: shop}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: shop-tls, namespace: shop}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: web-data, namespace: shop}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: web, namespace: shop}

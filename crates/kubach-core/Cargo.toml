@@ -1,0 +1,72 @@
+[package]
+name = "kubach-core"
+description = "Kubernetes domain logic for Kubach, independent of the UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# In-memory fakes of the OS key stores (`MemoryKeyStore`,
+# `FakeBiometricStore`) for tests of dependent crates. Never in release builds.
+test-support = []
+
+[dependencies]
+argon2.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+dirs.workspace = true
+flate2.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-timeout.workspace = true
+hyper-util.workspace = true
+imagesize.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+keyring.workspace = true
+kubach-i18n.workspace = true
+notify.workspace = true
+pgp.workspace = true
+serde.workspace = true
+# preserve_order: edited YAML keeps its key order (apiVersion, kind, metadata…).
+serde_json = { workspace = true, features = ["preserve_order"] }
+regex.workspace = true
+roxmltree.workspace = true
+secrecy.workspace = true
+semver.workspace = true
+serde-saphyr.workspace = true
+sha2.workspace = true
+similar.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tower.workspace = true
+usvg.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+zip.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+security-framework.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# ConPTY for the local terminal; Unix uses its own posix_spawn PTY (#385).
+portable-pty.workspace = true
+windows.workspace = true
+windows-sys.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+[dev-dependencies]
+rand_chacha.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros"] }

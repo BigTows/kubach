@@ -1,0 +1,212 @@
+# Release builds for Linux, macOS and Windows, x64 and arm64.
+#
+# Every push to main: packages as run artifacts. A tag equal to the
+# workspace version (e.g. 2026.10.1): the same packages in a GitHub Release,
+# plus the AUR PKGBUILD and SHA256SUMS.
+#
+# macOS signing is optional. Without these secrets the app gets an ad-hoc
+# signature: it runs (after "Open" in Finder), but Touch ID unlock is
+# unavailable and the vault asks for the password (ADR 0008).
+#   MACOS_CERTIFICATE_P12        base64 of a "Developer ID Application" .p12
+#   MACOS_CERTIFICATE_PASSWORD   its password
+#   MACOS_PROVISIONING_PROFILE   base64 of a Developer ID .provisionprofile
+#                                for the app id (keychain-access-groups)
+# Notarization, so Gatekeeper opens the app without a warning (App Store
+# Connect API key with the Developer role):
+#   APPLE_API_KEY_P8             base64 of AuthKey_<id>.p8
+#   APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['20[0-9][0-9].*']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: 2.41.1
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04: glibc 2.35, so the binary runs on older distributions too.
+          - { runner: ubuntu-22.04, arch: x86_64, nfpm: x86_64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64, nfpm: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p kubach-app
+      - name: Packaging tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm }}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" nfpm
+          curl -fsSL -o "$RUNNER_TEMP/bin/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
+          chmod +x "$RUNNER_TEMP/bin/appimagetool"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Shared libraries
+        run: ldd target/release/kubach
+      - run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubach-linux-${{ matrix.arch }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      SIGNED: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_PROVISIONING_PROFILE != '' }}
+      NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.APPLE_API_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p kubach-app
+      - name: Signing keychain
+        if: env.SIGNED == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 16)"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/kubach.provisionprofile"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user | xargs security list-keychains -d user -s "$keychain"
+          rm "$RUNNER_TEMP/cert.p12"
+      - name: Bundle (signed)
+        if: env.SIGNED == 'true'
+        run: scripts/bundle-macos.sh --profile "$RUNNER_TEMP/kubach.provisionprofile" --dmg
+      - name: Bundle (unsigned)
+        if: env.SIGNED != 'true'
+        run: scripts/bundle-macos.sh --unsigned --dmg
+      - name: Notarize
+        if: env.SIGNED == 'true' && env.NOTARIZE == 'true'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          for dmg in target/dist/*.dmg; do
+            xcrun notarytool submit "$dmg" --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" --wait
+            xcrun stapler staple "$dmg"
+          done
+          rm "$RUNNER_TEMP/AuthKey.p8"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubach-macos-${{ matrix.arch }}
+          path: target/dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $triple = if ('${{ matrix.arch }}' -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/$triple/rustup-init.exe" -OutFile "$env:RUNNER_TEMP\rustup-init.exe"
+            & "$env:RUNNER_TEMP\rustup-init.exe" -y --profile minimal --default-toolchain none
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # ring needs clang for aarch64-pc-windows-msvc.
+      - name: LLVM
+        if: matrix.arch == 'arm64'
+        run: |
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm -y --no-progress }
+            'C:\Program Files\LLVM\bin' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p kubach-app
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet tool install --global wix --version 5.0.2
+      - run: scripts/package-windows.ps1 -Arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubach-windows-${{ matrix.arch }}
+          path: |
+            target/dist/*.zip
+            target/dist/*.msi
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: PKGBUILD and checksums
+        run: |
+          sum() { sha256sum "dist/kubach-$VERSION-linux-$1.tar.gz" | cut -d' ' -f1; }
+          sed -e "s/@VERSION@/$VERSION/" \
+              -e "s/@SHA256_X86_64@/$(sum x86_64)/" \
+              -e "s/@SHA256_AARCH64@/$(sum aarch64)/" \
+              packaging/arch/PKGBUILD > dist/PKGBUILD
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Kubach ${{ env.VERSION }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

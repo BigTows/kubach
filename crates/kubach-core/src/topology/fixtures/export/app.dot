@@ -1,0 +1,49 @@
+digraph topology {
+  // Kubach topology: 16 nodes, 20 edges
+  rankdir=LR;
+  compound=true;
+  fontname="Helvetica";
+  node [shape=box, style="rounded", fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9, color="#8b8d98", fontcolor="#8b8d98"];
+  "External//203.0.113.10" [label="203.0.113.10\nExternal", shape=ellipse];
+  "External//lb.example.net" [label="lb.example.net\nExternal", shape=ellipse];
+  subgraph "cluster_shop" {
+    label="namespace shop";
+    style="rounded,dashed";
+    color="#8b8d98";
+    "ConfigMap/shop/web-config" [label="web-config\nConfigMap", shape=note];
+    "Deployment.apps/shop/api" [label="api\nDeployment · 1/1 ready", style="rounded"];
+    "Deployment.apps/shop/web" [label="web\nDeployment · 1/2 ready", style="rounded"];
+    "Ingress.networking.k8s.io/shop/shop" [label="shop\nIngress", style="rounded"];
+    "PersistentVolumeClaim/shop/web-data" [label="web-data\nPersistentVolumeClaim", shape=cylinder];
+    "Pod/shop/api-7c9-z" [label="api-7c9-z\nPod", style="rounded"];
+    "Pod/shop/web-5d4f-a" [label="web-5d4f-a\nPod", style="rounded"];
+    "Pod/shop/web-5d4f-b" [label="web-5d4f-b\nPod", style="rounded"];
+    "Secret/shop/api-secret" [label="api-secret\nSecret", shape=note];
+    "Secret/shop/shop-tls" [label="shop-tls\nSecret", shape=note];
+    "Secret/shop/web-secret" [label="web-secret\nSecret", shape=note];
+    "Service/shop/api" [label="api\nService", style="rounded"];
+    "Service/shop/web" [label="web\nService · LoadBalancer", style="rounded"];
+    "ServiceAccount/shop/web" [label="web\nServiceAccount", shape=note];
+  }
+  "Pod/shop/api-7c9-z" -> "Secret/shop/api-secret" [style=dashed, tooltip="env-ref"];
+  "Pod/shop/web-5d4f-a" -> "ConfigMap/shop/web-config" [style=dashed, tooltip="env-ref"];
+  "Pod/shop/web-5d4f-b" -> "ConfigMap/shop/web-config" [style=dashed, tooltip="env-ref"];
+  "Ingress.networking.k8s.io/shop/shop" -> "External//lb.example.net" [tooltip="exposes"];
+  "Service/shop/web" -> "External//203.0.113.10" [tooltip="exposes"];
+  "Pod/shop/web-5d4f-a" -> "PersistentVolumeClaim/shop/web-data" [style=dashed, tooltip="mounts"];
+  "Pod/shop/web-5d4f-a" -> "Secret/shop/web-secret" [style=dashed, tooltip="mounts"];
+  "Pod/shop/web-5d4f-b" -> "PersistentVolumeClaim/shop/web-data" [style=dashed, tooltip="mounts"];
+  "Pod/shop/web-5d4f-b" -> "Secret/shop/web-secret" [style=dashed, tooltip="mounts"];
+  "Deployment.apps/shop/api" -> "Pod/shop/api-7c9-z" [arrowhead=odiamond, tooltip="owns"];
+  "Deployment.apps/shop/web" -> "Pod/shop/web-5d4f-a" [arrowhead=odiamond, tooltip="owns"];
+  "Deployment.apps/shop/web" -> "Pod/shop/web-5d4f-b" [arrowhead=odiamond, tooltip="owns"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Service/shop/api" [label="shop.example.com/api → http", penwidth=1.6, tooltip="routes-to"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Service/shop/web" [label="shop.example.com → 80", penwidth=1.6, tooltip="routes-to"];
+  "Service/shop/api" -> "Pod/shop/api-7c9-z" [label="1 ready", penwidth=1.6, tooltip="selects"];
+  "Service/shop/web" -> "Pod/shop/web-5d4f-a" [label="1 ready", penwidth=1.6, tooltip="selects"];
+  "Service/shop/web" -> "Pod/shop/web-5d4f-b" [label="0/1 ready", penwidth=1.6, tooltip="selects"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Secret/shop/shop-tls" [style=dashed, tooltip="tls"];
+  "Pod/shop/web-5d4f-a" -> "ServiceAccount/shop/web" [style=dashed, tooltip="uses-sa"];
+  "Pod/shop/web-5d4f-b" -> "ServiceAccount/shop/web" [style=dashed, tooltip="uses-sa"];
+}

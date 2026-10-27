@@ -1,0 +1,17 @@
+[package]
+name = "kubach-i18n"
+description = "Interface translations of Kubach (Fluent), independent of the UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluent-bundle.workspace = true
+unic-langid.workspace = true
+
+[build-dependencies]
+fluent-syntax.workspace = true
+
+[dev-dependencies]
+fluent-syntax.workspace = true

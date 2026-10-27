@@ -1,0 +1,95 @@
+# Gateway API: a Gateway, an HTTPRoute, a GRPCRoute and a TLSRoute to a missing Gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: public, namespace: edge}
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      hostname: "*.example.com"
+      port: 443
+      protocol: HTTPS
+      tls:
+        certificateRefs: [{name: public-cert}]
+status:
+  addresses: [{type: IPAddress, value: 198.51.100.5}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: store, namespace: edge}
+spec:
+  parentRefs: [{name: public, sectionName: https}]
+  hostnames: [store.example.com]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /cart}}]
+      backendRefs: [{name: cart, port: 8080}]
+    - matches: [{path: {type: PathPrefix, value: /}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {name: rpc, namespace: edge}
+spec:
+  parentRefs: [{name: public}]
+  rules:
+    - matches: [{method: {service: cart.v1.Cart, method: Add}}]
+      backendRefs: [{name: cart, port: 9090}]
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata: {name: passthrough, namespace: edge}
+spec:
+  parentRefs: [{name: internal}]
+  rules:
+    - backendRefs: [{name: web, port: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cart, namespace: edge}
+spec:
+  selector: {app: cart}
+  ports: [{name: http, port: 8080}, {name: grpc, port: 9090}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: edge}
+spec:
+  selector: {app: web}
+  ports: [{port: 80}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cart, namespace: edge}
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: cart}}
+  template:
+    metadata: {labels: {app: cart}}
+    spec:
+      containers: [{name: cart, image: cart}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: edge}
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers: [{name: web, image: web}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-1-a
+  namespace: edge
+  labels: {app: web, pod-template-hash: "1"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-1, uid: r, controller: true}]
+spec:
+  containers: [{name: web, image: web}]
+status:
+  conditions: [{type: Ready, status: "True"}]
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: public-cert, namespace: edge}

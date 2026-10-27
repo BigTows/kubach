@@ -1,0 +1,197 @@
+# Flux objects as `kubectl get -o yaml` shows them (managedFields trimmed).
+
+# Reconciled and healthy, with an inventory.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+  generation: 3
+  finalizers:
+    - finalizers.fluxcd.io
+spec:
+  interval: 10m0s
+  path: ./apps/production
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+status:
+  observedGeneration: 3
+  lastAppliedRevision: main@sha1:6f1d2c3b
+  lastAttemptedRevision: main@sha1:6f1d2c3b
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: ReconciliationSucceeded
+      message: "Applied revision: main@sha1:6f1d2c3b"
+      lastTransitionTime: "2026-10-21T08:00:03Z"
+      observedGeneration: 3
+    - type: Healthy
+      status: "True"
+      reason: Succeeded
+      message: Health check passed in 2.01s
+      lastTransitionTime: "2026-10-21T08:00:03Z"
+      observedGeneration: 3
+  inventory:
+    entries:
+      - id: _podinfo__Namespace
+        v: v1
+      - id: podinfo_podinfo__Service
+        v: v1
+      - id: podinfo_podinfo_apps_Deployment
+        v: v1
+---
+# The path was removed from the repository: stalled.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra
+  namespace: flux-system
+  generation: 5
+spec:
+  interval: 1h
+  path: ./infra/prod
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+status:
+  observedGeneration: 5
+  lastAppliedRevision: main@sha1:aa11bb22
+  lastAttemptedRevision: main@sha1:cc33dd44
+  conditions:
+    - type: Ready
+      status: "False"
+      reason: ArtifactFailed
+      message: "kustomization path not found: stat /tmp/kustomization-1/infra/prod: no such file or directory"
+      lastTransitionTime: "2026-10-22T07:30:00Z"
+    - type: Stalled
+      status: "True"
+      reason: ArtifactFailed
+      message: "kustomization path not found: stat /tmp/kustomization-1/infra/prod: no such file or directory"
+      lastTransitionTime: "2026-10-22T07:30:00Z"
+---
+# Suspended by the user.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: legacy
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./legacy
+  prune: false
+  suspend: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+status:
+  lastAppliedRevision: main@sha1:0badc0de
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: ReconciliationSucceeded
+      message: "Applied revision: main@sha1:0badc0de"
+      lastTransitionTime: "2026-09-01T00:00:00Z"
+---
+# Upgrade to a new chart version timed out.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: podinfo
+  namespace: podinfo
+  generation: 2
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: podinfo
+      version: 6.7.x
+      sourceRef:
+        kind: HelmRepository
+        name: podinfo-repo
+        namespace: flux-system
+  upgrade:
+    remediation:
+      retries: 3
+status:
+  observedGeneration: 2
+  lastAttemptedRevision: 6.7.1
+  lastAttemptedReleaseAction: upgrade
+  failures: 1
+  upgradeFailures: 1
+  history:
+    - name: podinfo
+      namespace: podinfo
+      version: 3
+      status: deployed
+      chartName: podinfo
+      chartVersion: 6.7.0
+      appVersion: 6.7.0
+      firstDeployed: "2026-09-10T12:00:00Z"
+      lastDeployed: "2026-10-01T12:00:00Z"
+  conditions:
+    - type: Ready
+      status: "False"
+      reason: UpgradeFailed
+      message: "Helm upgrade failed for release podinfo/podinfo with chart podinfo@6.7.1: context deadline exceeded"
+      lastTransitionTime: "2026-10-22T09:00:00Z"
+    - type: Released
+      status: "False"
+      reason: UpgradeFailed
+      message: "Helm upgrade failed: context deadline exceeded"
+      lastTransitionTime: "2026-10-22T09:00:00Z"
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  url: ssh://git@github.com/acme/fleet
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+status:
+  artifact:
+    revision: main@sha1:6f1d2c3b
+    digest: sha256:0f1e2d3c
+    lastUpdateTime: "2026-10-21T07:59:58Z"
+    path: gitrepository/flux-system/flux-system/6f1d2c3b.tar.gz
+    url: http://source-controller.flux-system.svc.cluster.local./gitrepository/flux-system/flux-system/6f1d2c3b.tar.gz
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Succeeded
+      message: "stored artifact for revision 'main@sha1:6f1d2c3b'"
+      lastTransitionTime: "2026-10-21T07:59:58Z"
+    - type: ArtifactInStorage
+      status: "True"
+      reason: Succeeded
+      message: "stored artifact for revision 'main@sha1:6f1d2c3b'"
+      lastTransitionTime: "2026-10-21T07:59:58Z"
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: podinfo-repo
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://stefanprodan.github.io/podinfo
+status:
+  conditions:
+    - type: Ready
+      status: "False"
+      reason: IndexationFailed
+      message: "failed to fetch Helm repository index: failed to cache index to temporary file: Get \"https://stefanprodan.github.io/podinfo/index.yaml\": dial tcp: lookup stefanprodan.github.io: no such host"
+      lastTransitionTime: "2026-10-22T10:15:00Z"
+    - type: FetchFailed
+      status: "True"
+      reason: IndexationFailed
+      message: "failed to fetch Helm repository index"
+      lastTransitionTime: "2026-10-22T10:15:00Z"

@@ -1,0 +1,29 @@
+digraph topology {
+  // Kubach topology: 9 nodes, 7 edges
+  rankdir=LR;
+  compound=true;
+  fontname="Helvetica";
+  node [shape=box, style="rounded", fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9, color="#8b8d98", fontcolor="#8b8d98"];
+  subgraph "cluster_broken" {
+    label="namespace broken";
+    style="rounded,dashed";
+    color="#8b8d98";
+    "ConfigMap/broken/nope" [label="nope\nConfigMap · missing", shape=note, color="#e5484d", penwidth=2, style="rounded,dashed"];
+    "Deployment.apps/broken/web" [label="web\nDeployment · 0/1 ready", color="#e5484d", penwidth=2, style="rounded"];
+    "Ingress.networking.k8s.io/broken/front" [label="front\nIngress", color="#e5484d", penwidth=2, style="rounded"];
+    "PersistentVolumeClaim/broken/gone" [label="gone\nPersistentVolumeClaim · missing", shape=cylinder, color="#e5484d", penwidth=2, style="rounded,dashed"];
+    "Secret/broken/maybe" [label="maybe\nSecret · missing", shape=note, color="#e5484d", penwidth=2, style="rounded,dashed"];
+    "Service/broken/ghost" [label="ghost\nService · missing", color="#e5484d", penwidth=2, style="rounded,dashed"];
+    "Service/broken/lonely" [label="lonely\nService", color="#f5a524", penwidth=2, style="rounded"];
+    "Service/broken/web" [label="web\nService", color="#f5a524", penwidth=2, style="rounded"];
+    "ServiceAccount/broken/robot" [label="robot\nServiceAccount · missing", shape=note, color="#e5484d", penwidth=2, style="rounded,dashed"];
+  }
+  "Deployment.apps/broken/web" -> "ConfigMap/broken/nope" [color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="env-ref"];
+  "Deployment.apps/broken/web" -> "Secret/broken/maybe" [color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="env-ref"];
+  "Deployment.apps/broken/web" -> "PersistentVolumeClaim/broken/gone" [color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="mounts"];
+  "Ingress.networking.k8s.io/broken/front" -> "Service/broken/ghost" [label="80", color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="routes-to"];
+  "Ingress.networking.k8s.io/broken/front" -> "Service/broken/web" [label="/web → 9090 +1", penwidth=1.6, tooltip="routes-to"];
+  "Service/broken/web" -> "Deployment.apps/broken/web" [label="0/1 ready", penwidth=1.6, tooltip="selects"];
+  "Deployment.apps/broken/web" -> "ServiceAccount/broken/robot" [color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="uses-sa"];
+}

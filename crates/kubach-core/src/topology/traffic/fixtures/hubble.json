@@ -1,0 +1,98 @@
+{
+  "Requests": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "frontend",
+            "destination_namespace": "shop", "destination_workload": "cart"
+          },
+          "value": [1761400001, "8"]
+        }
+      ]
+    }
+  },
+  "Errors": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "frontend",
+            "destination_namespace": "shop", "destination_workload": "cart"
+          },
+          "value": [1761400001, "2"]
+        }
+      ]
+    }
+  },
+  "LatencyP95": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "frontend",
+            "destination_namespace": "shop", "destination_workload": "cart"
+          },
+          "value": [1761400001, "240"]
+        }
+      ]
+    }
+  },
+  "Flows": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "frontend",
+            "destination_namespace": "shop", "destination_workload": "cart"
+          },
+          "value": [1761400001, "16"]
+        },
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "cart",
+            "destination_namespace": "shop", "destination_workload": "redis"
+          },
+          "value": [1761400001, "6"]
+        },
+        {
+          "metric": {
+            "source_namespace": "", "source_workload": "",
+            "destination_namespace": "shop", "destination_workload": "frontend"
+          },
+          "value": [1761400001, "1.5"]
+        }
+      ]
+    }
+  },
+  "Dropped": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "cart",
+            "destination_namespace": "shop", "destination_workload": "redis"
+          },
+          "value": [1761400001, "2"]
+        },
+        {
+          "metric": {
+            "source_namespace": "shop", "source_workload": "frontend",
+            "destination_namespace": "billing", "destination_workload": "ledger"
+          },
+          "value": [1761400001, "0.5"]
+        }
+      ]
+    }
+  }
+}

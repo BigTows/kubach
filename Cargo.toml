@@ -1,0 +1,133 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+# Versioning: YEAR.MONTH.INC (month without leading zero, INC resets every month)
+version = "2026.10.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/BigTows/kubach"
+
+[workspace.dependencies]
+kubach-core = { path = "crates/kubach-core" }
+kubach-ui = { path = "crates/kubach-ui" }
+kubach-mcp = { path = "crates/kubach-mcp" }
+kubach-i18n = { path = "crates/kubach-i18n" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+argon2 = "0.6.0"
+alacritty_terminal = { version = "0.26.0", default-features = false }
+# Linux only: Secret values on the clipboard marked for history managers
+# (`x-kde-passwordManagerHint: secret`) on X11 and Wayland (#203).
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.11.0"
+# macOS only: CFString for the Touch ID prompt text (#80).
+core-foundation = "0.10.1"
+dirs = "7.0.0"
+flate2 = "1.1.10"
+# Interface translations (ADR 0018): Fluent messages with CLDR plurals.
+# `fluent-syntax` also reads the English keys in kubach-i18n's build script.
+fluent-bundle = "0.16.0"
+fluent-syntax = "0.12.0"
+futures = "0.3.34"
+# tree-sitter-yaml: syntax highlighting in the YAML editor.
+gpui-kit = { version = "0.8.0", features = ["tree-sitter-yaml"] }
+http = "1.5.0"
+# Streaming the body of tool downloads (#131). Already in the tree through kube.
+http-body-util = "0.1.5"
+# The kube client's own connection stack with TCP keepalive (#316). Already
+# in the tree through kube.
+hyper-timeout = "0.5.2"
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+# Local time of the point under the cursor in chart readouts (#376).
+# Already in the tree through k8s-openapi; adds the system time zone.
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
+k8s-openapi = { version = "0.28.0", features = ["latest"] }
+# OS credential stores (Keychain, Credential Manager, Secret Service via zbus).
+keyring = "4.2.0"
+# http-proxy / socks5: HTTPS_PROXY for tool downloads (#131) and kubeconfig proxy-url.
+kube = { version = "4.2.0", features = ["runtime", "ws", "http-proxy", "socks5"] }
+# Pixel size of downloaded chart icons from their header (#201). Already in
+# the tree through usvg.
+imagesize = "0.14.0"
+libc = "0.2.191"
+# Same version as gpui-component: completion/hover types of its code editor.
+lsp-types = { version = "0.97.0", features = ["proposed"] }
+regex = "1.13.1"
+# External references in downloaded SVG images (#229). The XML parser usvg
+# uses, already in the tree.
+roxmltree = "0.21.1"
+rmcp = { version = "3.6.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+secrecy = "0.10.3"
+# Chart versions in Helm repository indexes (already in the tree).
+semver = "1.0.28"
+# macOS only: vault key in the data protection Keychain behind Touch ID
+# (biometryCurrentSet, #80). Already in the tree through keyring.
+security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+notify = "8.2.0"
+# OpenPGP signatures of downloaded Helm releases (#403): rPGP, pure Rust,
+# without bzip2 (only detached signatures are verified).
+pgp = { version = "0.21.0", default-features = false }
+# Seeded RNG for test OpenPGP keys (#403). Already in the tree through pgp.
+rand_chacha = "0.3.1"
+# Local terminal (#319): PTY on Unix, ConPTY on Windows (from wezterm).
+portable-pty = "0.9.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["serialize", "deserialize"] }
+similar = "3.2.0"
+# SHA-256 of downloaded tools (#131). Already in the tree.
+sha2 = "0.11.1"
+# macOS only: Secret values on the pasteboard marked concealed and kept off
+# Universal Clipboard (#203). The version GPUI already uses on macOS.
+# Also the Dock icon of a binary run outside an `.app` bundle (#253).
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSPasteboard", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSString"] }
+# Windows only: the app icon as a resource of `kubach.exe` (#253). Already in
+# the tree through gpui.
+embed-resource = "3.0.12"
+# Unpacking downloaded tools (#131): tar.gz and zip (Windows).
+tar = { version = "0.4.46", default-features = false }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+toml = "1.1.8"
+toml_edit = "0.25.17"
+# A layer on kube clients that strips exec plugin arguments from auth errors
+# (#189) and retries idempotent requests once after a dropped connection
+# (#316). Already in the tree through kube.
+tower = { version = "0.5.3", default-features = false, features = ["retry", "util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+tokio-util = "0.7.20"
+# Rendering the app icon from its SVG (`examples/icons.rs`, #253) and an
+# exported topology to PNG (#327, with text). The version GPUI already uses.
+resvg = { version = "0.46.0", default-features = false }
+# Size of downloaded SVG chart icons as GPUI rasterizes them (#201). The
+# version and features GPUI already uses.
+usvg = { version = "0.46.0", default-features = false }
+# Language tags of the Fluent bundles (ADR 0018).
+unic-langid = "0.9.6"
+uuid = { version = "1.28.0", features = ["v4"] }
+# Windows only: Windows Hello key credentials for biometric unlock (#80).
+# Same version as gpui on Windows.
+windows = { version = "0.62.2", features = ["Foundation", "Security_Credentials", "Security_Cryptography", "Security_Cryptography_Core", "Storage_Streams"] }
+# Windows only: owner-only ACL on vault.kubach and exported kubeconfigs;
+# Secret values on the clipboard kept out of history and cloud sync (#203).
+# ToolHelp / ProcessStatus: threads and memory of the process in the debug
+# overlay of debug builds (#291).
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+# Linux only: logind's LockedHint (vault locks with the screen). Already in
+# the tree on Linux through gpui.
+zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
+zeroize = { version = "1.9.1", features = ["derive", "serde"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+
+# GPUI is far too slow unoptimized (scrolling stutters), so dependencies are
+# optimized even in dev builds; workspace crates stay fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

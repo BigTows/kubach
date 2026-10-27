@@ -1,0 +1,86 @@
+{
+  "Requests": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop", "dst_deployment": "cart", "dst_service": "cart"
+          },
+          "value": [1761400000.5, "30"]
+        },
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop", "dst_deployment": "cart", "dst_service": "cart.shop.svc.cluster.local"
+          },
+          "value": [1761400000.5, "10"]
+        },
+        {
+          "metric": {
+            "namespace": "shop", "statefulset": "worker",
+            "dst_namespace": "shop", "dst_statefulset": "db"
+          },
+          "value": [1761400000.5, "5"]
+        },
+        {
+          "metric": {
+            "namespace": "shop",
+            "dst_namespace": "shop", "dst_deployment": "frontend", "dst_service": "frontend"
+          },
+          "value": [1761400000.5, "2"]
+        },
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop"
+          },
+          "value": [1761400000.5, "7"]
+        }
+      ]
+    }
+  },
+  "Errors": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop", "dst_deployment": "cart", "dst_service": "cart"
+          },
+          "value": [1761400000.5, "0.4"]
+        }
+      ]
+    }
+  },
+  "LatencyP95": {
+    "status": "success",
+    "data": {
+      "resultType": "vector",
+      "result": [
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop", "dst_deployment": "cart", "dst_service": "cart"
+          },
+          "value": [1761400000.5, "12"]
+        },
+        {
+          "metric": {
+            "namespace": "shop", "deployment": "frontend",
+            "dst_namespace": "shop", "dst_deployment": "cart", "dst_service": "cart.shop.svc.cluster.local"
+          },
+          "value": [1761400000.5, "25"]
+        }
+      ]
+    }
+  },
+  "Bytes": {
+    "status": "success",
+    "data": { "resultType": "vector", "result": [] }
+  }
+}

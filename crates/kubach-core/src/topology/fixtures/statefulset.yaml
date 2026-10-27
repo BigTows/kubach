@@ -1,0 +1,67 @@
+# A StatefulSet behind a headless Service, and an ExternalName Service.
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: db}
+spec:
+  clusterIP: None
+  selector: {app: postgres}
+  ports: [{name: pg, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres, namespace: db}
+spec:
+  serviceName: postgres
+  replicas: 2
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers: [{name: pg, image: postgres}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-0
+  namespace: db
+  labels: {app: postgres}
+  ownerReferences: [{apiVersion: apps/v1, kind: StatefulSet, name: postgres, uid: s1, controller: true}]
+spec:
+  containers: [{name: pg, image: postgres}]
+  volumes: [{name: data, persistentVolumeClaim: {claimName: data-postgres-0}}]
+status:
+  conditions: [{type: Ready, status: "True"}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-1
+  namespace: db
+  labels: {app: postgres}
+  ownerReferences: [{apiVersion: apps/v1, kind: StatefulSet, name: postgres, uid: s1, controller: true}]
+spec:
+  containers: [{name: pg, image: postgres}]
+  volumes: [{name: data, persistentVolumeClaim: {claimName: data-postgres-1}}]
+status:
+  conditions: [{type: Ready, status: "True"}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-postgres-0, namespace: db}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-postgres-1, namespace: db}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-postgres-old, namespace: db}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: payments, namespace: db}
+spec:
+  type: ExternalName
+  externalName: api.payments.example.com

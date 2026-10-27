@@ -1,0 +1,21 @@
+# NetworkPolicies on top of app.yaml: default deny in shop, the api lets
+# only web in on its http port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: shop}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: api-from-web, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: api}}
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: web}}}]
+      ports: [{port: 8080}]
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: shop}

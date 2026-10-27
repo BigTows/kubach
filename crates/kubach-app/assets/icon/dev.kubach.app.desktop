@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kubach
+Comment=Kubernetes IDE
+Exec=kubach
+Icon=dev.kubach.app
+Terminal=false
+Categories=Development;
+StartupWMClass=dev.kubach.app

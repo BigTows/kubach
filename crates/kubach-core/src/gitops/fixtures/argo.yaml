@@ -1,0 +1,251 @@
+# Argo CD Applications as `kubectl get application -o yaml` shows them
+# (managedFields and most annotations trimmed).
+
+# Synced and healthy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook
+  namespace: argocd
+  generation: 412
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: guestbook
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+status:
+  sync:
+    status: Synced
+    comparedTo:
+      source:
+        repoURL: https://github.com/argoproj/argocd-example-apps.git
+        path: guestbook
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: guestbook
+    revision: 53e28ff20cc530b9ada2173fbbd64d48338583ba
+  health:
+    status: Healthy
+    lastTransitionTime: "2026-10-19T17:40:02Z"
+  reconciledAt: "2026-10-20T09:12:41Z"
+  sourceType: Directory
+  resources:
+    - version: v1
+      kind: Service
+      namespace: guestbook
+      name: guestbook-ui
+      status: Synced
+      health:
+        status: Healthy
+    - group: apps
+      version: v1
+      kind: Deployment
+      namespace: guestbook
+      name: guestbook-ui
+      status: Synced
+      health:
+        status: Healthy
+  operationState:
+    phase: Succeeded
+    message: successfully synced (all tasks run)
+    startedAt: "2026-10-19T17:39:58Z"
+    finishedAt: "2026-10-19T17:40:00Z"
+    operation:
+      initiatedBy:
+        automated: true
+      sync:
+        revision: 53e28ff20cc530b9ada2173fbbd64d48338583ba
+    syncResult:
+      revision: 53e28ff20cc530b9ada2173fbbd64d48338583ba
+      resources:
+        - group: apps
+          version: v1
+          kind: Deployment
+          namespace: guestbook
+          name: guestbook-ui
+          status: Synced
+          message: deployment.apps/guestbook-ui configured
+          hookPhase: Running
+          syncPhase: Sync
+  history:
+    - id: 7
+      revision: 53e28ff20cc530b9ada2173fbbd64d48338583ba
+      deployedAt: "2026-10-19T17:40:00Z"
+      deployStartedAt: "2026-10-19T17:39:58Z"
+      initiatedBy:
+        automated: true
+---
+# A failed automated sync: an immutable field changed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: payments
+  namespace: argocd
+spec:
+  project: payments
+  source:
+    repoURL: https://git.example.com/acme/payments.git
+    path: deploy/overlays/prod
+    targetRevision: main
+  destination:
+    name: in-cluster
+    namespace: payments
+  syncPolicy:
+    automated: {}
+    retry:
+      limit: 2
+status:
+  sync:
+    status: OutOfSync
+    revision: 9a1c2e4d7b0f3a5c6e8d9f0a1b2c3d4e5f6a7b8c
+  health:
+    status: Degraded
+  reconciledAt: "2026-10-22T11:02:17Z"
+  conditions:
+    - type: SyncError
+      message: 'Failed sync attempt to 9a1c2e4: one or more objects failed to apply (dry run) (retried 2 times).'
+      lastTransitionTime: "2026-10-22T11:01:55Z"
+  resources:
+    - version: v1
+      kind: Service
+      namespace: payments
+      name: payments-api
+      status: OutOfSync
+      health:
+        status: Healthy
+    - group: apps
+      version: v1
+      kind: Deployment
+      namespace: payments
+      name: payments-api
+      status: OutOfSync
+      health:
+        status: Degraded
+        message: Deployment "payments-api" exceeded its progress deadline
+  operationState:
+    phase: Failed
+    message: one or more objects failed to apply (retried 2 times)
+    retryCount: 2
+    startedAt: "2026-10-22T11:01:20Z"
+    finishedAt: "2026-10-22T11:01:55Z"
+    operation:
+      initiatedBy:
+        automated: true
+      retry:
+        limit: 2
+      sync:
+        revision: 9a1c2e4d7b0f3a5c6e8d9f0a1b2c3d4e5f6a7b8c
+    syncResult:
+      revision: 9a1c2e4d7b0f3a5c6e8d9f0a1b2c3d4e5f6a7b8c
+      resources:
+        - group: ""
+          version: v1
+          kind: Service
+          namespace: payments
+          name: payments-api
+          status: Synced
+          message: service/payments-api configured
+          syncPhase: Sync
+        - group: apps
+          version: v1
+          kind: Deployment
+          namespace: payments
+          name: payments-api
+          status: SyncFailed
+          message: 'Deployment.apps "payments-api" is invalid: spec.selector: Invalid value: field is immutable'
+          syncPhase: Sync
+---
+# Multi-source Helm chart with values from Git, drifted from Git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-stack
+  namespace: argocd
+spec:
+  project: platform
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: 4.1.0
+      helm:
+        valueFiles:
+          - $values/monitoring/values.yaml
+    - repoURL: https://git.example.com/acme/platform.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+status:
+  sync:
+    status: OutOfSync
+    revisions:
+      - 4.1.0
+      - 2b8d0c1
+  health:
+    status: Healthy
+  reconciledAt: "2026-10-22T10:00:00Z"
+  sourceTypes:
+    - Helm
+    - Directory
+---
+# A sync running right now.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop
+  namespace: argocd
+operation:
+  initiatedBy:
+    username: admin
+  sync:
+    revision: f00dbabe
+spec:
+  project: default
+  source:
+    repoURL: https://git.example.com/acme/shop.git
+    path: k8s
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop
+status:
+  sync:
+    status: OutOfSync
+    revision: f00dbabe
+  health:
+    status: Progressing
+    message: Waiting for rollout to finish
+  operationState:
+    phase: Running
+    message: waiting for healthy state of apps/Deployment/shop-web
+    startedAt: "2026-10-22T11:10:00Z"
+    operation:
+      initiatedBy:
+        username: admin
+      sync:
+        revision: f00dbabe
+---
+# Created, never reconciled (no controller in this cluster).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fresh
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git.example.com/acme/fresh.git
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fresh

@@ -1,0 +1,55 @@
+[package]
+name = "kubach-app"
+description = "Kubach desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kubach"
+path = "src/main.rs"
+
+[dependencies]
+kubach-core.workspace = true
+kubach-ui.workspace = true
+kubach-mcp.workspace = true
+kubach-i18n.workspace = true
+futures.workspace = true
+gpui-kit.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+dirs.workspace = true
+tokio = { workspace = true, features = ["time"] }
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[dev-dependencies]
+resvg.workspace = true
+tempfile.workspace = true
+
+# `cargo bundle` (cargo-bundle) builds `Kubach.app` with these icons.
+[package.metadata.bundle]
+name = "Kubach"
+identifier = "dev.kubach.app"
+icon = ["assets/icon/kubach.icns", "assets/icon/kubach-512.png"]
+category = "public.app-category.developer-tools"

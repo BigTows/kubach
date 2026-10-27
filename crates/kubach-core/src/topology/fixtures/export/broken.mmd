@@ -1,0 +1,30 @@
+flowchart LR
+  %% Kubach topology: 9 nodes, 7 edges
+  subgraph ns0["namespace broken"]
+    direction LR
+    n0[("<b>nope</b><br/><small>ConfigMap · missing</small>")]
+    n1["<b>web</b><br/><small>Deployment · 0/1 ready</small>"]
+    n2["<b>front</b><br/><small>Ingress</small>"]
+    n3[("<b>gone</b><br/><small>PersistentVolumeClaim · missing</small>")]
+    n4[("<b>maybe</b><br/><small>Secret · missing</small>")]
+    n5[["<b>ghost</b><br/><small>Service · missing</small>"]]
+    n6[["<b>lonely</b><br/><small>Service</small>"]]
+    n7[["<b>web</b><br/><small>Service</small>"]]
+    n8[("<b>robot</b><br/><small>ServiceAccount · missing</small>")]
+  end
+  n1 -.-> n0
+  n1 -.-> n4
+  n1 -.-> n3
+  n2 -.->|"80"| n5
+  n2 ==>|"/web → 9090 +1"| n7
+  n7 ==>|"0/1 ready"| n1
+  n1 -.-> n8
+  classDef error stroke:#e5484d,stroke-width:2px
+  classDef warning stroke:#f5a524,stroke-width:2px
+  classDef missing stroke:#e5484d,stroke-width:2px,stroke-dasharray:5 3
+  classDef unknown stroke:#8b8d98,stroke-dasharray:3 3
+  classDef isolated stroke:#3e63dd,stroke-width:2px
+  class n1,n2 error
+  class n0,n3,n4,n5,n8 missing
+  class n6,n7 warning
+  linkStyle 0,1,2,3,6 stroke:#e5484d

@@ -1,0 +1,76 @@
+# Dangling references of every kind.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: front, namespace: broken}
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: ghost, port: {number: 80}}}
+          - path: /web
+            pathType: Prefix
+            backend: {service: {name: web, port: {number: 9090}}}
+          - path: /named
+            pathType: Prefix
+            backend: {service: {name: web, port: {name: https}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: broken}
+spec:
+  selector: {app: web}
+  ports: [{name: http, port: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: lonely, namespace: broken}
+spec:
+  selector: {app: nobody}
+  ports: [{port: 80}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: broken}
+spec:
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      serviceAccountName: robot
+      containers:
+        - name: web
+          image: web
+          env:
+            - name: A
+              valueFrom: {configMapKeyRef: {name: nope, key: a}}
+            - name: B
+              valueFrom: {secretKeyRef: {name: maybe, key: b, optional: true}}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: gone}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-9-x
+  namespace: broken
+  labels: {app: web, pod-template-hash: "9"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-9, uid: r, controller: true}]
+spec:
+  serviceAccountName: robot
+  containers:
+    - name: web
+      image: web
+      env:
+        - name: A
+          valueFrom: {configMapKeyRef: {name: nope, key: a}}
+        - name: B
+          valueFrom: {secretKeyRef: {name: maybe, key: b, optional: true}}
+  volumes:
+    - name: data
+      persistentVolumeClaim: {claimName: gone}
+status:
+  phase: Pending
+  conditions: [{type: Ready, status: "False"}]

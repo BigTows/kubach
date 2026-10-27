@@ -1,0 +1,268 @@
+# Workloads of one namespace and their pods, as the API lists them.
+# Deployment web → ReplicaSets web-1 (old), web-2 → pods; Deployment api
+# shares web's labels (an overlapping selector) through ReplicaSet api-1.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop, uid: d-web}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template: {metadata: {labels: {app: web}}, spec: {containers: [{name: web, image: nginx}]}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: shop, uid: d-api}
+spec:
+  selector: {matchLabels: {app: web}}
+  template: {metadata: {labels: {app: web}}, spec: {containers: [{name: api, image: api}]}}
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-1
+  namespace: shop
+  uid: rs-web-1
+  ownerReferences: [{apiVersion: apps/v1, kind: Deployment, name: web, uid: d-web, controller: true}]
+spec: {selector: {matchLabels: {app: web, pod-template-hash: "1"}}}
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-2
+  namespace: shop
+  uid: rs-web-2
+  ownerReferences: [{apiVersion: apps/v1, kind: Deployment, name: web, uid: d-web, controller: true}]
+spec: {selector: {matchLabels: {app: web, pod-template-hash: "2"}}}
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api-1
+  namespace: shop
+  uid: rs-api-1
+  ownerReferences: [{apiVersion: apps/v1, kind: Deployment, name: api, uid: d-api, controller: true}]
+spec: {selector: {matchLabels: {app: web}}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-1-aaa
+  namespace: shop
+  uid: p-web-1-aaa
+  resourceVersion: "10"
+  creationTimestamp: "2026-10-25T10:00:00Z"
+  labels: {app: web, pod-template-hash: "1"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-1, uid: rs-web-1, controller: true}]
+spec: {nodeName: node-a, containers: [{name: web, image: nginx}]}
+status:
+  phase: Running
+  conditions: [{type: Ready, status: "True"}]
+  containerStatuses: [{name: web, image: nginx, imageID: "", ready: true, restartCount: 0, state: {running: {}}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-2-bbb
+  namespace: shop
+  uid: p-web-2-bbb
+  resourceVersion: "11"
+  creationTimestamp: "2026-10-25T10:05:00Z"
+  labels: {app: web, pod-template-hash: "2"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-2, uid: rs-web-2, controller: true}]
+spec: {nodeName: node-b, containers: [{name: web, image: nginx}]}
+status:
+  phase: Running
+  containerStatuses:
+    - name: web
+      image: nginx
+      imageID: ""
+      ready: false
+      restartCount: 3
+      state: {waiting: {reason: CrashLoopBackOff}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-2-ccc
+  namespace: shop
+  uid: p-web-2-ccc
+  resourceVersion: "12"
+  creationTimestamp: "2026-10-25T10:06:00Z"
+  labels: {app: web, pod-template-hash: "2"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-2, uid: rs-web-2, controller: true}]
+spec: {containers: [{name: web, image: nginx}]}
+status: {phase: Pending}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-1-xxx
+  namespace: shop
+  uid: p-api-1-xxx
+  creationTimestamp: "2026-10-25T09:00:00Z"
+  labels: {app: web}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: api-1, uid: rs-api-1, controller: true}]
+spec: {nodeName: node-a, containers: [{name: api, image: api}]}
+status: {phase: Running}
+---
+# Another namespace: never a pod of the workloads above.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-2-zzz
+  namespace: other
+  uid: p-other
+  creationTimestamp: "2026-10-25T10:07:00Z"
+  labels: {app: web, pod-template-hash: "2"}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: web-2, uid: rs-web-2, controller: true}]
+spec: {containers: [{name: web, image: nginx}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: db, namespace: shop, uid: s-db}
+spec:
+  selector: {matchLabels: {app: db}}
+  template: {metadata: {labels: {app: db}}, spec: {containers: [{name: db, image: postgres}]}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-10
+  namespace: shop
+  uid: p-db-10
+  labels: {app: db}
+  ownerReferences: [{apiVersion: apps/v1, kind: StatefulSet, name: db, uid: s-db, controller: true}]
+spec: {nodeName: node-a, containers: [{name: db, image: postgres}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-0
+  namespace: shop
+  uid: p-db-0
+  labels: {app: db}
+  ownerReferences: [{apiVersion: apps/v1, kind: StatefulSet, name: db, uid: s-db, controller: true}]
+spec: {nodeName: node-a, containers: [{name: db, image: postgres}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-2
+  namespace: shop
+  uid: p-db-2
+  labels: {app: db}
+  ownerReferences: [{apiVersion: apps/v1, kind: StatefulSet, name: db, uid: s-db, controller: true}]
+spec: {nodeName: node-b, containers: [{name: db, image: postgres}]}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: agent, namespace: shop, uid: ds-agent}
+spec:
+  selector: {matchLabels: {app: agent}}
+  template: {metadata: {labels: {app: agent}}, spec: {containers: [{name: agent, image: agent}]}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-q2
+  namespace: shop
+  uid: p-agent-q2
+  creationTimestamp: "2026-10-25T08:00:00Z"
+  labels: {app: agent}
+  ownerReferences: [{apiVersion: apps/v1, kind: DaemonSet, name: agent, uid: ds-agent, controller: true}]
+spec: {nodeName: node-b, containers: [{name: agent, image: agent}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-q1
+  namespace: shop
+  uid: p-agent-q1
+  creationTimestamp: "2026-10-25T08:00:00Z"
+  labels: {app: agent}
+  ownerReferences: [{apiVersion: apps/v1, kind: DaemonSet, name: agent, uid: ds-agent, controller: true}]
+spec: {nodeName: node-a, containers: [{name: agent, image: agent}]}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: report, namespace: shop, uid: j-report}
+spec:
+  selector: {matchLabels: {batch.kubernetes.io/controller-uid: j-report}}
+  template: {spec: {restartPolicy: Never, containers: [{name: report, image: busybox}]}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: report-abc
+  namespace: shop
+  uid: p-report-abc
+  creationTimestamp: "2026-10-25T07:00:00Z"
+  labels: {batch.kubernetes.io/controller-uid: j-report, job-name: report}
+  ownerReferences: [{apiVersion: batch/v1, kind: Job, name: report, uid: j-report, controller: true}]
+spec: {nodeName: node-b, restartPolicy: Never, containers: [{name: report, image: busybox}]}
+status:
+  phase: Succeeded
+  containerStatuses:
+    - name: report
+      image: busybox
+      imageID: ""
+      ready: false
+      restartCount: 0
+      state: {terminated: {reason: Completed, exitCode: 0}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: nightly, namespace: shop, uid: cj-nightly}
+spec:
+  schedule: "* * * * *"
+  jobTemplate: {spec: {template: {spec: {restartPolicy: Never, containers: [{name: n, image: busybox}]}}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-29000000
+  namespace: shop
+  uid: j-nightly-1
+  ownerReferences: [{apiVersion: batch/v1, kind: CronJob, name: nightly, uid: cj-nightly, controller: true}]
+spec: {template: {spec: {restartPolicy: Never, containers: [{name: n, image: busybox}]}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-29000001
+  namespace: shop
+  uid: j-nightly-2
+  ownerReferences: [{apiVersion: batch/v1, kind: CronJob, name: nightly, uid: cj-nightly, controller: true}]
+spec: {template: {spec: {restartPolicy: Never, containers: [{name: n, image: busybox}]}}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nightly-29000000-k1
+  namespace: shop
+  uid: p-nightly-1
+  creationTimestamp: "2026-10-25T06:00:00Z"
+  ownerReferences: [{apiVersion: batch/v1, kind: Job, name: nightly-29000000, uid: j-nightly-1, controller: true}]
+spec: {nodeName: node-a, restartPolicy: Never, containers: [{name: n, image: busybox}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nightly-29000001-k2
+  namespace: shop
+  uid: p-nightly-2
+  creationTimestamp: "2026-10-25T06:01:00Z"
+  ownerReferences: [{apiVersion: batch/v1, kind: Job, name: nightly-29000001, uid: j-nightly-2, controller: true}]
+spec: {nodeName: node-a, restartPolicy: Never, containers: [{name: n, image: busybox}]}
+---
+# A Job named like a CronJob's, of no CronJob: the name fallback takes
+# only the exact `<cronjob>-<digits>` shape.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nightly-backup-k3
+  namespace: shop
+  uid: p-nightly-backup
+  creationTimestamp: "2026-10-25T06:02:00Z"
+  ownerReferences: [{apiVersion: batch/v1, kind: Job, name: nightly-backup, uid: j-backup, controller: true}]
+spec: {containers: [{name: n, image: busybox}]}

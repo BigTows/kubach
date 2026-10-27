@@ -1,0 +1,109 @@
+{
+ "status": "success",
+ "data": {
+  "resultType": "matrix",
+  "result": [
+   {
+    "metric": {
+     "__name__": "container_memory_working_set_bytes",
+     "container": "coredns",
+     "endpoint": "https-metrics",
+     "id": "/kubepods/burstable/pod7e7ca82f-5d62-4c8e-b32c-051e7be85e16/9f7510731df37bca7f8f58b567270c4d4cede3e7e14ea1dc9f478cef7a5da826",
+     "image": "registry.k8s.io/coredns/coredns:v1.14.6",
+     "instance": "192.168.49.2:10250",
+     "job": "kubelet",
+     "metrics_path": "/metrics/cadvisor",
+     "name": "9f7510731df37bca7f8f58b567270c4d4cede3e7e14ea1dc9f478cef7a5da826",
+     "namespace": "kube-system",
+     "node": "minikube",
+     "pod": "coredns-559f6c778d-vshbg",
+     "service": "kube-prometheus-stack-kubelet"
+    },
+    "values": [
+     [
+      1792735680,
+      "23113728"
+     ],
+     [
+      1792735740,
+      "25235456"
+     ],
+     [
+      1792735800,
+      "26140672"
+     ],
+     [
+      1792735860,
+      "26529792"
+     ]
+    ]
+   },
+   {
+    "metric": {
+     "__name__": "container_memory_working_set_bytes",
+     "endpoint": "https-metrics",
+     "id": "/kubepods/burstable/pod7e7ca82f-5d62-4c8e-b32c-051e7be85e16",
+     "instance": "192.168.49.2:10250",
+     "job": "kubelet",
+     "metrics_path": "/metrics/cadvisor",
+     "namespace": "kube-system",
+     "node": "minikube",
+     "pod": "coredns-559f6c778d-vshbg",
+     "service": "kube-prometheus-stack-kubelet"
+    },
+    "values": [
+     [
+      1792735680,
+      "23363584"
+     ],
+     [
+      1792735740,
+      "25489408"
+     ],
+     [
+      1792735800,
+      "26390528"
+     ],
+     [
+      1792735860,
+      "26779648"
+     ]
+    ]
+   },
+   {
+    "metric": {
+     "__name__": "container_memory_working_set_bytes",
+     "endpoint": "https-metrics",
+     "id": "/kubepods/burstable/pod7e7ca82f-5d62-4c8e-b32c-051e7be85e16/a7a9fb63b45448e670797c51e37e8d4b164f7d53f430e75829c88c8170619a8a",
+     "image": "registry.k8s.io/pause:3.10.2",
+     "instance": "192.168.49.2:10250",
+     "job": "kubelet",
+     "metrics_path": "/metrics/cadvisor",
+     "name": "a7a9fb63b45448e670797c51e37e8d4b164f7d53f430e75829c88c8170619a8a",
+     "namespace": "kube-system",
+     "node": "minikube",
+     "pod": "coredns-559f6c778d-vshbg",
+     "service": "kube-prometheus-stack-kubelet"
+    },
+    "values": [
+     [
+      1792735680,
+      "200704"
+     ],
+     [
+      1792735740,
+      "200704"
+     ],
+     [
+      1792735800,
+      "200704"
+     ],
+     [
+      1792735860,
+      "200704"
+     ]
+    ]
+   }
+  ]
+ }
+}

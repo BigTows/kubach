@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.58" stop-color="#f1f1f1"/>
+      <stop offset="1" stop-color="#cfcfcf"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eeeeee"/>
+      <stop offset="1" stop-color="#a8a8a8"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#626262"/>
+      <stop offset="1" stop-color="#242424"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Upper cube -->
+  <g stroke-linejoin="round">
+    <path d="M256 54 L366 116 L256 179 L146 116 Z" fill="url(#top)"/>
+    <path d="M146 116 L256 179 L256 306 L146 243 Z" fill="url(#left)"/>
+    <path d="M366 116 L256 179 L256 306 L366 243 Z" fill="url(#right)"/>
+
+    <!-- Lower-left cube -->
+    <path d="M146 243 L256 306 L146 369 L36 306 Z" fill="url(#top)"/>
+    <path d="M36 306 L146 369 L146 496 L36 433 Z" fill="url(#left)"/>
+    <path d="M256 306 L146 369 L146 496 L256 433 Z" fill="url(#right)"/>
+
+    <!-- Lower-right cube -->
+    <path d="M366 243 L476 306 L366 369 L256 306 Z" fill="url(#top)"/>
+    <path d="M256 306 L366 369 L366 496 L256 433 Z" fill="url(#left)"/>
+    <path d="M476 306 L366 369 L366 496 L476 433 Z" fill="url(#right)"/>
+  </g>
+</svg>

@@ -1,0 +1,32 @@
+<!--
+  MSI for Kubach (WiX v5): kubach.exe in Program Files\Kubach and a Start
+  menu shortcut. scripts/package-windows.ps1 passes the variables.
+  MSI versions are major.minor.build with major < 256, so 2026.10.1 becomes
+  26.10.1. Keep UpgradeCode: newer MSIs replace older ones through it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Kubach" Manufacturer="Kubach" Version="$(var.MsiVersion)"
+           UpgradeCode="2C0FF52B-8FF4-4271-88A1-BF1B268C41AA" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Kubach is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="kubach.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="kubach.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/BigTows/kubach" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Kubach">
+        <Component>
+          <File Id="kubach.exe" Source="$(var.ExeFile)" KeyPath="yes">
+            <Shortcut Name="Kubach" Directory="ProgramMenuFolder" Advertise="yes"
+                      Icon="kubach.ico" WorkingDirectory="INSTALLFOLDER" />
+          </File>
+        </Component>
+        <Component>
+          <File Source="$(var.LicenseFile)" Name="LICENSE.txt" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+  </Package>
+</Wix>

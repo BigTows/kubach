@@ -1,0 +1,39 @@
+digraph topology {
+  // Kubach topology: 13 nodes, 13 edges
+  rankdir=LR;
+  compound=true;
+  fontname="Helvetica";
+  node [shape=box, style="rounded", fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9, color="#8b8d98", fontcolor="#8b8d98"];
+  "External//203.0.113.10" [label="203.0.113.10\nExternal", shape=ellipse];
+  "External//lb.example.net" [label="lb.example.net\nExternal", shape=ellipse];
+  subgraph "cluster_shop" {
+    label="namespace shop";
+    style="rounded,dashed";
+    color="#8b8d98";
+    "ConfigMap/shop/web-config" [label="web-config\nConfigMap", shape=note];
+    "Deployment.apps/shop/api" [label="api\nDeployment · 1/1 ready · isolated in", color="#3e63dd", penwidth=2, style="rounded"];
+    "Deployment.apps/shop/web" [label="web\nDeployment · 1/2 ready · isolated in", color="#3e63dd", penwidth=2, style="rounded"];
+    "Ingress.networking.k8s.io/shop/shop" [label="shop\nIngress", style="rounded"];
+    "PersistentVolumeClaim/shop/web-data" [label="web-data\nPersistentVolumeClaim", shape=cylinder];
+    "Secret/shop/api-secret" [label="api-secret\nSecret", shape=note];
+    "Secret/shop/shop-tls" [label="shop-tls\nSecret", shape=note];
+    "Secret/shop/web-secret" [label="web-secret\nSecret", shape=note];
+    "Service/shop/api" [label="api\nService", style="rounded"];
+    "Service/shop/web" [label="web\nService · LoadBalancer", style="rounded"];
+    "ServiceAccount/shop/web" [label="web\nServiceAccount", shape=note];
+  }
+  "Deployment.apps/shop/api" -> "Secret/shop/api-secret" [style=dashed, tooltip="env-ref"];
+  "Deployment.apps/shop/web" -> "ConfigMap/shop/web-config" [style=dashed, tooltip="env-ref"];
+  "Ingress.networking.k8s.io/shop/shop" -> "External//lb.example.net" [tooltip="exposes"];
+  "Service/shop/web" -> "External//203.0.113.10" [tooltip="exposes"];
+  "Deployment.apps/shop/web" -> "PersistentVolumeClaim/shop/web-data" [style=dashed, tooltip="mounts"];
+  "Deployment.apps/shop/web" -> "Secret/shop/web-secret" [style=dashed, tooltip="mounts"];
+  "Deployment.apps/shop/web" -> "Deployment.apps/shop/api" [label="allows TCP 8080", color="#30a46c", fontcolor="#30a46c", penwidth=1.6, tooltip="policy-allows"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Service/shop/api" [label="shop.example.com/api → http", penwidth=1.6, tooltip="routes-to"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Service/shop/web" [label="shop.example.com → 80", penwidth=1.6, tooltip="routes-to"];
+  "Service/shop/api" -> "Deployment.apps/shop/api" [label="1 ready", penwidth=1.6, tooltip="selects"];
+  "Service/shop/web" -> "Deployment.apps/shop/web" [label="blocked by policy", color="#e5484d", fontcolor="#e5484d", style=dashed, tooltip="selects"];
+  "Ingress.networking.k8s.io/shop/shop" -> "Secret/shop/shop-tls" [style=dashed, tooltip="tls"];
+  "Deployment.apps/shop/web" -> "ServiceAccount/shop/web" [style=dashed, tooltip="uses-sa"];
+}

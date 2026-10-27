@@ -1,0 +1,35 @@
+flowchart LR
+  %% Kubach topology: 13 nodes, 12 edges
+  n3(["<b>203.0.113.10</b><br/><small>External</small>"])
+  n4(["<b>lb.example.net</b><br/><small>External</small>"])
+  subgraph ns1["namespace shop"]
+    direction LR
+    n0[("<b>web-config</b><br/><small>ConfigMap</small>")]
+    n1["<b>api</b><br/><small>Deployment · 1/1 ready</small>"]
+    n2["<b>web</b><br/><small>Deployment · 1/2 ready</small>"]
+    n5["<b>shop</b><br/><small>Ingress</small>"]
+    n6[("<b>web-data</b><br/><small>PersistentVolumeClaim</small>")]
+    n7[("<b>api-secret</b><br/><small>Secret</small>")]
+    n8[("<b>shop-tls</b><br/><small>Secret</small>")]
+    n9[("<b>web-secret</b><br/><small>Secret</small>")]
+    n10[["<b>api</b><br/><small>Service</small>"]]
+    n11[["<b>web</b><br/><small>Service · LoadBalancer</small>"]]
+    n12[("<b>web</b><br/><small>ServiceAccount</small>")]
+  end
+  n1 -.-> n7
+  n2 -.-> n0
+  n5 --> n4
+  n11 --> n3
+  n2 -.-> n6
+  n2 -.-> n9
+  n5 ==>|"shop.example.com/api → http"| n10
+  n5 ==>|"shop.example.com → 80"| n11
+  n10 ==>|"1 ready"| n1
+  n11 ==>|"1/2 ready"| n2
+  n5 -.-> n8
+  n2 -.-> n12
+  classDef error stroke:#e5484d,stroke-width:2px
+  classDef warning stroke:#f5a524,stroke-width:2px
+  classDef missing stroke:#e5484d,stroke-width:2px,stroke-dasharray:5 3
+  classDef unknown stroke:#8b8d98,stroke-dasharray:3 3
+  classDef isolated stroke:#3e63dd,stroke-width:2px

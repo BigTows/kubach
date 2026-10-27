@@ -1,0 +1,23 @@
+# AUR package kubach-bin: the release tar.gz repackaged. The release
+# workflow fills in the version and checksums and attaches the result to
+# the GitHub Release; publish it to the AUR from there.
+pkgname=kubach-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Kubernetes IDE"
+arch=('x86_64' 'aarch64')
+url="https://github.com/BigTows/kubach"
+license=('MIT')
+depends=('libxkbcommon-x11' 'wayland' 'fontconfig' 'freetype2' 'vulkan-icd-loader')
+provides=('kubach')
+conflicts=('kubach')
+source_x86_64=("$url/releases/download/$pkgver/kubach-$pkgver-linux-x86_64.tar.gz")
+source_aarch64=("$url/releases/download/$pkgver/kubach-$pkgver-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+    cd "kubach-$pkgver-linux-$CARCH"
+    install -d "$pkgdir/usr"
+    cp -a bin share "$pkgdir/usr/"
+}

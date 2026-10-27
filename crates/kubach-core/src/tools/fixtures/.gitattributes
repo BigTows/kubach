@@ -1,0 +1,2 @@
+# Signed files: keep the bytes exact on every checkout (no CRLF).
+* -text

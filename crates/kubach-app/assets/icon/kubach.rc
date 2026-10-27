@@ -1,0 +1,2 @@
+// Icon resource 1: GPUI loads it as the window and taskbar icon.
+1 ICON "kubach.ico"
