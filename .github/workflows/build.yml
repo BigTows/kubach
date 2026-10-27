@@ -1,8 +1,9 @@
 # Release builds for Linux, macOS and Windows, x64 and arm64.
 #
-# Every push to main: packages as run artifacts. A tag equal to the
-# workspace version (e.g. 2026.10.1): the same packages in a GitHub Release,
-# plus the AUR PKGBUILD and SHA256SUMS.
+# Every push to main: packages as run artifacts. When the workspace version
+# in Cargo.toml (e.g. 2026.10.1) has no tag yet, the run also creates that
+# tag and a GitHub Release with the packages, the AUR PKGBUILD and
+# SHA256SUMS. So a release is a commit that bumps the version.
 #
 # macOS signing is optional. Without these secrets the app gets an ad-hoc
 # signature: it runs (after "Open" in Finder), but Touch ID unlock is
@@ -20,12 +21,13 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ['20[0-9][0-9].*']
   workflow_dispatch:
 
+# Runs queue instead of cancelling each other: a cancelled run could leave
+# a release half uploaded.
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -35,6 +37,29 @@ env:
   NFPM_VERSION: 2.41.1
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        name: Version and whether it is released
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            release=false
+          elif git ls-remote --exit-code --tags origin "refs/tags/$version" > /dev/null; then
+            echo "$version is already released"
+            release=false
+          else
+            echo "$version has no tag yet: releasing"
+            release=true
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
   linux:
     name: Linux ${{ matrix.arch }}
     strategy:
@@ -46,7 +71,7 @@ jobs:
           - { runner: ubuntu-22.04-arm, arch: aarch64, nfpm: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/linux-deps
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -63,7 +88,7 @@ jobs:
       - name: Shared libraries
         run: ldd target/release/kubach
       - run: scripts/package-linux.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kubach-linux-${{ matrix.arch }}
           path: target/dist/*
@@ -82,7 +107,7 @@ jobs:
       SIGNED: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_PROVISIONING_PROFILE != '' }}
       NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.APPLE_API_KEY_P8 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p kubach-app
@@ -134,7 +159,7 @@ jobs:
             done
           done
           rm "$RUNNER_TEMP/AuthKey.p8"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kubach-macos-${{ matrix.arch }}
           path: target/dist/*.dmg
@@ -153,7 +178,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust
         run: |
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -175,12 +200,12 @@ jobs:
           }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p kubach-app
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
       - run: dotnet tool install --global wix --version 5.0.2
       - run: scripts/package-windows.ps1 -Arch ${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kubach-windows-${{ matrix.arch }}
           path: |
@@ -189,19 +214,16 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, macos, windows]
+    if: needs.version.outputs.release == 'true'
+    needs: [version, linux, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Tag matches the workspace version
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ "$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version" >&2; exit 1; }
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -214,8 +236,12 @@ jobs:
               packaging/arch/PKGBUILD > dist/PKGBUILD
           (cd dist && sha256sum -- * > SHA256SUMS)
           cat dist/SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      # Creates the tag on this commit. Tags made with GITHUB_TOKEN don't
+      # start another run.
+      - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           name: Kubach ${{ env.VERSION }}
           files: dist/*
           generate_release_notes: true

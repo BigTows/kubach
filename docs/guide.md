@@ -54,8 +54,9 @@ cargo run -p kubach-ui --example gallery   # галерея дизайн-сис�
 - **macOS** — `Kubach.app` в `.dmg` (`scripts/bundle-macos.sh --dmg`).
 - **Windows** — portable `zip` и MSI ([`scripts/package-windows.ps1`](../scripts/package-windows.ps1), WiX 5).
 
-Тег, равный версии из `Cargo.toml` (`2026.10.1`), выкладывает те же файлы в GitHub Release
-вместе с `SHA256SUMS` и PKGBUILD для AUR (`kubach-bin`). macOS-сборка подписывается и
+Релиз — это коммит в `main`, поднимающий версию в `Cargo.toml`: если тега с этой версией
+(`2026.10.2`) ещё нет, run после сборки сам ставит тег и выкладывает те же файлы в
+GitHub Release вместе с `SHA256SUMS` и PKGBUILD для AUR (`kubach-bin`). macOS-сборка подписывается и
 нотаризуется, только если заданы секреты (список — в начале workflow). Без них у
 приложения ad-hoc подпись: Touch ID недоступен, хранилище открывается паролем.
 
