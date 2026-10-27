@@ -1,236 +1,165 @@
-# Kubach
+<p align="center">
+  <img src="crates/kubach-app/assets/icon/kubach-512.png" width="128" alt="Kubach">
+</p>
 
-Кроссплатформенная (macOS, Windows, Linux) Kubernetes IDE на Rust и
-[GPUI](https://gpui.rs) ([GPUI Kit](https://gpui-kit.com)).
+<h1 align="center">Kubach</h1>
 
-Kubach работает локально, с правами из вашего kubeconfig: в кластер ничего не
-устанавливается ([ADR 0004](docs/adr/0004-local-only.md)). Ещё он умеет быть MCP-сервером,
-чтобы ИИ-агент (Claude Code, Claude Desktop) работал с кластером в заданных вами рамках.
+<p align="center">
+  <b>A native, GPU-accelerated Kubernetes IDE — with a safe door for your AI agent.</b>
+</p>
 
-## Сборка и запуск
+<p align="center">
+  <a href="https://github.com/BigTows/kubach/releases"><img src="https://img.shields.io/github/v/release/BigTows/kubach?label=release" alt="Release"></a>
+  <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-x64%20%26%20arm64-informational" alt="Platforms">
+  <img src="https://img.shields.io/badge/built%20with-Rust%20%2B%20GPUI-orange" alt="Rust + GPUI">
+  <img src="https://img.shields.io/badge/vibe-coded%20%F0%9F%A4%96-blueviolet" alt="Vibe-coded">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"></a>
+</p>
 
-Нужен Rust (edition 2024, свежий stable) и Git.
+<p align="center">
+  <b>English</b> · <a href="README_RU.md">Русский</a> · <a href="README_CN.md">简体中文</a>
+</p>
 
-```sh
-cargo run --release                        # приложение
-cargo run -p kubach-ui --example gallery   # галерея дизайн-системы
-```
+---
 
-Бинарь называется `kubach`. Для разработки хватает `cargo run`: dev-профиль уже
-оптимизирует зависимости.
+> [!NOTE]
+> **Kubach is a vibe-coded project.** Nearly all of its code was written by AI agents,
+> with a human setting the direction, reviewing the result and making the calls. We say so up front so that you know what you're running.
 
-Иконка приложения лежит в [`crates/kubach-app/assets/icon`](crates/kubach-app/assets/icon):
-исходник `kubach.svg` и собранные из него (кубы на скруглённой тёмной подложке по сетке иконок Apple) `kubach.icns`, `kubach.ico` и `kubach-512.png` (она же — Dock при `cargo run`).
-После правки SVG их пересобирает `cargo run -p kubach-app --example icons`.
+## Why Kubach
 
-- **macOS** — при `cargo run` иконку в Dock ставит само приложение. Подписанный
-  `Kubach.app` собирает `scripts/bundle-macos.sh --profile <файл.provisionprofile>`
-  (`--debug` — быстрая dev-сборка). Bundle ID и команда берутся из профиля, сертификат —
-  из Keychain. Подпись с entitlement `keychain-access-groups` нужна для разблокировки
-  хранилища по Touch ID ([ADR 0008](docs/adr/0008-kubeconfig-vault.md)): при `cargo run`
-  она недоступна. Нужен профиль macOS App Development (этот Mac в списке устройств) с
-  сертификатом Apple Development или Developer ID с сертификатом Developer ID Application.
-- **Windows** — иконка вшивается в `kubach.exe` при сборке.
-- **Linux** — `dev.kubach.app.desktop` копируется в `~/.local/share/applications`,
-  а `kubach-512.png` — в `~/.local/share/icons/hicolor/512x512/apps/dev.kubach.app.png`.
+- **Native and fast.** Written in Rust on [GPUI](https://gpui.rs), the GPU UI framework
+  behind the Zed editor. No Electron and no browser inside.
+- **Nothing goes into your cluster.** Kubach runs on your machine with the rights
+  from your kubeconfig. It has no in-cluster agent, no operator and no CRDs.
+- **Built for working with AI.** Kubach is also an MCP server. Claude Code, Claude
+  Desktop or any other MCP client can work with your cluster within limits you set.
+  The agent never sees your credentials.
+- **Your kubeconfigs stay safe.** Imported configs live in an encrypted vault that
+  unlocks with a password, **Touch ID** or **Windows Hello**, and locks with your screen.
 
-Системные зависимости определяет GPUI, в репозитории они не перечислены. Смотрите
-требования GPUI для вашей ОС:
+## Features
 
-- **macOS** — Xcode (полный, не только Command Line Tools; нужен компилятор Metal).
-- **Windows** — Visual Studio Build Tools с C++ и Windows SDK.
-- **Linux** — компилятор C/C++, `pkg-config` и dev-пакеты для X11/Wayland, xkbcommon,
-  Vulkan и fontconfig (см. ниже).
+**Explore**
+- Several clusters at once: switch contexts instantly, connections stay warm.
+- Every resource kind, CRDs included, with live list + watch updates, events and
+  diagnostics.
+- **Topology**: a graph from Ingress / Gateway API to Service, workloads and pods, down
+  to ConfigMaps, Secrets and PVCs. It flags broken references and checks
+  NetworkPolicies ("can A reach B on port 443?").
+- Traffic overlay from Prometheus for Istio, Linkerd and Cilium Hubble.
+- CPU and memory from metrics-server, and history from Prometheus.
 
-### Сборки и релизы
+**Operate**
+- Logs, exec, port-forward, debug containers and a shell on the node.
+- Scale, rollout restart, cordon / drain and evictions.
+- A YAML editor with syntax highlighting, a diff before you apply, and server-side apply.
+- Secrets that stay secret: values are fetched only when you click "Show", never
+  cached, and cleared from the clipboard on a timer.
+- A built-in terminal with a `KUBECONFIG` scoped to the context you're in.
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) на каждый коммит в `main`
-собирает пакеты для x64 и arm64 и кладёт их в артефакты run:
+**Ship**
+- **Helm**: releases, history, upgrade, rollback, chart repositories with icons and
+  READMEs, and OCI charts. Kubach can download a pinned, checksum-verified `helm` for you.
+- **Kustomize**: build and diff overlays before applying.
+- **GitOps**: shows which Argo CD Application or Flux Kustomization / HelmRelease
+  manages a resource.
 
-- **Linux** (Ubuntu 22.04, glibc 2.35) — `.deb`, `.rpm`, Arch `.pkg.tar.zst`, AppImage и
-  `tar.gz` ([`scripts/package-linux.sh`](scripts/package-linux.sh), nfpm и appimagetool).
-- **macOS** — `Kubach.app` в `.dmg` (`scripts/bundle-macos.sh --dmg`).
-- **Windows** — portable `zip` и MSI ([`scripts/package-windows.ps1`](scripts/package-windows.ps1), WiX 5).
+**Collaborate with AI** ([MCP](docs/guide.md#mcp-ии-агенты))
+- Sessions are scoped to a context, namespaces and a profile: `read-only`, `debug` or
+  `deploy`.
+- Rights are granted on request: the agent asks, and you answer yes or no in the
+  Kubach window.
+- Writes, exec and Secret reveals each need your confirmation, or can be limited to
+  dry run and diff.
+- Every call goes to an audit log, which never contains Secret values.
+- Topology tools for the agent: `get_topology` and `can_reach`.
+- Connects over stdio (`kubach mcp`) or HTTP on `127.0.0.1` with a bearer token.
 
-Тег, равный версии из `Cargo.toml` (`2026.10.1`), выкладывает те же файлы в GitHub Release
-вместе с `SHA256SUMS` и PKGBUILD для AUR (`kubach-bin`). macOS-сборка подписывается и
-нотаризуется, только если заданы секреты (список — в начале workflow). Без них у
-приложения ad-hoc подпись: Touch ID недоступен, хранилище открывается паролем.
+**Feels like home**
+- Kubach Dark and Kubach Light themes.
+- Interface in English, Russian and Simplified Chinese.
 
-### Linux
+## Install
 
-Проверено на Debian 12 (bookworm) с актуальным stable Rust: `cargo build`,
-`cargo clippy --workspace --all-targets -- -D warnings` и `cargo test --workspace`
-проходят. Пакеты для Debian/Ubuntu (тот же список — в
-[`.github/actions/linux-deps`](.github/actions/linux-deps/action.yml)):
+Download the latest build from **[Releases](https://github.com/BigTows/kubach/releases)**.
+Each build is available for both x64 and arm64.
 
-```sh
-sudo apt-get install -y build-essential pkg-config \
-  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-  libx11-dev libx11-xcb-dev libxcb1-dev \
-  libfontconfig-dev libfreetype-dev libvulkan-dev \
-  libssl-dev libzstd-dev
-```
+| OS | Package | Notes |
+|---|---|---|
+| **macOS** 11+ | `Kubach-<version>-macos-<arch>.dmg` | Signed with Developer ID and notarized |
+| **Windows** 10+ | `.msi` installer or portable `.zip` | Not code-signed yet: SmartScreen may show a warning |
+| **Debian / Ubuntu** | `.deb` | `sudo apt install ./kubach_*.deb` |
+| **Fedora / RHEL / openSUSE** | `.rpm` | `sudo dnf install ./kubach-*.rpm` |
+| **Arch Linux** | `.pkg.tar.zst` or `PKGBUILD` (`kubach-bin`) | `sudo pacman -U kubach-*.pkg.tar.zst` |
+| **Any Linux** | `.AppImage` or `.tar.gz` | Needs glibc 2.35+ and a Vulkan driver |
 
-`libdbus` не нужен: D-Bus (logind, Secret Service) работает через чистый Rust `zbus`.
-Для запуска нужен Vulkan-драйвер (на Debian/Ubuntu — `mesa-vulkan-drivers`).
+Every push to `main` also produces fresh builds as
+[Actions artifacts](https://github.com/BigTows/kubach/actions/workflows/build.yml).
 
-Что зависит от окружения:
+### Connect your AI agent
 
-- **Настройки и хранилище** — в `$XDG_CONFIG_HOME/kubach` (по умолчанию `~/.config/kubach`)
-  или в `KUBACH_CONFIG_DIR`.
-- **Keychain** — Secret Service по D-Bus (GNOME Keyring, KWallet). Нужен только для режима
-  «Keychain» у хранилища kubeconfig; если службы нет, режим недоступен с указанием
-  причины, а пароль работает.
-- **Блокировка по экрану** — свойство `LockedHint` сессии logind. Его выставляют
-  GNOME, KDE и другие экраны блокировки, интегрированные с logind; без logind
-  (контейнер, нет GUI-сессии) хранилище блокируется только вручную и по таймеру.
-- **Окружение shell** — при запуске из `.desktop`-файла (без терминала) `PATH` и
-  `KUBECONFIG` берутся из `$SHELL -l -i`, как на macOS.
+First turn on agent access for a context in **Settings → Security**. Access is off by
+default.
 
-## Подключение кластеров
-
-Kubach читает `KUBECONFIG` (или `~/.kube/config`). Дополнительно кластеры добавляются
-кнопкой «+» на панели кластеров («Add cluster») или в Settings → Clusters:
-
-- **Link kubeconfig file** (по ссылке) — файл читается на месте и подмешивается после
-  `KUBECONFIG`. Изменения от `aws`, `gcloud` и других утилит подхватываются, учётные
-  данные остаются в вашем файле.
-- **Import kubeconfig file** / **Paste kubeconfig from clipboard** — конфиг копируется в
-  зашифрованное хранилище `vault.kubach` в папке настроек (`KUBACH_CONFIG_DIR` или
-  папка ОС). Подходит для файлов, которые негде хранить: от коллеги или из облачной
-  консоли. Шифрование — XChaCha20-Poly1305, ключ из пароля (Argon2id) и/или в системном
-  хранилище ключей ([ADR 0008](docs/adr/0008-kubeconfig-vault.md)). При импорте
-  показывается предпросмотр контекстов; конфликтующие имена контекстов переименовываются.
-- **Блокировка хранилища** — расшифрованные конфиги живут только в памяти. Хранилище
-  блокируется вручную («Lock imported clusters»), по таймеру бездействия (15 минут по
-  умолчанию) и при блокировке экрана ОС; после этого сессии импортированных контекстов
-  закрываются. Пароль спрашивается при первом подключении к такому контексту.
-  Таймер и блокировка по экрану настраиваются в Settings → Clusters.
-
-## MCP: ИИ-агенты
-
-Агент не получает учётных данных: он видит только MCP-tools, а запросы к API делает Kubach
-([ADR 0005](docs/adr/0005-mcp-permissions.md)). Сессия ограничена контекстом, namespace и
-профилем — потолком того, что агент может попросить:
-
-| Профиль | Что разрешено |
-|---------|---------------|
-| `read-only` | чтение ресурсов namespace и events, без значений Secrets |
-| `debug` | read-only, плюс логи и exec |
-| `deploy` | read-only, плюс изменения (apply, rollout, scale, delete) |
-
-Права выдаются по запросу (#227): сессия стартует без прав, и когда агенту впервые нужно
-право — читать namespace, раскрыть конкретный Secret, менять namespace, — Kubach спрашивает в
-своём окне. Ответ, «да» или «нет», действует до конца сессии; отказ повторно не спрашивается.
-Выданные права видны и отзываются в Settings → AI agent.
-
-Доступ выключен по умолчанию. Включите его для нужного контекста в Settings → Security
-(«AI agent access»): там же максимальный профиль, TTL сессии (до 8 ч), число namespace,
-режим изменений («Dry run and diff only» или «Apply after confirmation»), exec и
-«Secrets for the agent»: ничего, метаданные и проверки без значений (по умолчанию) или ещё
-раскрытие по запросу — на каждый Secret отдельный вопрос с предупреждением, что значение уйдёт
-провайдеру LLM. Если значения Secrets скрыты от вас самих, раскрытие агенту недоступно.
-
-### Топология для агента
-
-Два read-инструмента (#327, [ADR 0016](docs/adr/0016-topology.md)) — права как у остальных
-чтений: только namespace сессии, право чтения каждого, запись в аудит.
-
-- `get_topology` — граф связей компактным JSON: узлы (id, kind, namespace, name, presence,
-  поды, порты Service, хосты, изоляция NetworkPolicy), рёбра (маршруты, endpoints, ссылки на
-  ConfigMap/Secret — только имена, вердикт политики) и диагностики с сообщениями. Параметры:
-  `namespace` или `namespaces` (до 3), `resource` `{kind, name, namespace?}` с `depth` —
-  окрестность ресурса, `detail` (`workloads`/`pods`), `networkPolicies` (по умолчанию `true`).
-- `can_reach` — `from`, `to` (`{kind, name, namespace?}` workload/pod, `to` может быть
-  Service, или `{address}` — IP вне кластера), `port` (номер или имя), `protocol` → разрешено
-  ли соединение и почему: политики egress источника и ingress цели. Это анализ объектов
-  NetworkPolicy; применяет ли их CNI — неизвестно.
-
-Данные — одноразовый list нужных видов клиентом сессии; виды, которые политика или API не
-дали, перечислены в `unavailable`, их узлы — `unknown`.
-
-### Два способа подключения
-
-- **stdio** — `kubach mcp`, без окна; агент запускает его как дочерний процесс:
-
-  ```text
-  kubach mcp [--context NAME] [--namespace NS]... [--profile PROFILE] [--ttl DURATION] [--grant-read]
-  ```
-
-  `-c/--context` (по умолчанию стартовый контекст из настроек, иначе `current-context`),
-  `-n/--namespace` (можно повторять, если контекст позволяет), `-p/--profile`
-  (`read-only`, `debug`, `deploy`; потолок сессии, по умолчанию максимум контекста), `--ttl` (`30m`, `2h`,
-  `1h30m` или минуты), `--grant-read` (чтение namespace сессии разрешено сразу, без вопроса в
-  окне, — чтения работают и без запущенного приложения; Secrets и изменения всё равно
-  спрашиваются, настройки контекста не обходятся). Подробнее — `kubach mcp --help`.
-- **HTTP** — Settings → AI agent → «Serve MCP over HTTP». Сервер слушает
-  `http://127.0.0.1:<порт>/mcp` (порт фиксированный), пока запущен Kubach, и требует
-  bearer-токен. Токен хранится в папке настроек, читается только вами; его можно
-  перевыпустить, старые конфиги агентов перестанут работать.
-
-### Сниппеты
-
-Готовые команды с подставленными путём, контекстом и токеном копируются из
-Settings → AI agent → «Connect an agent». Вид такой:
+Kubach can register itself with your agent. It shows the config file and the change,
+applies them after you confirm, and keeps your other servers along with a backup of
+the file:
 
 ```sh
-# Claude Code, HTTP: работает в сессии, запущенной в приложении
-claude mcp add --transport http kubach http://127.0.0.1:<порт>/mcp \
-  --header "Authorization: Bearer <токен>"
-
-# Claude Code, stdio
-claude mcp add kubach -- /путь/к/kubach mcp \
-  --context <context> --namespace <namespace>
+kubach mcp install claude-code      # also: codex, opencode, cursor, claude-desktop
+kubach mcp clients                  # which agents are connected
+kubach mcp uninstall cursor
 ```
 
-Claude Desktop — в `claude_desktop_config.json` (Settings → Developer → Edit Config):
-
-```json
-{
-  "mcpServers": {
-    "kubach": {
-      "command": "/путь/к/kubach",
-      "args": ["mcp", "--context", "<context>", "--namespace", "<namespace>"]
-    }
-  }
-}
-```
-
-### Подтверждения и аудит
-
-Вопросы о правах и изменения (apply, delete, exec — каждый вызов; scale и rollout restart —
-один раз на namespace, если граница держится и на API-сервере) подтверждаются в окне Kubach.
-Для `kubach mcp` это значит, что приложение должно быть запущено с включённым HTTP-сервером,
-иначе вызовы, которым нужен ответ пользователя, отклоняются. Активные сессии с их правами и
-журнал аудита (без значений Secrets) видны в Settings → AI agent.
-
-## Документация
-
-- [Архитектура](docs/architecture.md)
-- [ADR](docs/adr/README.md): [0004 — только локально](docs/adr/0004-local-only.md),
-  [0005 — права MCP](docs/adr/0005-mcp-permissions.md), [0006 — Helm](docs/adr/0006-helm.md),
-  [0007 — Kustomize](docs/adr/0007-kustomize.md),
-  [0008 — хранилище kubeconfig](docs/adr/0008-kubeconfig-vault.md)
-- [Правила проекта](AGENT.md)
-
-Для Helm-действий (rollback, upgrade, uninstall) нужен установленный `helm`, для сборки
-Kustomize — `kustomize` или `kubectl`; просмотр работает и без них.
-
-## Структура репозитория
-
-- `crates/kubach-core` — доменная логика Kubernetes, без UI-зависимостей
-- `crates/kubach-mcp` — MCP-сервер: политики, сессии, аудит
-- `crates/kubach-ui` — дизайн-система: темы Kubach Dark / Light (`themes/kubach.json`), компоненты
-- `crates/kubach-app` — приложение (бинарь `kubach`)
+You can also run the stdio server yourself and tune the session:
 
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+kubach mcp                                   # the agent picks a context; Kubach asks you first
+kubach mcp --context prod --namespace shop   # pin a context and a namespace (repeat -n for more)
+kubach mcp -c staging -p read-only --ttl 2h  # cap the profile and the session length
+kubach mcp -c dev -n web --grant-read        # allow reads up front: they work without the app
+kubach mcp --help
 ```
 
-## Версионирование
+| Option | Meaning |
+|---|---|
+| `-c, --context NAME` | kubeconfig context (without any option, the agent chooses and you approve) |
+| `-n, --namespace NS` | limit the session to a namespace; repeat for several |
+| `-p, --profile` | `read-only`, `debug` or `deploy`: the most the session may ask for |
+| `--ttl` | session length: `30m`, `2h`, `1h30m` (30 minutes by default) |
+| `--grant-read` | allow reading the session's namespaces without asking; Secrets and changes are still confirmed |
 
-`YEAR.MONTH.INC`, например `2026.10.1`. Месяц без ведущего нуля (требование SemVer в
-Cargo), `INC` сбрасывается каждый месяц. Версия живёт в корневом `Cargo.toml`.
+Rights requests and changes are confirmed in the Kubach window, so keep the app running
+with **Settings → AI agent → HTTP server** turned on. The same HTTP server can serve
+agents directly at `http://127.0.0.1:<port>/mcp` with a bearer token. Ready-made
+commands with your path, port and token are under **Settings → AI agent → Connect an agent**.
+
+Where the binary lives: `/Applications/Kubach.app/Contents/MacOS/kubach` on macOS,
+`/usr/bin/kubach` on Linux packages, `C:\Program Files\Kubach\kubach.exe` on Windows.
+
+## Build from source
+
+You need a recent stable Rust toolchain plus the platform's GPUI prerequisites: Xcode
+on macOS, the Visual Studio C++ build tools on Windows, and on Linux the X11/Wayland,
+xkbcommon, Vulkan and fontconfig dev packages.
+
+```sh
+cargo run --release                        # the app
+cargo run -p kubach-ui --example gallery   # design system gallery
+```
+
+The [guide](docs/guide.md) covers platform details, the kubeconfig vault, MCP
+configuration and packaging (in Russian for now).
+
+## Learn more
+
+- [Guide](docs/guide.md): building, kubeconfig vault, MCP setup.
+- [Architecture](docs/architecture.md) and [decision records](docs/adr/README.md).
+- [Project rules](AGENT.md): the conventions the agents follow.
+
+Versions follow `YEAR.MONTH.INC`, for example `2026.10.1`.
+
+## License
+
+[MIT](LICENSE)
