@@ -88,6 +88,7 @@ agent-access-crds = custom resources
 agent-field-tool = Tool
 agent-field-session = Session
 agent-helm-values = Values (sensitive keys masked)
+agent-helm-values-diff = Values changes (sensitive values masked)
 agent-helm-objects = Objects
 agent-helm-as-user-title = Run this helm call with your credentials?
 agent-helm-as-user-warning = This helm call will run with your credentials from kubeconfig, not the session's temporary ServiceAccount. Only your own RBAC limits it, and only this one call.

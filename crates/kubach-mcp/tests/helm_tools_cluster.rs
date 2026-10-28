@@ -22,6 +22,11 @@
 //! puts cert-manager's leader election Role into a second namespace
 //! (`<namespace>-b`); run it with `KUBACH_TEST_NAMESPACE=kubach-test-21`. It
 //! creates and deletes both namespaces itself.
+//!
+//! `a_values_patch_changes_only_the_named_keys` (#22) upgrades podinfo
+//! with `valuesPatch` and reads its values masked; run it with
+//! `KUBACH_TEST_NAMESPACE=kubach-test-22`. It creates and deletes the
+//! namespace itself.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -757,5 +762,178 @@ async fn other_namespace_flow(base: Config, context: String, namespace: String, 
     );
     assert_eq!(uninstall.namespaces, std::slice::from_ref(&other));
     assert!(roles.get_opt(&leader).await.unwrap().is_none());
+    session.close().await.unwrap();
+}
+
+const PATCH_RELEASE: &str = "kubach-podinfo22";
+
+/// `helm_upgrade` with `valuesPatch` (#22): Kubach merges the patch into
+/// the release's values, so only the named keys change; `helm_get_values`
+/// and the answer mask the release's secrets. podinfo, under the temporary
+/// ServiceAccount. Run it with `KUBACH_TEST_NAMESPACE=kubach-test-22`; the
+/// namespace is deleted at the start and at the end whatever happens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster, helm and ghcr.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_values_patch_changes_only_the_named_keys() {
+    let (base, context, namespace) = config().await;
+    let user = Client::try_from(base.clone()).unwrap();
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    assert!(drop_namespaces(&namespaces, &[&namespace]).await);
+    let object: Namespace =
+        serde_json::from_value(json!({"metadata": {"name": namespace}})).unwrap();
+    namespaces
+        .create(&Default::default(), &object)
+        .await
+        .unwrap();
+    let flow_namespace = namespace.clone();
+    let flow = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(values_patch_flow(base, context, flow_namespace))
+    });
+    let outcome = tokio::task::spawn_blocking(move || flow.join())
+        .await
+        .unwrap();
+    let dropped = drop_namespaces(&namespaces, &[&namespace]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(dropped, "the test's namespace is still there");
+}
+
+async fn values_patch_flow(base: Config, context: String, namespace: String) {
+    let policy = SecurityPolicy {
+        mcp_enabled: true,
+        temporary_objects: true,
+        ..SecurityPolicy::default()
+    };
+    let spec = SessionSpec {
+        context,
+        server_url: base.cluster_url.to_string(),
+        namespaces: Vec::new(),
+        profile: Profile::Deploy,
+        ttl: Some(Duration::from_secs(900)),
+        hints: Vec::new(),
+    };
+    let session = Session::start(&base, &spec, &policy).await.unwrap();
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    server.set_helm(HelmEnv {
+        binary: kubach_core::settings::find_on_path("helm"),
+        kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        paths: HelmPaths::from_env(),
+    });
+    let secret = "s3cret-value-22";
+    call(
+        &server,
+        "helm_install",
+        json!({
+            "release": PATCH_RELEASE,
+            "chart": CHART,
+            "version": "6.15.0",
+            "namespace": namespace,
+            "values": format!(
+                "replicaCount: 1\nui:\n  message: hello\nextra:\n  password: {secret}\n"
+            ),
+        }),
+    )
+    .await;
+
+    // The temporary ServiceAccount cannot read Helm's storage Secrets
+    // without access to Secrets: a clear refusal, no other credentials.
+    let refused = server
+        .call(
+            "test",
+            "helm_get_values",
+            args(json!({"release": PATCH_RELEASE, "namespace": namespace})),
+        )
+        .await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused
+            .text
+            .contains("does not read them with other credentials"),
+        "{}",
+        refused.text
+    );
+    // With access to Secrets (asked for by list_secrets) it reads them.
+    call(&server, "list_secrets", json!({"namespace": namespace})).await;
+
+    // The release's values, masked.
+    let read = call(
+        &server,
+        "helm_get_values",
+        json!({"release": PATCH_RELEASE, "namespace": namespace}),
+    )
+    .await;
+    assert!(!read.to_string().contains(secret), "the values leak");
+    assert_eq!(read["maskedKeys"], json!(["extra.password"]));
+    let values = read["values"].as_str().unwrap_or_default().to_owned();
+    assert!(values.contains("message: hello"), "{values}");
+
+    // values and valuesPatch together: an input error, nothing asked.
+    let before = confirmer.requests().len();
+    let both = server
+        .call(
+            "test",
+            "helm_upgrade",
+            args(json!({"release": PATCH_RELEASE, "namespace": namespace,
+                        "values": "a: 1\n", "valuesPatch": "b: 2\n"})),
+        )
+        .await;
+    assert!(
+        both.is_error && both.text.contains("not both"),
+        "{}",
+        both.text
+    );
+    assert_eq!(confirmer.requests().len(), before);
+
+    // The patch: only the named keys change.
+    let upgraded = call(
+        &server,
+        "helm_upgrade",
+        json!({
+            "release": PATCH_RELEASE,
+            "namespace": namespace,
+            "valuesPatch": "replicaCount: 2\nui:\n  color: \"#123456\"\n",
+        }),
+    )
+    .await;
+    assert_eq!(upgraded["revision"], 2, "{upgraded}");
+    assert!(!upgraded.to_string().contains(secret), "the answer leaks");
+    let diff = upgraded["valuesDiff"].as_str().unwrap_or_default();
+    assert!(diff.contains("+replicaCount: 2"), "{diff}");
+    assert!(diff.contains("+  color: \"#123456\""), "{diff}");
+    let requests = confirmer.requests();
+    let RequestKind::Helm { helm } = &requests.last().unwrap().kind else {
+        panic!("the upgrade was not confirmed");
+    };
+    assert_eq!(helm.values_diff, diff);
+    assert!(!helm.values.contains(secret), "the dialog shows the secret");
+
+    // The stored values: merged, the secret kept as it was.
+    let stored = kubach_core::helm::Releases::new(Client::try_from(base.clone()).unwrap())
+        .get(&namespace, PATCH_RELEASE, None)
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 2);
+    let expected = json!({
+        "replicaCount": 2,
+        "ui": {"message": "hello", "color": "#123456"},
+        "extra": {"password": secret},
+    });
+    assert!(
+        stored.user_values.expose() == &expected,
+        "the stored values are not the merged ones"
+    );
+
+    call(
+        &server,
+        "helm_uninstall",
+        json!({"release": PATCH_RELEASE, "namespace": namespace}),
+    )
+    .await;
     session.close().await.unwrap();
 }

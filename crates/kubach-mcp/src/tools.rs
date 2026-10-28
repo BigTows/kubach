@@ -788,6 +788,7 @@ pub(crate) async fn run(
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
         "helm_release_history" => helm_tools::history(ctx, args).await,
+        "helm_get_values" => helm_tools::get_values(ctx, args).await,
         "helm_install" => helm_tools::install(ctx, args).await,
         "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
         "helm_rollback" => helm_tools::rollback(ctx, args).await,
