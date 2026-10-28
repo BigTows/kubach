@@ -81,6 +81,7 @@ agent-helm-objects = 对象
 agent-helm-as-user-title = 使用您的凭据运行此 helm 调用？
 agent-helm-as-user-warning = 此 helm 调用将使用您 kubeconfig 中的凭据运行，而不是会话的临时 ServiceAccount。只有您自己的 RBAC 会限制它，并且仅限这一次调用。
 agent-helm-as-user-objects = ServiceAccount 无法创建或删除 chart 中的这些集群级对象、RBAC 以及其他 namespace 中的对象：
+agent-helm-as-user-show-all = 显示全部对象
 agent-helm-as-user-tick = 使用我的 kubeconfig 凭据运行此 helm 调用
 agent-helm-dry-run-as-user = 使用我的凭据试运行
 agent-helm-runs-as-user-title = 使用您的凭据运行
