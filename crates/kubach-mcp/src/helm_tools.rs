@@ -1509,23 +1509,9 @@ async fn approve(
         mode: ctx.session.mode_in(&allowed.namespace),
         allow_remember: false,
     };
-    let decision = ask(ctx.confirmer, &request).await;
-    if !ctx.session.is_active() {
-        return Err(Denial::new(
-            DenialCode::SessionEnded,
-            "the session ended while waiting for the user",
-        )
-        .into());
-    }
-    match decision {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => Ok(()),
-        ConfirmationDecision::Denied { reason } | ConfirmationDecision::Rejected { reason } => {
-            Err(ToolError::Rejected(reason))
-        }
-        ConfirmationDecision::Provided { .. } => Err(ToolError::Rejected(Some(
-            "unexpected answer to a confirmation".into(),
-        ))),
-    }
+    // Under the user's credentials, beyond the namespace, uninstalling or
+    // with cluster-scoped objects: always asked (#30).
+    crate::tools::approve_change(ctx, request, "the session ended while waiting for the user").await
 }
 
 /// The latest revision after a change, under the namespace's identity.

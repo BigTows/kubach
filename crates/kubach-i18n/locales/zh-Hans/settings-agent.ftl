@@ -76,6 +76,11 @@ settings-session-no-namespace = 还没有 namespace：代理第一次使用某�
 # $raised: 超出最低权限而允许的内容，例如“更改”。
 settings-session-raised = 此会话已允许：{ $raised }
 settings-session-no-grants = 尚未授予权限。
+# $list：用户选择不再询问的更改，例如“cert-manager 中的扩缩容”(#30)。
+settings-session-remembered = 无需询问：{ $list }
+# $action：agent-action-*，$namespace：位置。
+settings-session-remembered-item = { $namespace } 中的{ $action }
+settings-ask-again = 重新询问
 settings-boundary-client-only = 仅在 Kubach 中限制
 settings-boundary-impersonation = 在 Kubach 和 API 服务器中限制（impersonation）
 settings-boundary-temporary-sa = 在 Kubach 和 API 服务器中限制（临时 ServiceAccount）

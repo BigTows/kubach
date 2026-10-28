@@ -24,6 +24,7 @@ use crate::forwards::{SessionForwards, StopReason};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
+use crate::remember::{Remembered, RememberedSet};
 use crate::rules::{Capability, temporary_sa_requirements};
 use crate::scope::{ScopeError, SessionMode, SessionScope, SessionSpec};
 use crate::settings::SecurityPolicy;
@@ -151,6 +152,9 @@ pub struct Session {
     changed: Mutex<HashSet<ChangedObject>>,
     /// The agent's port-forwards (#17); they end with the session.
     forwards: SessionForwards,
+    /// Kinds of change per namespace the user said not to ask about again
+    /// in this session (#30). Only in memory.
+    remembered: Mutex<RememberedSet>,
     /// This session, for tasks that must not keep it alive.
     me: Weak<Session>,
 }
@@ -220,6 +224,7 @@ impl Session {
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
+            remembered: Mutex::default(),
             me: me.clone(),
         });
         spawn_ttl_guard(Arc::downgrade(&session), session.scope.deadline());
@@ -253,6 +258,7 @@ impl Session {
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
+            remembered: Mutex::default(),
             me: me.clone(),
         })
     }
@@ -779,6 +785,11 @@ impl Session {
             grants.revoke(grant);
             grants.clone()
         };
+        // Changes go no further without asking once their namespace's
+        // right is taken back (#30).
+        if matches!(grant, Grant::Read { .. } | Grant::Modify { .. }) {
+            sync::lock(&self.remembered).forget_in(grant.namespace());
+        }
         // Forwards stand on reading their namespace (#17).
         if let Grant::Read { namespace } = grant {
             self.forwards.stop_in(namespace, StopReason::Revoked);
@@ -787,6 +798,35 @@ impl Session {
             self.sync_namespace(&next, grant.namespace()).await?;
         }
         Ok(())
+    }
+
+    /// What the user said not to ask about again in this session (#30).
+    pub fn remembered(&self) -> Vec<Remembered> {
+        sync::lock(&self.remembered).list()
+    }
+
+    /// Whether the user said not to ask about `remembered` again.
+    pub fn is_remembered(&self, remembered: &Remembered) -> bool {
+        self.is_active() && sync::lock(&self.remembered).contains(remembered)
+    }
+
+    /// Changes whenever something remembered is forgotten; pass it to
+    /// [`Session::remember`] from before the question.
+    pub(crate) fn remember_epoch(&self) -> u64 {
+        sync::lock(&self.remembered).epoch()
+    }
+
+    /// Remembers `remembered` for the rest of the session, unless the
+    /// session ended or something was forgotten since `epoch` (a revocation
+    /// while the user was deciding). Returns whether it was kept.
+    pub(crate) fn remember(&self, remembered: Remembered, epoch: u64) -> bool {
+        let mut set = sync::lock(&self.remembered);
+        self.is_active() && set.insert(remembered, epoch)
+    }
+
+    /// "Ask again" (#30): forgets everything remembered in this session.
+    pub fn forget_remembered(&self) {
+        sync::lock(&self.remembered).clear();
     }
 
     /// The agent's port-forwards (#17).
@@ -865,6 +905,7 @@ impl Session {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.forget_remembered();
         self.forwards.stop_all(StopReason::SessionEnded);
         let boundaries: Vec<Arc<Boundary>> =
             sync::lock(&self.boundaries).values().cloned().collect();
@@ -1153,6 +1194,7 @@ mod tests {
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
+            remembered: Mutex::default(),
             me: me.clone(),
         })
     }

@@ -161,15 +161,23 @@ impl McpServer {
             progress,
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
+            remembered: std::sync::Mutex::new(None),
         };
         let result = tools::run(&ctx, tool, &args).await;
         let decisions = sync::into_inner(ctx.decisions);
         let accesses = sync::into_inner(ctx.accesses);
         let namespace = sync::into_inner(ctx.namespace);
         let ran_as = sync::into_inner(ctx.identity);
+        let remembered = sync::into_inner(ctx.remembered);
         let change = result.as_ref().ok().and_then(|output| output.audit.clone());
         let (decided_by, allowed, reason, code) = match &result {
-            Ok(output) if output.confirmed => (DecidedBy::User, true, None, "ok".to_owned()),
+            Ok(output) if output.confirmed => {
+                let by = match remembered {
+                    Some(crate::remember::RememberNote::Used(_)) => DecidedBy::Remembered,
+                    _ => DecidedBy::User,
+                };
+                (by, true, None, "ok".to_owned())
+            }
             Ok(_) => (DecidedBy::None, true, None, "ok".to_owned()),
             Err(error @ ToolError::Denied(_)) => (
                 DecidedBy::Policy,
@@ -212,6 +220,7 @@ impl McpServer {
                 args: masked_args,
                 change,
                 decided_by,
+                remembered: remembered.as_ref().map(|note| note.audit().to_owned()),
                 allowed,
                 reason: reason.clone(),
                 identity: ran_as
@@ -225,7 +234,10 @@ impl McpServer {
         }
         match result {
             Ok(output) => CallOutcome {
-                text: output.text,
+                text: match &remembered {
+                    Some(note) => format!("{}\n{}", note.agent_text(), output.text),
+                    None => output.text,
+                },
                 is_error: false,
             },
             Err(error) => CallOutcome {
@@ -252,6 +264,7 @@ impl McpServer {
                         .unwrap_or(Value::Null),
                     change: None,
                     decided_by: DecidedBy::LaunchArgs,
+                    remembered: None,
                     allowed: result.is_ok(),
                     reason: result.as_ref().err().map(|e| e.to_string()),
                     identity: session.describe_identity(Some(&namespace)),
@@ -278,6 +291,7 @@ impl McpServer {
             } else {
                 DecidedBy::User
             },
+            remembered: None,
             allowed: matches!(decision.outcome, "granted" | "access"),
             reason: decision.reason.clone(),
             identity: self
@@ -308,6 +322,7 @@ impl McpServer {
             }),
             change: None,
             decided_by: DecidedBy::User,
+            remembered: None,
             allowed: matches!(decision.outcome, "session" | "always"),
             reason: decision.reason.clone(),
             identity: self
@@ -381,7 +396,9 @@ impl McpServer {
              have {access}.{more}{helm} {namespaces} Cluster-scoped resources and calls across \
              all namespaces are not available. {secrets}{writes} Changes, deletions, \
              commands in containers and port-forwards (port_forward_start, on 127.0.0.1 of the \
-             user's machine) are previewed and need the user's approval one by one. Call \
+             user's machine) are previewed and need the user's approval one by one; the user may \
+             tick \"don't ask again\" for one kind of change in one namespace for this session, \
+             and the result of such a call then says it was approved that way. Call \
              `session_info` for details.",
             scope.context
         )

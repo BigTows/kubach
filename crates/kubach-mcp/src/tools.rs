@@ -33,8 +33,8 @@ use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Request, service_account_changes,
     walk_fields,
 };
+use crate::remember::{RememberNote, rememberable};
 use crate::scope::NamespaceSource;
-use crate::scope::SessionMode;
 use crate::secret_tools;
 use crate::secret_write;
 use crate::session::{Session, SessionError};
@@ -164,6 +164,9 @@ pub(crate) struct Ctx<'a> {
     /// Who the call ran as when not the namespace's identity: a helm call
     /// the user allowed under their own credentials (#18).
     pub identity: std::sync::Mutex<Option<String>>,
+    /// Whether the change ran on an earlier "don't ask again" or the user
+    /// ticked it now (#30), for the audit log and the agent.
+    pub remembered: std::sync::Mutex<Option<RememberNote>>,
 }
 
 /// One answer for a right, as the audit log records it: never a value.
@@ -444,7 +447,9 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
         });
     };
     match decision {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => {
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => {
             if let Err(error) = ctx.session.decide(grant.clone(), true).await {
                 let message = format!(
                     "the user allowed this session to {grant}, but Kubach could not grant it: \
@@ -586,7 +591,9 @@ pub(crate) async fn ask_access_now(
         });
     };
     match decision {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => {
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => {
             let always = decision == ConfirmationDecision::ApprovedAlways;
             if let Err(error) = ctx.session.decide_access(raise, true, always).await {
                 let message = format!(
@@ -1096,6 +1103,13 @@ fn session_info(session: &Session) -> String {
         "boundaries": boundaries,
         "expiresAt": scope.expires_at.to_string(),
         "grants": session.grants().entries(),
+        "notAskedAgain": session.remembered(),
+        "notAskedAgainRules": "The user may tick \"don't ask again\" in Kubach for one kind of \
+            change in one namespace (scale, rollout_restart, apply_manifest, exec, \
+            port_forward_start, helm_install, helm_upgrade, helm_rollback); such calls then run \
+            without a window until the session ends, and the result says so. Deleting, Secrets, \
+            Helm with the user's credentials or beyond its namespace and changes with dangerous \
+            fields are always asked.",
         "namespaceRules": "Name any namespace in a call (list_namespaces shows the ones Kubach \
             knows of); reading built-in resources there needs no question. Revealing one Secret \
             is asked for that Secret; a refusal holds until the session ends.",
@@ -1618,18 +1632,49 @@ pub(crate) async fn confirm_as(
         details,
         dangerous,
         mode: ctx.session.mode_in(&allowed.namespace),
-        allow_remember: ctx.session.mode_in(&allowed.namespace) != SessionMode::ClientOnly,
+        allow_remember: false,
     };
+    approve_change(
+        ctx,
+        request,
+        "the session ended while waiting for confirmation",
+    )
+    .await
+}
+
+/// Asks the user to approve a change, unless they said not to ask again
+/// about this kind of change in this namespace in this session (#30).
+/// [`rememberable`] decides whether the request offers that at all; a
+/// "don't ask again" ticked now is kept unless something was forgotten
+/// while the user decided.
+pub(crate) async fn approve_change(
+    ctx: &Ctx<'_>,
+    mut request: ConfirmationRequest,
+    ended: &str,
+) -> Result<(), ToolError> {
+    let remember = rememberable(&request);
+    request.allow_remember = remember.is_some();
+    if let Some(remembered) = &remember
+        && ctx.session.is_remembered(remembered)
+    {
+        *sync::lock(&ctx.remembered) = Some(RememberNote::Used(remembered.clone()));
+        return Ok(());
+    }
+    let epoch = ctx.session.remember_epoch();
     let decision = ask(ctx.confirmer, &request).await;
     // The session may have ended while the user was deciding.
     if !ctx.session.is_active() {
-        return Err(Denial::new(
-            DenialCode::SessionEnded,
-            "the session ended while waiting for confirmation",
-        )
-        .into());
+        return Err(Denial::new(DenialCode::SessionEnded, ended).into());
     }
     match decision {
+        ConfirmationDecision::ApprovedForSession => {
+            if let Some(remembered) = remember
+                && ctx.session.remember(remembered.clone(), epoch)
+            {
+                *sync::lock(&ctx.remembered) = Some(RememberNote::Saved(remembered));
+            }
+            Ok(())
+        }
         ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => Ok(()),
         ConfirmationDecision::Denied { reason } | ConfirmationDecision::Rejected { reason } => {
             Err(ToolError::Rejected(reason))

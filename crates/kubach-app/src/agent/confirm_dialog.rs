@@ -284,6 +284,9 @@ struct ConfirmView {
     as_user: bool,
     /// The whole values of a Helm change, folded under the values diff.
     show_values: bool,
+    /// "Don't ask again until the session ends" for this kind of change in
+    /// this namespace (#30); off until the user ticks it.
+    remember: bool,
     _observe: Subscription,
 }
 
@@ -297,6 +300,7 @@ impl ConfirmView {
             always: false,
             as_user: false,
             show_values: false,
+            remember: false,
             _observe: observe,
         }
     }
@@ -582,6 +586,28 @@ impl Render for ConfirmView {
         });
         let always = self.always;
         let show_values = self.show_values;
+        // Offered only where Kubach marked the request and the kind of
+        // change may be remembered at all (#30): never for deletions,
+        // Secrets, Helm with the user's credentials, dangerous fields or a
+        // client-only namespace.
+        let remember_offer = request
+            .allow_remember
+            .then(|| kubach_mcp::rememberable(&request))
+            .flatten();
+        let remember = remember_offer.is_some() && self.remember;
+        let remember_tick = remember_offer.map(|offer| {
+            Checkbox::new("confirm-remember")
+                .label(t!(
+                    "agent-remember",
+                    action = super::remembered_action_label(offer.action),
+                    namespace = offer.namespace.as_str()
+                ))
+                .checked(remember)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.remember = *checked;
+                    cx.notify();
+                }))
+        });
         let (reject, approve) = match (&grant, &secret_change) {
             _ if access.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
             _ if access.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
@@ -869,6 +895,8 @@ impl Render for ConfirmView {
                     .children(acknowledge)
                     .children(details),
             )
+            // Next to the buttons, in sight without scrolling.
+            .children(remember_tick)
             .child(
                 div()
                     .flex()
@@ -918,6 +946,8 @@ impl Render for ConfirmView {
                                 }
                                 let decision = if this.always {
                                     ConfirmationDecision::ApprovedAlways
+                                } else if remember {
+                                    ConfirmationDecision::ApprovedForSession
                                 } else {
                                     ConfirmationDecision::Approved
                                 };

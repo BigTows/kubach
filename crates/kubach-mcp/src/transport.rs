@@ -288,6 +288,7 @@ mod token_tests {
     fn session() -> ExternalSession {
         ExternalSession {
             raised: None,
+            remembered: Vec::new(),
             id: "s".into(),
             pid: 1,
             context: "minikube".into(),
