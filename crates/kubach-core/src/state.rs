@@ -64,6 +64,44 @@ pub struct AppState {
     /// removes it; one that failed on its own stays.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<SavedForward>,
+    /// Column and direction a table is sorted by, per table (#33): a
+    /// resource kind ([`kind_key`]) or a screen ([`screen_table_key`]).
+    /// Tables in their default order are not stored. Shared by all
+    /// contexts.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub table_sorts: BTreeMap<String, TableSort>,
+}
+
+/// How a table is sorted: the stable key of a column (never its title or
+/// index) and the direction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSort {
+    pub column: String,
+    pub order: SortOrder,
+}
+
+/// Direction of a [`TableSort`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortOrder {
+    #[serde(rename = "asc")]
+    Ascending,
+    #[serde(rename = "desc")]
+    Descending,
+}
+
+impl TableSort {
+    pub fn new(column: impl Into<String>, order: SortOrder) -> Self {
+        Self {
+            column: column.into(),
+            order,
+        }
+    }
+
+    /// Trims the column; `None` when it is empty.
+    fn normalized(self) -> Option<Self> {
+        let column = self.column.trim();
+        (!column.is_empty()).then(|| Self::new(column, self.order))
+    }
 }
 
 /// A port-forward to restart on the next run.
@@ -142,6 +180,7 @@ impl Default for AppState {
             panel_widths: BTreeMap::new(),
             forward_ports: BTreeMap::new(),
             forwards: Vec::new(),
+            table_sorts: BTreeMap::new(),
         }
     }
 }
@@ -298,6 +337,29 @@ impl AppState {
     pub fn forget_column_order(&mut self, kind: &str) -> bool {
         self.column_orders.remove(kind).is_some()
     }
+
+    /// Remembered sort of the table `key` ([`kind_key`] or
+    /// [`screen_table_key`]). Its column may be gone: the table then keeps
+    /// its default order.
+    pub fn table_sort(&self, key: &str) -> Option<&TableSort> {
+        self.table_sorts.get(key)
+    }
+
+    /// Remembers the sort of the table `key`, or forgets it with `None`
+    /// (the default order); returns whether the state changed. A sort
+    /// without a column is forgotten.
+    pub fn remember_table_sort(&mut self, key: &str, sort: Option<TableSort>) -> bool {
+        match sort.and_then(TableSort::normalized) {
+            Some(sort) => self.table_sorts.insert(key.to_owned(), sort.clone()) != Some(sort),
+            None => self.table_sorts.remove(key).is_some(),
+        }
+    }
+}
+
+/// Key of a table outside the resource browser in [`AppState::table_sorts`]:
+/// `screen:gitops`. The prefix keeps it apart from [`kind_key`]s.
+pub fn screen_table_key(screen: &str) -> String {
+    format!("screen:{screen}")
 }
 
 /// Key of a resource kind in [`AppState::column_orders`]: `Pod`,
@@ -500,6 +562,13 @@ fn parse(text: &str) -> AppState {
                 if port.is_some() {
                     state.remember_forward_port(&context, &key, port);
                 }
+            }
+        }
+    }
+    if let Some(Value::Object(sorts)) = root.remove("table_sorts") {
+        for (key, entry) in sorts {
+            if let Ok(sort) = serde_json::from_value::<TableSort>(entry) {
+                state.remember_table_sort(&key, Some(sort));
             }
         }
     }
@@ -1003,5 +1072,115 @@ mod tests {
         assert_eq!(state.prometheus("b"), None);
         // Nothing found, time unknown: still a search that happened.
         assert_eq!(state.prometheus("c"), Some(&PrometheusDiscovery::default()));
+    }
+
+    #[test]
+    fn table_sorts_are_remembered_per_table() {
+        let mut state = AppState::default();
+        let pods = kind_key("", "Pod");
+        let deployments = kind_key("apps", "Deployment");
+        let gitops = screen_table_key("gitops");
+        assert!(
+            state.remember_table_sort(&pods, Some(TableSort::new("age", SortOrder::Descending)))
+        );
+        assert!(state.remember_table_sort(
+            &deployments,
+            Some(TableSort::new("name", SortOrder::Ascending))
+        ));
+        assert!(state.remember_table_sort(
+            &gitops,
+            Some(TableSort::new("status", SortOrder::Ascending))
+        ));
+        // The same sort again changes nothing.
+        assert!(
+            !state.remember_table_sort(&pods, Some(TableSort::new("age", SortOrder::Descending)))
+        );
+        // Changing one table leaves the others alone.
+        assert!(
+            state.remember_table_sort(&pods, Some(TableSort::new("age", SortOrder::Ascending)))
+        );
+        assert_eq!(
+            state.table_sort(&pods),
+            Some(&TableSort::new("age", SortOrder::Ascending))
+        );
+        assert_eq!(
+            state.table_sort(&deployments),
+            Some(&TableSort::new("name", SortOrder::Ascending))
+        );
+        assert_eq!(
+            state.table_sort(&gitops),
+            Some(&TableSort::new("status", SortOrder::Ascending))
+        );
+        assert_eq!(state.table_sort("Service"), None);
+        // Back to the default order forgets the table.
+        assert!(state.remember_table_sort(&pods, None));
+        assert!(!state.remember_table_sort(&pods, None));
+        assert_eq!(state.table_sort(&pods), None);
+        assert!(state.table_sort(&deployments).is_some());
+        // A sort without a column is no sort.
+        assert!(
+            state.remember_table_sort(&gitops, Some(TableSort::new("  ", SortOrder::Ascending)))
+        );
+        assert_eq!(state.table_sort(&gitops), None);
+    }
+
+    #[test]
+    fn table_sorts_round_trip_and_broken_ones_are_dropped() {
+        let mut state = AppState::default();
+        assert!(
+            !serde_json::to_string(&state)
+                .unwrap()
+                .contains("table_sorts")
+        );
+        state.remember_table_sort(
+            "Pod",
+            Some(TableSort::new("restarts", SortOrder::Descending)),
+        );
+        state.remember_table_sort(
+            &screen_table_key("helm.releases"),
+            Some(TableSort::new("name", SortOrder::Ascending)),
+        );
+        let text = serde_json::to_string(&state).unwrap();
+        assert!(
+            text.contains(r#""Pod":{"column":"restarts","order":"desc"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""screen:helm.releases":{"column":"name","order":"asc"}"#),
+            "{text}"
+        );
+        assert_eq!(parse(&text), state);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(STATE_FILE);
+        save(&file, &state).unwrap();
+        assert_eq!(load(&file), state);
+
+        let text = r#"{
+            "version": 1,
+            "table_sorts": {
+                "Pod": {"column": "age", "order": "desc"},
+                "Service": {"column": "name", "order": "sideways"},
+                "Secret": {"order": "asc"},
+                "ConfigMap": {"column": "", "order": "asc"},
+                "Node": "name",
+                "Job.batch": {"column": " status ", "order": "asc", "extra": 1}
+            }
+        }"#;
+        let state = parse(text);
+        assert_eq!(state.table_sorts.len(), 2);
+        assert_eq!(
+            state.table_sort("Pod"),
+            Some(&TableSort::new("age", SortOrder::Descending))
+        );
+        assert_eq!(
+            state.table_sort("Job.batch"),
+            Some(&TableSort::new("status", SortOrder::Ascending))
+        );
+        // Files from before #33 have no sorts.
+        assert!(
+            parse(r#"{"version": 1, "column_orders": {}}"#)
+                .table_sorts
+                .is_empty()
+        );
     }
 }
