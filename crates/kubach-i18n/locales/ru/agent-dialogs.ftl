@@ -90,6 +90,7 @@ agent-helm-objects = Объекты
 agent-helm-as-user-title = Выполнить этот вызов helm от ваших учётных данных?
 agent-helm-as-user-warning = Этот вызов helm выполнится от ваших учётных данных из kubeconfig, а не от временного ServiceAccount сессии. Ограничивает его только ваш RBAC, и только этот один вызов.
 agent-helm-as-user-objects = ServiceAccount не может создать или удалить эти объекты уровня кластера, RBAC и объекты в других namespace чарта:
+agent-helm-as-user-show-all = Показать все объекты
 agent-helm-as-user-tick = Выполнить этот вызов helm от моих учётных данных из kubeconfig
 agent-helm-dry-run-as-user = Пробный запуск от моих учётных данных
 agent-helm-runs-as-user-title = Выполняется от ваших учётных данных

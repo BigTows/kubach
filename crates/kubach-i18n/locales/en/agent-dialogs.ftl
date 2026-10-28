@@ -93,6 +93,7 @@ agent-helm-objects = Objects
 agent-helm-as-user-title = Run this helm call with your credentials?
 agent-helm-as-user-warning = This helm call will run with your credentials from kubeconfig, not the session's temporary ServiceAccount. Only your own RBAC limits it, and only this one call.
 agent-helm-as-user-objects = The ServiceAccount cannot create or delete these cluster-scoped objects, RBAC and objects in other namespaces of the chart:
+agent-helm-as-user-show-all = Show all objects
 agent-helm-as-user-tick = Run this helm call with my kubeconfig credentials
 agent-helm-dry-run-as-user = Dry run with my credentials
 agent-helm-runs-as-user-title = Runs with your credentials
