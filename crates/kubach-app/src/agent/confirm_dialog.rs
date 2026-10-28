@@ -68,7 +68,7 @@ fn title(request: &ConfirmationRequest) -> String {
             grant: Grant::Modify { .. },
         } => t!("agent-title-modify"),
         RequestKind::Exec { .. } => t!("agent-title-exec"),
-        RequestKind::Ceiling { .. } => t!("agent-title-ceiling"),
+        RequestKind::Access { .. } => t!("agent-title-access"),
         RequestKind::Helm { helm } => match helm.action {
             kubach_mcp::HelmAction::Install => t!("agent-title-helm-install"),
             kubach_mcp::HelmAction::Upgrade => t!("agent-title-helm-upgrade"),
@@ -253,8 +253,8 @@ struct ConfirmView {
     /// The user ticked "I understand" for the dangerous findings; the
     /// approve button waits for it (#194).
     acknowledged: bool,
-    /// "Always allow on this cluster" on a ceiling request (#417); off
-    /// until the user ticks it.
+    /// "Allow by default" on an access request (#15); off until the user
+    /// ticks it.
     always: bool,
     _observe: Subscription,
 }
@@ -293,7 +293,7 @@ fn label_width(window: &Window, cx: &App) -> Pixels {
         t!("agent-field-revision"),
         t!("agent-field-runs-as"),
         t!("agent-field-asks-for"),
-        t!("agent-field-ceiling"),
+        t!("agent-field-access-now"),
         t!("agent-field-tool"),
         t!("agent-field-session"),
     ];
@@ -418,9 +418,9 @@ impl Render for ConfirmView {
             request.kind,
             RequestKind::ChartSource { .. } | RequestKind::UseContext { .. }
         );
-        // Raising the ceiling (#417).
-        let ceiling = match &request.kind {
-            RequestKind::Ceiling { raise, current, .. } => Some((*raise, *current)),
+        // Access beyond the minimum (#15).
+        let access = match &request.kind {
+            RequestKind::Access { raise, current, .. } => Some((*raise, *current)),
             _ => None,
         };
         // Copying or deleting a Secret (#230).
@@ -438,7 +438,7 @@ impl Render for ConfirmView {
             // Exec is a command, not a diff: no colors, every argument apart.
             RequestKind::Exec { command } => Some(command_block(command, cx).into_any_element()),
             _ => (grant.is_none()
-                && ceiling.is_none()
+                && access.is_none()
                 && !source
                 && !request.details.trim().is_empty())
             .then(|| {
@@ -522,8 +522,8 @@ impl Render for ConfirmView {
         });
         let always = self.always;
         let (reject, approve) = match (&grant, &secret_change) {
-            _ if ceiling.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
-            _ if ceiling.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
+            _ if access.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
+            _ if access.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
             _ if source => (t!("agent-deny"), t!("agent-allow-session")),
             _ if helm.is_some() => (
                 t!("agent-reject"),
@@ -626,16 +626,16 @@ impl Render for ConfirmView {
                             cx,
                         ))
                     })
-                    .when_some(ceiling, |this, (raise, current)| {
+                    .when_some(access, |this, (raise, current)| {
                         this.child(field(
                             t!("agent-field-asks-for"),
-                            raise.to_string(),
+                            super::raise_label(raise),
                             label_width,
                             cx,
                         ))
                         .child(field(
-                            t!("agent-field-ceiling"),
-                            current.to_string(),
+                            t!("agent-field-access-now"),
+                            super::access_label(current),
                             label_width,
                             cx,
                         ))
@@ -703,13 +703,11 @@ impl Render for ConfirmView {
                     ))
                 })
             })
-            .when(ceiling.is_some(), |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(request.details.clone()),
-                )
+            .when(access.is_some(), |this| {
+                this.child(div().text_sm().text_color(theme.muted_foreground).child(t!(
+                    "agent-access-details",
+                    context = request.context.as_str()
+                )))
                 .child(
                     div()
                         .flex()

@@ -4,14 +4,15 @@
 //!
 //! Resources are listed explicitly (never `*`) so that `secrets` can never be
 //! granted by accident: Secrets appear only through [`grant_rules`], when the
-//! user granted reading a namespace on a context that allows Secret
-//! metadata, or revealing one Secret (#227).
+//! session has Secret access in a namespace, or the user allowed revealing
+//! one Secret (#227, #15).
 
 use k8s_openapi::api::rbac::v1::PolicyRule;
 use kubach_core::rbac::ResourceAccess;
 
+use crate::access::Access;
 use crate::grants::{Grant, Grants};
-use crate::settings::{DeployMode, ExecMode, Profile, SecretAccess, SecurityPolicy};
+use crate::settings::Profile;
 
 const READ_VERBS: &[&str] = &["get", "list", "watch"];
 const WRITE_VERBS: &[&str] = &["create", "update", "patch", "delete"];
@@ -118,11 +119,10 @@ pub fn read_rules(profile: Profile) -> Vec<PolicyRule> {
     rules
 }
 
-/// What `modify(ns)` grants: exec (debug, when the settings allow it) and
-/// the write verbs (deploy), narrowed by the settings.
-pub fn modify_rules(profile: Profile, policy: &SecurityPolicy) -> Vec<PolicyRule> {
+/// What `modify(ns)` grants: exec (debug) and the write verbs (deploy).
+pub fn modify_rules(profile: Profile) -> Vec<PolicyRule> {
     let mut rules = Vec::new();
-    if profile >= Profile::Debug && policy.exec != ExecMode::Disabled {
+    if profile >= Profile::Debug {
         // Exec over WebSocket is authorized as `get` before 1.30, `create` after.
         rules.push(rule("", &["pods/exec"], &["get", "create"]));
     }
@@ -136,28 +136,23 @@ pub fn modify_rules(profile: Profile, policy: &SecurityPolicy) -> Vec<PolicyRule
     rules
 }
 
-/// Role rules of a whole profile, narrowed by the context's settings (no
-/// exec rule when exec is disabled, no write rules when deploy is dry-run
-/// only). Never Secrets.
-pub fn role_rules(profile: Profile, policy: &SecurityPolicy) -> Vec<PolicyRule> {
+/// Role rules of a whole profile. Never Secrets.
+pub fn role_rules(profile: Profile) -> Vec<PolicyRule> {
     let mut rules = read_rules(profile);
-    rules.extend(modify_rules(profile, policy));
+    rules.extend(modify_rules(profile));
     rules
 }
 
-/// The Role of a temporary ServiceAccount: exactly the rights granted in
-/// `namespace` so far (#227, variant A). Empty until the user grants one.
+/// The Role of a temporary ServiceAccount: exactly the rights the session
+/// has in `namespace` so far within its `access` (#227 variant A, #15).
+/// Empty until the agent first works there.
 ///
 /// Secret metadata needs `get`/`list` on all Secrets of the namespace, so
 /// their values pass through Kubach as well: that "the agent sees no values"
 /// is held by Kubach alone (ADR 0005). Revealing a Secret adds a rule for
 /// that name only.
-pub fn grant_rules(
-    grants: &Grants,
-    namespace: &str,
-    profile: Profile,
-    policy: &SecurityPolicy,
-) -> Vec<PolicyRule> {
+pub fn grant_rules(grants: &Grants, namespace: &str, access: Access) -> Vec<PolicyRule> {
+    let profile = access.profile;
     let mut rules = Vec::new();
     let mut revealed = Vec::new();
     let mut modify = false;
@@ -165,17 +160,17 @@ pub fn grant_rules(
         match grant {
             Grant::Read { .. } => {
                 rules.extend(read_rules(profile));
-                if policy.secrets >= SecretAccess::Metadata {
+                if access.secrets {
                     rules.push(rule("", &["secrets"], &["get", "list"]));
                 }
             }
-            Grant::Secret { name, .. } if policy.secrets == SecretAccess::Reveal => {
+            Grant::Secret { name, .. } if access.secrets => {
                 revealed.push(name.clone());
             }
             Grant::Secret { .. } => {}
             Grant::Modify { .. } => {
                 modify = true;
-                rules.extend(modify_rules(profile, policy));
+                rules.extend(modify_rules(profile));
             }
         }
     }
@@ -188,7 +183,7 @@ pub fn grant_rules(
     // Secrets written through the user (#230): RBAC cannot narrow `create`
     // by name, so creating is allowed with `modify(ns)`; patching and
     // deleting only the Secrets the user approved a change of.
-    if modify && writes_secrets(profile, policy) {
+    if modify && writes_secrets(access) {
         rules.push(rule("", &["secrets"], &["create"]));
         let written = grants.secret_writes_in(namespace);
         if !written.is_empty() {
@@ -202,16 +197,9 @@ pub fn grant_rules(
 }
 
 /// Whether the agent may write Secrets through the user (#230): the deploy
-/// profile, changes applied after confirmation and Secret metadata.
-pub fn writes_secrets(profile: Profile, policy: &SecurityPolicy) -> bool {
-    profile >= Profile::Deploy
-        && deploy_persists(policy)
-        && policy.secrets >= SecretAccess::Metadata
-}
-
-/// Whether the deploy profile can persist anything under `policy`.
-pub fn deploy_persists(policy: &SecurityPolicy) -> bool {
-    policy.deploy == DeployMode::ApplyAfterConfirmation
+/// profile and Secret access.
+pub fn writes_secrets(access: Access) -> bool {
+    access.profile >= Profile::Deploy && access.secrets
 }
 
 /// An access a tool needs; tests list the ones the user has (#417).
@@ -296,7 +284,7 @@ mod tests {
     #[test]
     fn no_profile_grants_secrets_or_wildcards() {
         for profile in [Profile::ReadOnly, Profile::Debug, Profile::Deploy] {
-            let rules = role_rules(profile, &SecurityPolicy::development());
+            let rules = role_rules(profile);
             for rule in &rules {
                 let resources = rule.resources.clone().unwrap_or_default();
                 assert!(!resources.iter().any(|r| r == "secrets" || r.contains('*')));
@@ -321,7 +309,7 @@ mod tests {
 
     #[test]
     fn read_only_has_no_logs_exec_or_writes() {
-        let rules = role_rules(Profile::ReadOnly, &SecurityPolicy::development());
+        let rules = role_rules(Profile::ReadOnly);
         let resources = all_resources(&rules);
         assert!(!resources.iter().any(|r| r.contains('/')));
         for rule in &rules {
@@ -330,21 +318,20 @@ mod tests {
     }
 
     #[test]
-    fn debug_exec_follows_settings() {
-        let mut policy = SecurityPolicy::development();
-        policy.exec = ExecMode::Disabled;
-        let resources = all_resources(&role_rules(Profile::Debug, &policy));
+    fn debug_has_logs_and_exec_but_no_writes() {
+        let resources = all_resources(&role_rules(Profile::Debug));
         assert!(resources.contains(&"pods/log".to_string()));
-        assert!(!resources.contains(&"pods/exec".to_string()));
-
-        policy.exec = ExecMode::OneShot;
-        let resources = all_resources(&role_rules(Profile::Debug, &policy));
         assert!(resources.contains(&"pods/exec".to_string()));
+        assert!(
+            role_rules(Profile::Debug)
+                .iter()
+                .all(|r| !r.verbs.iter().any(|v| v == "delete"))
+        );
     }
 
     #[test]
     fn deploy_never_writes_identity_objects() {
-        let rules = role_rules(Profile::Deploy, &SecurityPolicy::development());
+        let rules = role_rules(Profile::Deploy);
         for rule in rules
             .iter()
             .filter(|r| r.verbs.iter().any(|v| v == "create"))
@@ -366,15 +353,10 @@ mod tests {
 
     #[test]
     fn role_starts_empty_and_follows_grants() {
-        let policy = SecurityPolicy::development();
-        assert!(grant_rules(&Grants::new(), "web", Profile::Deploy, &policy).is_empty());
+        let access = Access::ALL;
+        assert!(grant_rules(&Grants::new(), "web", access).is_empty());
 
-        let read = grant_rules(
-            &grants(&[Grant::read("web")]),
-            "web",
-            Profile::Deploy,
-            &policy,
-        );
+        let read = grant_rules(&grants(&[Grant::read("web")]), "web", access);
         assert!(
             read.iter()
                 .all(|r| r.verbs.iter().all(|v| READ_VERBS.contains(&v.as_str())))
@@ -386,15 +368,7 @@ mod tests {
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].verbs, ["get", "list"]);
         // Another namespace's grants are not this Role's.
-        assert!(
-            grant_rules(
-                &grants(&[Grant::read("api")]),
-                "web",
-                Profile::Deploy,
-                &policy
-            )
-            .is_empty()
-        );
+        assert!(grant_rules(&grants(&[Grant::read("api")]), "web", access).is_empty());
 
         let all = grant_rules(
             &grants(&[
@@ -403,8 +377,7 @@ mod tests {
                 Grant::modify("web"),
             ]),
             "web",
-            Profile::Deploy,
-            &policy,
+            access,
         );
         let named: Vec<_> = all.iter().filter(|r| r.resource_names.is_some()).collect();
         assert_eq!(named.len(), 1);
@@ -419,71 +392,54 @@ mod tests {
 
     #[test]
     fn secret_writes_are_narrowed_by_name() {
-        let policy = SecurityPolicy {
-            deploy: DeployMode::ApplyAfterConfirmation,
-            ..SecurityPolicy::development()
-        };
-        let secret_rules = |grants: &Grants, profile, policy: &SecurityPolicy| {
-            grant_rules(grants, "web", profile, policy)
+        let secret_rules = |grants: &Grants, access: Access| {
+            grant_rules(grants, "web", access)
                 .into_iter()
                 .filter(|r| r.resources.as_deref() == Some(&["secrets".to_owned()][..]))
                 .filter(|r| r.verbs.iter().any(|v| v != "get" && v != "list"))
                 .collect::<Vec<_>>()
         };
         let mut granted = grants(&[Grant::read("web"), Grant::modify("web")]);
-        let rules = secret_rules(&granted, Profile::Deploy, &policy);
+        let rules = secret_rules(&granted, Access::ALL);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].verbs, ["create"]);
         assert!(rules[0].resource_names.is_none());
 
         granted.add_secret_write("web", "db");
-        let rules = secret_rules(&granted, Profile::Deploy, &policy);
+        let rules = secret_rules(&granted, Access::ALL);
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1].verbs, ["patch", "delete"]);
         assert_eq!(
             rules[1].resource_names.as_deref(),
             Some(&["db".to_owned()][..])
         );
-        // Never without modify, the deploy profile or applied changes.
+        // Never without modify, the deploy profile or Secret access.
         let read_only = grants(&[Grant::read("web")]);
-        assert!(secret_rules(&read_only, Profile::Deploy, &policy).is_empty());
-        assert!(secret_rules(&granted, Profile::Debug, &policy).is_empty());
-        let dry = SecurityPolicy {
-            deploy: DeployMode::DryRunOnly,
-            ..policy.clone()
+        assert!(secret_rules(&read_only, Access::ALL).is_empty());
+        assert!(secret_rules(&granted, Access::ALL.capped(Profile::Debug)).is_empty());
+        let none = Access {
+            secrets: false,
+            ..Access::ALL
         };
-        assert!(secret_rules(&granted, Profile::Deploy, &dry).is_empty());
-        let none = SecurityPolicy {
-            secrets: SecretAccess::None,
-            ..policy
-        };
-        assert!(secret_rules(&granted, Profile::Deploy, &none).is_empty());
+        assert!(secret_rules(&granted, none).is_empty());
     }
 
     #[test]
-    fn secret_rules_follow_the_setting() {
-        let policy = SecurityPolicy {
-            secrets: SecretAccess::None,
-            ..SecurityPolicy::development()
-        };
+    fn secret_rules_follow_secret_access() {
+        // Reading only: no rule on Secrets at all, not even metadata (#15).
         let rules = grant_rules(
             &grants(&[Grant::read("web"), Grant::secret("web", "db")]),
             "web",
-            Profile::ReadOnly,
-            &policy,
+            Access::NONE,
         );
         assert!(!all_resources(&rules).contains(&"secrets".to_owned()));
-        let metadata = SecurityPolicy {
-            secrets: SecretAccess::Metadata,
-            ..SecurityPolicy::development()
+        let metadata = Access {
+            secrets: true,
+            ..Access::NONE
         };
-        let rules = grant_rules(
-            &grants(&[Grant::read("web"), Grant::secret("web", "db")]),
-            "web",
-            Profile::ReadOnly,
-            &metadata,
-        );
+        let rules = grant_rules(&grants(&[Grant::read("web")]), "web", metadata);
         assert!(rules.iter().all(|r| r.resource_names.is_none()));
+        assert!(all_resources(&rules).contains(&"secrets".to_owned()));
     }
 
     #[test]

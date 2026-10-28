@@ -14,11 +14,8 @@ agent-notice-refused = Agent refused
 agent-notice-text = { $text }
 # $summary is what the agent asked, in English.
 agent-notice-mcp-off = { $summary }: AI agent access is off for this context.
-agent-notice-protected-context = { $summary }: the context is a protected cluster.
-agent-notice-protected = Protected cluster
-agent-notice-protected-ceiling = { $summary } The context is a protected cluster, so Kubach refused without asking.
 agent-notice-session-only = Allowed for this session only
-agent-notice-session-only-text = The settings file cannot be written, so the raised ceiling holds only until the session ends.
+agent-notice-session-only-text = The settings file cannot be written, so the access holds only until the session ends.
 
 ## Dialog titles
 
@@ -26,7 +23,7 @@ agent-title-read = Allow the agent to read?
 agent-title-reveal = Reveal a Secret to the agent?
 agent-title-modify = Allow the agent to make changes?
 agent-title-exec = Run the agent's command?
-agent-title-ceiling = Raise the agent's ceiling?
+agent-title-access = Give the agent more access?
 agent-title-helm-install = Install the agent's Helm release?
 agent-title-helm-upgrade = Upgrade the agent's Helm release?
 agent-title-helm-rollback = Roll back the Helm release?
@@ -60,7 +57,7 @@ agent-secret-no-take-back = Kubach cannot take it back once the agent has it.
 agent-deny = Deny
 agent-reject = Reject
 agent-approve = Approve
-agent-allow-always = Allow always
+agent-allow-always = Allow by default
 agent-allow-session = Allow for this session
 agent-helm-install = Install
 agent-helm-upgrade = Upgrade
@@ -82,13 +79,16 @@ agent-field-version = Version
 agent-field-revision = Revision
 agent-field-runs-as = Runs as
 agent-field-asks-for = Asks for
-agent-field-ceiling = Ceiling now
+agent-field-access-now = Has now
+agent-access-details = Allowing adds this until the session ends. With “Allow by default” the minimal access of { $context } is raised in Settings → Security for good. Either way every change, deletion, Helm action and command is still approved one by one, and nothing exceeds your own Kubernetes rights.
+agent-access-secrets = Secrets (metadata and checks)
+agent-access-crds = custom resources
 agent-field-tool = Tool
 agent-field-session = Session
 agent-helm-values = Values (sensitive keys masked)
 agent-helm-objects = Objects
-agent-always = Always allow on this cluster
-agent-always-note = Raises the agent's ceiling in Settings → Security of { $context } for good, with a note of when and from which session. Only the settings can lower it again.
+agent-always = Allow by default
+agent-always-note = Raises the minimal access in Settings → Security of { $context } for good, with a note of when and from which session. “Reset to read” there takes it back.
 agent-limits-off = Server-side limits are off
 agent-limits-off-note = The call runs with your own credentials; only Kubach checks it.
 agent-client-only = Boundary only in Kubach: the call runs with your own credentials.
@@ -179,17 +179,18 @@ agent-key-unknown = Kubach can't tell whether it belongs to the certificate
 ## Starting a session
 
 agent-use-context-summary = { $client } wants to work in context { $context }
-agent-use-context-details = A yes starts an agent session on { $context }: it begins without namespaces and rights. Reading a namespace, changing it and raising the ceiling are each asked for here when a call needs them, up to the { $profile } profile, for { $minutes } minutes.
+# $access: the minimal access, e.g. "Read".
+agent-use-context-details = A yes starts an agent session on { $context } until Kubach quits, at most 8 h. Without asking it has: { $access }. Anything more is asked for here.
 agent-consent-summary = Start an AI agent session on `{ $context }` with the credentials from the Kubach vault?
 agent-consent-session = new, for pid { $pid }
 agent-consent-tool = start a session
 agent-consent-namespaces = Namespaces: { $namespaces }
-agent-consent-namespaces-any = any the agent names, each asked for here
-agent-consent-profile = Profile: { $profile } at most; each right is asked for
+agent-consent-namespaces-any = any the agent names
+agent-consent-access = Without asking: { $access }; more is asked for here
 agent-consent-time = Time: { $time }, or until the vault locks
 agent-consent-reading = Reading: { $reading }
 agent-consent-reading-granted = allowed from the start (--grant-read)
-agent-consent-reading-asked = asked for here when the agent needs it
+agent-consent-reading-asked = within the minimal access
 agent-consent-process = Process: { $process }
 agent-consent-unknown-process = pid { $pid } (the OS does not show this process)
 agent-consent-warning = The pid is reported by the process itself. If you did not just start an agent for this context, reject.

@@ -230,7 +230,7 @@ fn helm_changes_need_the_ceiling_the_namespace_and_a_confirmation() {
     )
     .check(&request)
     .unwrap_err();
-    assert_eq!(denial.code, DenialCode::NeedsCeiling);
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
 
     let scope = scope_with(Profile::Deploy, &permissive(), &[NS]);
     let allowed = Policy::new(

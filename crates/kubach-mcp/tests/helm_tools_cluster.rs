@@ -73,7 +73,7 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
         context,
         server_url: base.cluster_url.to_string(),
         namespaces: Vec::new(),
-        profile: Profile::ReadOnly,
+        profile: Profile::Deploy,
         ttl: Some(Duration::from_secs(900)),
         hints: Vec::new(),
     };
@@ -103,7 +103,8 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     )
     .await;
 
-    // Install: ceiling raise, read(ns), modify(ns), the change itself.
+    // Install: the access (changes), the change itself; the namespace's
+    // rights come with the access (#15).
     let installed = call(
         &server,
         "helm_install",
@@ -125,14 +126,14 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
         .iter()
         .map(|request| match &request.kind {
             RequestKind::ChartSource { .. } => "source",
-            RequestKind::Ceiling { .. } => "ceiling",
+            RequestKind::Access { .. } => "access",
             RequestKind::Grant { .. } => "grant",
             RequestKind::Helm { .. } => "helm",
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, ["source", "ceiling", "grant", "grant", "helm"]);
-    let RequestKind::Helm { helm } = &requests[4].kind else {
+    assert_eq!(kinds, ["source", "access", "helm"]);
+    let RequestKind::Helm { helm } = &requests[2].kind else {
         unreachable!()
     };
     assert_eq!(helm.action, HelmAction::Install);

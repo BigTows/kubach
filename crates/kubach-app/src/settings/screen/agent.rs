@@ -2,9 +2,9 @@
 //! agent, the session for HTTP agents, active sessions with the rights
 //! their agents were granted (#227) and the audit log.
 //!
-//! The HTTP session is one button (#401): it starts without namespaces,
-//! and its ceiling (profile) and length come from the context's security
-//! settings, so there is nothing else to pick here.
+//! Sessions start without namespaces (#401), with the context's minimal
+//! access from its security settings (#15), so there is nothing to pick
+//! here.
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,7 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_core::settings::{DEFAULT_MCP_PORT, Settings};
 use kubach_i18n::t;
-use kubach_mcp::{BoundaryInfo, Grant, GrantState, Profile, SessionMode};
+use kubach_mcp::{BoundaryInfo, Grant, GrantState, SessionMode};
 use kubach_ui::{NumberRow, SettingRow, ToggleRow};
 
 use super::{Entry, Group, SettingsScreen, searchable, setter};
@@ -102,15 +102,6 @@ fn grant_label(grant: &Grant) -> String {
             name = name.as_str()
         ),
         Grant::Modify { namespace } => t!("settings-grant-modify", namespace = namespace.as_str()),
-    }
-}
-
-/// A session's ceiling, named like the choices of the security settings.
-fn profile_label(profile: Profile) -> String {
-    match profile {
-        Profile::ReadOnly => t!("settings-profile-read-only"),
-        Profile::Debug => t!("settings-profile-debug"),
-        Profile::Deploy => t!("settings-profile-deploy"),
     }
 }
 
@@ -479,7 +470,7 @@ impl SettingsScreen {
                 row.context,
                 row.namespaces.join(" "),
                 row.profile,
-                profile_label(row.profile),
+                agent::level_label(row.profile),
                 row.clients.join(" ")
             );
             group = group.entry(Entry::new(text, session_row(ix, row, state, cx)));
@@ -746,7 +737,7 @@ fn session_row(
     let title = t!(
         "settings-session-title",
         context = row.context.as_str(),
-        profile = profile_label(row.profile)
+        profile = agent::level_label(row.profile)
     );
     let clients = if row.clients.is_empty() {
         t!("settings-session-no-calls")
@@ -887,7 +878,10 @@ fn session_row(
                             .text_xs()
                             .whitespace_normal()
                             .text_color(theme.warning)
-                            .child(t!("settings-session-raised", raised = raised.to_string())),
+                            .child(t!(
+                                "settings-session-raised",
+                                raised = agent::raise_label(raised)
+                            )),
                     )
                 })
                 .when(no_grants, |this| {

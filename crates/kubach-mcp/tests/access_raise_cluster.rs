@@ -1,12 +1,11 @@
-//! Raising the agent's ceiling from a session against a real cluster
-//! (#417): a read-only context, the user allows the deploy profile for the
-//! session, and the temporary ServiceAccount's Role grows with it only
-//! where the namespace's own rights were granted. Ignored by default; run
-//! with
+//! Raising the agent's access from a session against a real cluster (#417,
+//! #15): the default minimum (reading), the user allows changes for the
+//! session, and the temporary ServiceAccount — created automatically where
+//! the user's RBAC allows it — grows with it. Ignored by default; run with
 //!
 //! ```sh
-//! KUBACH_TEST_CONTEXT=minikube KUBACH_TEST_NAMESPACE=kubach-test-417 \
-//!     cargo test -p kubach-mcp --test ceiling_raise_cluster -- --ignored
+//! KUBACH_TEST_CONTEXT=minikube KUBACH_TEST_NAMESPACE=kubach-test-15 \
+//!     cargo test -p kubach-mcp --test access_raise_cluster -- --ignored
 //! ```
 //!
 //! The namespace must exist; the session's objects are deleted at the end.
@@ -17,7 +16,7 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{ConfigMap, ServiceAccount};
 use k8s_openapi::api::rbac::v1::Role;
 use kubach_mcp::{
-    Ceiling, McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session,
+    Access, McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session,
     SessionSpec,
 };
 use kube::api::{Api, DeleteParams};
@@ -57,19 +56,16 @@ fn args(value: Value) -> Map<String, Value> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a cluster (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
-async fn a_raised_ceiling_widens_the_role_of_granted_namespaces() {
+async fn raised_access_widens_the_role_of_the_namespace() {
     let (base, context, namespace) = config().await;
-    // The strict ceiling with a separate identity: read-only, dry run.
-    let policy = SecurityPolicy {
-        mcp_enabled: true,
-        temporary_objects: true,
-        ..SecurityPolicy::default()
-    };
+    // The defaults: reading without asking, the identity chosen
+    // automatically.
+    let policy = SecurityPolicy::default();
     let spec = SessionSpec {
         context,
         server_url: base.cluster_url.to_string(),
         namespaces: Vec::new(),
-        profile: Profile::ReadOnly,
+        profile: Profile::Deploy,
         ttl: Some(Duration::from_secs(600)),
         hints: Vec::new(),
     };
@@ -92,7 +88,7 @@ async fn a_raised_ceiling_widens_the_role_of_granted_namespaces() {
             .unwrap_or(false)
     };
 
-    // Reading first: the Role holds read verbs only.
+    // Reading first, without a question: the Role holds read verbs only.
     let outcome = server
         .call(
             "test",
@@ -101,10 +97,12 @@ async fn a_raised_ceiling_widens_the_role_of_granted_namespaces() {
         )
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(confirmer.requests().is_empty());
+    assert!(roles.get_opt(&role).await.unwrap().is_some(), "SA created");
     assert!(!write_verbs().await);
 
-    // A real apply on a read-only ceiling: the raise is asked first, then
-    // changing the namespace, then the apply itself with its diff.
+    // A real apply beyond the minimum: the access is asked first, then the
+    // apply itself with its diff.
     let yaml =
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kubach-test-ceiling\ndata:\n  a: b\n";
     let outcome = server
@@ -119,21 +117,15 @@ async fn a_raised_ceiling_widens_the_role_of_granted_namespaces() {
         .requests()
         .iter()
         .map(|request| match &request.kind {
-            RequestKind::Ceiling { .. } => "ceiling",
+            RequestKind::Access { .. } => "access",
             RequestKind::Grant { .. } => "grant",
             RequestKind::Call => "call",
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, ["grant", "ceiling", "grant", "call"]);
-    assert_eq!(
-        session.ceiling(),
-        Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false
-        }
-    );
+    assert_eq!(kinds, ["access", "call"]);
+    assert_eq!(session.access(), Access::profile(Profile::Deploy));
+
     // The API server allows the change too: the SA's Role grew.
     assert!(eventually(async || write_verbs().await).await);
     let maps: Api<ConfigMap> = Api::namespaced(user.clone(), &namespace);

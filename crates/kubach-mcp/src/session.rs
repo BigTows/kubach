@@ -3,11 +3,11 @@
 //! request (#227) and, per namespace, the identity the agent's calls there
 //! run under (#401).
 //!
-//! A session starts without namespaces. When the user allows reading one,
-//! the session first sets up the strongest identity the settings and the
-//! user's rights allow in that namespace (impersonation, then a temporary
-//! ServiceAccount, then client only, ADR 0005) and only then records the
-//! right. A namespace where only Kubach holds the boundary is marked so.
+//! A session starts without namespaces. When the agent first works in one,
+//! the session first sets up the strongest identity the user's rights allow
+//! in that namespace (impersonation, then a temporary ServiceAccount, then
+//! client only, ADR 0005; chosen automatically since #15) and only then
+//! records the right. A namespace where only Kubach holds the boundary is marked so.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use kubach_core::rbac::{ResourceAccess, can_i, can_i_all};
 use kube::{Client, Config};
 use serde::{Deserialize, Serialize};
 
-use crate::ceiling::{Ceiling, Raises};
+use crate::access::{Access, Raises};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
@@ -40,22 +40,6 @@ pub enum SessionError {
     Ended,
     #[error("namespace `{0}` is not part of this session")]
     NotInSession(String),
-    /// The context allows one namespace per session, and another one is
-    /// already readable.
-    #[error(
-        "this context allows one namespace per agent session, and this session already reads \
-         `{0}`. Start a new session for another namespace, or allow several in Kubach: Settings \
-         → Security → Namespaces per agent session"
-    )]
-    SingleNamespace(String),
-    /// The context requires limits the API server enforces, and neither
-    /// impersonation nor a temporary ServiceAccount is available (#197).
-    #[error(
-        "this context requires server-side limits, but the session would run with your own \
-         credentials ({0}). Fix impersonation or temporary objects, or turn off \
-         \"Require server-side limits\" in the context's security settings"
-    )]
-    ServerLimitsRequired(String),
 }
 
 impl From<IdentityError> for SessionError {
@@ -145,7 +129,7 @@ pub struct Session {
     /// `SelfSubjectAccessReview` answers of the user per namespace, cached
     /// for the session.
     rbac: Mutex<HashMap<ResourceAccess, bool>>,
-    /// The user's answers about raising the ceiling (#417).
+    /// The user's answers about access (#15).
     raises: Mutex<Raises>,
     /// Chart sources (`oci://…` repositories) the user allowed or refused
     /// for this session (#418).
@@ -445,31 +429,33 @@ impl Session {
         }
     }
 
-    /// The user's answers about raising the ceiling so far (#417).
+    /// The user's answers about access so far (#15).
     pub fn raises(&self) -> Raises {
         sync::lock(&self.raises).clone()
     }
 
-    /// What the user raised the ceiling by in this session, if anything.
-    pub fn raised(&self) -> Option<Ceiling> {
+    /// What the user allowed beyond the minimum in this session, if
+    /// anything.
+    pub fn raised(&self) -> Option<Access> {
         let granted = self.raises().granted;
-        (granted != Ceiling::NONE).then_some(granted)
+        (granted != Access::NONE).then_some(granted)
     }
 
-    /// The ceiling now: the session's profile and settings, raised by what
-    /// the user allowed.
-    pub fn ceiling(&self) -> Ceiling {
-        Ceiling::of(self.scope.profile, &self.scope.policy).join(self.raises().granted)
+    /// What the session has without asking at its start: the context's
+    /// minimum, capped by the launch's profile.
+    pub fn minimum(&self) -> Access {
+        self.scope.policy.minimum.capped(self.scope.profile)
     }
 
-    /// The scope with the raised ceiling applied: the profile and the
-    /// settings the Role of a temporary ServiceAccount mirrors.
-    pub fn effective_scope(&self) -> SessionScope {
-        let mut scope = self.scope.clone();
-        let (profile, policy) = self.raises().granted.widen(scope.profile, &scope.policy);
-        scope.profile = profile;
-        scope.policy = policy;
-        scope
+    /// The access now: the minimum, raised by what the user allowed,
+    /// capped by the launch's profile. The Role of a temporary
+    /// ServiceAccount mirrors it.
+    pub fn access(&self) -> Access {
+        self.scope
+            .policy
+            .minimum
+            .join(self.raises().granted)
+            .capped(self.scope.profile)
     }
 
     /// Records a tool call of `client`.
@@ -538,20 +524,20 @@ impl Session {
         self.ask.lock().await
     }
 
-    /// Records the user's answer for `grant`. A yes to reading a namespace
-    /// first sets up the namespace's identity (#401); a yes patches the Role
-    /// of a temporary ServiceAccount. If either fails the right is not
-    /// granted and the error is returned (#227, variant A). A no is kept so
-    /// the user is not asked again.
+    /// Records the answer for `grant`: given within the access (#15) or by
+    /// the user (revealing a Secret). Granting `read(ns)` first sets up the
+    /// namespace's identity (#401); a grant patches the Role of a temporary
+    /// ServiceAccount. If either fails the right is not granted and the
+    /// error is returned (#227, variant A). A no is kept so the user is not
+    /// asked again.
     pub async fn decide(&self, grant: Grant, granted: bool) -> Result<(), SessionError> {
         self.decide_with(grant, granted, false).await
     }
 
-    /// Grants reading a pinned namespace from the start, because the launch
-    /// arguments say so (`kubach mcp --grant-read`). Only `read(ns)` and
-    /// only for the session's pinned namespaces: Secrets and changes are
-    /// still asked for, and the ceiling (settings, profile) is checked by
-    /// the policy as for any other right.
+    /// Sets up a pinned namespace from the start, because the launch
+    /// arguments say so (`kubach mcp --grant-read`). Only `read(ns)`, which
+    /// the minimum gives anyway since #15, and only for the session's
+    /// pinned namespaces.
     pub async fn grant_read_at_launch(&self, namespace: &str) -> Result<(), SessionError> {
         if !self.scope.namespaces.iter().any(|n| n == namespace) {
             return Err(SessionError::NotInSession(namespace.to_owned()));
@@ -591,27 +577,16 @@ impl Session {
     }
 
     /// Whether reading `namespace` may be granted at all: a pinned session
-    /// keeps to its namespaces, and a context with one namespace per session
-    /// to the first one granted. The policy checks the same before asking;
-    /// this holds even if two questions raced.
+    /// keeps to its namespaces. The policy checks the same first.
     fn admit(&self, namespace: &str) -> Result<(), SessionError> {
         if self.scope.pinned() && !self.scope.namespaces.iter().any(|n| n == namespace) {
             return Err(SessionError::NotInSession(namespace.to_owned()));
-        }
-        if !self.scope.policy.multiple_namespaces
-            && let Some(other) = self
-                .namespaces()
-                .into_iter()
-                .find(|other| other != namespace)
-        {
-            return Err(SessionError::SingleNamespace(other));
         }
         Ok(())
     }
 
     /// Sets up the identity of `namespace` unless it has one: ADR 0005's
-    /// choice, done per namespace. With "Require server-side limits" a
-    /// namespace where only Kubach could hold the boundary is refused.
+    /// choice, done per namespace.
     async fn prepare(&self, namespace: &str) -> Result<(), SessionError> {
         if self.boundary(namespace).is_some() {
             return Ok(());
@@ -625,9 +600,15 @@ impl Session {
             // Leftovers of crashed sessions (ADR 0005); best effort.
             let _ = identity::sweep_expired(&self.user_client, namespace).await;
         }
-        let (identity, notes) =
-            choose_identity(base, &self.user_client, &self.scope, namespace).await;
-        let degraded = check_server_limits(identity.mode(), &notes, &self.scope.policy)?;
+        let (identity, notes) = choose_identity(
+            base,
+            &self.user_client,
+            &self.scope,
+            self.access().profile,
+            namespace,
+        )
+        .await;
+        let degraded = server_limits_warning(identity.mode(), &notes, &self.scope.policy);
         sync::lock(&self.boundaries).insert(
             namespace.to_owned(),
             Arc::new(Boundary {
@@ -639,14 +620,11 @@ impl Session {
         Ok(())
     }
 
-    /// Mirrors `grants` on the identity of `namespace`, within the ceiling
+    /// Mirrors `grants` on the identity of `namespace`, within the access
     /// as raised so far.
     async fn sync_namespace(&self, grants: &Grants, namespace: &str) -> Result<(), SessionError> {
         if let Some(boundary) = self.boundary(namespace) {
-            boundary
-                .identity
-                .sync_grants(grants, &self.effective_scope())
-                .await?;
+            boundary.identity.sync_grants(grants, self.access()).await?;
         }
         Ok(())
     }
@@ -703,9 +681,7 @@ impl Session {
         if let Some(boundary) = self.boundary(namespace)
             && let Identity::TemporaryServiceAccount(sa) = &boundary.identity
         {
-            let scope = self.effective_scope();
-            let mut rules =
-                crate::rules::grant_rules(&self.grants(), namespace, scope.profile, &scope.policy);
+            let mut rules = crate::rules::grant_rules(&self.grants(), namespace, self.access());
             rules.extend(extra);
             sa.set_rules(rules).await?;
         }
@@ -719,17 +695,17 @@ impl Session {
         self.sync_namespace(&grants, namespace).await
     }
 
-    /// Records the user's answer about raising the ceiling by `raise`
-    /// (#417). A yes widens the Role of every temporary ServiceAccount the
-    /// session has, so the API server allows the rights already granted in
-    /// those namespaces up to the new profile (rights not granted stay out:
-    /// a raise never stands in for `read(ns)` or `modify(ns)`). If a patch
-    /// fails, the ceiling is not raised and the error is returned; Roles
-    /// already patched are put back. A no is kept so the same request is
-    /// not asked again. `saved`: the user raised it in the settings too.
-    pub async fn decide_ceiling(
+    /// Records the user's answer about access `raise` (#15). A yes widens
+    /// the Role of every temporary ServiceAccount the session has, so the
+    /// API server allows the rights already set up in those namespaces up
+    /// to the new access (`modify(ns)` still follows on the first change
+    /// there). If a patch fails, the access is not raised and the error is
+    /// returned; Roles already patched are put back. A no is kept so the
+    /// same request is not asked again. `saved`: the user raised the
+    /// context's minimum in the settings too.
+    pub async fn decide_access(
         &self,
-        raise: Ceiling,
+        raise: Access,
         granted: bool,
         saved: bool,
     ) -> Result<(), SessionError> {
@@ -852,18 +828,20 @@ async fn allowed(client: &Client, accesses: &[ResourceAccess]) -> Result<(), Str
 }
 
 /// ADR 0005 for `namespace`: impersonation if configured and permitted,
-/// else a temporary SA if allowed by settings and RBAC, else client only.
+/// else a temporary SA if the user's RBAC allows it, else client only.
+/// `profile` names the impersonated identity.
 async fn choose_identity(
     base: &Config,
     user_client: &Client,
     scope: &SessionScope,
+    profile: crate::settings::Profile,
     namespace: &str,
 ) -> (Identity, Vec<String>) {
     let mut notes = Vec::new();
     let policy = &scope.policy;
 
     if let Some(target) = &policy.impersonation {
-        let (user, groups) = target.render(namespace, scope.profile);
+        let (user, groups) = target.render(namespace, profile);
         let mut accesses = vec![ResourceAccess::new("impersonate", "", "users").named(&user)];
         accesses.extend(
             groups
@@ -914,7 +892,7 @@ async fn choose_identity(
             Err(reason) => notes.push(format!("temporary ServiceAccount not possible: {reason}")),
         }
     } else {
-        notes.push("temporary objects are disabled for this context".into());
+        notes.push("temporary objects are off for this session".into());
     }
 
     (
@@ -925,28 +903,22 @@ async fn choose_identity(
     )
 }
 
-/// What a client-only namespace means for the context's settings (#197):
-/// an error when the context requires server-side limits, a warning when a
-/// server-enforced identity was configured but did not work, nothing when
-/// none was configured (the UI marks client-only namespaces anyway).
-fn check_server_limits(
+/// The mark of a client-only namespace (#197, #15): `server-side limits
+/// are off: <why>` when a server-enforced identity was tried and did not
+/// work (no RBAC for a temporary ServiceAccount, broken impersonation).
+/// Nothing when none was tried (tests only; the UI marks client-only
+/// namespaces anyway).
+fn server_limits_warning(
     mode: SessionMode,
     notes: &[String],
     policy: &SecurityPolicy,
-) -> Result<Option<String>, SessionError> {
+) -> Option<String> {
     if mode.server_enforced() {
-        return Ok(None);
+        return None;
     }
-    let reason = if notes.is_empty() {
-        "no server-side identity is configured for this context".to_owned()
-    } else {
-        notes.join("; ")
-    };
-    if policy.require_server_enforced {
-        return Err(SessionError::ServerLimitsRequired(reason));
-    }
-    let configured = policy.impersonation.is_some() || policy.temporary_objects;
-    Ok(configured.then(|| format!("server-side limits are off: {reason}")))
+    let reason = notes.join("; ");
+    let tried = policy.impersonation.is_some() || policy.temporary_objects;
+    tried.then(|| format!("server-side limits are off: {reason}"))
 }
 
 #[cfg(test)]
@@ -1013,36 +985,32 @@ mod tests {
         url
     }
 
-    fn impersonating(require: bool) -> SecurityPolicy {
+    fn impersonating() -> SecurityPolicy {
         SecurityPolicy {
             mcp_enabled: true,
             impersonation: Some(ImpersonationTarget {
                 user: "kubach:mcp:{namespace}:{profile}".into(),
                 groups: Vec::new(),
             }),
-            require_server_enforced: require,
+            temporary_objects: false,
             ..SecurityPolicy::default()
         }
     }
 
-    /// Runs the identity choice against `url` and applies the context's
-    /// requirement, as [`Session::start`] does.
-    async fn start_identity(
-        url: &str,
-        policy: &SecurityPolicy,
-    ) -> Result<(SessionMode, Option<String>), SessionError> {
+    /// Runs the identity choice against `url`, as [`Session::start`] does.
+    async fn start_identity(url: &str, policy: &SecurityPolicy) -> (SessionMode, Option<String>) {
         let base = Config::new(url.parse().unwrap());
         let user = Client::try_from(base.clone()).unwrap();
-        let scope = scope_with(Profile::ReadOnly, policy, &[]);
-        let (identity, notes) = choose_identity(&base, &user, &scope, NS).await;
-        let warning = check_server_limits(identity.mode(), &notes, policy)?;
-        Ok((identity.mode(), warning))
+        let scope = scope_with(Profile::Deploy, policy, &[]);
+        let (identity, notes) = choose_identity(&base, &user, &scope, Profile::ReadOnly, NS).await;
+        let warning = server_limits_warning(identity.mode(), &notes, policy);
+        (identity.mode(), warning)
     }
 
     #[tokio::test]
-    async fn broken_impersonation_without_the_flag_starts_with_a_warning() {
+    async fn broken_impersonation_starts_with_a_warning() {
         let url = fake_ssar(false).await;
-        let (mode, warning) = start_identity(&url, &impersonating(false)).await.unwrap();
+        let (mode, warning) = start_identity(&url, &impersonating()).await;
         assert_eq!(mode, SessionMode::ClientOnly);
         let warning = warning.expect("the fallback is not silent");
         assert!(
@@ -1056,68 +1024,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_impersonation_with_the_flag_does_not_start() {
-        let url = fake_ssar(false).await;
-        let error = start_identity(&url, &impersonating(true))
-            .await
-            .unwrap_err();
-        let SessionError::ServerLimitsRequired(reason) = &error else {
-            panic!("unexpected error: {error}");
-        };
+    async fn without_rbac_for_a_service_account_the_namespace_is_marked() {
+        // The automatic choice (#15): no rights for a temporary
+        // ServiceAccount, so limits only in Kubach, and that is not silent.
+        let (mode, warning) = start_identity(&unreachable(), &SecurityPolicy::default()).await;
+        assert_eq!(mode, SessionMode::ClientOnly);
+        let warning = warning.expect("marked");
         assert!(
-            reason.contains("missing rights: impersonate users"),
-            "{reason}"
+            warning.starts_with("server-side limits are off: "),
+            "{warning}"
         );
-        assert!(error.to_string().contains("requires server-side limits"));
-    }
-
-    #[tokio::test]
-    async fn unreachable_rbac_with_the_flag_does_not_start() {
-        let policy = SecurityPolicy {
-            temporary_objects: true,
-            ..impersonating(true)
-        };
-        let error = start_identity(&unreachable(), &policy).await.unwrap_err();
-        let SessionError::ServerLimitsRequired(reason) = &error else {
-            panic!("unexpected error: {error}");
-        };
-        assert!(reason.contains("impersonation of"), "{reason}");
         assert!(
-            reason.contains("temporary ServiceAccount not possible"),
-            "{reason}"
+            warning.contains("temporary ServiceAccount not possible"),
+            "{warning}"
         );
     }
 
     #[tokio::test]
-    async fn working_impersonation_satisfies_the_flag() {
+    async fn working_impersonation_needs_no_mark() {
         let url = fake_ssar(true).await;
-        let (mode, warning) = start_identity(&url, &impersonating(true)).await.unwrap();
+        let (mode, warning) = start_identity(&url, &impersonating()).await;
         assert_eq!(mode, SessionMode::Impersonation);
         assert_eq!(warning, None);
-    }
-
-    #[tokio::test]
-    async fn nothing_configured_is_refused_only_with_the_flag() {
-        let url = unreachable();
-        let plain = SecurityPolicy {
-            mcp_enabled: true,
-            ..SecurityPolicy::default()
-        };
-        let (mode, warning) = start_identity(&url, &plain).await.unwrap();
-        assert_eq!(mode, SessionMode::ClientOnly);
-        assert_eq!(warning, None, "nothing degraded: nothing was configured");
-
-        let required = SecurityPolicy {
-            require_server_enforced: true,
-            ..plain
-        };
-        let error = start_identity(&url, &required).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("temporary objects are disabled for this context"),
-            "{error}"
-        );
     }
 
     /// A session on the API server at `url` started without namespaces,
@@ -1126,7 +1054,7 @@ mod tests {
         let base = Config::new(url.parse().unwrap());
         let user_client = Client::try_from(base.clone()).unwrap();
         Arc::new(Session {
-            scope: scope_with(Profile::ReadOnly, policy, &[]),
+            scope: scope_with(Profile::Deploy, policy, &[]),
             identities: Identities::Cluster {
                 base: Box::new(base),
             },
@@ -1149,12 +1077,8 @@ mod tests {
     #[tokio::test]
     async fn each_new_namespace_gets_its_own_identity() {
         let url = fake_ssar(true).await;
-        let policy = SecurityPolicy {
-            multiple_namespaces: true,
-            ..impersonating(true)
-        };
-        let session = open_session(&url, &policy);
-        // Nothing is set up before the user allows reading.
+        let session = open_session(&url, &impersonating());
+        // Nothing is set up before the agent works in a namespace.
         assert!(session.boundaries().is_empty());
         assert!(session.client_in("web").is_err());
         assert_eq!(session.describe_identity(Some("web")), "user");
@@ -1184,23 +1108,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_namespace_without_server_limits_is_refused_when_they_are_required() {
-        let url = fake_ssar(false).await;
-        let session = open_session(&url, &impersonating(true));
-        let error = session.decide(Grant::read("web"), true).await.unwrap_err();
-        assert!(
-            matches!(error, SessionError::ServerLimitsRequired(_)),
-            "{error}"
-        );
-        // Not granted, not remembered as refused: the user may fix RBAC.
-        assert_eq!(session.grants().state(&Grant::read("web")), None);
-        assert!(session.boundaries().is_empty());
-    }
-
-    #[tokio::test]
     async fn a_client_only_namespace_is_marked() {
         let url = fake_ssar(false).await;
-        let session = open_session(&url, &impersonating(false));
+        let session = open_session(&url, &impersonating());
         session.decide(Grant::read("web"), true).await.unwrap();
         let boundaries = session.boundaries();
         assert_eq!(boundaries[0].mode, SessionMode::ClientOnly);
@@ -1218,19 +1128,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_namespace_per_session_holds_in_the_session_too() {
+    async fn any_number_of_namespaces() {
         let url = fake_ssar(true).await;
-        let session = open_session(&url, &impersonating(false));
-        session.decide(Grant::read("web"), true).await.unwrap();
-        let error = session.decide(Grant::read("api"), true).await.unwrap_err();
-        assert!(
-            matches!(&error, SessionError::SingleNamespace(ns) if ns == "web"),
-            "{error}"
-        );
-        assert!(session.client_in("api").is_err());
-        // Revoked, the namespace no longer counts.
-        session.revoke(&Grant::read("web")).await.unwrap();
-        session.decide(Grant::read("api"), true).await.unwrap();
+        let session = open_session(&url, &impersonating());
+        for namespace in ["web", "api", "db"] {
+            session.decide(Grant::read(namespace), true).await.unwrap();
+        }
+        assert_eq!(session.namespaces(), ["api", "db", "web"]);
     }
 
     #[test]
@@ -1240,7 +1144,7 @@ mod tests {
             SessionMode::TemporaryServiceAccount,
         ] {
             assert_eq!(
-                check_server_limits(mode, &[], &impersonating(true)).unwrap(),
+                server_limits_warning(mode, &[], &SecurityPolicy::default()),
                 None
             );
         }

@@ -1,11 +1,11 @@
-//! What a session is allowed to touch: profile, settings, TTL and, if the
-//! launch pinned them, namespaces. Validated once when the session starts;
+//! What a session is allowed to touch: the context's settings (its minimal
+//! access, #15), the launch's cap on the profile, TTL and, if the launch
+//! pinned them, namespaces. Validated once when the session starts;
 //! immutable afterwards.
 //!
-//! Since #401 a session starts without namespaces: the agent names one,
-//! and the user is asked for reading it the first time (ADR 0005, "Права
-//! по запросу"). Namespaces pinned at launch (`kubach mcp --namespace`)
-//! restrict the session to them, as before.
+//! A session starts without namespaces (#401): the agent names any, and
+//! reading built-in kinds there needs no question (#15). Namespaces pinned
+//! at launch (`kubach mcp --namespace`) restrict the session to them.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use k8s_openapi::jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::names;
-use crate::settings::{Profile, SecurityPolicy};
+use crate::settings::{MAX_SESSION_TTL, Profile, SecurityPolicy};
 
 /// What a session is started with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,11 +23,14 @@ pub struct SessionSpec {
     /// API server URL of the context; settings are keyed by both.
     pub server_url: String,
     /// Namespaces pinned at launch: the session may ask only for these.
-    /// Empty: any namespace the agent names, each asked for (#401).
+    /// Empty: any namespace the agent names (#401).
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// The broadest profile this session may get, minimum or asked for
+    /// (`kubach mcp --profile`); [`Profile::Deploy`] when not narrowed.
+    /// Narrows only: it never grants anything (#15).
     pub profile: Profile,
-    /// `None` takes the context's default TTL.
+    /// `None`: until the app or process exits, at most [`MAX_SESSION_TTL`].
     pub ttl: Option<Duration>,
     /// Namespaces Kubach knows of for this context without listing them
     /// (kubeconfig, its settings, recently opened), for `list_namespaces`
@@ -98,10 +101,6 @@ pub enum ScopeError {
     InvalidNamespace(String),
     #[error("namespace `{0}` is listed twice")]
     DuplicateNamespace(String),
-    #[error("this context allows a single namespace per session")]
-    SingleNamespaceOnly,
-    #[error("profile {requested} exceeds the context's maximum ({max})")]
-    ProfileTooBroad { requested: Profile, max: Profile },
     #[error("TTL must be between 1 second and {max:?}")]
     InvalidTtl { max: Duration },
 }
@@ -112,10 +111,11 @@ pub struct SessionScope {
     pub id: String,
     pub context: String,
     pub server_url: String,
-    /// Pinned at launch; empty: any namespace, each asked for.
+    /// Pinned at launch; empty: any namespace.
     pub namespaces: Vec<String>,
     /// Known namespaces for `list_namespaces`; valid names only.
     pub hints: Vec<NamespaceHint>,
+    /// The launch's cap on the profile; see [`SessionSpec::profile`].
     pub profile: Profile,
     pub policy: SecurityPolicy,
     pub ttl: Duration,
@@ -139,17 +139,8 @@ impl SessionScope {
                 return Err(ScopeError::DuplicateNamespace(namespace.clone()));
             }
         }
-        if spec.namespaces.len() > 1 && !policy.multiple_namespaces {
-            return Err(ScopeError::SingleNamespaceOnly);
-        }
-        if spec.profile > policy.max_profile {
-            return Err(ScopeError::ProfileTooBroad {
-                requested: spec.profile,
-                max: policy.max_profile,
-            });
-        }
-        let cap = policy.ttl_cap();
-        let ttl = spec.ttl.unwrap_or(policy.default_ttl.min(cap));
+        let cap = MAX_SESSION_TTL;
+        let ttl = spec.ttl.unwrap_or(cap);
         if ttl.is_zero() || ttl > cap {
             return Err(ScopeError::InvalidTtl { max: cap });
         }
@@ -226,7 +217,7 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::ExecMode;
+    use crate::access::Access;
 
     fn spec(namespaces: &[&str], profile: Profile) -> SessionSpec {
         SessionSpec {
@@ -251,22 +242,20 @@ mod tests {
     }
 
     #[test]
-    fn profile_cannot_exceed_settings() {
+    fn the_profile_is_a_cap_not_checked_against_the_minimum() {
         let policy = SecurityPolicy::default();
         assert!(policy.mcp_enabled);
-        assert!(matches!(
-            SessionScope::new(&spec(&["web"], Profile::Debug), &policy),
-            Err(ScopeError::ProfileTooBroad { .. })
-        ));
+        // A broader cap than the minimum is fine: more is asked for (#15).
+        assert!(SessionScope::new(&spec(&["web"], Profile::Deploy), &policy).is_ok());
         let scope = SessionScope::new(&spec(&["web"], Profile::ReadOnly), &policy).unwrap();
-        assert_eq!(scope.ttl, policy.default_ttl);
+        assert_eq!(scope.ttl, MAX_SESSION_TTL);
         assert_eq!(scope.single_namespace(), Some("web"));
         assert_eq!(scope.id.len(), 12);
     }
 
     #[test]
     fn namespaces_are_validated() {
-        let mut policy = SecurityPolicy::development();
+        let policy = SecurityPolicy::with_minimum(Access::ALL);
         for bad in [
             "",
             "*",
@@ -286,11 +275,7 @@ mod tests {
                 assert!(result.is_err(), "{bad:?} accepted");
             }
         }
-        assert_eq!(
-            SessionScope::new(&spec(&["a", "b"], Profile::ReadOnly), &policy).unwrap_err(),
-            ScopeError::SingleNamespaceOnly
-        );
-        policy.multiple_namespaces = true;
+        // Any number of namespaces (#15).
         assert!(SessionScope::new(&spec(&["a", "b"], Profile::ReadOnly), &policy).is_ok());
         assert_eq!(
             SessionScope::new(&spec(&["a", "a"], Profile::ReadOnly), &policy).unwrap_err(),
@@ -311,7 +296,7 @@ mod tests {
             NamespaceHint::new("team", NamespaceSource::RecentlyOpened),
             NamespaceHint::new("web", NamespaceSource::RecentlyOpened),
         ];
-        let scope = SessionScope::new(&s, &SecurityPolicy::development()).unwrap();
+        let scope = SessionScope::new(&s, &SecurityPolicy::default()).unwrap();
         assert_eq!(
             scope.hints,
             [
@@ -324,10 +309,7 @@ mod tests {
 
     #[test]
     fn ttl_is_bounded() {
-        let policy = SecurityPolicy {
-            exec: ExecMode::OneShot,
-            ..SecurityPolicy::development()
-        };
+        let policy = SecurityPolicy::default();
         let mut s = spec(&["web"], Profile::Deploy);
         s.ttl = Some(Duration::from_secs(9 * 3600));
         assert!(matches!(

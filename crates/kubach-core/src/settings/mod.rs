@@ -25,9 +25,8 @@ pub use model::{
 };
 pub use presets::{Presets, ResourcePreset};
 pub use security::{
-    AgentSecrets, CeilingRaise, ContextKey, ContextPolicy, ContextSecurity, DeployMode, ExecMode,
-    Loosened, MAX_CEILING_RAISES, NamespaceLimit, PolicyIssue, Preset, Profile,
-    SECRET_VALUES_HIDDEN, SecretAction, SecuritySettings,
+    AccessRaise, AgentAccess, AgentLevel, ContextKey, ContextPolicy, ContextSecurity,
+    MAX_ACCESS_RAISES, SECRET_VALUES_HIDDEN, SecretAction, SecuritySettings,
 };
 pub(crate) use watch::watch_names;
 pub use watch::{SettingsWatcher, watch};

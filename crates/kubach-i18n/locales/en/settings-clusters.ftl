@@ -182,71 +182,35 @@ settings-hide-message = The tile leaves the hotbar; the kubeconfig is not change
 
 ## Security of a context
 
-settings-profile-read-only = Read-only
-settings-profile-debug = Debug
-settings-profile-deploy = Deploy
-settings-deploy-dry-run = Dry run only
-settings-deploy-apply = Apply after approval
-settings-exec-never = Never
-settings-exec-single = Single commands
-settings-exec-shell = Single commands and a shell
-settings-namespaces-one = One
-settings-namespaces-several = Several
-settings-agent-secrets-none = None
-settings-agent-secrets-metadata = Metadata and checks
-settings-agent-secrets-reveal = Metadata, checks and reveal on request
-settings-security-preset = Preset
-settings-security-preset-strict = Strict: the defaults.
-settings-security-preset-development = Development: everything allowed, each change confirmed, Secret values shown and revealed to the agent on request.
-settings-security-preset-custom = Custom values.
-settings-preset-strict = Strict
-settings-preset-development = Development
 settings-group-security = Security
-settings-security-description-no-server = What an AI agent connected over MCP may do. New contexts are strict. No API server in kubeconfig.
-settings-security-description = What an AI agent connected over MCP may do. New contexts are strict. Settings are bound to this name and server { $server }.
-# $list: what is looser, joined with commas (hotbar-loosened-*).
-settings-security-loosened = Looser than the defaults for { $name }: { $list }.
-settings-security-relaxed = Relaxed security
-settings-security-suggest-development = This looks like a local cluster. The Development preset is suggested; it is not applied automatically.
-settings-group-secrets = Secrets
+settings-security-description-no-server = Whether you see Secret values here, and what an AI agent connected over MCP gets without asking. No API server in kubeconfig.
+settings-security-description = Whether you see Secret values here, and what an AI agent connected over MCP gets without asking. Settings are bound to this name and server { $server }.
 settings-hide-secret-values = Hide Secret values
 settings-hide-secret-values-description = No Show, Copy or Load value for Secrets of this context, and no reveal in Helm and Kustomize. Values can still be replaced without loading them.
 settings-group-agent-mcp = AI agent (MCP)
-settings-agent-mcp-description = An agent starts with no rights. It names a namespace, and Kubach asks you the first time it reads it, reveals a Secret or changes something. These settings are the most it can ever get here.
+settings-agent-mcp-description = Without asking, the agent gets the minimal access below. For more it asks you in Kubach: for one session, or by default on this cluster. Changes, deletions, Helm and every command in a container are still approved one by one, and your own Kubernetes rights are the limit.
 settings-mcp-enabled = AI agent access
 settings-mcp-enabled-description = Off: no agent session starts on this cluster.
+settings-minimum-access = Minimal access
+settings-minimum-access-description = What the agent gets without asking. Read: built-in resources (Pods, Deployments, Services, ConfigMaps, Jobs, Ingresses, events…) in every namespace, no Secrets. Debug: also logs and commands in containers. Changes: also apply, delete, scale and Helm.
+settings-minimum-read = Read
+settings-minimum-debug = Debug
+settings-minimum-changes = Changes
+settings-minimum-secrets = Secrets by default
+settings-minimum-secrets-description = Secret names, keys, sizes and checks inside Kubach without asking, never values. Off: the agent asks first. Revealing values is asked for each Secret, and only while “Hide Secret values” is off.
+settings-minimum-crds = Custom resources by default
+settings-minimum-crds-description = Kinds beyond the built-in ones (CRDs such as Flux or Argo CD objects) without asking. They may hold credentials or make a controller act with its own rights. Off: the agent asks first. ServiceAccounts, RBAC and Secrets are never changed through them.
+settings-minimum-reset = Reset to read
+settings-minimum-reset-description = Back to reading built-in resources; everything else is asked for again. Sessions already running keep what they have until they end.
 # $time: e.g. 10:00:00; $changes: what was raised, as recorded in the settings file.
-settings-ceiling-raised = Raised at an agent's request on { $time } by session { $session }: { $changes }.
-settings-ceiling-raised-client = Raised at an agent's request on { $time } by session { $session } ({ $client }): { $changes }.
-settings-ceiling-raised-earlier =
+settings-access-raised = Allowed by default at an agent's request on { $time } by session { $session }: { $changes }.
+settings-access-raised-client = Allowed by default at an agent's request on { $time } by session { $session } ({ $client }): { $changes }.
+settings-access-raised-earlier =
     { $count ->
         [one] ({ $count } earlier raise in the settings file)
        *[other] ({ $count } earlier raises in the settings file)
     }
-settings-ceiling-raised-title = Ceiling raised from a session
-settings-protected = Protected cluster
-settings-protected-description = The agent cannot ask to raise the limits below from a session: such calls are refused with an explanation and you are not asked. Only this setting turns it off. For production.
-settings-max-profile = Most the agent may ask for
-settings-max-profile-description = Read-only: view resources. Debug: also logs and exec. Deploy: also changes. Above this the agent may ask you in Kubach to raise it, for one session or always, unless the cluster is protected.
-settings-deploy-mode = Changes
-settings-deploy-mode-description = With Deploy. Dry run: the agent sees the diff and nothing changes. Apply: each change runs after you approve it, including Secrets with values you type in Kubach.
-settings-exec-mode = Commands in containers
-settings-exec-mode-description = With Debug or Deploy. You approve every command.
-settings-agent-secrets = Secrets for the agent
-settings-agent-secrets-hidden-description = Names, keys, sizes and checks inside Kubach, never values. Revealing needs “Hide Secret values” off: the agent never gets a value you may not see.
-settings-agent-secrets-description = Reveal asks you for each Secret and warns that its values go to the model's provider. Other tools always hide values.
-settings-agent-other-kinds = Custom resources (CRDs)
-settings-agent-other-kinds-description = Off: only built-in kinds such as Pods, Deployments, Services, ConfigMaps, Jobs and Ingresses. On: custom resources too, which may hold credentials or make a controller (Flux, Argo CD) act with its own rights. Secrets, ServiceAccounts and RBAC stay off-limits.
-settings-namespaces = Namespaces per session
-settings-namespaces-description = One: the first namespace you allow is the only one the session gets. Several: each new namespace is asked for.
-settings-session-ttl = Session length
-settings-session-ttl-description = A session and every right in it end after this, at most 8 h, or when Kubach quits. `kubach mcp` sessions last 30 minutes unless started with a longer --ttl.
-settings-group-enforcement = Enforcement by the cluster
-settings-enforcement-description = Kubach checks every agent call itself. These add a second check by the API server, so a mistake in Kubach cannot give the agent more than you allowed.
-settings-temporary-objects = Separate identity for the agent
-settings-temporary-objects-description = In each namespace you let the agent read, Kubach creates a ServiceAccount whose Role holds exactly what you allowed, and removes it when the session ends. Needs admin rights in the namespace.
-settings-require-server-enforced = Require it
-settings-require-server-enforced-description = Refuse a namespace where the cluster cannot enforce the limits. Off: such a namespace is marked “limits only in Kubach” and every change in it is approved one by one.
+settings-access-raised-title = Raised from a session
 
 ## Presets page
 

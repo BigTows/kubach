@@ -50,8 +50,7 @@ async fn each_namespace_gets_its_own_service_account() {
     let (base, context, namespace, other) = config().await;
     let policy = SecurityPolicy {
         temporary_objects: true,
-        multiple_namespaces: true,
-        ..SecurityPolicy::development()
+        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
     };
     let spec = SessionSpec {
         context,

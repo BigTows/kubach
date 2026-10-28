@@ -23,6 +23,8 @@ pub enum DecidedBy {
     None,
     /// Granted by the launch arguments (`kubach mcp --grant-read`).
     LaunchArgs,
+    /// Granted within the session's access without a question (#15).
+    Access,
 }
 
 /// One audit record.

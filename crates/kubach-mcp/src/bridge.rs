@@ -140,8 +140,9 @@ pub struct ExternalSession {
     pub id: String,
     pub pid: u32,
     pub context: String,
-    /// Pinned at launch, else the namespaces the user allowed reading.
+    /// Pinned at launch, else the namespaces the agent worked in.
     pub namespaces: Vec<String>,
+    /// The access level now (#15).
     pub profile: Profile,
     /// The weakest mode among the namespaces; see `boundaries`.
     pub mode: SessionMode,
@@ -157,9 +158,9 @@ pub struct ExternalSession {
     /// The user's answers for rights so far (#227).
     #[serde(default)]
     pub grants: Vec<GrantEntry>,
-    /// The ceiling the user raised for this session, if any (#417).
+    /// Access the user allowed beyond the minimum in this session (#15).
     #[serde(default)]
-    pub raised: Option<crate::ceiling::Ceiling>,
+    pub raised: Option<crate::access::Access>,
 }
 
 impl ExternalSession {
@@ -177,7 +178,7 @@ impl ExternalSession {
             pid,
             context: scope.context.clone(),
             namespaces: session.namespaces(),
-            profile: scope.profile,
+            profile: session.access().profile,
             mode: session.mode(),
             boundaries: session.boundaries(),
             started_at: scope.started_at.to_string(),
@@ -225,11 +226,11 @@ pub struct HostRequest {
     /// Empty: the context's default namespace.
     #[serde(default)]
     pub namespaces: Vec<String>,
-    /// `None`: the context's maximum profile (a ceiling; each right in it
-    /// is asked for, #227).
+    /// `None`: not narrowed (`kubach mcp --profile` caps the session; more
+    /// than the minimum is asked for, #15).
     #[serde(default)]
     pub profile: Option<Profile>,
-    /// `None`: the context's TTL.
+    /// `None`: as long as the app runs, at most 8 h.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
     /// `--grant-read`: reading the session's namespaces is granted from the

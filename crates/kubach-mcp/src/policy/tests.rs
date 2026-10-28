@@ -6,8 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::grants::{Grant, GrantState, Grants};
 use crate::scope::SessionMode;
-use crate::settings::SecretAccess;
-use crate::settings::{DeployMode, ExecMode, SecurityPolicy};
+use crate::settings::SecurityPolicy;
 use crate::testutil::grants;
 use crate::testutil::{NS, OTHER_NS, catalog, permissive, scope, scope_with};
 
@@ -178,10 +177,7 @@ fn all_namespaces_flag_is_rejected() {
 
 #[test]
 fn multi_namespace_sessions_need_an_explicit_namespace() {
-    let policy = SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    };
+    let policy = permissive();
     let scope = scope_with(Profile::ReadOnly, &policy, &[NS, OTHER_NS]);
     let catalog = catalog();
     let policy = open_policy(&scope, &catalog, false);
@@ -393,22 +389,22 @@ fn read_only_asks_to_raise_the_ceiling_for_debug_or_deploy() {
         container: None,
         namespace: None,
     };
-    assert_eq!(denied(Profile::ReadOnly, logs), DenialCode::NeedsCeiling);
+    assert_eq!(denied(Profile::ReadOnly, logs), DenialCode::NeedsAccess);
     let exec = Request::Exec {
         pod: "web-0".into(),
         container: None,
         namespace: None,
         command: vec!["id".into()],
     };
-    assert_eq!(denied(Profile::ReadOnly, exec), DenialCode::NeedsCeiling);
+    assert_eq!(denied(Profile::ReadOnly, exec), DenialCode::NeedsAccess);
     let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n";
     assert_eq!(
         denied(Profile::ReadOnly, apply_yaml(cm, true)),
-        DenialCode::NeedsCeiling
+        DenialCode::NeedsAccess
     );
     assert_eq!(
         denied(Profile::Debug, apply_yaml(cm, true)),
-        DenialCode::NeedsCeiling
+        DenialCode::NeedsAccess
     );
     let scale = Request::Scale {
         kind: KindRef::new("Deployment"),
@@ -416,7 +412,7 @@ fn read_only_asks_to_raise_the_ceiling_for_debug_or_deploy() {
         namespace: None,
         replicas: 2,
     };
-    assert_eq!(denied(Profile::Debug, scale), DenialCode::NeedsCeiling);
+    assert_eq!(denied(Profile::Debug, scale), DenialCode::NeedsAccess);
 }
 
 #[test]
@@ -429,17 +425,8 @@ fn exec_follows_settings_and_always_needs_confirmation() {
     };
     let allowed = check(Profile::Debug, exec.clone()).unwrap();
     assert_eq!(allowed.confirmation, Confirmation::Required);
-
-    let policy = SecurityPolicy {
-        exec: ExecMode::Disabled,
-        ..permissive()
-    };
-    let scope = scope_with(Profile::Debug, &policy, &[NS]);
-    let catalog = catalog();
-    let denial = open_policy(&scope, &catalog, false)
-        .check(&exec)
-        .unwrap_err();
-    assert_eq!(denial.code, DenialCode::NeedsCeiling);
+    // Below debug, exec is asked for (#15).
+    assert_eq!(denied(Profile::ReadOnly, exec), DenialCode::NeedsAccess);
 
     let empty = Request::Exec {
         pod: "web-0".into(),
@@ -451,44 +438,27 @@ fn exec_follows_settings_and_always_needs_confirmation() {
 }
 
 #[test]
-fn dry_run_only_settings_block_every_real_change() {
-    let policy = SecurityPolicy {
-        deploy: DeployMode::DryRunOnly,
-        ..permissive()
-    };
-    let scope = scope_with(Profile::Deploy, &policy, &[NS]);
+fn a_launch_cap_refuses_without_asking() {
+    // `kubach mcp --profile read-only`: more is never asked for (#15).
+    let scope = crate::testutil::scope_capped(Profile::ReadOnly, &permissive(), &[NS]);
     let catalog = catalog();
     let policy = open_policy(&scope, &catalog, false);
     let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n";
-    let dry = policy.check(&apply_yaml(cm, true)).unwrap();
-    assert_eq!(dry.confirmation, Confirmation::NotNeeded);
-    assert_eq!(
-        policy.check(&apply_yaml(cm, false)).unwrap_err().code,
-        DenialCode::NeedsCeiling
-    );
-    for request in [
-        Request::Scale {
-            kind: KindRef::new("Deployment"),
-            name: "web".into(),
-            namespace: None,
-            replicas: 2,
-        },
-        Request::Restart {
-            kind: KindRef::new("Deployment"),
-            name: "web".into(),
-            namespace: None,
-        },
-        Request::Delete {
-            kind: KindRef::new("Deployment"),
-            name: "web".into(),
-            namespace: None,
-        },
-    ] {
-        assert_eq!(
-            policy.check(&request).unwrap_err().code,
-            DenialCode::NeedsCeiling
-        );
+    for request in [apply_yaml(cm, true), apply_yaml(cm, false), scale()] {
+        let denial = policy.check(&request).unwrap_err();
+        assert_eq!(denial.code, DenialCode::Profile, "{request:?}");
+        assert!(denial.message.contains("--profile"), "{}", denial.message);
     }
+    // What is not about the level still works, Secrets included.
+    assert!(policy.check(&list("Pod", None)).is_ok());
+    assert!(
+        policy
+            .check(&Request::SecretList {
+                namespace: None,
+                name: None
+            })
+            .is_ok()
+    );
 }
 
 #[test]
@@ -915,44 +885,61 @@ fn a_secret_is_never_revealed_without_its_own_grant() {
 }
 
 #[test]
-fn reveal_off_is_refused_without_asking() {
-    for secrets in [SecretAccess::Metadata, SecretAccess::None] {
-        let settings = SecurityPolicy {
-            secrets,
-            ..permissive()
-        };
-        let denial = checked(Profile::Deploy, &settings, &[], SERVER, &reveal("db")).unwrap_err();
-        assert_eq!(denial.code, DenialCode::RevealDisabled);
-        assert_eq!(denial.grant, None);
-        // Even an old grant does not help.
-        let granted = [Grant::read(NS), Grant::secret(NS, "db")];
-        assert_eq!(
-            checked(Profile::Deploy, &settings, &granted, SERVER, &reveal("db"))
-                .unwrap_err()
-                .code,
-            DenialCode::RevealDisabled
-        );
-    }
-    let none = SecurityPolicy {
-        secrets: SecretAccess::None,
-        ..permissive()
-    };
+fn hidden_values_refuse_reveal_without_asking() {
+    let settings = hidden_values();
+    let denial = checked(Profile::Deploy, &settings, &[], SERVER, &reveal("db")).unwrap_err();
+    assert_eq!(denial.code, DenialCode::RevealDisabled);
+    assert_eq!(denial.grant, None);
+    assert!(
+        denial.message.contains("Hide Secret values"),
+        "{}",
+        denial.message
+    );
+    // Even an old grant does not help.
+    let granted = [Grant::read(NS), Grant::secret(NS, "db")];
+    assert_eq!(
+        checked(Profile::Deploy, &settings, &granted, SERVER, &reveal("db"))
+            .unwrap_err()
+            .code,
+        DenialCode::RevealDisabled
+    );
+    // Without Secret access, even metadata is asked for first (#15).
     let list_secrets = Request::SecretList {
         namespace: None,
         name: None,
     };
+    let denial = checked(
+        Profile::Deploy,
+        &no_secrets(),
+        &[Grant::read(NS)],
+        SERVER,
+        &list_secrets,
+    )
+    .unwrap_err();
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
     assert_eq!(
-        checked(
-            Profile::Deploy,
-            &none,
-            &[Grant::read(NS)],
-            SERVER,
-            &list_secrets
-        )
-        .unwrap_err()
-        .code,
-        DenialCode::Settings
+        denial.access,
+        Some(Access {
+            secrets: true,
+            ..Access::NONE
+        })
     );
+}
+
+/// Everything but Secrets in the minimum.
+fn no_secrets() -> SecurityPolicy {
+    SecurityPolicy::with_minimum(Access {
+        secrets: false,
+        ..Access::ALL
+    })
+}
+
+/// Everything in the minimum, Secret values hidden from the user.
+fn hidden_values() -> SecurityPolicy {
+    SecurityPolicy {
+        hide_secret_values: true,
+        ..permissive()
+    }
 }
 
 #[test]
@@ -978,25 +965,9 @@ fn beyond_the_ceiling_a_raise_is_asked_not_a_right() {
         ),
     ] {
         let denial = checked(Profile::ReadOnly, &permissive(), &[], SERVER, &request).unwrap_err();
-        assert_eq!(denial.code, DenialCode::NeedsCeiling, "{request:?}");
+        assert_eq!(denial.code, DenialCode::NeedsAccess, "{request:?}");
         assert_eq!(denial.grant, None);
-        assert!(denial.ceiling.is_some(), "{request:?}");
-    }
-    // Settings cap as well: exec off, dry-run only.
-    let strict = SecurityPolicy {
-        exec: ExecMode::Disabled,
-        deploy: DeployMode::DryRunOnly,
-        ..permissive()
-    };
-    let exec = Request::Exec {
-        pod: "web-0".into(),
-        container: None,
-        namespace: None,
-        command: vec!["id".into()],
-    };
-    for request in [exec, scale()] {
-        let denial = checked(Profile::Deploy, &strict, &[], SERVER, &request).unwrap_err();
-        assert_eq!(denial.code, DenialCode::NeedsCeiling, "{request:?}");
+        assert!(denial.access.is_some(), "{request:?}");
     }
     // Another namespace is never asked for either.
     let denial = checked(
@@ -1058,7 +1029,7 @@ fn rights_end_with_the_session() {
 }
 
 #[test]
-fn modify_covers_only_scale_and_restart() {
+fn modify_never_spares_a_confirmation() {
     let read = [Grant::read(NS)];
     // Changing asks for modify after read, in server-enforced modes.
     let denial = checked(Profile::Deploy, &permissive(), &read, SERVER, &scale()).unwrap_err();
@@ -1076,7 +1047,7 @@ fn modify_covers_only_scale_and_restart() {
         };
         for request in [scale(), restart] {
             let allowed = checked(Profile::Deploy, &permissive(), &both, mode, &request).unwrap();
-            assert_eq!(allowed.confirmation, Confirmation::NotNeeded, "{request:?}");
+            assert_eq!(allowed.confirmation, Confirmation::Required, "{request:?}");
         }
         let delete = Request::Delete {
             kind: KindRef::new("Deployment"),
@@ -1132,10 +1103,7 @@ fn client_only_never_remembers_modify() {
 
 #[test]
 fn comparing_two_namespaces_needs_both() {
-    let settings = SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    };
+    let settings = permissive();
     let scope = scope_with(Profile::ReadOnly, &settings, &[NS, OTHER_NS]);
     let catalog = catalog();
     let compare = Request::SecretCompare {
@@ -1292,31 +1260,27 @@ fn delete_secret(name: &str) -> Request {
 #[test]
 fn secret_writes_need_deploy_applied_changes_and_metadata() {
     let all = [Grant::read(NS), Grant::modify(NS)];
-    for request in [
+    for (case, request) in [
         write(SecretOp::Create, None),
         write(SecretOp::Update, None),
         copy(None, Some("pull-copy")),
         delete_secret("db"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // The case number, not the request: CodeQL takes a Secret request
+        // in a message for a logged Secret.
         let allowed = checked(Profile::Deploy, &permissive(), &all, SERVER, &request).unwrap();
-        assert_eq!(allowed.confirmation, Confirmation::Required, "{request:?}");
+        assert_eq!(allowed.confirmation, Confirmation::Required, "case {case}");
         assert!(request.is_mutating());
         for profile in [Profile::ReadOnly, Profile::Debug] {
             let denial = checked(profile, &permissive(), &all, SERVER, &request).unwrap_err();
-            assert_eq!(denial.code, DenialCode::NeedsCeiling, "{request:?}");
+            assert_eq!(denial.code, DenialCode::NeedsAccess, "case {case}");
         }
-        let dry = SecurityPolicy {
-            deploy: DeployMode::DryRunOnly,
-            ..permissive()
-        };
-        let denial = checked(Profile::Deploy, &dry, &all, SERVER, &request).unwrap_err();
-        assert_eq!(denial.code, DenialCode::NeedsCeiling);
-        let no_secrets = SecurityPolicy {
-            secrets: SecretAccess::None,
-            ..permissive()
-        };
+        let no_secrets = no_secrets();
         let denial = checked(Profile::Deploy, &no_secrets, &all, SERVER, &request).unwrap_err();
-        assert_eq!(denial.code, DenialCode::Settings);
+        assert_eq!(denial.code, DenialCode::NeedsAccess);
         // The ladder: reading, then changing the namespace.
         let denial = checked(Profile::Deploy, &permissive(), &[], SERVER, &request).unwrap_err();
         assert_eq!(denial.grant, Some(Grant::read(NS)));
@@ -1431,10 +1395,7 @@ fn copies_stay_within_the_sessions_rights() {
         denied(Profile::Deploy, copy(None, None)),
         DenialCode::InvalidInput
     );
-    let settings = SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    };
+    let settings = permissive();
     let scope = scope_with(Profile::Deploy, &settings, &[NS, OTHER_NS]);
     let catalog = catalog();
     let mode = SessionMode::Impersonation;
@@ -1639,10 +1600,10 @@ fn a_dry_run_lists_secret_reads_too() {
 // ------------------------------------------------------------- allowlist of kinds (#192)
 
 fn strict_kinds() -> SecurityPolicy {
-    SecurityPolicy {
-        other_kinds: false,
-        ..permissive()
-    }
+    SecurityPolicy::with_minimum(Access {
+        crds: false,
+        ..Access::ALL
+    })
 }
 
 fn check_kinds(
@@ -1689,9 +1650,9 @@ fn only_allowlisted_kinds_are_readable_by_default() {
             "RoleBinding",
         ] {
             let denial = check_kinds(&strict_kinds(), mode, &list(kind, None)).unwrap_err();
-            assert_eq!(denial.code, DenialCode::ForbiddenKind, "{kind} {mode:?}");
+            assert_eq!(denial.code, DenialCode::NeedsAccess, "{kind} {mode:?}");
             assert!(
-                denial.message.contains("Allow other kinds"),
+                denial.message.contains("custom resources"),
                 "{}",
                 denial.message
             );
@@ -1708,7 +1669,7 @@ fn only_allowlisted_kinds_are_readable_by_default() {
             check_kinds(&strict_kinds(), mode, &widget)
                 .unwrap_err()
                 .code,
-            DenialCode::ForbiddenKind
+            DenialCode::NeedsAccess
         );
         assert!(check_kinds(&permissive(), mode, &widget).is_ok());
     }
@@ -1739,7 +1700,7 @@ fn only_allowlisted_kinds_are_writable_by_default() {
             )
             .unwrap_err()
             .code,
-            DenialCode::ForbiddenKind
+            DenialCode::NeedsAccess
         );
         assert!(check_kinds(&strict_kinds(), mode, &delete("Deployment")).is_ok());
         // Allowing other kinds opens CRDs, never identity objects.
@@ -1982,7 +1943,7 @@ fn gitops_kinds_need_other_kinds_allowed() {
             )
             .unwrap_err()
             .code,
-            DenialCode::ForbiddenKind
+            DenialCode::NeedsAccess
         );
     }
 }
@@ -2011,10 +1972,7 @@ fn on_request(
 }
 
 fn several() -> SecurityPolicy {
-    SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    }
+    permissive()
 }
 
 /// Strings that are not exactly one namespace name.
@@ -2179,54 +2137,22 @@ fn dynamic_sessions_still_refuse_cluster_scope_and_all_namespaces() {
 }
 
 #[test]
-fn one_namespace_per_session_keeps_to_the_first_granted() {
-    let single = permissive();
-    assert!(!single.multiple_namespaces);
-    // Before any grant, any namespace may be asked for.
-    assert_eq!(
-        on_request(&single, &[], &list("Pod", Some(OTHER_NS)))
+fn any_number_of_namespaces() {
+    // Each namespace's read right is set up on first use, as many as the
+    // agent names (#15).
+    let settings = permissive();
+    for namespace in [OTHER_NS, "team-a", "team-b"] {
+        assert_eq!(
+            on_request(
+                &settings,
+                &[Grant::read(NS), Grant::modify(NS)],
+                &list("Pod", Some(namespace))
+            )
             .unwrap_err()
             .grant,
-        Some(Grant::read(OTHER_NS))
-    );
-    // After one is granted, every other is refused without a question.
-    for request in naming(OTHER_NS) {
-        let denial = on_request(&single, &[Grant::read(NS), Grant::modify(NS)], &request)
-            .expect_err(&format!("{request:?}"));
-        assert_eq!(denial.code, DenialCode::Namespace, "{request:?}");
-        assert_eq!(denial.grant, None, "{request:?}");
-        assert!(denial.message.contains("one namespace per agent session"));
+            Some(Grant::read(namespace))
+        );
     }
-    let compare = Request::SecretCompare {
-        namespace: Some(NS.into()),
-        name: "a".into(),
-        key: "k".into(),
-        other_namespace: Some(OTHER_NS.into()),
-        other_name: "b".into(),
-        other_key: "k".into(),
-    };
-    assert_eq!(
-        on_request(&single, &[Grant::read(NS)], &compare)
-            .unwrap_err()
-            .code,
-        DenialCode::Namespace
-    );
-    // A refused namespace does not count as used.
-    let mut refused = Grants::new();
-    refused.set(Grant::read(NS), GrantState::Denied);
-    assert_eq!(
-        on_request_in(&single, refused, SERVER, &list("Pod", Some(OTHER_NS)))
-            .unwrap_err()
-            .grant,
-        Some(Grant::read(OTHER_NS))
-    );
-    // With several allowed, the next one is asked for.
-    assert_eq!(
-        on_request(&several(), &[Grant::read(NS)], &list("Pod", Some(OTHER_NS)))
-            .unwrap_err()
-            .grant,
-        Some(Grant::read(OTHER_NS))
-    );
 }
 
 #[test]
@@ -2259,7 +2185,8 @@ fn modes_are_per_namespace() {
         replicas: 2,
     };
     let granted = grants(&[Grant::read(NS), Grant::read(OTHER_NS)]);
-    // NS: modify(ns) is asked for and then spares the confirmation.
+    // NS: modify(ns) is needed (set up without a question since #15); the
+    // change is still confirmed.
     assert_eq!(
         on_request_in(&several(), granted.clone(), modes.clone(), &scale_in(NS))
             .unwrap_err()
@@ -2269,8 +2196,8 @@ fn modes_are_per_namespace() {
     let mut with_modify = granted.clone();
     with_modify.set(Grant::modify(NS), GrantState::Granted);
     let allowed = on_request_in(&several(), with_modify, modes.clone(), &scale_in(NS)).unwrap();
-    assert_eq!(allowed.confirmation, Confirmation::NotNeeded);
-    // OTHER_NS: nothing to remember, every change confirmed on its own.
+    assert_eq!(allowed.confirmation, Confirmation::Required);
+    // OTHER_NS: no modify(ns) to set up, every change confirmed on its own.
     let allowed = on_request_in(&several(), granted, modes, &scale_in(OTHER_NS)).unwrap();
     assert_eq!(allowed.confirmation, Confirmation::Required);
 }
@@ -2297,36 +2224,27 @@ fn raised(
 }
 
 fn strict_on() -> SecurityPolicy {
-    SecurityPolicy {
-        mcp_enabled: true,
-        ..SecurityPolicy::default()
-    }
+    SecurityPolicy::default()
 }
 
 #[test]
 fn a_raise_names_only_what_is_missing() {
     let denial = raised(Profile::ReadOnly, &strict_on(), Raises::default(), &scale()).unwrap_err();
-    assert_eq!(denial.code, DenialCode::NeedsCeiling);
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
+    assert_eq!(denial.access, Some(Access::profile(Profile::Deploy)));
+    // The deploy level without Secrets: writing one asks for Secrets only.
+    let denial = raised(
+        Profile::Deploy,
+        &no_secrets(),
+        Raises::default(),
+        &delete_secret("db"),
+    )
+    .unwrap_err();
     assert_eq!(
-        denial.ceiling,
-        Some(Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false
-        })
-    );
-    // The deploy profile with dry-run only: only applying is missing.
-    let dry = SecurityPolicy {
-        deploy: DeployMode::DryRunOnly,
-        ..permissive()
-    };
-    let denial = raised(Profile::Deploy, &dry, Raises::default(), &scale()).unwrap_err();
-    assert_eq!(
-        denial.ceiling,
-        Some(Ceiling {
-            profile: Profile::ReadOnly,
-            apply: true,
-            exec: false
+        denial.access,
+        Some(Access {
+            secrets: true,
+            ..Access::NONE
         })
     );
 }
@@ -2334,45 +2252,32 @@ fn a_raise_names_only_what_is_missing() {
 #[test]
 fn a_granted_raise_lets_the_call_through_but_keeps_confirmations_and_rights() {
     let raises = Raises {
-        granted: Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false,
-        },
+        granted: Access::profile(Profile::Debug),
         ..Raises::default()
     };
-    let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n";
-    let allowed = raised(
-        Profile::ReadOnly,
-        &strict_on(),
-        raises.clone(),
-        &apply_yaml(cm, false),
-    )
-    .unwrap();
-    assert_eq!(allowed.confirmation, Confirmation::Required);
-    // Exec was not part of the raise.
     let exec = Request::Exec {
         pod: "web-0".into(),
         container: None,
         namespace: None,
         command: vec!["id".into()],
     };
-    let denial = raised(Profile::ReadOnly, &strict_on(), raises.clone(), &exec).unwrap_err();
-    assert_eq!(denial.code, DenialCode::NeedsCeiling);
-    assert_eq!(
-        denial.ceiling,
-        Some(Ceiling {
-            profile: Profile::ReadOnly,
-            apply: false,
-            exec: true
-        })
-    );
-    // A raise is not a right: without modify(ns) the namespace is asked.
+    let allowed = raised(Profile::ReadOnly, &strict_on(), raises.clone(), &exec).unwrap();
+    assert_eq!(allowed.confirmation, Confirmation::Required);
+    // Changes were not part of the raise.
+    let denial = raised(Profile::ReadOnly, &strict_on(), raises.clone(), &scale()).unwrap_err();
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
+    assert_eq!(denial.access, Some(Access::profile(Profile::Deploy)));
+    // The namespace's change right still follows on first use (set up
+    // without a question by the tool layer).
     let settings = strict_on();
     let scope = scope_with(Profile::ReadOnly, &settings, &[NS]);
     let catalog = catalog();
+    let deploy = Raises {
+        granted: Access::profile(Profile::Deploy),
+        ..Raises::default()
+    };
     let denial = Policy::new(&scope, &catalog, false, grants(&[Grant::read(NS)]), SERVER)
-        .with_raises(raises)
+        .with_raises(deploy)
         .check(&scale())
         .unwrap_err();
     assert_eq!(denial.code, DenialCode::NeedsGrant);
@@ -2382,15 +2287,11 @@ fn a_granted_raise_lets_the_call_through_but_keeps_confirmations_and_rights() {
 #[test]
 fn a_refused_raise_is_not_asked_again() {
     let raises = Raises {
-        refused: vec![Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false,
-        }],
+        refused: vec![Access::profile(Profile::Deploy)],
         ..Raises::default()
     };
     let denial = raised(Profile::ReadOnly, &strict_on(), raises, &scale()).unwrap_err();
-    assert_eq!(denial.code, DenialCode::CeilingRefused);
+    assert_eq!(denial.code, DenialCode::AccessRefused);
     assert!(
         denial.message.contains("not asked again"),
         "{}",
@@ -2399,41 +2300,30 @@ fn a_refused_raise_is_not_asked_again() {
 }
 
 #[test]
-fn a_protected_cluster_never_asks_to_raise() {
-    let protected = SecurityPolicy {
-        protected: true,
-        ..strict_on()
+fn custom_resources_are_asked_for() {
+    let widget = Request::Get {
+        kind: KindRef {
+            kind: "Widget".into(),
+            api_version: Some("example.com/v1".into()),
+        },
+        name: "w".into(),
+        namespace: None,
     };
-    let denial = raised(Profile::ReadOnly, &protected, Raises::default(), &scale()).unwrap_err();
-    assert_eq!(denial.code, DenialCode::Protected);
-    assert!(
-        denial
-            .message
-            .contains("Settings → Security → Protected cluster"),
-        "{}",
-        denial.message
+    let denial = raised(Profile::Deploy, &strict_on(), Raises::default(), &widget).unwrap_err();
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
+    assert_eq!(
+        denial.access,
+        Some(Access {
+            crds: true,
+            ..Access::NONE
+        })
     );
-    // Within the ceiling, protection changes nothing.
-    assert!(
-        raised(
-            Profile::ReadOnly,
-            &protected,
-            Raises::default(),
-            &list("Pod", None)
-        )
-        .is_ok()
-    );
-    // Settings the agent cannot ask for stay refused as before.
-    let no_secrets = SecurityPolicy {
-        secrets: SecretAccess::None,
-        ..permissive()
+    let crds = Raises {
+        granted: Access {
+            crds: true,
+            ..Access::NONE
+        },
+        ..Raises::default()
     };
-    let denial = raised(
-        Profile::Deploy,
-        &no_secrets,
-        Raises::default(),
-        &delete_secret("db"),
-    )
-    .unwrap_err();
-    assert_eq!(denial.code, DenialCode::Settings);
+    assert!(raised(Profile::ReadOnly, &strict_on(), crds, &widget).is_ok());
 }

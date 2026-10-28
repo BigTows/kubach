@@ -29,6 +29,7 @@ use kube::{Client, Config};
 use secrecy::SecretString;
 use tokio::task::JoinHandle;
 
+use crate::access::Access;
 use crate::grants::Grants;
 use crate::rules::grant_rules;
 use crate::scope::{SessionMode, SessionScope};
@@ -163,23 +164,15 @@ impl Identity {
     }
 
     /// Mirrors the session's grants on the server (#227): the Role of a
-    /// temporary ServiceAccount gets exactly the granted rights. Other
-    /// identities have nothing to change: impersonation stays within the
-    /// administrator's RBAC, client-only within Kubach.
-    pub async fn sync_grants(
-        &self,
-        grants: &Grants,
-        scope: &SessionScope,
-    ) -> Result<(), IdentityError> {
+    /// temporary ServiceAccount gets exactly the granted rights within the
+    /// session's `access` (#15). Other identities have nothing to change:
+    /// impersonation stays within the administrator's RBAC, client-only
+    /// within Kubach.
+    pub async fn sync_grants(&self, grants: &Grants, access: Access) -> Result<(), IdentityError> {
         match self {
             Self::TemporaryServiceAccount(sa) => {
-                sa.set_rules(grant_rules(
-                    grants,
-                    &sa.namespace,
-                    scope.profile,
-                    &scope.policy,
-                ))
-                .await
+                sa.set_rules(grant_rules(grants, &sa.namespace, access))
+                    .await
             }
             _ => Ok(()),
         }
@@ -299,12 +292,7 @@ impl TemporaryServiceAccount {
                 &Role {
                     metadata: meta(Some(owner.clone())),
                     // Empty until the user grants a right (#227).
-                    rules: Some(grant_rules(
-                        &Grants::new(),
-                        &self.namespace,
-                        scope.profile,
-                        &scope.policy,
-                    )),
+                    rules: Some(grant_rules(&Grants::new(), &self.namespace, Access::NONE)),
                 },
             )
             .await?;
