@@ -85,6 +85,7 @@ agent-access-crds = пользовательские ресурсы
 agent-field-tool = Инструмент
 agent-field-session = Сессия
 agent-helm-values = Values (чувствительные ключи скрыты)
+agent-helm-values-diff = Изменения values (чувствительные значения скрыты)
 agent-helm-objects = Объекты
 agent-helm-as-user-title = Выполнить этот вызов helm от ваших учётных данных?
 agent-helm-as-user-warning = Этот вызов helm выполнится от ваших учётных данных из kubeconfig, а не от временного ServiceAccount сессии. Ограничивает его только ваш RBAC, и только этот один вызов.

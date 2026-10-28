@@ -750,7 +750,15 @@ impl Render for ConfirmView {
                                 .child(text),
                         )
                 };
-                this.when(!helm.values.trim().is_empty(), |this| {
+                // How the release's values change (#22), masked.
+                this.when(!helm.values_diff.trim().is_empty(), |this| {
+                    this.child(block(
+                        "confirm-helm-values-diff",
+                        t!("agent-helm-values-diff"),
+                        helm.values_diff.clone(),
+                    ))
+                })
+                .when(!helm.values.trim().is_empty(), |this| {
                     this.child(block(
                         "confirm-helm-values",
                         t!("agent-helm-values"),
