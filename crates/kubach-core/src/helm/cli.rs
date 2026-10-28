@@ -689,10 +689,8 @@ pub async fn template(
 ) -> Result<String, HelmCliError> {
     check_release_name(request.release.trim()).map_err(HelmCliError::Refused)?;
     let chart_dir = write_stored(&request.chart)?;
-    let command = HelmCommand::template(
-        request,
-        chart_dir.as_ref().map(|(_, path)| path.as_path()),
-    );
+    let command =
+        HelmCommand::template(request, chart_dir.as_ref().map(|(_, path)| path.as_path()));
     let output = run(helm, &command, timeout).await;
     drop(chart_dir);
     output
@@ -1019,7 +1017,10 @@ mod tests {
         // No context, kubeconfig or credentials: nothing reaches a cluster.
         assert!(command.env.is_empty());
         assert!(command.secret_env.expose().is_empty());
-        assert_eq!(command.stdin.as_ref().unwrap().expose(), "replicaCount: 2\n");
+        assert_eq!(
+            command.stdin.as_ref().unwrap().expose(),
+            "replicaCount: 2\n"
+        );
         request.chart = UpgradeChart::Stored(stored_chart());
         request.is_upgrade = true;
         let stored = HelmCommand::template(&request, Some(Path::new("/tmp/x")));

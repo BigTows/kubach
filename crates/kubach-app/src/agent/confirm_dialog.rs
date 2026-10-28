@@ -522,7 +522,11 @@ impl Render for ConfirmView {
                     t!("agent-helm-as-user-objects"),
                 ]
                 .into_iter()
-                .chain(helm.user_objects.iter().map(|object| format!("  - {object}")))
+                .chain(
+                    helm.user_objects
+                        .iter()
+                        .map(|object| format!("  - {object}")),
+                )
                 .collect(),
                 theme.danger,
                 cx,
