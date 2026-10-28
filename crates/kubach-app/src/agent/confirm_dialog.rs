@@ -12,7 +12,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, Wind
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_i18n::t;
-use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, RequestKind};
+use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentials, RequestKind};
 use kubach_ui::measure;
 
 use super::{AgentState, Notice, countdown, global, secret_dialog};
@@ -256,6 +256,9 @@ struct ConfirmView {
     /// "Allow by default" on an access request (#15); off until the user
     /// ticks it.
     always: bool,
+    /// "Run this helm call with my credentials" (#18); off until the user
+    /// ticks it, and the approve button waits for it.
+    as_user: bool,
     _observe: Subscription,
 }
 
@@ -267,6 +270,7 @@ impl ConfirmView {
             id,
             acknowledged: false,
             always: false,
+            as_user: false,
             _observe: observe,
         }
     }
@@ -501,7 +505,45 @@ impl Render for ConfirmView {
                     cx.notify();
                 }))
         });
-        let approve_blocked = needs_ack && !self.acknowledged;
+        // Helm under the user's own credentials (#18): the question with an
+        // unticked box, or the warning once allowed.
+        let credentials = helm
+            .as_ref()
+            .map(|helm| helm.credentials)
+            .unwrap_or_default();
+        let ask_user = credentials == HelmCredentials::AskUser;
+        let as_user_block = helm.as_ref().and_then(|helm| match helm.credentials {
+            HelmCredentials::Session => None,
+            HelmCredentials::AskUser => Some(warning_block(
+                t!("agent-helm-as-user-title"),
+                [
+                    t!("agent-helm-as-user-warning"),
+                    t!("agent-helm-as-user-objects"),
+                ]
+                .into_iter()
+                .chain(helm.user_objects.iter().map(|object| format!("  - {object}")))
+                .collect(),
+                theme.danger,
+                cx,
+            )),
+            HelmCredentials::User => Some(warning_block(
+                t!("agent-helm-runs-as-user-title"),
+                vec![t!("agent-helm-runs-as-user")],
+                theme.danger,
+                cx,
+            )),
+        });
+        let as_user_tick = ask_user.then(|| {
+            Checkbox::new("confirm-as-user")
+                .label(t!("agent-helm-as-user-tick"))
+                .checked(self.as_user)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.as_user = *checked;
+                    cx.notify();
+                }))
+        });
+        let has_dangerous = has_dangerous || credentials != HelmCredentials::Session;
+        let approve_blocked = (needs_ack && !self.acknowledged) || (ask_user && !self.as_user);
         // What a yes to a right means; for a Secret, the warning.
         let meaning = grant.as_ref().map(|_| {
             if secret {
@@ -528,6 +570,12 @@ impl Render for ConfirmView {
             _ if helm.is_some() => (
                 t!("agent-reject"),
                 match helm.as_ref().map(|helm| helm.action) {
+                    // A yes leads to the dry run first, not the change (#18).
+                    Some(kubach_mcp::HelmAction::Install | kubach_mcp::HelmAction::Upgrade)
+                        if ask_user =>
+                    {
+                        t!("agent-helm-dry-run-as-user")
+                    }
                     Some(kubach_mcp::HelmAction::Install) => t!("agent-helm-install"),
                     Some(kubach_mcp::HelmAction::Upgrade) => t!("agent-helm-upgrade"),
                     Some(kubach_mcp::HelmAction::Rollback) => t!("agent-helm-rollback"),
@@ -750,6 +798,8 @@ impl Render for ConfirmView {
                         .child(t!("agent-client-only")),
                 )
             })
+            .children(as_user_block)
+            .children(as_user_tick)
             .children(dangerous)
             .children(acknowledge)
             .children(details)

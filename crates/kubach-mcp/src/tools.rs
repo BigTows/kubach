@@ -161,6 +161,9 @@ pub(crate) struct Ctx<'a> {
     /// The namespace the call acts in once the policy allowed it, for the
     /// identity in the audit log.
     pub namespace: std::sync::Mutex<Option<String>>,
+    /// Who the call ran as when not the namespace's identity: a helm call
+    /// the user allowed under their own credentials (#18).
+    pub identity: std::sync::Mutex<Option<String>>,
 }
 
 /// One answer for a right, as the audit log records it: never a value.

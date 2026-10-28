@@ -149,11 +149,13 @@ impl McpServer {
             helm: self.helm(),
             progress,
             namespace: std::sync::Mutex::new(None),
+            identity: std::sync::Mutex::new(None),
         };
         let result = tools::run(&ctx, tool, &args).await;
         let decisions = sync::into_inner(ctx.decisions);
         let accesses = sync::into_inner(ctx.accesses);
         let namespace = sync::into_inner(ctx.namespace);
+        let ran_as = sync::into_inner(ctx.identity);
         let change = result.as_ref().ok().and_then(|output| output.audit.clone());
         let (decided_by, allowed, reason, code) = match &result {
             Ok(output) if output.confirmed => (DecidedBy::User, true, None, "ok".to_owned()),
@@ -201,7 +203,8 @@ impl McpServer {
                 decided_by,
                 allowed,
                 reason: reason.clone(),
-                identity: self.inner.session.describe_identity(namespace.as_deref()),
+                identity: ran_as
+                    .unwrap_or_else(|| self.inner.session.describe_identity(namespace.as_deref())),
                 result: code,
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             };
@@ -352,7 +355,9 @@ impl McpServer {
             " Helm: helm_search_charts and helm_show_values for charts of the repositories added \
              in Kubach (or an oci:// chart the user allows), helm_list_releases and \
              helm_release_history; helm_install, helm_upgrade, helm_rollback and helm_uninstall \
-             run a server-side dry run that the user approves in Kubach."
+             run a server-side dry run that the user approves in Kubach. A chart with \
+             cluster-scoped objects (CRDs, ClusterRoles, webhooks) or RBAC: Kubach asks the user \
+             to run that one call with their own credentials."
         } else {
             ""
         };
@@ -958,10 +963,12 @@ fn catalog() -> Vec<ToolSpec> {
             name: "helm_install",
             description: "Install a chart as a release in the namespace with Kubach's helm. Kubach \
                           runs a server-side dry run, shows the user the chart, version, values \
-                          (secrets masked) and objects, and installs after the user approves; \
-                          cluster-scoped objects (CRDs, ClusterRoles, webhooks) need the user's \
-                          explicit consent. Charts only from repositories added in Kubach or \
-                          oci://; values only as YAML text.",
+                          (secrets masked) and objects, and installs after the user approves. \
+                          Cluster-scoped objects (CRDs, ClusterRoles, webhooks) and RBAC: \
+                          Kubach asks the user to run this call with their own credentials \
+                          (found with helm template before the dry run); if the user says no, \
+                          you get the list of objects. Charts only from repositories added in \
+                          Kubach or oci://; values only as YAML text.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -985,7 +992,9 @@ fn catalog() -> Vec<ToolSpec> {
             name: "helm_upgrade",
             description: "Upgrade a release: a new chart or version and/or new values (YAML; they \
                           replace the release's values; without values it keeps its own). The \
-                          user sees the dry-run diff and approves.",
+                          user sees the dry-run diff and approves. Cluster-scoped objects or \
+                          RBAC in the new chart or the current revision: Kubach asks the user to \
+                          run this call with their own credentials first.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -1007,7 +1016,9 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "helm_rollback",
             description: "Roll a release back to an earlier revision (see helm_release_history); \
-                          the user sees the diff and approves.",
+                          the user sees the diff and approves. Cluster-scoped objects or RBAC in \
+                          either revision: Kubach asks the user to run it with their own \
+                          credentials.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -1026,7 +1037,9 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "helm_uninstall",
-            description: "Uninstall a release; the user sees the objects that go with it and approves.",
+            description: "Uninstall a release; the user sees the objects that go with it and \
+                          approves. Cluster-scoped objects or RBAC in the release: Kubach asks \
+                          the user to run it with their own credentials.",
             schema: object_schema(
                 {
                     let mut p = json!({
