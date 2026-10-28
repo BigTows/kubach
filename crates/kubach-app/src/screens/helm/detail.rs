@@ -15,6 +15,7 @@ use super::super::helm_release::{
     DiffSource, Tab, default_diff_pair, revision_columns, revision_row, status_tone, tab_text,
     update_text,
 };
+use super::super::table_sort;
 use super::{Detail, HelmScreen, Load, ViewerKey};
 
 impl HelmScreen {
@@ -166,6 +167,7 @@ impl HelmScreen {
                         .ok();
                 })
             });
+            table_sort::remember(&table, table_sort::screen("helm.revisions"), cx);
             detail.history_table = Some(table);
             new_table = true;
         }
