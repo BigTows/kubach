@@ -119,6 +119,12 @@ pub fn read_rules(profile: Profile) -> Vec<PolicyRule> {
     rules
 }
 
+/// What a running port-forward needs (#17). Port-forward over WebSocket is
+/// authorized as `get` before 1.30, `create` after, like exec.
+pub fn forward_rule() -> PolicyRule {
+    rule("", &["pods/portforward"], &["get", "create"])
+}
+
 /// What `modify(ns)` grants: exec (debug) and the write verbs (deploy).
 pub fn modify_rules(profile: Profile) -> Vec<PolicyRule> {
     let mut rules = Vec::new();
@@ -162,6 +168,10 @@ pub fn grant_rules(grants: &Grants, namespace: &str, access: Access) -> Vec<Poli
                 rules.extend(read_rules(profile));
                 if access.secrets {
                     rules.push(rule("", &["secrets"], &["get", "list"]));
+                }
+                // Only while a forward the user approved runs (#17).
+                if profile >= Profile::Debug && grants.is_forwarding(namespace) {
+                    rules.push(forward_rule());
                 }
             }
             Grant::Secret { name, .. } if access.secrets => {
@@ -209,6 +219,7 @@ pub enum Capability {
     ListEvents,
     PodLogs,
     PodExec,
+    PodPortForward,
     PatchDeployments,
     ScaleDeployments,
     DeleteDeployments,
@@ -219,11 +230,12 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Capability; 11] = [
+    pub const ALL: [Capability; 12] = [
         Self::ListPods,
         Self::ListEvents,
         Self::PodLogs,
         Self::PodExec,
+        Self::PodPortForward,
         Self::PatchDeployments,
         Self::ScaleDeployments,
         Self::DeleteDeployments,
@@ -240,6 +252,7 @@ impl Capability {
             Self::ListEvents => ResourceAccess::new("list", "", "events"),
             Self::PodLogs => ResourceAccess::new("get", "", "pods/log"),
             Self::PodExec => ResourceAccess::new("create", "", "pods/exec"),
+            Self::PodPortForward => ResourceAccess::new("create", "", "pods/portforward"),
             Self::PatchDeployments => ResourceAccess::new("patch", "apps", "deployments"),
             Self::ScaleDeployments => ResourceAccess::new("patch", "apps", "deployments/scale"),
             Self::DeleteDeployments => ResourceAccess::new("delete", "apps", "deployments"),
@@ -304,6 +317,41 @@ mod tests {
                 );
                 assert!(rule.resource_names.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn port_forward_is_in_the_role_only_while_a_forward_runs() {
+        let debug = Access {
+            profile: Profile::Debug,
+            secrets: false,
+            crds: false,
+        };
+        let read_only = Access {
+            profile: Profile::ReadOnly,
+            ..debug
+        };
+        let has_forward = |grants: &Grants, access| {
+            all_resources(&grant_rules(grants, "web", access))
+                .contains(&"pods/portforward".to_string())
+        };
+        let mut grants = crate::testutil::grants(&[Grant::read("web")]);
+        assert!(!has_forward(&grants, debug));
+        assert!(grants.set_forwarding("web", true));
+        assert!(has_forward(&grants, debug));
+        // Never below the debug level, never in another namespace.
+        assert!(!has_forward(&grants, read_only));
+        assert!(
+            !all_resources(&grant_rules(&grants, "other", debug))
+                .contains(&"pods/portforward".to_string())
+        );
+        // Revoking reading the namespace takes it away.
+        grants.revoke(&Grant::read("web"));
+        assert!(!has_forward(&grants, debug));
+        assert!(!grants.is_forwarding("web"));
+        // Not part of any profile's Role by itself.
+        for profile in [Profile::ReadOnly, Profile::Debug, Profile::Deploy] {
+            assert!(!all_resources(&role_rules(profile)).contains(&"pods/portforward".to_string()));
         }
     }
 

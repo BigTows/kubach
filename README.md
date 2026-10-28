@@ -74,6 +74,9 @@
   dry run and diff.
 - Every call goes to an audit log, which never contains Secret values.
 - Topology tools for the agent: `get_topology` and `can_reach`.
+- Port-forward for the agent (`port_forward_start`, `port_forward_list`,
+  `port_forward_stop`): `127.0.0.1` only, each forward confirmed, shown under
+  **Port forwards** and stopped with the session.
 - Connects over stdio (`kubach mcp`) or HTTP on `127.0.0.1` with a bearer token.
 
 **Feels like home**

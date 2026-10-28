@@ -59,7 +59,12 @@ impl McpServer {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                session,
+                session: {
+                    // Stops outside a tool call (the user, the session's
+                    // end) are audited too (#17).
+                    session.forwards().set_audit(audit.clone());
+                    session
+                },
                 registry: PluginRegistry::with_builtins(),
                 confirmer,
                 audit,
@@ -71,6 +76,12 @@ impl McpServer {
     /// Offers the Helm tools with the user's `helm` (#418).
     pub fn set_helm(&self, env: HelmEnv) {
         *sync::write(&self.inner.helm) = Some(Arc::new(env));
+    }
+
+    /// Runs the session's port-forwards in `manager`: the app's, so they
+    /// show on its "Port forwards" screen (#17). Before the first forward.
+    pub fn set_forward_manager(&self, manager: kubach_core::streams::PortForwardManager) {
+        self.inner.session.forwards().set_manager(manager);
     }
 
     fn helm(&self) -> Option<Arc<HelmEnv>> {
@@ -359,9 +370,10 @@ impl McpServer {
         format!(
             "Kubach gives you access to Kubernetes namespaces of context {}. Without asking you \
              have {access}.{more}{helm} {namespaces} Cluster-scoped resources and calls across \
-             all namespaces are not available. {secrets}{writes} Changes, deletions and \
-             commands in containers are previewed and need the user's approval one by one. \
-             Call `session_info` for details.",
+             all namespaces are not available. {secrets}{writes} Changes, deletions, \
+             commands in containers and port-forwards (port_forward_start, on 127.0.0.1 of the \
+             user's machine) are previewed and need the user's approval one by one. Call \
+             `session_info` for details.",
             scope.context
         )
     }
@@ -467,7 +479,7 @@ fn tool_access(name: &str) -> Option<Access> {
         })
     };
     match name {
-        "get_logs" | "exec" => need(Profile::Debug, false),
+        "get_logs" | "exec" | "port_forward_start" => need(Profile::Debug, false),
         "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
         | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
@@ -1042,6 +1054,47 @@ fn catalog() -> Vec<ToolSpec> {
             ),
             read_only: false,
             destructive: true,
+        },
+        ToolSpec {
+            name: "port_forward_start",
+            description: "Forward a local TCP port on 127.0.0.1 of the user's machine to a pod, or \
+                          to a ready pod of a Service or Deployment, to check a service from \
+                          inside (health endpoint, metrics, a database while debugging). Needs \
+                          the user's approval. Returns the forward's id and 127.0.0.1:<port>; \
+                          the forward ends with the session.",
+            schema: object_schema(
+                {
+                    let mut p = json!({
+                        "target": {"type": "string", "description": "pod/<name>, service/<name> or deployment/<name>"},
+                        "port": {"description": "Remote port: a number (a Service port for services) or a port name such as http",
+                                 "oneOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "string"}]},
+                        "localPort": {"type": "integer", "minimum": 1024, "maximum": 65535,
+                                      "description": "Local port on 127.0.0.1; any free port when left out"},
+                    });
+                    p.as_object_mut()
+                        .unwrap()
+                        .extend(ns.as_object().unwrap().clone());
+                    p
+                },
+                &["target", "port"],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "port_forward_list",
+            description: "Port-forwards of this session: target, ports, local address, state and \
+                          last error.",
+            schema: object_schema(json!({}), &[]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "port_forward_stop",
+            description: "Stop one of this session's port-forwards by id.",
+            schema: object_schema(json!({"id": {"type": "integer", "minimum": 1}}), &["id"]),
+            read_only: false,
+            destructive: false,
         },
         ToolSpec {
             name: "exec",

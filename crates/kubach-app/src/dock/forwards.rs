@@ -164,6 +164,13 @@ impl Forwards {
         &self.list
     }
 
+    /// The manager the AI agent's sessions run their forwards in (#17), so
+    /// they show here and the user can stop them. They are never
+    /// remembered for the next run.
+    pub fn manager(&self) -> PortForwardManager {
+        self.manager.clone()
+    }
+
     /// Forwards of the last run not running yet.
     pub fn restoring(&self) -> &[Restore] {
         &self.restoring
@@ -177,12 +184,20 @@ impl Forwards {
             .and_then(|(_, name)| name.as_deref())
     }
 
-    /// Context a forward runs in, when it was started in one.
+    /// Context a forward runs in, when it was started in one (an agent's
+    /// in its session's context).
     pub fn context(&self, id: ForwardId) -> Option<&str> {
         self.saved
             .iter()
             .find(|(forward, _)| *forward == id)
             .map(|(_, saved)| saved.context.as_str())
+            .or_else(|| {
+                self.list
+                    .iter()
+                    .find(|info| info.id == id)
+                    .and_then(|info| info.agent.as_ref())
+                    .map(|agent| agent.context.as_str())
+            })
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {

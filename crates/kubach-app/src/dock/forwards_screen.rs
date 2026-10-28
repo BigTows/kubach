@@ -385,7 +385,25 @@ fn forward_row(
     ];
     let target = format!("{}/{}:{}", info.namespace, info.source, info.source_port);
     let connections = SharedString::from(t!("dock-forwards-connections-tooltip"));
-    let mut details = vec![
+    let mut details = Vec::new();
+    // An AI agent's forward (#17): whose, so the user can stop it.
+    if let Some(agent) = &info.agent {
+        let tooltip = SharedString::from(t!(
+            "dock-forwards-agent-tooltip",
+            client = agent.client.as_str(),
+            session = agent.session.as_str()
+        ));
+        details.push(
+            div()
+                .id(SharedString::from(format!("forward-agent-{id}")))
+                .flex_none()
+                .text_color(cx.theme().warning)
+                .child(t!("dock-forwards-agent", client = agent.client.as_str()))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .into_any_element(),
+        );
+    }
+    details.push(
         div()
             .id(SharedString::from(format!("forward-connections-{id}")))
             .flex_none()
@@ -396,7 +414,7 @@ fn forward_row(
             ))
             .tooltip(move |window, cx| Tooltip::new(connections.clone()).build(window, cx))
             .into_any_element(),
-    ];
+    );
     // A pod source is its own pod.
     if !info.source.starts_with("pod/") {
         details.push(

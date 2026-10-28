@@ -35,6 +35,14 @@ pub enum RequestKind {
     /// spelled out, and not as a diff (#194). `details` holds the same
     /// command as one shell line.
     Exec { command: Vec<String> },
+    /// One port-forward of the agent (#17), confirmed every time:
+    /// `127.0.0.1:<local_port>` (any free port when `None`) to `port`
+    /// (number or name) of `target` (`pod/web-0`, `service/web`). TCP only.
+    PortForward {
+        target: String,
+        port: String,
+        local_port: Option<u16>,
+    },
     /// A right for the rest of the session (#227): since #15 only revealing
     /// one Secret, and the UI must show the warning that the value leaves
     /// for the model's provider.
