@@ -120,7 +120,8 @@ impl ImpersonationTarget {
 /// API server URL so that a renamed context does not inherit permissions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityPolicy {
-    /// MCP access for this context at all.
+    /// MCP access for this context at all. On by default (#9); the user
+    /// turns it off per context in Settings → Security.
     pub mcp_enabled: bool,
     /// The broadest profile a session may use.
     pub max_profile: Profile,
@@ -152,10 +153,11 @@ pub struct SecurityPolicy {
 }
 
 impl Default for SecurityPolicy {
-    /// Strict defaults for a context the user has not configured.
+    /// Strict defaults for a context the user has not configured: agent
+    /// access on (#9), but read-only, dry-run only, no exec, Secret metadata only.
     fn default() -> Self {
         Self {
-            mcp_enabled: false,
+            mcp_enabled: true,
             max_profile: Profile::ReadOnly,
             temporary_objects: false,
             deploy: DeployMode::DryRunOnly,
@@ -269,7 +271,7 @@ mod tests {
     #[test]
     fn defaults_are_strict() {
         let policy = SecurityPolicy::default();
-        assert!(!policy.mcp_enabled);
+        assert!(policy.mcp_enabled, "agent access is on by default (#9)");
         assert_eq!(policy.max_profile, Profile::ReadOnly);
         assert!(!policy.temporary_objects);
         assert_eq!(policy.deploy, DeployMode::DryRunOnly);

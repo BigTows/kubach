@@ -873,12 +873,15 @@ mod tests {
         let (handle, mut events) = spawn(&command, (80, 24)).unwrap();
         let mut output = String::new();
         wait_for(&mut events, &mut output, "$ ", Duration::from_secs(10));
-        handle.write(b"sleep 30\r".to_vec());
-        // `Ctrl-Z` flushes unread input, so only once the line was read.
+        // `Ctrl-Z` flushes unread input, so only once the shell ran the
+        // line. Not its echo: the terminal echoes it before a shell reading
+        // whole lines (dash) has read it. The quotes keep "started" out of
+        // the echo.
+        handle.write(b"echo st''arted; sleep 30\r".to_vec());
         wait_for(
             &mut events,
             &mut output,
-            "sleep 30\r\n",
+            "started\r\n",
             Duration::from_secs(10),
         );
         // Again until it works: a `SIGTSTP` that arrives before the child
