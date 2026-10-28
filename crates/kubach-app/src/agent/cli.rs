@@ -853,6 +853,9 @@ async fn heartbeat(session: Arc<Session>, key: String, dir: Option<PathBuf>) {
                 eprintln!("kubach mcp: {grant} taken back, but the Role was not updated: {error}");
             }
         }
+        if reply.forget_remembered {
+            session.forget_remembered();
+        }
         if reply.revoked {
             eprintln!("kubach mcp: the session was revoked in Kubach");
             let _ = session.close().await;

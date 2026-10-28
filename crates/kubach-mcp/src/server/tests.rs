@@ -2431,3 +2431,214 @@ async fn helm_get_values_masks_secrets_and_never_falls_back() {
         ]
     );
 }
+
+// ------------------------------------------------- don't ask again (#30)
+
+/// An impersonated session whose user ticks "don't ask again" wherever it
+/// is offered.
+async fn remembering_fixture() -> Fixture {
+    fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        true,
+    )
+    .await
+}
+
+fn remembered(action: crate::RememberedAction) -> crate::Remembered {
+    crate::Remembered {
+        action,
+        namespace: NS.into(),
+    }
+}
+
+fn web_deployment(host_path: bool) -> String {
+    let volumes = if host_path {
+        "      volumes:\n      - name: host\n        hostPath:\n          path: /\n"
+    } else {
+        ""
+    };
+    format!(
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    \
+         spec:\n      containers:\n      - name: app\n        image: nginx\n{volumes}"
+    )
+}
+
+#[tokio::test]
+async fn dont_ask_again_holds_for_that_change_in_that_namespace() {
+    use crate::RememberedAction;
+    let f = remembering_fixture().await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    let first = f.server.call("agent", "scale", args(scale.clone())).await;
+    assert!(!first.is_error, "{}", first.text);
+    assert!(
+        first.text.contains("chose not to be asked again"),
+        "{}",
+        first.text
+    );
+    assert_eq!(call_requests(&f), 1);
+    assert!(f.confirmer.requests()[0].allow_remember);
+    assert_eq!(
+        f.server.session().remembered(),
+        vec![remembered(RememberedAction::Scale)]
+    );
+
+    // The next scale runs without a window, and everyone is told.
+    let patches = |f: &Fixture| {
+        f.api
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PATCH "))
+            .count()
+    };
+    let before = patches(&f);
+    let second = f.server.call("agent", "scale", args(scale)).await;
+    assert!(!second.is_error, "{}", second.text);
+    assert!(
+        second
+            .text
+            .starts_with("Approved by the user's earlier choice"),
+        "{}",
+        second.text
+    );
+    assert_eq!(call_requests(&f), 1);
+    assert_eq!(patches(&f), before + 1);
+    let audit = audit_lines(&f.audit_path);
+    let scales: Vec<&Value> = audit
+        .iter()
+        .filter(|line| line["tool"] == "scale")
+        .collect();
+    assert_eq!(scales[0]["decided_by"], "user");
+    assert_eq!(scales[0]["remembered"], "saved");
+    assert_eq!(scales[1]["decided_by"], "remembered");
+    assert_eq!(scales[1]["remembered"], "used");
+    assert!(
+        audit
+            .iter()
+            .filter(|line| line["tool"] != "scale")
+            .all(|line| line.get("remembered").is_none())
+    );
+
+    // Another kind of change is asked on its own.
+    let restart = json!({"kind": "Deployment", "name": "web"});
+    f.server
+        .call("agent", "rollout_restart", args(restart.clone()))
+        .await;
+    assert_eq!(call_requests(&f), 2);
+    f.server
+        .call("agent", "rollout_restart", args(restart))
+        .await;
+    assert_eq!(call_requests(&f), 2);
+
+    // Deleting is asked every time and never offers it.
+    let delete = json!({"kind": "Widget", "apiVersion": "example.com/v1", "name": "w"});
+    for _ in 0..2 {
+        f.server
+            .call("agent", "delete_resource", args(delete.clone()))
+            .await;
+    }
+    assert_eq!(call_requests(&f), 4);
+    assert!(!f.confirmer.requests()[3].allow_remember);
+
+    // session_info lists it.
+    let info = f
+        .server
+        .call("agent", "session_info", Map::new())
+        .await
+        .text;
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["notAskedAgain"][0]["action"], "scale");
+    assert_eq!(info["notAskedAgain"][0]["namespace"], NS);
+}
+
+#[tokio::test]
+async fn dont_ask_again_never_covers_dangerous_fields() {
+    let f = remembering_fixture().await;
+    let apply = |host_path: bool| {
+        args(json!({"yaml": web_deployment(host_path), "namespace": NS, "dryRun": false}))
+    };
+    let outcome = f.server.call("agent", "apply_manifest", apply(false)).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(call_requests(&f), 1);
+    f.server.call("agent", "apply_manifest", apply(false)).await;
+    assert_eq!(call_requests(&f), 1, "remembered");
+    // A hostPath needs "I understand" every time (#194).
+    for _ in 0..2 {
+        f.server.call("agent", "apply_manifest", apply(true)).await;
+    }
+    let requests = f.confirmer.requests();
+    assert_eq!(call_requests(&f), 3);
+    assert!(!requests[1].dangerous.is_empty());
+    assert!(!requests[1].allow_remember && !requests[2].allow_remember);
+}
+
+#[tokio::test]
+async fn secrets_are_asked_past_dont_ask_again() {
+    let f = remembering_fixture().await;
+    for _ in 0..2 {
+        f.server
+            .call(
+                "agent",
+                "delete_secret",
+                args(json!({"name": "db", "explanation": "rotate"})),
+            )
+            .await;
+    }
+    let forms: Vec<_> = f
+        .confirmer
+        .requests()
+        .into_iter()
+        .filter(|request| matches!(request.kind, RequestKind::Secret { .. }))
+        .collect();
+    assert_eq!(forms.len(), 2, "every deletion is asked");
+    assert!(forms.iter().all(|request| !request.allow_remember));
+    assert!(f.server.session().remembered().is_empty());
+}
+
+#[tokio::test]
+async fn dont_ask_again_ends_with_the_right_or_the_session() {
+    use crate::RememberedAction;
+    let f = remembering_fixture().await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    let session = f.server.session();
+    assert!(session.is_remembered(&remembered(RememberedAction::Scale)));
+
+    // Taking `modify(ns)` back forgets it.
+    session.revoke(&Grant::modify(NS)).await.unwrap();
+    assert!(session.remembered().is_empty());
+
+    // "Ask again" in Settings forgets it too.
+    session.decide(Grant::modify(NS), true).await.unwrap();
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    assert_eq!(call_requests(&f), 2);
+    assert_eq!(session.remembered().len(), 1);
+    session.forget_remembered();
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    assert_eq!(call_requests(&f), 3, "asked again");
+
+    // A new session starts with nothing remembered; this one forgets it
+    // when it ends.
+    assert_eq!(session.remembered().len(), 1);
+    session.close().await.unwrap();
+    assert!(session.remembered().is_empty());
+    assert!(!session.is_remembered(&remembered(RememberedAction::Scale)));
+}
+
+#[tokio::test]
+async fn client_only_never_offers_dont_ask_again() {
+    let f = fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        false,
+    )
+    .await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    f.server.call("agent", "scale", args(scale)).await;
+    assert_eq!(call_requests(&f), 2);
+    assert!(f.confirmer.requests().iter().all(|r| !r.allow_remember));
+    assert!(f.server.session().remembered().is_empty());
+}

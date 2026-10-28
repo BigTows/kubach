@@ -95,6 +95,16 @@ agent-helm-as-user-tick = Выполнить этот вызов helm от мо�
 agent-helm-dry-run-as-user = Пробный запуск от моих учётных данных
 agent-helm-runs-as-user-title = Выполняется от ваших учётных данных
 agent-helm-runs-as-user = Вы разрешили выполнить этот вызов helm от ваших учётных данных из kubeconfig. Пробный запуск выше тоже шёл от них; пока ничего не изменено.
+# «Не спрашивать» (#30). $action: вид изменения (agent-action-*), $namespace: где.
+agent-remember = Не спрашивать до конца сессии: { $action } в { $namespace }
+agent-action-scale = масштабирование
+agent-action-rollout-restart = перезапуск (rollout restart)
+agent-action-apply = применение манифестов
+agent-action-exec = команды в контейнерах
+agent-action-port-forward = port-forward
+agent-action-helm-install = установка Helm-релизов
+agent-action-helm-upgrade = обновление Helm-релизов
+agent-action-helm-rollback = откат Helm-релизов
 agent-always = Разрешать по умолчанию
 agent-always-note = Повышает минимальный доступ в Настройки → Security для { $context } насовсем, с отметкой, когда и из какой сессии. Вернуть можно там же кнопкой «Сбросить до чтения».
 agent-limits-off = Серверные ограничения выключены

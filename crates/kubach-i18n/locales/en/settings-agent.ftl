@@ -85,6 +85,11 @@ settings-session-no-namespace = No namespace yet: set up when the agent first wo
 # $raised: what was allowed beyond the minimum, e.g. "Changes".
 settings-session-raised = Allowed for this session: { $raised }
 settings-session-no-grants = No rights granted yet.
+# $list: kinds of change the user said not to ask about, e.g. "scaling in cert-manager" (#30).
+settings-session-remembered = Without asking: { $list }
+# $action: agent-action-*, $namespace: where.
+settings-session-remembered-item = { $action } in { $namespace }
+settings-ask-again = Ask again
 settings-boundary-client-only = limits only in Kubach
 settings-boundary-impersonation = limits in Kubach and the API server (impersonation)
 settings-boundary-temporary-sa = limits in Kubach and the API server (temporary ServiceAccount)

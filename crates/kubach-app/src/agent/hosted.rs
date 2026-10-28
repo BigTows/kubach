@@ -145,7 +145,9 @@ pub(super) async fn after_consent<T>(
     start: impl Future<Output = Result<T, String>>,
 ) -> Result<T, HostRefusal> {
     match kubach_mcp::confirm::ask(confirmer, consent).await {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => start
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => start
             .await
             .map_err(|error| HostRefusal::denied(format!("cannot start the session: {error}"))),
         ConfirmationDecision::Rejected { .. } => Err(HostRefusal::rejected(context)),

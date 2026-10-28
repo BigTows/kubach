@@ -86,6 +86,16 @@ agent-helm-as-user-tick = 使用我的 kubeconfig 凭据运行此 helm 调用
 agent-helm-dry-run-as-user = 使用我的凭据试运行
 agent-helm-runs-as-user-title = 使用您的凭据运行
 agent-helm-runs-as-user = 您已允许此 helm 调用使用您 kubeconfig 中的凭据运行。上面的试运行也使用了这些凭据；目前尚未做任何更改。
+# “不再询问”(#30)。$action：更改类型(agent-action-*)，$namespace：位置。
+agent-remember = 本会话结束前不再询问：{ $namespace } 中的{ $action }
+agent-action-scale = 扩缩容
+agent-action-rollout-restart = 滚动重启
+agent-action-apply = 应用清单
+agent-action-exec = 容器内命令
+agent-action-port-forward = 端口转发
+agent-action-helm-install = Helm 安装
+agent-action-helm-upgrade = Helm 升级
+agent-action-helm-rollback = Helm 回滚
 agent-always = 默认允许
 agent-always-note = 永久提升 { $context } 在 设置 → Security 中的最低权限，并记录时间和来源会话。可在那里用“重置为读取”撤销。
 agent-limits-off = 服务器端限制已关闭

@@ -214,6 +214,9 @@ fn command_block(command: &[String], cx: &App) -> impl IntoElement + use<> {
 /// around the scrolling body.
 const DIALOG_CHROME: f32 = 220.;
 
+/// Height of the "don't ask again" row by the buttons and its gap (#30).
+const REMEMBER_ROW: f32 = 32.;
+
 /// "CustomResourceDefinition × 6, ClusterRole × 12": objects counted by
 /// kind (the first word of each), in the order they first appear.
 fn kind_counts(objects: &[String]) -> String {
@@ -308,6 +311,9 @@ struct ConfirmView {
     show_values: bool,
     /// Every object behind "run with my credentials", folded under counts.
     show_user_objects: bool,
+    /// "Don't ask again until the session ends" for this kind of change in
+    /// this namespace (#30); off until the user ticks it.
+    remember: bool,
     _observe: Subscription,
 }
 
@@ -322,6 +328,7 @@ impl ConfirmView {
             as_user: false,
             show_values: false,
             show_user_objects: false,
+            remember: false,
             _observe: observe,
         }
     }
@@ -620,6 +627,28 @@ impl Render for ConfirmView {
         });
         let always = self.always;
         let show_values = self.show_values;
+        // Offered only where Kubach marked the request and the kind of
+        // change may be remembered at all (#30): never for deletions,
+        // Secrets, Helm with the user's credentials, dangerous fields or a
+        // client-only namespace.
+        let remember_offer = request
+            .allow_remember
+            .then(|| kubach_mcp::rememberable(&request))
+            .flatten();
+        let remember = remember_offer.is_some() && self.remember;
+        let remember_tick = remember_offer.map(|offer| {
+            Checkbox::new("confirm-remember")
+                .label(t!(
+                    "agent-remember",
+                    action = super::remembered_action_label(offer.action),
+                    namespace = offer.namespace.as_str()
+                ))
+                .checked(remember)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.remember = *checked;
+                    cx.notify();
+                }))
+        });
         let (reject, approve) = match (&grant, &secret_change) {
             _ if access.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
             _ if access.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
@@ -657,8 +686,15 @@ impl Render for ConfirmView {
 
         // The buttons stay in sight: everything above them scrolls. The
         // dialog itself is at most the viewport less its margins, and its
-        // title, paddings and our buttons take the rest.
-        let body_height = (window.viewport_size().height - px(DIALOG_CHROME)).max(px(120.));
+        // title, paddings and our buttons take the rest, with the "don't
+        // ask again" row next to the buttons when it is there (#30).
+        let chrome = DIALOG_CHROME
+            + if remember_tick.is_some() {
+                REMEMBER_ROW
+            } else {
+                0.
+            };
+        let body_height = (window.viewport_size().height - px(chrome)).max(px(120.));
         div()
             .flex()
             .flex_col()
@@ -910,6 +946,8 @@ impl Render for ConfirmView {
                     .children(acknowledge)
                     .children(details),
             )
+            // Next to the buttons, in sight without scrolling.
+            .children(remember_tick)
             .child(
                 div()
                     .flex()
@@ -959,6 +997,8 @@ impl Render for ConfirmView {
                                 }
                                 let decision = if this.always {
                                     ConfirmationDecision::ApprovedAlways
+                                } else if remember {
+                                    ConfirmationDecision::ApprovedForSession
                                 } else {
                                     ConfirmationDecision::Approved
                                 };
