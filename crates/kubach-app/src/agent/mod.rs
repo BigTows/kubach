@@ -334,6 +334,9 @@ struct External {
     revoked: HashSet<String>,
     /// Rights the user took back, by session; sent with the next heartbeat.
     revoked_grants: HashMap<String, Vec<Grant>>,
+    /// Sessions whose "don't ask again" the user cleared (#30); told to the
+    /// process on its next heartbeat.
+    forget_remembered: HashSet<String>,
 }
 
 /// The app's side of the bridge.
@@ -369,12 +372,16 @@ impl BridgeHandler for AppBridge {
             .revoked_grants
             .remove(&session.id)
             .unwrap_or_default();
+        let forget_remembered = external.forget_remembered.remove(&session.id);
         // Shown as taken back right away; the process confirms it with its
         // next heartbeat.
         for entry in &mut session.grants {
             if revoke_grants.contains(&entry.grant) {
                 entry.state = kubach_mcp::GrantState::Denied;
             }
+        }
+        if forget_remembered {
+            session.remembered.clear();
         }
         external.live.insert(
             session.id.clone(),
@@ -385,6 +392,7 @@ impl BridgeHandler for AppBridge {
         Some(HeartbeatReply {
             revoked,
             revoke_grants,
+            forget_remembered,
         })
     }
 
@@ -402,6 +410,7 @@ impl BridgeHandler for AppBridge {
         external.live.remove(id);
         external.revoked.remove(id);
         external.revoked_grants.remove(id);
+        external.forget_remembered.remove(id);
         drop(external);
         self.confirmer.tx.unbounded_send(UiEvent::Changed).ok();
         true
@@ -503,6 +512,9 @@ pub struct SessionRow {
     pub grants: Vec<GrantEntry>,
     /// Access the user allowed beyond the minimum for this session (#15).
     pub raised: Option<kubach_mcp::Access>,
+    /// Kinds of change per namespace the user said not to ask about again
+    /// in this session (#30).
+    pub remembered: Vec<kubach_mcp::Remembered>,
 }
 
 /// One audit log line, as shown in the settings page.
@@ -811,6 +823,7 @@ impl AgentState {
                 revoking: false,
                 grants: session.grants().entries(),
                 raised: session.raised(),
+                remembered: session.remembered(),
             });
         }
         let external = sync::lock(&self.external);
@@ -833,6 +846,7 @@ impl AgentState {
                 revoking: external.revoked.contains(&session.id),
                 grants: session.grants.clone(),
                 raised: session.raised,
+                remembered: session.remembered.clone(),
             })
             .collect();
         drop(external);
@@ -852,6 +866,7 @@ impl AgentState {
             revoking: false,
             grants: session.grants,
             raised: session.raised,
+            remembered: session.remembered,
         }));
         others.sort_by(|a, b| a.started_at.cmp(&b.started_at));
         rows.extend(others);
@@ -1363,6 +1378,28 @@ impl AgentState {
         cx.notify();
     }
 
+    /// "Ask again" (#30): session `id` forgets every "don't ask again" at
+    /// once if the app runs it, else on the next heartbeat of its `kubach
+    /// mcp` process (shown as forgotten right away).
+    pub fn forget_remembered(&mut self, id: &str, cx: &mut Context<Self>) {
+        let session = self
+            .session
+            .as_ref()
+            .filter(|session| session.id() == id)
+            .cloned()
+            .or_else(|| self.hosted.session(id));
+        if let Some(session) = session {
+            session.forget_remembered();
+        } else {
+            let mut external = sync::lock(&self.external);
+            if let Some((session, _, _)) = external.live.get_mut(id) {
+                session.remembered.clear();
+                external.forget_remembered.insert(id.to_owned());
+            }
+        }
+        cx.notify();
+    }
+
     /// Takes back one right of session `id` (#227): at once for sessions the
     /// app runs, with the next heartbeat for a `kubach mcp` process.
     pub fn revoke_grant(&mut self, id: &str, grant: Grant, cx: &mut Context<Self>) {
@@ -1568,9 +1605,11 @@ impl AgentState {
                 live,
                 revoked,
                 revoked_grants,
+                forget_remembered,
             } = &mut *external;
             revoked.retain(|id| live.contains_key(id));
             revoked_grants.retain(|id, _| live.contains_key(id));
+            forget_remembered.retain(|id| live.contains_key(id));
             changed |= external.live.len() != before;
         }
         let now = Instant::now();
@@ -1683,6 +1722,21 @@ pub fn access_label(access: kubach_mcp::Access) -> String {
     parts.join(" + ")
 }
 
+/// A kind of change the user may say not to ask about again (#30).
+pub fn remembered_action_label(action: kubach_mcp::RememberedAction) -> String {
+    use kubach_mcp::RememberedAction;
+    match action {
+        RememberedAction::Scale => t!("agent-action-scale"),
+        RememberedAction::RolloutRestart => t!("agent-action-rollout-restart"),
+        RememberedAction::ApplyManifest => t!("agent-action-apply"),
+        RememberedAction::Exec => t!("agent-action-exec"),
+        RememberedAction::PortForwardStart => t!("agent-action-port-forward"),
+        RememberedAction::HelmInstall => t!("agent-action-helm-install"),
+        RememberedAction::HelmUpgrade => t!("agent-action-helm-upgrade"),
+        RememberedAction::HelmRollback => t!("agent-action-helm-rollback"),
+    }
+}
+
 /// What an access request asks for: only the parts beyond what the
 /// session has, so a request for Secrets alone does not read as "Read".
 pub fn raise_label(raise: kubach_mcp::Access) -> String {
@@ -1728,6 +1782,7 @@ mod tests {
             clients: Vec::new(),
             calls: 0,
             grants: Vec::new(),
+            remembered: Vec::new(),
         }
     }
 
@@ -1766,6 +1821,42 @@ mod tests {
         assert!(app.ended("s", "mine"));
         let external = external.lock().unwrap();
         assert!(external.live.is_empty() && external.revoked.is_empty());
+    }
+
+    /// "Ask again" reaches the process with its next heartbeat, once, and
+    /// the list is shown empty meanwhile (#30).
+    #[test]
+    fn ask_again_reaches_the_process() {
+        let (tx, _rx) = mpsc::unbounded();
+        let external = Arc::new(Mutex::new(External::default()));
+        let app = AppBridge {
+            confirmer: UiConfirmer {
+                tx,
+                waiting: WaitingCount::default(),
+            },
+            external: external.clone(),
+            hosted: HostedSessions::new(),
+        };
+        let mut session = external_session("s");
+        session.remembered = vec![kubach_mcp::Remembered {
+            action: kubach_mcp::RememberedAction::Scale,
+            namespace: "web".into(),
+        }];
+        let reply = app.heartbeat(session.clone(), "mine").unwrap();
+        assert!(!reply.forget_remembered);
+        external
+            .lock()
+            .unwrap()
+            .forget_remembered
+            .insert("s".into());
+        assert!(
+            app.heartbeat(session.clone(), "mine")
+                .unwrap()
+                .forget_remembered
+        );
+        assert!(external.lock().unwrap().live["s"].0.remembered.is_empty());
+        // Told once; the process reports what it remembers from then on.
+        assert!(!app.heartbeat(session, "mine").unwrap().forget_remembered);
     }
 
     #[test]

@@ -250,6 +250,7 @@ impl SessionForwards {
             }),
             change: None,
             decided_by,
+            remembered: None,
             allowed: true,
             reason: Some(why.into()),
             identity: forward.identity.clone(),

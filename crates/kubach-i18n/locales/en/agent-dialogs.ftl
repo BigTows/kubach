@@ -98,6 +98,16 @@ agent-helm-as-user-tick = Run this helm call with my kubeconfig credentials
 agent-helm-dry-run-as-user = Dry run with my credentials
 agent-helm-runs-as-user-title = Runs with your credentials
 agent-helm-runs-as-user = You allowed this helm call to run with your credentials from kubeconfig. The dry run above ran with them too; nothing has changed yet.
+# "Don't ask again" (#30). $action: a kind of change (agent-action-*), $namespace: where.
+agent-remember = Don't ask again until the session ends: { $action } in { $namespace }
+agent-action-scale = scaling
+agent-action-rollout-restart = rollout restarts
+agent-action-apply = applying manifests
+agent-action-exec = commands in containers
+agent-action-port-forward = port-forwards
+agent-action-helm-install = Helm installs
+agent-action-helm-upgrade = Helm upgrades
+agent-action-helm-rollback = Helm rollbacks
 agent-always = Allow by default
 agent-always-note = Raises the minimal access in Settings → Security of { $context } for good, with a note of when and from which session. “Reset to read” there takes it back.
 agent-limits-off = Server-side limits are off

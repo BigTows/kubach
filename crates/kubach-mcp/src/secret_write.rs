@@ -623,6 +623,7 @@ fn refused(decision: ConfirmationDecision, what: &str) -> ToolError {
         ))),
         ConfirmationDecision::Approved
         | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession
         | ConfirmationDecision::Provided { .. } => {
             ToolError::Failed(format!("unexpected answer to {what}; nothing was written"))
         }

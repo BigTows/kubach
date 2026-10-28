@@ -116,8 +116,10 @@ pub struct ConfirmationRequest {
     /// privileged, ServiceAccount change…). The UI must not hide them.
     pub dangerous: Vec<Finding>,
     pub mode: SessionMode,
-    /// "Remember this decision" may be offered. Never in client-only mode
-    /// (ADR 0005).
+    /// "Don't ask again this session" may be offered for this kind of
+    /// change in this namespace (#30): set by Kubach from
+    /// [`rememberable`](crate::remember::rememberable), never in client-only
+    /// mode (ADR 0005). The UI checks that function too.
     pub allow_remember: bool,
 }
 
@@ -129,6 +131,11 @@ pub enum ConfirmationDecision {
     /// settings for good ([`RequestKind::Access`] only; any other request
     /// answered this way counts as a plain approval).
     ApprovedAlways,
+    /// Approved, and the user ticked "don't ask again this session" for
+    /// this kind of change in this namespace (#30). Kubach remembers it
+    /// only for a request it marked [`ConfirmationRequest::allow_remember`];
+    /// any other request answered this way counts as a plain approval.
+    ApprovedForSession,
     /// The values the user entered or generated for a
     /// [`RequestKind::Secret`] form (#230). They are written by Kubach and
     /// never reach the agent, the audit log or `Debug` output; the answer
@@ -150,7 +157,10 @@ pub enum ConfirmationDecision {
 
 impl ConfirmationDecision {
     pub fn is_approved(&self) -> bool {
-        matches!(self, Self::Approved | Self::ApprovedAlways)
+        matches!(
+            self,
+            Self::Approved | Self::ApprovedAlways | Self::ApprovedForSession
+        )
     }
 
     /// The user answered no themselves.
@@ -160,7 +170,10 @@ impl ConfirmationDecision {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Approved | Self::ApprovedAlways | Self::Provided { .. } => None,
+            Self::Approved
+            | Self::ApprovedAlways
+            | Self::ApprovedForSession
+            | Self::Provided { .. } => None,
             Self::Denied { reason } | Self::Rejected { reason } => reason.as_deref(),
         }
     }
@@ -197,6 +210,8 @@ pub struct ScriptedConfirmer {
     approve: bool,
     /// Ticks "Allow by default" for access requests.
     always: bool,
+    /// Ticks "Don't ask again this session" where offered (#30).
+    remember: bool,
     /// What an approving confirmer enters into Secret forms.
     input: Option<SecretInput>,
     requests: Mutex<Vec<ConfirmationRequest>>,
@@ -207,6 +222,7 @@ impl ScriptedConfirmer {
         Self {
             approve: true,
             always: false,
+            remember: false,
             input: None,
             requests: Mutex::new(Vec::new()),
         }
@@ -216,6 +232,7 @@ impl ScriptedConfirmer {
         Self {
             approve: false,
             always: false,
+            remember: false,
             input: None,
             requests: Mutex::new(Vec::new()),
         }
@@ -233,6 +250,15 @@ impl ScriptedConfirmer {
     pub fn approving_always() -> Self {
         Self {
             always: true,
+            ..Self::approving()
+        }
+    }
+
+    /// Approves everything, ticking "Don't ask again this session" where
+    /// the request offers it (#30).
+    pub fn approving_for_session() -> Self {
+        Self {
+            remember: true,
             ..Self::approving()
         }
     }
@@ -265,6 +291,8 @@ impl Confirmer for ScriptedConfirmer {
         } else if self.approve && self.always && matches!(request.kind, RequestKind::Access { .. })
         {
             ConfirmationDecision::ApprovedAlways
+        } else if self.approve && self.remember && request.allow_remember {
+            ConfirmationDecision::ApprovedForSession
         } else if self.approve {
             ConfirmationDecision::Approved
         } else {
@@ -349,6 +377,10 @@ mod tests {
         let back: ConfirmationRequest =
             serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
         assert_eq!(back, exec);
+        let remembered: ConfirmationDecision =
+            serde_json::from_str(r#"{"decision":"approved-for-session"}"#).unwrap();
+        assert_eq!(remembered, ConfirmationDecision::ApprovedForSession);
+        assert!(remembered.is_approved());
         let rejected: ConfirmationDecision =
             serde_json::from_str(r#"{"decision":"rejected","reason":null}"#).unwrap();
         assert!(rejected.is_rejected() && !rejected.is_approved());

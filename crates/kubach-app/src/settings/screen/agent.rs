@@ -830,6 +830,47 @@ fn session_row(
                 })
         }));
     let no_grants = row.grants.is_empty();
+    // "Don't ask again" of this session, with "Ask again" (#30).
+    let remembered = (!row.remembered.is_empty()).then(|| {
+        let list = row
+            .remembered
+            .iter()
+            .map(|r| {
+                t!(
+                    "settings-session-remembered-item",
+                    action = agent::remembered_action_label(r.action),
+                    namespace = r.namespace.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let forget = state.downgrade();
+        let session = row.id.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_color(theme.warning)
+                    .child(t!("settings-session-remembered", list = list)),
+            )
+            .child(
+                Button::new(("agent-ask-again", ix))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("settings-ask-again"))
+                    .on_click(move |_, _, cx| {
+                        forget
+                            .update(cx, |agent, cx| agent.forget_remembered(&session, cx))
+                            .ok();
+                    }),
+            )
+    });
     div()
         .flex()
         .items_center()
@@ -892,7 +933,8 @@ fn session_row(
                             .child(t!("settings-session-no-grants")),
                     )
                 })
-                .when(!no_grants, |this| this.child(grants)),
+                .when(!no_grants, |this| this.child(grants))
+                .children(remembered),
         )
         .child(
             Button::new(("agent-revoke", ix))

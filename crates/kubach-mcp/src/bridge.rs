@@ -161,6 +161,9 @@ pub struct ExternalSession {
     /// Access the user allowed beyond the minimum in this session (#15).
     #[serde(default)]
     pub raised: Option<crate::access::Access>,
+    /// Kinds of change the user said not to ask about again (#30).
+    #[serde(default)]
+    pub remembered: Vec<crate::remember::Remembered>,
 }
 
 impl ExternalSession {
@@ -187,6 +190,7 @@ impl ExternalSession {
             calls: activity.calls,
             grants: session.grants().entries(),
             raised: session.raised(),
+            remembered: session.remembered(),
         }
     }
 }
@@ -198,6 +202,9 @@ pub struct HeartbeatReply {
     /// Rights the user took back in the app since the last heartbeat.
     #[serde(default)]
     pub revoke_grants: Vec<Grant>,
+    /// The user pressed "Ask again" (#30): forget every "don't ask again".
+    #[serde(default)]
+    pub forget_remembered: bool,
 }
 
 /// A heartbeat: the session and its key.

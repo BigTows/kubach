@@ -13,7 +13,8 @@
 //!   app runs for `kubach mcp`.
 //! - [`confirm`], [`audit`], [`masking`]: human-in-the-loop, local audit
 //!   log, credential masking; [`secret_write`]: Secrets written through
-//!   the user, whose values the agent never sees (#230).
+//!   the user, whose values the agent never sees (#230); [`remember`]:
+//!   "don't ask again this session" for one kind of change (#30).
 //!
 //! UI-free: depends on `kubach-core` only.
 
@@ -31,6 +32,7 @@ pub mod names;
 pub mod policy;
 pub mod presence;
 pub mod proxy;
+pub mod remember;
 pub mod rules;
 pub mod scope;
 pub mod server;
@@ -56,6 +58,7 @@ pub use grants::{Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY};
 pub use identity::{Identity, sweep_expired};
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
+pub use remember::{Remembered, RememberedAction, rememberable};
 pub use scope::{NamespaceHint, NamespaceSource, SessionMode, SessionScope, SessionSpec};
 pub use secret_write::{
     KeySize, SecretInput, SecretOp, SecretRequest, SecretSource, SecretUser, check_input,
