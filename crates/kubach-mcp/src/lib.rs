@@ -29,6 +29,7 @@ pub mod identity;
 pub mod masking;
 pub mod names;
 pub mod policy;
+pub mod presence;
 pub mod proxy;
 pub mod rules;
 pub mod scope;

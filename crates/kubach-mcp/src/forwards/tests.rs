@@ -407,3 +407,181 @@ async fn a_session_keeps_a_bounded_number_of_forwards() {
         super::MAX_FORWARDS_PER_SESSION
     );
 }
+
+// ------------------------------------------- the agent disconnects (#34)
+
+const TOKEN: &str = "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt";
+
+/// Serves `f`'s session as the app does, the agents gone after `grace`.
+async fn endpoint(f: &Fixture, grace: Duration) -> crate::transport::HttpEndpoint {
+    let shared = crate::shared::SharedServer::new();
+    shared.set(Some(f.server.clone()));
+    crate::transport::serve_shared_with_grace(
+        shared,
+        crate::transport::HttpOptions {
+            port: 0,
+            token: TOKEN.into(),
+            bridge: None,
+        },
+        grace,
+    )
+    .await
+    .unwrap()
+}
+
+/// Sends one MCP HTTP request; returns the open connection, the status
+/// and the response head (the body is left unread).
+async fn send(
+    port: u16,
+    method: &str,
+    session: Option<&str>,
+    accept: &str,
+    body: &str,
+) -> (TcpStream, u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let session = session
+        .map(|id| format!("mcp-session-id: {id}\r\nmcp-protocol-version: 2025-06-18\r\n"))
+        .unwrap_or_default();
+    let head = format!(
+        "{method} {} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {TOKEN}\r\n\
+         content-type: application/json\r\naccept: {accept}\r\n{session}\
+         content-length: {}\r\n\r\n{body}",
+        crate::transport::MCP_PATH,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        response.push_str(&line);
+    }
+    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (reader.into_inner(), status, response)
+}
+
+/// Initializes an MCP session over HTTP; returns its id.
+async fn initialize(port: u16) -> String {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "agent", "version": "1"}},
+    })
+    .to_string();
+    let both = "application/json, text/event-stream";
+    let (_, status, head) = send(port, "POST", None, both, &body).await;
+    assert_eq!(status, 200, "{head}");
+    let id = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("mcp-session-id")
+                .then(|| value.trim().to_owned())
+        })
+        .expect("a session id");
+    let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let (_, status, head) = send(port, "POST", Some(&id), both, &initialized.to_string()).await;
+    assert_eq!(status, 202, "{head}");
+    id
+}
+
+/// Whether forward `id` is still running after a while.
+async fn still_running(f: &Fixture, id: u64) -> bool {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.server.session().forwards().manager().get(id).is_some()
+}
+
+/// Waits up to `limit` until nothing listens on `addr` any more.
+async fn closed_within(addr: SocketAddr, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if TcpStream::connect(addr).await.is_err() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn closing_the_mcp_session_stops_the_agents_forwards_at_once() {
+    let f = fixture(true).await;
+    let endpoint = endpoint(&f, Duration::from_secs(3600)).await;
+    let port = endpoint.addr.port();
+    let session = initialize(port).await;
+    let (id, addr) = start(&f, "service/web", json!("http")).await;
+    assert!(still_running(&f, id).await);
+
+    let (_, status, head) = send(port, "DELETE", Some(&session), "*/*", "").await;
+    assert!((200..300).contains(&status), "{head}");
+    assert!(closed(addr).await);
+    assert!(stop_audited(&f.audit_path, "disconnected").await);
+    // The Role lost pods/portforward; the session itself goes on.
+    assert!(!f.server.session().grants().is_forwarding(NS));
+    assert!(f.server.session().is_active());
+
+    // An agent connecting again works in the same session.
+    initialize(port).await;
+    let (again, _) = start(&f, "pod/web-0", json!(8080)).await;
+    assert!(still_running(&f, again).await);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_client_leaving_keeps_the_forwards_of_another() {
+    let f = fixture(true).await;
+    let endpoint = endpoint(&f, Duration::from_secs(3600)).await;
+    let port = endpoint.addr.port();
+    let first = initialize(port).await;
+    let _second = initialize(port).await;
+    let (id, _) = start(&f, "service/web", json!("http")).await;
+    let (_, status, _) = send(port, "DELETE", Some(&first), "*/*", "").await;
+    assert!((200..300).contains(&status));
+    assert!(still_running(&f, id).await);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_open_stream_keeps_forwards_and_its_loss_ends_them_after_the_grace() {
+    let f = fixture(true).await;
+    let grace = Duration::from_millis(400);
+    let endpoint = endpoint(&f, grace).await;
+    let port = endpoint.addr.port();
+    let session = initialize(port).await;
+    // The client's GET stream, as MCP clients keep it.
+    let (stream, status, head) = send(port, "GET", Some(&session), "text/event-stream", "").await;
+    assert_eq!(status, 200, "{head}");
+    let (id, addr) = start(&f, "service/web", json!("http")).await;
+    tokio::time::sleep(grace * 3).await;
+    assert!(
+        still_running(&f, id).await,
+        "an open stream is a connected agent"
+    );
+
+    // The client is gone without closing its session.
+    drop(stream);
+    assert!(closed_within(addr, Duration::from_secs(30)).await);
+    assert!(stop_audited(&f.audit_path, "disconnected").await);
+    assert!(f.server.session().is_active());
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_silent_agent_loses_its_forwards_after_the_grace() {
+    let f = fixture(true).await;
+    let grace = Duration::from_millis(500);
+    let endpoint = endpoint(&f, grace).await;
+    let port = endpoint.addr.port();
+    initialize(port).await;
+    let (id, addr) = start(&f, "service/web", json!("http")).await;
+    // Within the grace period nothing happens.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.server.session().forwards().manager().get(id).is_some());
+    assert!(closed_within(addr, Duration::from_secs(10)).await);
+    assert!(stop_audited(&f.audit_path, "disconnected").await);
+    endpoint.shutdown().await;
+}
