@@ -83,7 +83,6 @@ hotbar-state-connected = Connected, { $version }
 hotbar-state-error = Error: { $error }
 # $list: what is looser, joined with commas (hotbar-loosened-*).
 hotbar-security-looser = Looser than strict: { $list }
-hotbar-loosened-mcp = AI agent access
 hotbar-loosened-profile = profile
 hotbar-loosened-temporary-objects = separate identity in the cluster
 hotbar-loosened-deploy = applying changes

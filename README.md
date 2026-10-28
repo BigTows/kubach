@@ -99,8 +99,10 @@ Every push to `main` also produces fresh builds as
 
 ### Connect your AI agent
 
-First turn on agent access for a context in **Settings → Security**. Access is off by
-default.
+Agent access is on by default for every context, with strict limits: read-only,
+changes only as dry-run, no exec, Secret values hidden. The context the agent picks is
+approved by you in the Kubach window, and a **Protected cluster** refuses any request to
+raise the limits. Turn access off, or allow more, per context in **Settings → Security**.
 
 Kubach can register itself with your agent. It shows the config file and the change,
 applies them after you confirm, and keeps your other servers along with a backup of

@@ -76,7 +76,6 @@ hotbar-state-connecting = 正在连接…
 hotbar-state-connected = 已连接，{ $version }
 hotbar-state-error = 错误：{ $error }
 hotbar-security-looser = 比严格设置宽松：{ $list }
-hotbar-loosened-mcp = AI 代理访问
 hotbar-loosened-profile = 配置档
 hotbar-loosened-temporary-objects = 集群中的独立身份
 hotbar-loosened-deploy = 应用更改

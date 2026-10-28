@@ -153,7 +153,6 @@ impl Default for ContextPolicy {
 /// A setting that is looser than the strict default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Loosened {
-    McpEnabled,
     MaxProfile,
     TemporaryObjects,
     Deploy,
@@ -172,7 +171,6 @@ impl Loosened {
     /// What is looser, for lists like "Looser than strict: exec, …".
     pub fn label(self) -> &'static str {
         match self {
-            Self::McpEnabled => "AI agent access",
             Self::MaxProfile => "profile",
             Self::TemporaryObjects => "separate identity in the cluster",
             Self::Deploy => "applying changes",
@@ -240,9 +238,12 @@ pub enum PolicyIssue {
 }
 
 impl ContextPolicy {
+    /// The defaults. AI agent access is on (#9): the agent still gets only
+    /// read-only, dry-run, no exec and no Secret values, and the user approves
+    /// each context it picks in the Kubach window.
     pub fn strict() -> Self {
         Self {
-            mcp_enabled: false,
+            mcp_enabled: true,
             max_profile: Profile::ReadOnly,
             temporary_objects: false,
             deploy: DeployMode::DryRun,
@@ -295,7 +296,6 @@ impl ContextPolicy {
     pub fn loosened(&self) -> Vec<Loosened> {
         let strict = Self::strict();
         [
-            (self.mcp_enabled, Loosened::McpEnabled),
             (self.max_profile > strict.max_profile, Loosened::MaxProfile),
             (self.temporary_objects, Loosened::TemporaryObjects),
             (self.deploy != strict.deploy, Loosened::Deploy),
@@ -638,7 +638,8 @@ mod tests {
     #[test]
     fn defaults_are_strict() {
         let policy = ContextPolicy::default();
-        assert!(!policy.mcp_enabled);
+        // AI agent access is on by default (#9) and is not a loosening.
+        assert!(policy.mcp_enabled);
         assert_eq!(policy.max_profile, Profile::ReadOnly);
         assert!(!policy.temporary_objects);
         assert_eq!(policy.deploy, DeployMode::DryRun);
@@ -649,7 +650,8 @@ mod tests {
         assert!(policy.loosened().is_empty());
         assert!(policy.validate().is_empty());
         assert_eq!(policy.matching_preset(), Some(Preset::Strict));
-        assert!(!policy.allows(Profile::ReadOnly));
+        assert!(policy.allows(Profile::ReadOnly));
+        assert!(!policy.allows(Profile::Debug));
         const { assert!(SESSION_ENDS_ON_WINDOW_CLOSE) };
         assert_eq!(policy.agent_secrets, AgentSecrets::MetadataAndChecks);
         assert_eq!(MAX_SESSION_TTL_MINUTES, 480);
@@ -661,7 +663,7 @@ mod tests {
         assert!(policy.validate().is_empty());
         assert_eq!(policy.clone().normalized(), policy);
         assert_eq!(policy.matching_preset(), Some(Preset::Development));
-        assert_eq!(policy.loosened().len(), 9);
+        assert_eq!(policy.loosened().len(), 8);
         assert!(!policy.hide_secret_values);
         assert_eq!(
             policy.effective_agent_secrets(),
@@ -674,14 +676,31 @@ mod tests {
 
     #[test]
     fn custom_values_match_no_preset() {
+        // Turning agent access off is stricter, not looser.
         let policy = ContextPolicy {
-            mcp_enabled: true,
+            mcp_enabled: false,
             ..ContextPolicy::strict()
         };
         assert_eq!(policy.matching_preset(), None);
-        assert_eq!(policy.loosened(), [Loosened::McpEnabled]);
-        assert!(policy.allows(Profile::ReadOnly));
-        assert!(!policy.allows(Profile::Debug));
+        assert!(policy.loosened().is_empty());
+        assert!(!policy.allows(Profile::ReadOnly));
+    }
+
+    #[test]
+    fn agent_access_defaults_on_but_stored_off_stays_off() {
+        // A stored entry without the field reads as the default: on.
+        let missing: ContextPolicy =
+            serde_json::from_str(r#"{"session_ttl_minutes": 20}"#).unwrap();
+        assert!(missing.mcp_enabled);
+        // An explicit choice made before #9 is kept.
+        let off: ContextPolicy = serde_json::from_str(r#"{"mcp_enabled": false}"#).unwrap();
+        assert!(!off.mcp_enabled);
+        // And it is stored, since it differs from the default.
+        let mut settings = SecuritySettings::default();
+        let key = ContextKey::new("prod", "https://prod.example.com");
+        settings.set_policy(&key, off);
+        assert_eq!(settings.contexts.len(), 1);
+        assert!(!settings.policy(&key).mcp_enabled);
     }
 
     #[test]
@@ -784,8 +803,8 @@ mod tests {
         );
         assert_eq!(policy.loosened(), [Loosened::SecretValues]);
         assert_eq!(policy.matching_preset(), None);
-        // Independent of the agent settings: MCP stays off.
-        assert!(!policy.allows(Profile::ReadOnly));
+        // Independent of the agent settings.
+        assert!(policy.allows(Profile::ReadOnly));
         assert!(ContextPolicy::development().allows_secret(SecretAction::Show));
     }
 
@@ -945,11 +964,7 @@ mod tests {
             },
         );
         let policy = settings.policy(&key);
-        assert_eq!(
-            policy.loosened(),
-            [Loosened::McpEnabled],
-            "protection is stricter"
-        );
+        assert!(policy.loosened().is_empty(), "protection is stricter");
         assert!(
             settings
                 .raise_ceiling(&key, (Profile::Deploy, true, true), "s", "", "t")
@@ -997,14 +1012,14 @@ mod tests {
         settings.set_policy(
             &key,
             ContextPolicy {
-                mcp_enabled: true,
+                mcp_enabled: false,
                 exec: ExecMode::InteractiveShell,
                 ..ContextPolicy::strict()
             },
         );
         assert_eq!(settings.contexts.len(), 1);
         let stored = settings.policy(&key);
-        assert!(stored.mcp_enabled);
+        assert!(!stored.mcp_enabled);
         assert_eq!(stored.exec, ExecMode::Disabled);
     }
 

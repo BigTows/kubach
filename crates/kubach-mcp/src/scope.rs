@@ -240,21 +240,20 @@ mod tests {
     }
 
     #[test]
-    fn disabled_by_default() {
-        let err = SessionScope::new(
-            &spec(&["web"], Profile::ReadOnly),
-            &SecurityPolicy::default(),
-        )
-        .unwrap_err();
+    fn disabled_when_turned_off() {
+        // On by default (#9); the user may turn it off per context.
+        let policy = SecurityPolicy {
+            mcp_enabled: false,
+            ..SecurityPolicy::default()
+        };
+        let err = SessionScope::new(&spec(&["web"], Profile::ReadOnly), &policy).unwrap_err();
         assert_eq!(err, ScopeError::Disabled("minikube".into()));
     }
 
     #[test]
     fn profile_cannot_exceed_settings() {
-        let policy = SecurityPolicy {
-            mcp_enabled: true,
-            ..SecurityPolicy::default()
-        };
+        let policy = SecurityPolicy::default();
+        assert!(policy.mcp_enabled);
         assert!(matches!(
             SessionScope::new(&spec(&["web"], Profile::Debug), &policy),
             Err(ScopeError::ProfileTooBroad { .. })
