@@ -113,6 +113,19 @@ pub struct ForwardInfo {
     /// Holds its local port but forwards nothing (see
     /// [`PortForwardManager::set_paused`]).
     pub paused: bool,
+    /// The AI agent's session that opened it (#17); `None` for the user's
+    /// own forwards.
+    pub agent: Option<ForwardAgent>,
+}
+
+/// Who opened a forward through MCP (#17), for the "Port forwards" screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardAgent {
+    /// The kubeconfig context of the session.
+    pub context: String,
+    /// The MCP client's self-reported name.
+    pub client: String,
+    pub session: String,
 }
 
 /// Health of a forward, derived from its most recent connection.
@@ -151,7 +164,21 @@ impl PortForwardManager {
         port: u16,
         local_port: impl Into<LocalPort>,
     ) -> Result<ForwardInfo, StreamError> {
-        self.start_source(client, source, port, local_port.into(), false)
+        self.start_source(client, source, port, local_port.into(), false, None)
+            .await
+    }
+
+    /// Like [`start`](Self::start), for an AI agent's session (#17): the
+    /// forward is marked as the agent's. Same listener, same `127.0.0.1`.
+    pub async fn start_for_agent(
+        &self,
+        client: &Client,
+        source: &ForwardSource,
+        port: u16,
+        local_port: impl Into<LocalPort>,
+        agent: ForwardAgent,
+    ) -> Result<ForwardInfo, StreamError> {
+        self.start_source(client, source, port, local_port.into(), false, Some(agent))
             .await
     }
 
@@ -165,7 +192,7 @@ impl PortForwardManager {
         port: u16,
         local_port: impl Into<LocalPort>,
     ) -> Result<ForwardInfo, StreamError> {
-        self.start_source(client, source, port, local_port.into(), true)
+        self.start_source(client, source, port, local_port.into(), true, None)
             .await
     }
 
@@ -176,6 +203,7 @@ impl PortForwardManager {
         port: u16,
         local_port: LocalPort,
         paused: bool,
+        agent: Option<ForwardAgent>,
     ) -> Result<ForwardInfo, StreamError> {
         let api: Api<Pod> = Api::namespaced(client.clone(), &source.namespace);
         let target = resolve_in(&api, source, port).await?;
@@ -185,6 +213,7 @@ impl PortForwardManager {
             source_port: port,
             pod: target.pod.clone(),
             remote_port: target.port,
+            agent,
         };
         let connector = source_connector(api, source.clone(), port, target);
         self.start_with(route, local_port, connector, paused)
@@ -289,6 +318,7 @@ struct Route {
     source_port: u16,
     pod: String,
     remote_port: u16,
+    agent: Option<ForwardAgent>,
 }
 
 #[derive(Default)]
@@ -323,6 +353,7 @@ impl Registry {
             error_count: 0,
             last_error: None,
             paused,
+            agent: route.agent,
         };
         self.forwards.insert(
             id,
@@ -600,6 +631,7 @@ mod tests {
             source_port: port,
             pod: pod.into(),
             remote_port: port,
+            agent: None,
         }
     }
 
@@ -833,6 +865,29 @@ mod tests {
         assert_eq!(roundtrip(info.local_addr, b"again").await, b"again");
         assert_eq!(manager.get(info.id).unwrap().local_addr.port(), port);
         assert!(!manager.set_paused(info.id + 1, true));
+    }
+
+    #[tokio::test]
+    async fn an_agent_forward_is_marked_and_listens_on_loopback_only() {
+        let manager = PortForwardManager::new();
+        let agent = ForwardAgent {
+            context: "minikube".into(),
+            client: "agent".into(),
+            session: "s1".into(),
+        };
+        let route = Route {
+            agent: Some(agent.clone()),
+            ..route("web", 80)
+        };
+        let info = manager
+            .start_with(route, 0, echo_connector(), false)
+            .unwrap();
+        assert_eq!(
+            info.local_addr.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(manager.get(info.id).unwrap().agent, Some(agent));
+        assert_eq!(roundtrip(info.local_addr, b"ok").await, b"ok");
     }
 
     #[tokio::test]

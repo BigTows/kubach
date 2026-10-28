@@ -18,6 +18,7 @@ agent-title-read = 允许代理读取？
 agent-title-reveal = 向代理显示 Secret？
 agent-title-modify = 允许代理进行更改？
 agent-title-exec = 运行代理的命令？
+agent-title-port-forward = 为代理打开端口转发？
 agent-title-access = 给予代理更多权限？
 agent-title-helm-install = 安装代理的 Helm release？
 agent-title-helm-upgrade = 升级代理的 Helm release？

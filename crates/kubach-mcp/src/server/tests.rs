@@ -386,6 +386,7 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
             ("get_logs", json!({"pod": "web-0", "namespace": ns})),
             ("top_pods", json!({"namespace": ns})),
             ("exec", json!({"pod": "web-0", "namespace": ns, "command": ["id"]})),
+            ("port_forward_start", json!({"target": "pod/web-0", "port": 8080, "namespace": ns})),
             ("scale", json!({"kind": "Deployment", "name": "web", "namespace": ns, "replicas": 5})),
             ("rollout_restart", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
             ("delete_resource", json!({"kind": "Deployment", "name": "web", "namespace": ns})),

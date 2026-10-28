@@ -21,6 +21,7 @@ pub mod access;
 pub mod audit;
 pub mod bridge;
 pub mod confirm;
+pub mod forwards;
 pub mod grants;
 pub mod helm_tools;
 pub mod hosted;

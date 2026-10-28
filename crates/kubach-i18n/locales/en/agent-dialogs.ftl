@@ -23,6 +23,7 @@ agent-title-read = Allow the agent to read?
 agent-title-reveal = Reveal a Secret to the agent?
 agent-title-modify = Allow the agent to make changes?
 agent-title-exec = Run the agent's command?
+agent-title-port-forward = Open the agent's port-forward?
 agent-title-access = Give the agent more access?
 agent-title-helm-install = Install the agent's Helm release?
 agent-title-helm-upgrade = Upgrade the agent's Helm release?
