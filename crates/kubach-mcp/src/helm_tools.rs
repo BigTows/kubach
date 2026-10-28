@@ -9,9 +9,12 @@
 //! runs with live phases → result`.
 //!
 //! Boundaries:
-//! - the namespace comes from the session: `--namespace` is forced, every
-//!   object of the dry run must land in it, `--create-namespace` only for a
-//!   namespace the session may change;
+//! - the namespace comes from the session: `--namespace` is forced,
+//!   `--create-namespace` only for the release namespace and only where
+//!   the session may change it. An object of the chart in another
+//!   namespace (#21) needs the session's rights there (`read(ns)`,
+//!   `modify(ns)`, set up as for any tool) and the user's explicit tick,
+//!   and under a temporary ServiceAccount the user's credentials as below;
 //! - helm acts under the namespace's identity: a temporary ServiceAccount's
 //!   short-lived token through `HELM_KUBETOKEN` (its Role widened for helm
 //!   only while the call runs), the administrator's identity through
@@ -21,7 +24,8 @@
 //! - cluster-scoped objects of a chart (CRDs, ClusterRoles, webhooks, PVs,
 //!   StorageClasses…) and RBAC inside the namespace need the user's
 //!   explicit tick in the dialog. A temporary ServiceAccount cannot create
-//!   them, so under one Kubach finds them first without the cluster —
+//!   them (nor anything in another namespace, #21), so under one Kubach
+//!   finds them first without the cluster —
 //!   `helm template` for install and upgrade (plus the current revision of
 //!   an upgrade), the revision's manifest for rollback and uninstall — and
 //!   asks the user to run this one call with their own kubeconfig
@@ -97,9 +101,9 @@ pub const USER_IDENTITY: &str =
     "user: your kubeconfig credentials, allowed for this helm call only";
 
 /// Why such a call runs as the user, for the audit log.
-const USER_REASON: &str = "the chart has cluster-scoped objects or RBAC that the namespace's \
-                           temporary ServiceAccount cannot create; the user allowed this one call \
-                           under their own credentials";
+const USER_REASON: &str = "the chart has cluster-scoped objects, RBAC or objects in other \
+                           namespaces that the namespace's temporary ServiceAccount cannot create; \
+                           the user allowed this one call under their own credentials";
 
 /// What the session knows about the user's `helm`: the binary Kubach uses
 /// (settings, `PATH` or downloaded), the kubeconfig files of the context
@@ -184,9 +188,14 @@ pub struct HelmChange {
     #[serde(default)]
     pub credentials: HelmCredentials,
     /// Why the user's credentials are asked for: the cluster-scoped
-    /// objects and RBAC a temporary ServiceAccount cannot create or delete.
+    /// objects, RBAC and objects in other namespaces a temporary
+    /// ServiceAccount cannot create or delete.
     #[serde(default)]
     pub user_objects: Vec<String>,
+    /// Namespaces besides the release's that the call changes (#21), each
+    /// allowed to the session (`modify(ns)`) before the user is asked.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 // ------------------------------------------------------------- arguments
@@ -400,12 +409,67 @@ pub(crate) struct Preview {
     /// `(group, plural)` of the namespaced objects, for the Role of a
     /// temporary ServiceAccount.
     pub kinds: Vec<(String, String)>,
+    /// Objects in namespaces other than the release's (#21).
+    pub elsewhere: Vec<Elsewhere>,
 }
 
-/// Checks the objects a chart renders: each must land in `namespace`;
-/// cluster-scoped objects and RBAC inside the namespace are findings the
-/// user ticks, and refused outright under a temporary ServiceAccount,
-/// whose namespaced Role cannot create them anyway.
+/// An object of a chart in a namespace other than the release's (#21).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Elsewhere {
+    pub namespace: String,
+    /// `Role name (namespace other)`.
+    pub object: String,
+}
+
+/// What a temporary ServiceAccount cannot do among a call's manifests
+/// (#18), and the objects in other namespaces (#21), each once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Scan {
+    pub findings: Vec<Finding>,
+    pub elsewhere: Vec<Elsewhere>,
+}
+
+/// The namespaces of `elsewhere`, sorted, each once.
+pub(crate) fn other_namespaces<'a>(
+    elsewhere: impl IntoIterator<Item = &'a Elsewhere>,
+) -> Vec<String> {
+    let mut namespaces: Vec<String> = elsewhere
+        .into_iter()
+        .map(|object| object.namespace.clone())
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces
+}
+
+/// The release namespace first, then the others a call changes: what the
+/// audit log records (#21).
+pub(crate) fn touched(namespace: &str, others: &[String]) -> Vec<String> {
+    std::iter::once(namespace.to_owned())
+        .chain(others.iter().filter(|other| *other != namespace).cloned())
+        .collect()
+}
+
+/// What the agent is told when the session may not change `other` (#21).
+pub(crate) fn elsewhere_refusal(
+    other: &str,
+    namespace: &str,
+    objects: &[String],
+    why: &str,
+) -> String {
+    format!(
+        "the chart puts {} into namespace {other}, outside the release namespace {namespace}; \
+         this call needs the right to change {other} and does not have it: {why}. Nothing ran. \
+         Change the chart's values so these go into {namespace} (for example the namespace of \
+         leader election), or ask the user to do it from Kubach's Helm screen",
+        objects.join(", ")
+    )
+}
+
+/// Checks the objects a chart renders. Cluster-scoped objects, RBAC
+/// inside the namespace and objects in other namespaces (#21) are
+/// findings the user ticks; under a temporary ServiceAccount, whose
+/// namespaced Role cannot create them anyway, they are refused outright.
 pub(crate) fn check_objects(
     resources: &[ManifestResource],
     namespace: &str,
@@ -423,26 +487,63 @@ pub(crate) fn check_objects(
             Some(kind) => !kind.namespaced,
             None => CLUSTER_KINDS.contains(&resource.kind.as_str()),
         };
+        let elsewhere = match resource.namespace.as_deref() {
+            Some(other) if !cluster_scoped && other != namespace => Some(other),
+            _ => None,
+        };
+        let rbac = !cluster_scoped
+            && matches!(resource.kind.as_str(), "Role" | "RoleBinding")
+            && group == "rbac.authorization.k8s.io";
         let shown = if cluster_scoped {
             format!("{} {} (cluster-scoped)", resource.kind, resource.name)
+        } else if let Some(other) = elsewhere {
+            format!("{} {} (namespace {other})", resource.kind, resource.name)
         } else {
             format!("{} {}", resource.kind, resource.name)
         };
-        if !cluster_scoped
-            && let Some(other) = resource.namespace.as_deref()
-            && other != namespace
-        {
-            return Err(Denial::new(
-                DenialCode::Namespace,
-                format!(
-                    "the chart puts {} {} into namespace {other}; this call may only touch \
-                     {namespace}. Change the chart's values so everything goes into the \
-                     release namespace",
-                    resource.kind, resource.name
-                ),
-            ));
-        }
-        if cluster_scoped {
+        if let Some(other) = elsewhere {
+            if !crate::names::is_dns_label(other) {
+                return Err(Denial::new(
+                    DenialCode::Namespace,
+                    format!(
+                        "the chart puts {} {} into {other:?}, which is not a namespace name",
+                        resource.kind, resource.name
+                    ),
+                ));
+            }
+            if mode == SessionMode::TemporaryServiceAccount {
+                return Err(Denial::new(
+                    DenialCode::Namespace,
+                    format!(
+                        "the server-side dry run shows {} {} in namespace {other}, which helm \
+                         template did not render; in {namespace} helm runs as the session's \
+                         ServiceAccount, which cannot change another namespace. Change the \
+                         values so it goes into {namespace}, or ask the user to install it from \
+                         Kubach's Helm screen",
+                        resource.kind, resource.name
+                    ),
+                ));
+            }
+            preview.elsewhere.push(Elsewhere {
+                namespace: other.to_owned(),
+                object: shown.clone(),
+            });
+            preview.findings.push(Finding {
+                document: None,
+                path: shown.clone(),
+                message: if rbac {
+                    format!(
+                        "grants rights in namespace {other}, outside the release namespace \
+                         {namespace}"
+                    )
+                } else {
+                    format!(
+                        "in namespace {other}, outside the release namespace {namespace}: \
+                         refused unless you allow it here"
+                    )
+                },
+            });
+        } else if cluster_scoped {
             if mode == SessionMode::TemporaryServiceAccount {
                 return Err(Denial::new(
                     DenialCode::ClusterScoped,
@@ -463,16 +564,15 @@ pub(crate) fn check_objects(
                 message: "cluster-scoped object of the chart: refused unless you allow it here"
                     .into(),
             });
-        } else if matches!(resource.kind.as_str(), "Role" | "RoleBinding")
-            && group == "rbac.authorization.k8s.io"
-        {
+        } else if rbac {
             if mode == SessionMode::TemporaryServiceAccount {
                 return Err(Denial::new(
                     DenialCode::ForbiddenKind,
                     format!(
                         "the server-side dry run shows {} {}, which helm template did not \
-                         render; the session's ServiceAccount cannot grant RBAC rights. Turn it off in the values (rbac.create: false) or ask the \
-                         user to install it from Kubach's Helm screen",
+                         render; the session's ServiceAccount cannot grant RBAC rights. Turn it \
+                         off in the values (rbac.create: false) or ask the user to install it \
+                         from Kubach's Helm screen",
                         resource.kind, resource.name
                     ),
                 ));
@@ -483,7 +583,10 @@ pub(crate) fn check_objects(
                 message: "grants rights inside the namespace".into(),
             });
         }
-        if !cluster_scoped && let Some(kind) = served {
+        if !cluster_scoped
+            && elsewhere.is_none()
+            && let Some(kind) = served
+        {
             let key = (kind.api.group.clone(), kind.api.plural.clone());
             if !preview.kinds.contains(&key) {
                 preview.kinds.push(key);
@@ -494,16 +597,15 @@ pub(crate) fn check_objects(
     Ok(preview)
 }
 
-/// The cluster-scoped objects and RBAC of `manifests` (#18): what a
-/// temporary ServiceAccount cannot create or delete, checked as for the
-/// user (an object in another namespace is still refused). Each object
-/// once, in order.
+/// The cluster-scoped objects, RBAC and objects in other namespaces of
+/// `manifests` (#18, #21): what a temporary ServiceAccount cannot create
+/// or delete, checked as for the user. Each object once, in order.
 pub(crate) fn beyond_service_account(
     manifests: &[&str],
     namespace: &str,
     catalog: &ApiCatalog,
-) -> Result<Vec<Finding>, Denial> {
-    let mut findings: Vec<Finding> = Vec::new();
+) -> Result<Scan, Denial> {
+    let mut scan = Scan::default();
     for manifest in manifests {
         let preview = check_objects(
             &manifest_resources(manifest),
@@ -512,16 +614,22 @@ pub(crate) fn beyond_service_account(
             SessionMode::ClientOnly,
         )?;
         for finding in preview.findings {
-            if !findings.iter().any(|known| known.path == finding.path) {
-                findings.push(finding);
+            if !scan.findings.iter().any(|known| known.path == finding.path) {
+                scan.findings.push(finding);
+            }
+        }
+        for object in preview.elsewhere {
+            if !scan.elsewhere.contains(&object) {
+                scan.elsewhere.push(object);
             }
         }
     }
-    Ok(findings)
+    Ok(scan)
 }
 
 /// Whether a call must ask for the user's credentials (#18): only under a
-/// temporary ServiceAccount, and only for objects it cannot handle.
+/// temporary ServiceAccount, and only for objects it cannot handle —
+/// objects in other namespaces among them (#21).
 /// Client-only and impersonated namespaces keep their own identity and
 /// the usual tick per finding.
 pub(crate) fn needs_user_credentials(mode: SessionMode, findings: &[Finding]) -> bool {
@@ -533,8 +641,9 @@ pub(crate) fn user_refusal(objects: &[String], reason: Option<&str>) -> String {
     format!(
         "the user did not allow this helm call to run with their own credentials{}. Nothing ran. \
          The namespace's temporary ServiceAccount cannot create or delete: {}. Turn these off \
-         in the values (CRDs: crds.enabled/installCRDs false; RBAC: rbac.create false) and call \
-         again, or ask the user to do it from Kubach's Helm screen",
+         in the values (CRDs: crds.enabled/installCRDs false; RBAC: rbac.create false; objects \
+         in other namespaces: move them into the release namespace) and call again, or ask the \
+         user to do it from Kubach's Helm screen",
         reason.map(|r| format!(" ({r})")).unwrap_or_default(),
         objects.join(", ")
     )
@@ -867,15 +976,22 @@ fn require_binary(env: &HelmEnv) -> Result<PathBuf, ToolError> {
         .ok_or_else(|| helm_error(HelmCliError::NotInstalled))
 }
 
-/// Manifests diffed with Secret values and sensitive env masked.
-fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
-    let diff = unified_diff(
-        &masked_manifest(old),
-        &masked_manifest(new),
-        old_label,
-        new_label,
-    );
-    truncate(&diff, 64 * 1024).into_owned()
+/// Manifests diffed with Secret values and sensitive env masked. Parsed
+/// on the blocking pool: the deep schemas of a chart's CRDs overflowed the
+/// async worker's stack on upgrade (#21), as in [`preview_from`].
+async fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
+    let (old, new) = (old.to_owned(), new.to_owned());
+    let (old_label, new_label) = (old_label.to_owned(), new_label.to_owned());
+    kubach_core::runtime::blocking(move || {
+        let diff = unified_diff(
+            &masked_manifest(&old),
+            &masked_manifest(&new),
+            &old_label,
+            &new_label,
+        );
+        truncate(&diff, 64 * 1024).into_owned()
+    })
+    .await
 }
 
 /// What the agent is told after a change: status, revision, objects and
@@ -1109,6 +1225,11 @@ async fn approve(
             _ => format!(" ({})", change.chart),
         }
     );
+    let summary = if change.namespaces.is_empty() {
+        summary
+    } else {
+        format!("{summary}, also changing {}", change.namespaces.join(", "))
+    };
     let summary = match change.credentials {
         HelmCredentials::Session => summary,
         HelmCredentials::AskUser => format!("{summary} with your own kubeconfig credentials"),
@@ -1194,17 +1315,11 @@ async fn preview_from(
     .map_err(ToolError::from)
 }
 
-/// What the namespace's temporary ServiceAccount could not do among
-/// `manifests` (#18); empty for any other identity. Parsed on the
+/// What a temporary ServiceAccount could not do among `manifests` (#18)
+/// and their objects in other namespaces (#21), whatever the namespace's
+/// identity: [`needs_user_credentials`] decides by the mode. Parsed on the
 /// blocking pool, as in [`preview_from`].
-async fn user_findings(
-    ctx: &Ctx<'_>,
-    namespace: &str,
-    manifests: &[&str],
-) -> Result<Vec<Finding>, ToolError> {
-    if ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
-        return Ok(Vec::new());
-    }
+async fn scan(ctx: &Ctx<'_>, namespace: &str, manifests: &[&str]) -> Result<Scan, ToolError> {
     let manifests: Vec<String> = manifests.iter().map(|text| (*text).to_owned()).collect();
     let namespace = namespace.to_owned();
     let catalog = ctx.session.catalog().clone();
@@ -1216,14 +1331,61 @@ async fn user_findings(
     .map_err(ToolError::from)
 }
 
-/// `Kind name` of each object `helm template` rendered, parsed on the
-/// blocking pool.
-async fn rendered_objects(rendered: Option<&str>) -> Vec<String> {
+/// Sets up the session's rights in each namespace besides the release's
+/// that the chart changes (#21): the same `read(ns)` and `modify(ns)` as
+/// any tool in that namespace, through [`authorize`] (a pinned session
+/// refuses it). Done before the user is asked about the call and before
+/// anything changes; a refusal names the objects. The call's namespace
+/// for the audit log stays the release's.
+async fn authorize_elsewhere(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    release: &str,
+    elsewhere: &[Elsewhere],
+) -> Result<(), ToolError> {
+    for other in other_namespaces(elsewhere) {
+        let result = authorize(
+            ctx,
+            &Request::HelmChange {
+                namespace: Some(other.clone()),
+                release: release.to_owned(),
+            },
+        )
+        .await;
+        *sync::lock(&ctx.namespace) = Some(allowed.namespace.clone());
+        let Err(error) = result else {
+            continue;
+        };
+        let objects: Vec<String> = elsewhere
+            .iter()
+            .filter(|object| object.namespace == other)
+            .map(|object| object.object.clone())
+            .collect();
+        let message = elsewhere_refusal(&other, &allowed.namespace, &objects, &error.message());
+        return Err(match error {
+            ToolError::Denied(denial) => Denial::new(denial.code, message).into(),
+            ToolError::Rejected(_) => ToolError::Rejected(Some(message)),
+            ToolError::Api { code, .. } => ToolError::Api { code, message },
+            ToolError::Failed(_) => ToolError::Failed(message),
+        });
+    }
+    Ok(())
+}
+
+/// `Kind name` of each object `helm template` rendered, with the
+/// namespace of one outside `namespace`, parsed on the blocking pool.
+async fn rendered_objects(rendered: Option<&str>, namespace: &str) -> Vec<String> {
     let text = rendered.unwrap_or_default().to_owned();
+    let namespace = namespace.to_owned();
     kubach_core::runtime::blocking(move || {
         manifest_resources(&text)
             .iter()
-            .map(|r| format!("{} {}", r.kind, r.name))
+            .map(|r| match r.namespace.as_deref() {
+                Some(other) if other != namespace => {
+                    format!("{} {} (namespace {other})", r.kind, r.name)
+                }
+                _ => format!("{} {}", r.kind, r.name),
+            })
             .collect()
     })
     .await
@@ -1296,19 +1458,33 @@ fn bullet_list(prefix: &str, objects: &[String]) -> String {
         .join("\n")
 }
 
-/// A changed release, with the audit record of a call that ran under the
-/// user's credentials (#18).
-fn changed_as(text: String, as_user: bool, findings: &[Finding]) -> ToolOutput {
+/// A changed release, with its audit record: every namespace the call
+/// changed (#21) and, for a call under the user's credentials, why (#18).
+fn changed_as(
+    text: String,
+    as_user: bool,
+    findings: &[Finding],
+    namespaces: Vec<String>,
+) -> ToolOutput {
+    let mut audit = json!({ "namespaces": namespaces });
+    if as_user {
+        audit["ranAs"] = json!("user");
+        audit["why"] = json!(USER_REASON);
+        audit["objects"] = json!(findings.iter().map(|f| f.path.as_str()).collect::<Vec<_>>());
+    }
     ToolOutput {
         text,
         confirmed: true,
-        audit: as_user.then(|| {
-            json!({
-                "ranAs": "user",
-                "why": USER_REASON,
-                "objects": findings.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
-            })
-        }),
+        audit: Some(audit),
+    }
+}
+
+/// The user's objects of a change: shown only when asked about (#18).
+fn user_objects(as_user: bool, findings: &[Finding]) -> Vec<String> {
+    if as_user {
+        findings.iter().map(|f| f.path.clone()).collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -1365,6 +1541,7 @@ pub(crate) async fn install(
         identity: String::new(),
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
+        namespaces: Vec::new(),
     };
     // Under a temporary ServiceAccount, the chart's cluster-scoped objects
     // and RBAC are found on the client first (#18).
@@ -1379,19 +1556,21 @@ pub(crate) async fn install(
         is_upgrade: false,
     };
     let rendered = rendered(ctx, &binary, &template).await;
-    let user = user_findings(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
-    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    let scan = scan(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
+    authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     if as_user {
-        let objects = rendered_objects(rendered.as_deref()).await;
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
             "Objects of helm template (rendered without the cluster):\n{}\n\n{DRY_RUN_NEXT}",
             bullet_list("+", &objects)
         );
         let change = HelmChange {
             objects,
+            namespaces: other_namespaces(&scan.elsewhere),
             ..base_change.clone()
         };
-        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+        ask_user_credentials(ctx, &env, &allowed, change, details, &scan.findings).await?;
     }
     let run = helm_run(ctx, &env, &namespace, as_user).await?;
     // The server-side dry run, under the namespace's identity or, allowed
@@ -1413,6 +1592,9 @@ pub(crate) async fn install(
     })
     .await?;
     let mut preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
+    // The dry run may show more than helm template did (#21).
+    authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere).await?;
+    let others = other_namespaces(scan.elsewhere.iter().chain(&preview.elsewhere));
     if a.create_namespace {
         preview
             .cluster
@@ -1436,7 +1618,8 @@ pub(crate) async fn install(
         } else {
             HelmCredentials::Session
         },
-        user_objects: user.iter().map(|f| f.path.clone()).collect(),
+        user_objects: user_objects(as_user, &scan.findings),
+        namespaces: others.clone(),
         ..base_change
     };
     let details = format!(
@@ -1475,7 +1658,8 @@ pub(crate) async fn install(
             &output,
         ),
         as_user,
-        &user,
+        &scan.findings,
+        touched(&namespace, &others),
     ))
 }
 
@@ -1563,6 +1747,7 @@ pub(crate) async fn upgrade(
         identity: String::new(),
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
+        namespaces: Vec::new(),
     };
     // Under a temporary ServiceAccount: what the new chart renders on the
     // client and what the current revision holds (an upgrade deletes what
@@ -1576,24 +1761,26 @@ pub(crate) async fn upgrade(
     };
     let rendered = rendered(ctx, &binary, &template).await;
     let current_manifest = release_manifest(&current);
-    let user = user_findings(
+    let scan = scan(
         ctx,
         &namespace,
         &[rendered.as_deref().unwrap_or_default(), &current_manifest],
     )
     .await?;
-    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     if as_user {
-        let objects = rendered_objects(rendered.as_deref()).await;
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
             "Objects of helm template (rendered without the cluster):\n{}\n\n{DRY_RUN_NEXT}",
             bullet_list("+", &objects)
         );
         let change = HelmChange {
             objects,
+            namespaces: other_namespaces(&scan.elsewhere),
             ..base_change.clone()
         };
-        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+        ask_user_credentials(ctx, &env, &allowed, change, details, &scan.findings).await?;
     }
     let run = helm_run(ctx, &env, &namespace, as_user).await?;
     let preview_release = with_helm_role(ctx, &namespace, &[], as_user, async {
@@ -1613,12 +1800,16 @@ pub(crate) async fn upgrade(
     })
     .await?;
     let preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
+    // The dry run may show more than helm template did (#21).
+    authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere).await?;
+    let others = other_namespaces(scan.elsewhere.iter().chain(&preview.elsewhere));
     let diff = masked_diff(
         current.manifest.expose(),
         preview_release.manifest.expose(),
         &format!("revision {}", current.revision),
         "after the upgrade",
-    );
+    )
+    .await;
     let change = HelmChange {
         version: Some(preview_release.chart.version.clone()),
         objects: preview.objects.clone(),
@@ -1629,7 +1820,8 @@ pub(crate) async fn upgrade(
         } else {
             HelmCredentials::Session
         },
-        user_objects: user.iter().map(|f| f.path.clone()).collect(),
+        user_objects: user_objects(as_user, &scan.findings),
+        namespaces: others.clone(),
         ..base_change
     };
     let details = if diff.trim().is_empty() {
@@ -1669,7 +1861,8 @@ pub(crate) async fn upgrade(
             &output,
         ),
         as_user,
-        &user,
+        &scan.findings,
+        touched(&namespace, &others),
     ))
 }
 
@@ -1705,20 +1898,23 @@ pub(crate) async fn rollback(
     .await?;
     // The revision rolled back to, and the current one: a rollback deletes
     // what the target no longer has (#18).
-    let user = user_findings(
+    let scan = scan(
         ctx,
         &namespace,
         &[&release_manifest(&target), &release_manifest(&current)],
     )
     .await?;
-    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let others = other_namespaces(&scan.elsewhere);
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     let preview = preview_from(ctx, &target, &namespace, as_user).await?;
     let diff = masked_diff(
         current.manifest.expose(),
         target.manifest.expose(),
         &format!("revision {}", current.revision),
         &format!("revision {}", target.revision),
-    );
+    )
+    .await;
     let identity = if as_user {
         USER_IDENTITY.to_owned()
     } else {
@@ -1741,6 +1937,7 @@ pub(crate) async fn rollback(
         identity,
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
+        namespaces: others.clone(),
     };
     let details = if diff.trim().is_empty() {
         "The rollback changes no object.".to_owned()
@@ -1750,7 +1947,7 @@ pub(crate) async fn rollback(
     // Nothing runs before this window: one question covers both the
     // user's credentials and the rollback.
     if as_user {
-        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+        ask_user_credentials(ctx, &env, &allowed, change, details, &scan.findings).await?;
     } else {
         approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     }
@@ -1780,7 +1977,8 @@ pub(crate) async fn rollback(
             &output,
         ),
         as_user,
-        &user,
+        &scan.findings,
+        touched(&namespace, &others),
     ))
 }
 
@@ -1809,8 +2007,10 @@ pub(crate) async fn uninstall(
     })
     .await?;
     // Uninstalling deletes the revision's cluster-scoped objects too (#18).
-    let user = user_findings(ctx, &namespace, &[&release_manifest(&current)]).await?;
-    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    let scan = scan(ctx, &namespace, &[&release_manifest(&current)]).await?;
+    authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let others = other_namespaces(&scan.elsewhere);
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     let preview = preview_from(ctx, &current, &namespace, as_user).await?;
     let identity = if as_user {
         USER_IDENTITY.to_owned()
@@ -1830,6 +2030,7 @@ pub(crate) async fn uninstall(
         identity,
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
+        namespaces: others.clone(),
     };
     let mut details = String::from("Objects deleted with the release:\n");
     for object in &preview.objects {
@@ -1839,7 +2040,7 @@ pub(crate) async fn uninstall(
         details.push_str("Its revisions stay (--keep-history).\n");
     }
     if as_user {
-        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+        ask_user_credentials(ctx, &env, &allowed, change, details, &scan.findings).await?;
     } else {
         approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     }
@@ -1862,7 +2063,8 @@ pub(crate) async fn uninstall(
     Ok(changed_as(
         result_text(HelmAction::Uninstall, None, &preview, &phases, &output),
         as_user,
-        &user,
+        &scan.findings,
+        touched(&namespace, &others),
     ))
 }
 

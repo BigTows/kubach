@@ -17,6 +17,11 @@
 //! temporary ServiceAccount: refused without the user's tick, installed
 //! and uninstalled with it. Its cluster-scoped objects are deleted at the
 //! end whatever happens; run it with `KUBACH_TEST_NAMESPACE=kubach-test-18`.
+//!
+//! `objects_in_another_namespace_run_as_the_user_only_with_consent` (#21)
+//! puts cert-manager's leader election Role into a second namespace
+//! (`<namespace>-b`); run it with `KUBACH_TEST_NAMESPACE=kubach-test-21`. It
+//! creates and deletes both namespaces itself.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -284,8 +289,8 @@ fn helm_changes(requests: &[ConfirmationRequest]) -> Vec<(HelmAction, HelmCreden
 
 /// Deletes what the cert-manager release may have left behind, through the
 /// user's credentials: its cluster-scoped objects above all.
-async fn clean_cert_manager(user: &Client, namespace: &str) {
-    let labels = ListParams::default().labels(&format!("app.kubernetes.io/instance={CM_RELEASE}"));
+async fn clean_cert_manager(user: &Client, namespace: &str, release: &str) {
+    let labels = ListParams::default().labels(&format!("app.kubernetes.io/instance={release}"));
     let dp = DeleteParams::default();
     macro_rules! wipe {
         ($api:expr) => {{
@@ -303,12 +308,12 @@ async fn clean_cert_manager(user: &Client, namespace: &str) {
     wipe!(Api::<Role>::namespaced(user.clone(), namespace));
     wipe!(Api::<RoleBinding>::namespaced(user.clone(), namespace));
     let secrets: Api<Secret> = Api::namespaced(user.clone(), namespace);
-    let storage = ListParams::default().labels(&format!("owner=helm,name={CM_RELEASE}"));
+    let storage = ListParams::default().labels(&format!("owner=helm,name={release}"));
     let _ = secrets.delete_collection(&dp, &storage).await;
     if let Ok(list) = secrets.list(&ListParams::default()).await {
         for secret in list {
             let name = secret.metadata.name.unwrap_or_default();
-            if name.starts_with(CM_RELEASE) {
+            if name.starts_with(release) {
                 let _ = secrets.delete(&name, &dp).await;
             }
         }
@@ -325,9 +330,9 @@ async fn clean_cert_manager(user: &Client, namespace: &str) {
 }
 
 /// Waits (at most two minutes) until no CRD of the release is left.
-async fn crds_gone(user: &Client) -> bool {
+async fn crds_gone(user: &Client, release: &str) -> bool {
     let crds: Api<CustomResourceDefinition> = Api::all(user.clone());
-    let labels = ListParams::default().labels(&format!("app.kubernetes.io/instance={CM_RELEASE}"));
+    let labels = ListParams::default().labels(&format!("app.kubernetes.io/instance={release}"));
     for _ in 0..60 {
         if crds
             .list(&labels)
@@ -380,8 +385,8 @@ async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
     let outcome = tokio::task::spawn_blocking(move || flow.join())
         .await
         .unwrap();
-    clean_cert_manager(&user, &namespace).await;
-    let gone = crds_gone(&user).await;
+    clean_cert_manager(&user, &namespace, CM_RELEASE).await;
+    let gone = crds_gone(&user, CM_RELEASE).await;
     if created {
         let _ = namespaces
             .delete(&namespace, &DeleteParams::default())
@@ -519,5 +524,238 @@ async fn cert_manager_flow(base: Config, context: String, namespace: String) {
         helm_changes(&confirmer.requests()).last(),
         Some(&(HelmAction::Uninstall, HelmCredentials::AskUser))
     );
+    session.close().await.unwrap();
+}
+
+const CM21_RELEASE: &str = "kubach-cm21";
+
+/// Waits (at most two minutes) until `name` is gone.
+async fn namespace_gone(namespaces: &Api<Namespace>, name: &str) -> bool {
+    for _ in 0..60 {
+        if namespaces.get_opt(name).await.is_ok_and(|ns| ns.is_none()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
+}
+
+/// Deletes the test's namespaces, and an empty one an earlier run of the
+/// #18 test left behind; waits for them at most two minutes each.
+async fn drop_namespaces(namespaces: &Api<Namespace>, names: &[&str]) -> bool {
+    let mut gone = true;
+    for name in names {
+        assert!(name.starts_with("kubach-test-"), "{name}");
+        if namespaces.get_opt(name).await.unwrap_or(None).is_some() {
+            let _ = namespaces.delete(name, &DeleteParams::default()).await;
+            gone &= namespace_gone(namespaces, name).await;
+        }
+    }
+    gone
+}
+
+/// cert-manager with its leader election Role and RoleBinding in a second
+/// namespace (#21), under the temporary ServiceAccount: the call runs as the
+/// user only with the tick, and every window names the other namespace.
+/// Run it with `KUBACH_TEST_NAMESPACE=kubach-test-21`; the second namespace
+/// is `kubach-test-21-b`. Both namespaces, the CRDs and the cluster-scoped
+/// objects are deleted at the start and at the end whatever happens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster, helm and quay.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn objects_in_another_namespace_run_as_the_user_only_with_consent() {
+    let (base, context, namespace) = config().await;
+    let other = format!("{namespace}-b");
+    let user = Client::try_from(base.clone()).unwrap();
+    let crds: Api<CustomResourceDefinition> = Api::all(user.clone());
+    // Only this test's own leftovers may be there; they go below.
+    let installed = crds.get_opt("certificates.cert-manager.io").await.unwrap();
+    assert!(
+        installed.is_none_or(|crd| {
+            crd.metadata
+                .labels
+                .unwrap_or_default()
+                .get("app.kubernetes.io/instance")
+                .is_some_and(|instance| instance == CM21_RELEASE)
+        }),
+        "cert-manager is installed on this cluster already; use another one"
+    );
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    // On a thread with a large stack: deleting CRDs returns them, and
+    // their deep schemas may not fit a test worker's stack.
+    let leftovers = |base: Config, namespace: String, other: String| {
+        let cleanup = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let user = Client::try_from(base).unwrap();
+                        clean_cert_manager(&user, &namespace, CM21_RELEASE).await;
+                        clean_cert_manager(&user, &other, CM21_RELEASE).await;
+                        crds_gone(&user, CM21_RELEASE).await
+                    })
+            })
+            .unwrap();
+        tokio::task::spawn_blocking(move || cleanup.join().unwrap_or(false))
+    };
+    leftovers(base.clone(), namespace.clone(), other.clone())
+        .await
+        .unwrap();
+    assert!(drop_namespaces(&namespaces, &[&namespace, &other, "kubach-test-18"]).await);
+    for name in [&namespace, &other] {
+        let object: Namespace =
+            serde_json::from_value(json!({"metadata": {"name": name}})).unwrap();
+        namespaces
+            .create(&Default::default(), &object)
+            .await
+            .unwrap();
+    }
+    let cleanup_base = base.clone();
+    let (flow_namespace, flow_other) = (namespace.clone(), other.clone());
+    let flow = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(other_namespace_flow(
+                base,
+                context,
+                flow_namespace,
+                flow_other,
+            ))
+    });
+    let outcome = tokio::task::spawn_blocking(move || flow.join())
+        .await
+        .unwrap();
+    let crds_cleaned = leftovers(cleanup_base, namespace.clone(), other.clone())
+        .await
+        .unwrap_or(false);
+    let dropped = drop_namespaces(&namespaces, &[&namespace, &other]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(crds_cleaned, "the CRDs of the release are still there");
+    assert!(dropped, "the test's namespaces are still there");
+}
+
+fn last_helm(confirmer: &UserTick) -> kubach_mcp::HelmChange {
+    confirmer
+        .requests()
+        .iter()
+        .rev()
+        .find_map(|request| match &request.kind {
+            RequestKind::Helm { helm } => Some((**helm).clone()),
+            _ => None,
+        })
+        .expect("a Helm window")
+}
+
+async fn other_namespace_flow(base: Config, context: String, namespace: String, other: String) {
+    let policy = SecurityPolicy {
+        mcp_enabled: true,
+        temporary_objects: true,
+        ..SecurityPolicy::default()
+    };
+    let spec = SessionSpec {
+        context,
+        server_url: base.cluster_url.to_string(),
+        namespaces: Vec::new(),
+        profile: Profile::Deploy,
+        ttl: Some(Duration::from_secs(900)),
+        hints: Vec::new(),
+    };
+    let session = Session::start(&base, &spec, &policy).await.unwrap();
+    let confirmer = Arc::new(UserTick {
+        allow_user: AtomicBool::new(false),
+        requests: Mutex::default(),
+    });
+    let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    server.set_helm(HelmEnv {
+        binary: kubach_core::settings::find_on_path("helm"),
+        kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        paths: HelmPaths::from_env(),
+    });
+    let user = Client::try_from(base.clone()).unwrap();
+    let roles: Api<Role> = Api::namespaced(user.clone(), &other);
+    let leader = format!("{CM21_RELEASE}-cert-manager-cainjector:leaderelection");
+    let shown = format!("Role {leader} (namespace {other})");
+    let values = format!(
+        "crds:\n  enabled: true\n  keep: false\nglobal:\n  leaderElection:\n    namespace: \
+         {other}\nstartupapicheck:\n  enabled: false\n"
+    );
+    let install = json!({
+        "release": CM21_RELEASE,
+        "chart": CERT_MANAGER,
+        "version": "v1.18.2",
+        "namespace": namespace,
+        "values": values,
+    });
+
+    // Without the tick: a refusal naming the object and its namespace,
+    // and nothing in either namespace.
+    let refused = server
+        .call("test", "helm_install", args(install.clone()))
+        .await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(refused.text.contains("did not allow"), "{}", refused.text);
+    assert!(refused.text.contains(&shown), "{}", refused.text);
+    let asked = last_helm(&confirmer);
+    assert_eq!(asked.credentials, HelmCredentials::AskUser);
+    assert_eq!(asked.namespaces, std::slice::from_ref(&other));
+    assert!(
+        asked.user_objects.contains(&shown),
+        "{:?}",
+        asked.user_objects
+    );
+    assert!(roles.get_opt(&leader).await.unwrap().is_none());
+
+    // With the tick: installed as the user, the Role lands in the other
+    // namespace, and the second window names it too.
+    confirmer.allow_user.store(true, Ordering::SeqCst);
+    call(&server, "helm_install", install).await;
+    let approved = last_helm(&confirmer);
+    assert_eq!(approved.credentials, HelmCredentials::User);
+    assert_eq!(approved.identity, USER_IDENTITY);
+    assert_eq!(approved.namespaces, std::slice::from_ref(&other));
+    assert!(approved.objects.contains(&shown), "{:?}", approved.objects);
+    assert!(roles.get_opt(&leader).await.unwrap().is_some());
+
+    // The upgrade of #21: the current revision and the new chart both put
+    // the Role into the other namespace.
+    let before = confirmer.requests().len();
+    call(
+        &server,
+        "helm_upgrade",
+        json!({"release": CM21_RELEASE, "namespace": namespace}),
+    )
+    .await;
+    assert_eq!(
+        helm_changes(&confirmer.requests()[before..]),
+        [
+            (HelmAction::Upgrade, HelmCredentials::AskUser),
+            (HelmAction::Upgrade, HelmCredentials::User),
+        ]
+    );
+    assert_eq!(
+        last_helm(&confirmer).namespaces,
+        std::slice::from_ref(&other)
+    );
+
+    // Uninstall: one window, as the user; the Role goes with the release.
+    call(
+        &server,
+        "helm_uninstall",
+        json!({"release": CM21_RELEASE, "namespace": namespace}),
+    )
+    .await;
+    let uninstall = last_helm(&confirmer);
+    assert_eq!(
+        (uninstall.action, uninstall.credentials),
+        (HelmAction::Uninstall, HelmCredentials::AskUser)
+    );
+    assert_eq!(uninstall.namespaces, std::slice::from_ref(&other));
+    assert!(roles.get_opt(&leader).await.unwrap().is_none());
     session.close().await.unwrap();
 }
