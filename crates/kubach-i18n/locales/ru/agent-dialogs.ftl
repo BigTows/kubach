@@ -21,6 +21,7 @@ agent-title-read = Разрешить агенту чтение?
 agent-title-reveal = Показать агенту Secret?
 agent-title-modify = Разрешить агенту изменения?
 agent-title-exec = Выполнить команду агента?
+agent-title-port-forward = Открыть port-forward агента?
 agent-title-access = Дать агенту больше доступа?
 agent-title-helm-install = Установить релиз Helm агента?
 agent-title-helm-upgrade = Обновить релиз Helm агента?

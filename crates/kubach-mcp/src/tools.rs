@@ -487,6 +487,7 @@ fn named_namespace(request: &Request) -> Option<&str> {
         | Request::Restart { namespace, .. }
         | Request::Delete { namespace, .. }
         | Request::Exec { namespace, .. }
+        | Request::PortForward { namespace, .. }
         | Request::SecretList { namespace, .. }
         | Request::SecretCheck { namespace, .. }
         | Request::SecretCompare { namespace, .. }
@@ -874,6 +875,9 @@ pub(crate) async fn run(
                 .clamp(1, MAX_EXEC_TIMEOUT);
             exec(ctx, &allowed, a.container.as_deref(), &a.command, timeout).await
         }
+        "port_forward_start" => crate::forwards::start(ctx, args).await,
+        "port_forward_list" => crate::forwards::list(ctx, args).await,
+        "port_forward_stop" => crate::forwards::stop(ctx, args).await,
         "list_secrets" => {
             let a: SecretListArgs = parse(args)?;
             let request = Request::SecretList {
@@ -1589,7 +1593,7 @@ async fn confirm(
     .await
 }
 
-async fn confirm_as(
+pub(crate) async fn confirm_as(
     ctx: &Ctx<'_>,
     kind: RequestKind,
     allowed: &Allowed,

@@ -2327,3 +2327,169 @@ fn custom_resources_are_asked_for() {
     };
     assert!(raised(Profile::ReadOnly, &strict_on(), crds, &widget).is_ok());
 }
+
+fn forward(target: &str, port: ForwardPortRef, local_port: Option<u16>) -> Request {
+    Request::PortForward {
+        namespace: None,
+        target: target.into(),
+        port,
+        local_port,
+    }
+}
+
+#[test]
+fn port_forward_needs_the_debug_level_and_always_a_confirmation() {
+    let request = forward("service/web", ForwardPortRef::Number(80), None);
+    // Below the debug level the user is asked for more access (#15).
+    assert_eq!(
+        denied(Profile::ReadOnly, request.clone()),
+        DenialCode::NeedsAccess
+    );
+    let scope = scope(Profile::ReadOnly);
+    let catalog = catalog();
+    let denial = open_policy(&scope, &catalog, false)
+        .check(&request)
+        .unwrap_err();
+    assert_eq!(denial.access.map(|a| a.profile), Some(Profile::Debug));
+    for profile in [Profile::Debug, Profile::Deploy] {
+        let allowed = check(profile, request.clone()).unwrap();
+        assert_eq!(allowed.confirmation, Confirmation::Required);
+        assert_eq!(allowed.namespace, NS);
+        assert_eq!(allowed.kind.unwrap().api.kind, "Service");
+        assert_eq!(allowed.name.as_deref(), Some("web"));
+    }
+    // A launch capped below debug never gets it.
+    let capped = crate::testutil::scope_capped(Profile::ReadOnly, &permissive(), &[NS]);
+    let denial = open_policy(&capped, &catalog, false)
+        .check(&request)
+        .unwrap_err();
+    assert_eq!(denial.code, DenialCode::Profile);
+}
+
+#[test]
+fn port_forward_needs_reading_the_namespace_only() {
+    let request = forward(
+        "pod/web-0",
+        ForwardPortRef::Name("http".into()),
+        Some(18080),
+    );
+    let scope = scope(Profile::Debug);
+    let catalog = catalog();
+    // Nothing yet: reading the namespace is set up first.
+    let fresh = Policy::new(
+        &scope,
+        &catalog,
+        false,
+        Grants::new(),
+        SessionMode::Impersonation,
+    );
+    let denial = fresh.check(&request).unwrap_err();
+    assert_eq!(denial.code, DenialCode::NeedsGrant);
+    assert_eq!(denial.grant, Some(Grant::read(NS)));
+    // With it, no `modify(ns)` is needed, even where the API server holds
+    // the boundary.
+    let reading = Policy::new(
+        &scope,
+        &catalog,
+        false,
+        grants(&[Grant::read(NS)]),
+        SessionMode::Impersonation,
+    );
+    let allowed = reading.check(&request).unwrap();
+    assert_eq!(
+        reading.required_grants(&request, &allowed),
+        vec![Grant::read(NS)]
+    );
+    // A refused read is final.
+    let mut refused = Grants::new();
+    refused.set(Grant::read(NS), GrantState::Denied);
+    let policy = Policy::new(&scope, &catalog, false, refused, SessionMode::ClientOnly);
+    assert_eq!(
+        policy.check(&request).unwrap_err().code,
+        DenialCode::GrantDenied
+    );
+    // A closed session forwards nothing.
+    assert_eq!(
+        open_policy(&scope, &catalog, true)
+            .check(&request)
+            .unwrap_err()
+            .code,
+        DenialCode::SessionEnded
+    );
+}
+
+#[test]
+fn port_forward_targets_ports_and_namespaces_are_checked() {
+    let number = ForwardPortRef::Number(80);
+    for target in [
+        "pod/web-0",
+        "pods/web-0",
+        "po/web-0",
+        "service/web",
+        "svc/web",
+        "Service/web",
+        "deployment/api",
+        "deploy/api",
+    ] {
+        assert!(
+            check(Profile::Debug, forward(target, number.clone(), None)).is_ok(),
+            "{target}"
+        );
+    }
+    for target in [
+        "web",
+        "secret/db",
+        "statefulset/db",
+        "node/n1",
+        "pod/",
+        "pod/../../kube-system/pods/x",
+        "pod/Web",
+        "/web",
+    ] {
+        let code = denied(Profile::Debug, forward(target, number.clone(), None));
+        assert!(
+            matches!(code, DenialCode::InvalidInput | DenialCode::InvalidName),
+            "{target}: {code:?}"
+        );
+    }
+    for port in [
+        ForwardPortRef::Number(0),
+        ForwardPortRef::Name(String::new()),
+        ForwardPortRef::Name("HTTP".into()),
+        ForwardPortRef::Name("a-very-long-port-name".into()),
+        ForwardPortRef::Name("80".into()),
+        ForwardPortRef::Name("-http".into()),
+        ForwardPortRef::Name("ht--tp".into()),
+    ] {
+        assert_eq!(
+            denied(Profile::Debug, forward("pod/web-0", port.clone(), None)),
+            DenialCode::InvalidInput,
+            "{port}"
+        );
+    }
+    // Well-known local ports stay with the system and the user.
+    for local in [0, 22, 80, 1023] {
+        assert_eq!(
+            denied(
+                Profile::Debug,
+                forward("pod/web-0", number.clone(), Some(local))
+            ),
+            DenialCode::InvalidInput
+        );
+    }
+    assert!(
+        check(
+            Profile::Debug,
+            forward("pod/web-0", number.clone(), Some(1024))
+        )
+        .is_ok()
+    );
+    // Another namespace than the pinned one is refused.
+    let elsewhere = Request::PortForward {
+        namespace: Some("kube-system".into()),
+        target: "svc/kube-dns".into(),
+        port: number,
+        local_port: None,
+    };
+    assert_eq!(denied(Profile::Debug, elsewhere), DenialCode::Namespace);
+}

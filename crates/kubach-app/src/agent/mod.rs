@@ -1161,6 +1161,11 @@ impl AgentState {
                             this.audit.clone(),
                         );
                         server.set_helm(helm);
+                        // The agent's forwards show on the "Port
+                        // forwards" screen (#17).
+                        if let Some(forwards) = crate::dock::forwards(cx) {
+                            server.set_forward_manager(forwards.read(cx).manager());
+                        }
                         // The previous HTTP session ends; the shared
                         // handler serves the new one from now on.
                         close_all(this.session.take().into_iter().collect());
@@ -1247,6 +1252,9 @@ impl AgentState {
         let helm =
             AppSettings::try_global(cx).map(|settings| helm_env(settings.read(cx).get(), false));
         let pid = request.pid;
+        // The agent's forwards run here and show on the "Port forwards"
+        // screen (#17).
+        let forward_manager = crate::dock::forwards(cx).map(|forwards| forwards.read(cx).manager());
         let task = runtime::spawn(async move {
             // Who asks, as far as the OS tells: the pid comes from the
             // process itself.
@@ -1263,6 +1271,9 @@ impl AgentState {
                 let server = McpServer::new(session.clone(), confirmer.clone(), audit);
                 if let Some(helm) = helm {
                     server.set_helm(helm);
+                }
+                if let Some(manager) = forward_manager {
+                    server.set_forward_manager(manager);
                 }
                 // `--grant-read` of the process, under the same rules as there.
                 if plan.grant_read

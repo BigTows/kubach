@@ -50,6 +50,27 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 /// Longest exec command, all arguments together, in bytes. Keeps the
 /// confirmation dialog readable in full (#194).
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
+/// Lowest local port an agent's port-forward may take (#17): well-known
+/// ports stay with the system and the user.
+pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
+
+/// The remote port of a port-forward as the agent names it: a number, or
+/// a port name (`http`) looked up on the target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ForwardPortRef {
+    Number(u16),
+    Name(String),
+}
+
+impl fmt::Display for ForwardPortRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Number(port) => write!(f, "{port}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
 
 /// A kind as the agent names it: `Deployment`, `deployments`, optionally
 /// with `apiVersion` to disambiguate.
@@ -133,6 +154,15 @@ pub enum Request {
         container: Option<String>,
         namespace: Option<String>,
         command: Vec<String>,
+    },
+    /// `port_forward_start` (#17): a local port on `127.0.0.1` to a pod,
+    /// or to a ready pod of a Service or Deployment. `target` is
+    /// `pod/<name>`, `service/<name>` or `deployment/<name>`.
+    PortForward {
+        namespace: Option<String>,
+        target: String,
+        port: ForwardPortRef,
+        local_port: Option<u16>,
     },
     /// Secret names, types, keys, sizes and who uses them; no values.
     SecretList {
@@ -457,7 +487,9 @@ impl<'a> Policy<'a> {
             })
         };
         match request {
-            Request::Logs { .. } | Request::Exec { .. } => need(Profile::Debug, false),
+            Request::Logs { .. } | Request::Exec { .. } | Request::PortForward { .. } => {
+                need(Profile::Debug, false)
+            }
             Request::Apply { .. }
             | Request::Scale { .. }
             | Request::Restart { .. }
@@ -548,6 +580,9 @@ impl<'a> Policy<'a> {
             | Request::Top { .. }
             | Request::SecretList { .. }
             | Request::SecretCheck { .. } => vec![read],
+            // Reading the namespace; the Role gets `pods/portforward` only
+            // while a forward runs, and every forward is confirmed (#17).
+            Request::PortForward { .. } => vec![read],
             Request::Topology { .. } => allowed
                 .namespaces
                 .iter()
@@ -753,6 +788,31 @@ impl<'a> Policy<'a> {
                 allowed.confirmation = Confirmation::Required;
                 Ok(allowed)
             }
+            Request::PortForward {
+                namespace,
+                target,
+                port,
+                local_port,
+            } => {
+                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                let (kind, name) = forward_target(target)?;
+                allowed.kind = Some(self.read_kind(&KindRef::new(kind))?);
+                allowed.name = Some(object_name(name)?);
+                check_forward_port(port)?;
+                if let Some(local) = local_port
+                    && *local < MIN_FORWARD_LOCAL_PORT
+                {
+                    return Err(Denial::new(
+                        DenialCode::InvalidInput,
+                        format!(
+                            "localPort must be {MIN_FORWARD_LOCAL_PORT} to 65535; leave it out \
+                             for any free port"
+                        ),
+                    ));
+                }
+                allowed.confirmation = Confirmation::Required;
+                Ok(allowed)
+            }
             Request::SecretList { namespace, name } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
                 if let Some(name) = name {
@@ -947,6 +1007,7 @@ impl<'a> Policy<'a> {
         let what = match request {
             Request::Logs { .. } => "reading logs",
             Request::Exec { .. } => "exec",
+            Request::PortForward { .. } => "port-forward",
             Request::Apply { dry_run: true, .. } => "a dry-run apply",
             Request::Apply { .. } => "apply",
             Request::SecretWrite { .. }
@@ -1340,6 +1401,52 @@ fn secret_keys(keys: &[String]) -> Result<(), Denial> {
         }
     }
     Ok(())
+}
+
+/// The kind and name of a port-forward target: `pod/<name>`,
+/// `service/<name>` or `deployment/<name>` (also `pods`, `po`, `svc`,
+/// `deploy`), as in the forward dialog of the app (#17).
+pub fn forward_target(target: &str) -> Result<(&'static str, &str), Denial> {
+    let invalid = || {
+        Denial::new(
+            DenialCode::InvalidInput,
+            "target must be pod/<name>, service/<name> or deployment/<name>",
+        )
+    };
+    let (kind, name) = target.split_once('/').ok_or_else(invalid)?;
+    let kind = match kind.to_ascii_lowercase().as_str() {
+        "pod" | "pods" | "po" => "Pod",
+        "service" | "services" | "svc" => "Service",
+        "deployment" | "deployments" | "deploy" => "Deployment",
+        _ => return Err(invalid()),
+    };
+    Ok((kind, name))
+}
+
+/// A remote port: a number from 1, or a port name (`IANA_SVC_NAME`: up to
+/// 15 lowercase letters, digits and inner dashes, with a letter).
+fn check_forward_port(port: &ForwardPortRef) -> Result<(), Denial> {
+    let valid = match port {
+        ForwardPortRef::Number(number) => *number > 0,
+        ForwardPortRef::Name(name) => {
+            (1..=15).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && name.bytes().any(|b| b.is_ascii_lowercase())
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Denial::new(
+            DenialCode::InvalidInput,
+            "port must be a port number (1-65535) or a port name such as http",
+        ))
+    }
 }
 
 fn container_name(name: &str) -> Result<(), Denial> {

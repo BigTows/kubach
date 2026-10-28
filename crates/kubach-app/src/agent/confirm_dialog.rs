@@ -68,6 +68,7 @@ fn title(request: &ConfirmationRequest) -> String {
             grant: Grant::Modify { .. },
         } => t!("agent-title-modify"),
         RequestKind::Exec { .. } => t!("agent-title-exec"),
+        RequestKind::PortForward { .. } => t!("agent-title-port-forward"),
         RequestKind::Access { .. } => t!("agent-title-access"),
         RequestKind::Helm { helm } => match helm.action {
             kubach_mcp::HelmAction::Install => t!("agent-title-helm-install"),

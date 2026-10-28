@@ -20,6 +20,7 @@ use kube::{Client, Config};
 use serde::{Deserialize, Serialize};
 
 use crate::access::{Access, Raises};
+use crate::forwards::{SessionForwards, StopReason};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
@@ -148,6 +149,10 @@ pub struct Session {
     /// session, as `(namespace, kind, name)`: reading the logs of their pods
     /// is confirmed (#190).
     changed: Mutex<HashSet<ChangedObject>>,
+    /// The agent's port-forwards (#17); they end with the session.
+    forwards: SessionForwards,
+    /// This session, for tasks that must not keep it alive.
+    me: Weak<Session>,
 }
 
 /// Under which identity a `helm` process acts in a namespace (#418): the
@@ -195,7 +200,8 @@ impl Session {
         // The user's RBAC is checked per namespace when a call needs it,
         // not probed here: with namespaces on request (#401) the home
         // namespace says nothing about the one the agent will name.
-        let session = Arc::new(Self {
+        let forwards = SessionForwards::new(&scope.id);
+        let session = Arc::new_cyclic(|me| Self {
             scope,
             identities: Identities::Cluster {
                 base: Box::new(base.clone()),
@@ -213,6 +219,8 @@ impl Session {
             ask: tokio::sync::Mutex::new(()),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            forwards,
+            me: me.clone(),
         });
         spawn_ttl_guard(Arc::downgrade(&session), session.scope.deadline());
         Ok(session)
@@ -227,7 +235,8 @@ impl Session {
         catalog: ApiCatalog,
         capabilities: HashSet<Capability>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let forwards = SessionForwards::new(&scope.id);
+        Arc::new_cyclic(|me| Self {
             scope,
             user_client: identity.client(),
             identities: Identities::Fixed(identity),
@@ -243,6 +252,8 @@ impl Session {
             ask: tokio::sync::Mutex::new(()),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            forwards,
+            me: me.clone(),
         })
     }
 
@@ -768,10 +779,77 @@ impl Session {
             grants.revoke(grant);
             grants.clone()
         };
+        // Forwards stand on reading their namespace (#17).
+        if let Grant::Read { namespace } = grant {
+            self.forwards.stop_in(namespace, StopReason::Revoked);
+        }
         if self.is_active() {
             self.sync_namespace(&next, grant.namespace()).await?;
         }
         Ok(())
+    }
+
+    /// The agent's port-forwards (#17).
+    pub fn forwards(&self) -> &SessionForwards {
+        &self.forwards
+    }
+
+    /// Before a port-forward in `namespace` starts (#17): a temporary
+    /// ServiceAccount's Role gets `pods/portforward` there. If the patch
+    /// fails, nothing is recorded and the error is returned.
+    pub(crate) async fn begin_forward(&self, namespace: &str) -> Result<(), SessionError> {
+        let _role = self.role.lock().await;
+        if !self.is_active() {
+            return Err(SessionError::Ended);
+        }
+        let mut next = self.grants();
+        if !next.set_forwarding(namespace, true) {
+            return Ok(());
+        }
+        self.sync_namespace(&next, namespace).await?;
+        *sync::lock(&self.grants) = next;
+        Ok(())
+    }
+
+    /// After the last port-forward in `namespace` stopped: the Role loses
+    /// `pods/portforward` again. Best effort; the Role goes with the
+    /// session anyway.
+    pub(crate) async fn end_forward(&self, namespace: &str) {
+        let _role = self.role.lock().await;
+        if self.forwards.any_in(namespace) {
+            return;
+        }
+        let next = {
+            let mut grants = sync::lock(&self.grants);
+            if !grants.set_forwarding(namespace, false) {
+                return;
+            }
+            grants.clone()
+        };
+        if self.is_active() {
+            let _ = self.sync_namespace(&next, namespace).await;
+        }
+    }
+
+    /// Notices forwards the user stopped in the app, once a forward runs:
+    /// they are audited, and the Role follows (#17).
+    pub(crate) fn watch_forwards(&self) {
+        let me = self.me.clone();
+        self.forwards.watch_with(|manager| {
+            let mut changes = manager.subscribe();
+            kubach_core::runtime::spawn(async move {
+                use futures::StreamExt as _;
+                while changes.next().await.is_some() {
+                    while changes.try_recv().is_ok() {}
+                    let Some(session) = me.upgrade() else {
+                        break;
+                    };
+                    for namespace in session.forwards.reconcile() {
+                        session.end_forward(&namespace).await;
+                    }
+                }
+            })
+        });
     }
 
     /// Sets answers directly, skipping identities and the Role. For tests
@@ -787,6 +865,7 @@ impl Session {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.forwards.stop_all(StopReason::SessionEnded);
         let boundaries: Vec<Arc<Boundary>> =
             sync::lock(&self.boundaries).values().cloned().collect();
         let mut first_error = None;
@@ -1053,8 +1132,10 @@ mod tests {
     fn open_session(url: &str, policy: &SecurityPolicy) -> Arc<Session> {
         let base = Config::new(url.parse().unwrap());
         let user_client = Client::try_from(base.clone()).unwrap();
-        Arc::new(Session {
-            scope: scope_with(Profile::Deploy, policy, &[]),
+        let scope = scope_with(Profile::Deploy, policy, &[]);
+        let forwards = SessionForwards::new(&scope.id);
+        Arc::new_cyclic(|me| Session {
+            scope,
             identities: Identities::Cluster {
                 base: Box::new(base),
             },
@@ -1071,6 +1152,8 @@ mod tests {
             ask: tokio::sync::Mutex::new(()),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            forwards,
+            me: me.clone(),
         })
     }
 

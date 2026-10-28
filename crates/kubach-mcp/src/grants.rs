@@ -116,6 +116,11 @@ pub struct Grants {
     /// in the window. A temporary ServiceAccount gets `patch`/`delete` on
     /// these names only, while `modify(ns)` stands.
     secret_writes: std::collections::BTreeSet<(String, String)>,
+    /// Namespaces where the agent has a port-forward open (#17). Not a
+    /// right of its own: every forward is confirmed in the window. A
+    /// temporary ServiceAccount gets `pods/portforward` there while
+    /// `read(ns)` stands and a forward runs.
+    forwarding: std::collections::BTreeSet<String>,
 }
 
 impl Grants {
@@ -156,6 +161,24 @@ impl Grants {
             let namespace = grant.namespace();
             self.secret_writes.retain(|(ns, _)| ns != namespace);
         }
+        if matches!(grant, Grant::Read { .. }) {
+            self.forwarding.remove(grant.namespace());
+        }
+    }
+
+    /// Marks whether the agent has a port-forward open in `namespace`
+    /// (#17). Returns `false` if nothing changed.
+    pub fn set_forwarding(&mut self, namespace: &str, open: bool) -> bool {
+        if open {
+            self.forwarding.insert(namespace.to_owned())
+        } else {
+            self.forwarding.remove(namespace)
+        }
+    }
+
+    /// Whether the agent has a port-forward open in `namespace`.
+    pub fn is_forwarding(&self, namespace: &str) -> bool {
+        self.forwarding.contains(namespace)
     }
 
     /// Records that the user approved writing Secret `namespace/name`.
