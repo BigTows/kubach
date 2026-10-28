@@ -1821,16 +1821,18 @@ users:
                 name,
             )
         };
-        // Strict by default: AI agent access is off.
-        let error = choose(&settings, "dev").unwrap_err();
-        assert!(error.contains("AI agent access is off"), "{error}");
+        let dev = ContextKey::new("dev", "https://127.0.0.1:6443");
+        // AI agent access is on by default (#9); turned off, the choice is refused.
         settings.security.set_policy(
-            &ContextKey::new("dev", "https://127.0.0.1:6443"),
+            &dev,
             ContextPolicy {
-                mcp_enabled: true,
+                mcp_enabled: false,
                 ..ContextPolicy::strict()
             },
         );
+        let error = choose(&settings, "dev").unwrap_err();
+        assert!(error.contains("AI agent access is off"), "{error}");
+        settings.security.set_policy(&dev, ContextPolicy::strict());
         settings.security.set_policy(
             &ContextKey::new("prod", "https://prod.example.com"),
             ContextPolicy {

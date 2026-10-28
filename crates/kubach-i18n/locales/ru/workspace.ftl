@@ -76,7 +76,6 @@ hotbar-state-connecting = Подключение…
 hotbar-state-connected = Подключено, { $version }
 hotbar-state-error = Ошибка: { $error }
 hotbar-security-looser = Мягче строгих настроек: { $list }
-hotbar-loosened-mcp = доступ ИИ-агента
 hotbar-loosened-profile = профиль
 hotbar-loosened-temporary-objects = отдельная идентичность в кластере
 hotbar-loosened-deploy = применение изменений

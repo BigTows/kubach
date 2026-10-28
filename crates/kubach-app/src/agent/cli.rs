@@ -987,6 +987,16 @@ users:
     fn resolves_from_settings_and_refuses_when_disabled() {
         let contexts = Contexts::from_yaml(KUBECONFIG).unwrap();
         let mut settings = Settings::default();
+        let key = ContextKey::new("dev", "https://127.0.0.1:6443");
+        // On by default (#9): the strict default resolves.
+        assert!(resolve(Options::default(), &settings, &contexts, None).is_ok());
+        settings.security.set_policy(
+            &key,
+            ContextPolicy {
+                mcp_enabled: false,
+                ..ContextPolicy::strict()
+            },
+        );
         let error = resolve(Options::default(), &settings, &contexts, None).unwrap_err();
         assert!(error.contains("AI agent access is off"), "{error}");
         // The flag does not widen the settings.
@@ -997,7 +1007,6 @@ users:
         let error = resolve(flagged.clone(), &settings, &contexts, None).unwrap_err();
         assert!(error.contains("AI agent access is off"), "{error}");
 
-        let key = ContextKey::new("dev", "https://127.0.0.1:6443");
         settings
             .security
             .set_policy(&key, ContextPolicy::development());

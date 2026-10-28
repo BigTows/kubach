@@ -32,7 +32,7 @@ pub(super) fn hotbar_prefs(cx: &App) -> HotbarPrefs {
 }
 
 /// Whether the security policy of `context` is looser than the strict
-/// defaults (e.g. MCP sessions allowed).
+/// defaults (e.g. exec or applying changes allowed).
 pub(super) fn security_relaxed(
     settings: Option<&Settings>,
     context: &ContextInfo,
@@ -49,7 +49,6 @@ pub(super) fn security_relaxed(
 /// What is looser, in the interface language, for "Looser than strict: …".
 pub(crate) fn loosened_label(loosened: Loosened) -> String {
     match loosened {
-        Loosened::McpEnabled => t!("hotbar-loosened-mcp"),
         Loosened::MaxProfile => t!("hotbar-loosened-profile"),
         Loosened::TemporaryObjects => t!("hotbar-loosened-temporary-objects"),
         Loosened::Deploy => t!("hotbar-loosened-deploy"),
@@ -564,5 +563,58 @@ mod tests {
         let rows = tooltip_rows(&context, None, &ConnectionState::Disconnected, 9);
         assert_eq!(value(&rows, "Shortcut"), None);
         assert_eq!(value(&rows, "Source"), None);
+    }
+
+    #[test]
+    fn agent_access_alone_is_no_warning() {
+        use kubach_core::settings::security::Loosened;
+        use kubach_core::settings::{ContextKey, ContextPolicy, ExecMode, Profile, Settings};
+
+        use super::security_relaxed;
+
+        let context = ContextInfo {
+            name: "prod".into(),
+            cluster: "prod-cluster".into(),
+            user: None,
+            namespace: None,
+            server: Some("https://prod.example.com".into()),
+        };
+        let key = ContextKey::new("prod", "https://prod.example.com");
+        let mut settings = Settings::default();
+        // Unconfigured: agent access is on (#9), no badge and no
+        // "Looser than the defaults" line (both come from `loosened()`).
+        assert!(settings.security.policy(&key).mcp_enabled);
+        assert!(security_relaxed(Some(&settings), &context).is_empty());
+        // Stored on explicitly, the rest strict: still nothing.
+        settings.security.set_policy(
+            &key,
+            ContextPolicy {
+                mcp_enabled: true,
+                ..ContextPolicy::strict()
+            },
+        );
+        assert!(security_relaxed(Some(&settings), &context).is_empty());
+        // Turned off: stricter, not a warning either.
+        settings.security.set_policy(
+            &key,
+            ContextPolicy {
+                mcp_enabled: false,
+                ..ContextPolicy::strict()
+            },
+        );
+        assert!(security_relaxed(Some(&settings), &context).is_empty());
+        // A really looser setting still warns.
+        settings.security.set_policy(
+            &key,
+            ContextPolicy {
+                max_profile: Profile::Debug,
+                exec: ExecMode::ConfirmEach,
+                ..ContextPolicy::strict()
+            },
+        );
+        assert_eq!(
+            security_relaxed(Some(&settings), &context),
+            [Loosened::MaxProfile, Loosened::Exec]
+        );
     }
 }

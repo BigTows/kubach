@@ -331,10 +331,18 @@ users:
         let open = Contexts::load_all(vec![local_file(&dir)], imported(true)).unwrap();
         let unlocked = unlocked_contexts(&imported(true));
 
-        // Unlocked but AI agent access off for the context (#39).
+        // Unlocked but AI agent access turned off for the context (#39, #9).
+        let mut off = Settings::default();
+        off.security.set_policy(
+            &ContextKey::new("prod-imported", SERVER),
+            ContextPolicy {
+                mcp_enabled: false,
+                ..ContextPolicy::strict()
+            },
+        );
         let refusal = plan(
             &request("prod-imported"),
-            &Settings::default(),
+            &off,
             Some(&open),
             &names,
             &unlocked,
