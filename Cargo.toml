@@ -50,7 +50,7 @@ keyring = "4.2.0"
 kube = { version = "4.2.0", features = ["runtime", "ws", "http-proxy", "socks5"] }
 # Pixel size of downloaded chart icons from their header (#201). Already in
 # the tree through usvg.
-imagesize = "0.14.0"
+imagesize = "0.15.0"
 libc = "0.2.191"
 # Same version as gpui-component: completion/hover types of its code editor.
 lsp-types = { version = "0.97.0", features = ["proposed"] }
