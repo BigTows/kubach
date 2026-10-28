@@ -20,7 +20,7 @@ alacritty_terminal = { version = "0.26.0", default-features = false }
 # Linux only: Secret values on the clipboard marked for history managers
 # (`x-kde-passwordManagerHint: secret`) on X11 and Wayland (#203).
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 # macOS only: CFString for the Touch ID prompt text (#80).
 core-foundation = "0.10.1"
