@@ -97,6 +97,7 @@ details-name = 名称
 details-namespace = Namespace
 details-created = 创建时间
 details-uid = UID
+details-copy-name = 复制名称
 details-copy-uid = 复制 UID
 details-reason = 原因
 details-security = 安全

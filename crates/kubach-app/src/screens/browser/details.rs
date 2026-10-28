@@ -928,19 +928,35 @@ impl ResourceDetails {
             .health
             .clone()
             .unwrap_or_else(|| target.plugin.health(object));
+        let name = object.metadata.name.clone().unwrap_or_default();
         div()
             .flex()
             .items_center()
             .gap_2()
             .child(
+                // The name may be cut short; the copy is whole.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
-                    .child(object.metadata.name.clone().unwrap_or_default()),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(name.clone()),
+                    )
+                    .when(!name.is_empty(), |this| {
+                        this.child(
+                            Clipboard::new("copy-name")
+                                .value(name)
+                                .tooltip(t!("details-copy-name")),
+                        )
+                    }),
             )
             .children(header_badge(target, object, &health))
             .child(crate::editor::edit_button(

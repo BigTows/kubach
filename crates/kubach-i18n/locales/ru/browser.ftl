@@ -106,6 +106,7 @@ details-name = Имя
 details-namespace = Namespace
 details-created = Создан
 details-uid = UID
+details-copy-name = Скопировать имя
 details-copy-uid = Скопировать UID
 details-reason = Причина
 details-security = Безопасность

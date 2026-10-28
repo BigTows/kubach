@@ -115,6 +115,7 @@ details-name = Name
 details-namespace = Namespace
 details-created = Created
 details-uid = UID
+details-copy-name = Copy name
 details-copy-uid = Copy UID
 details-reason = Reason
 details-security = Security
