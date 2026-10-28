@@ -210,6 +210,28 @@ fn command_block(command: &[String], cx: &App) -> impl IntoElement + use<> {
         }))
 }
 
+/// Height the dialog's title, paddings, margins and our buttons take
+/// around the scrolling body.
+const DIALOG_CHROME: f32 = 220.;
+
+/// "CustomResourceDefinition × 6, ClusterRole × 12": objects counted by
+/// kind (the first word of each), in the order they first appear.
+fn kind_counts(objects: &[String]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for object in objects {
+        let kind = object.split_whitespace().next().unwrap_or_default();
+        match counts.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(kind, n)| format!("{kind} × {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Lines of a unified diff, colored as git does: added green, removed
 /// red, hunk headers muted. Long lines wrap: nothing hides past the edge.
 fn diff_lines(text: &str, cx: &App) -> Vec<Div> {
@@ -284,6 +306,8 @@ struct ConfirmView {
     as_user: bool,
     /// The whole values of a Helm change, folded under the values diff.
     show_values: bool,
+    /// Every object behind "run with my credentials", folded under counts.
+    show_user_objects: bool,
     _observe: Subscription,
 }
 
@@ -297,6 +321,7 @@ impl ConfirmView {
             always: false,
             as_user: false,
             show_values: false,
+            show_user_objects: false,
             _observe: observe,
         }
     }
@@ -535,11 +560,14 @@ impl Render for ConfirmView {
                     t!("agent-helm-as-user-objects"),
                 ]
                 .into_iter()
-                .chain(
+                .chain(if self.show_user_objects {
                     helm.user_objects
                         .iter()
-                        .map(|object| format!("  - {object}")),
-                )
+                        .map(|object| format!("  - {object}"))
+                        .collect()
+                } else {
+                    vec![kind_counts(&helm.user_objects)]
+                })
                 .collect(),
                 theme.danger,
                 cx,
@@ -550,6 +578,16 @@ impl Render for ConfirmView {
                 theme.danger,
                 cx,
             )),
+        });
+        let show_all_objects = (ask_user && !self.show_user_objects).then(|| {
+            Button::new("confirm-show-user-objects")
+                .ghost()
+                .xsmall()
+                .label(t!("agent-helm-as-user-show-all"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_user_objects = true;
+                    cx.notify();
+                }))
         });
         let as_user_tick = ask_user.then(|| {
             Checkbox::new("confirm-as-user")
@@ -617,8 +655,10 @@ impl Render for ConfirmView {
                 .children(secret_dialog::users(secret, cx))
         });
 
-        // The buttons stay in sight: everything above them scrolls.
-        let body_height = window.viewport_size().height * 0.7;
+        // The buttons stay in sight: everything above them scrolls. The
+        // dialog itself is at most the viewport less its margins, and its
+        // title, paddings and our buttons take the rest.
+        let body_height = (window.viewport_size().height - px(DIALOG_CHROME)).max(px(120.));
         div()
             .flex()
             .flex_col()
@@ -864,6 +904,7 @@ impl Render for ConfirmView {
                         )
                     })
                     .children(as_user_block)
+                    .children(show_all_objects)
                     .children(as_user_tick)
                     .children(dangerous)
                     .children(acknowledge)
@@ -1002,5 +1043,21 @@ mod tests {
         assert_eq!(shown, format!("a\\nb{VISIBLE_SPACE}"));
         let escaped: Vec<&str> = ranges.iter().map(|r| &shown[r.clone()]).collect();
         assert_eq!(escaped, ["\\n", &VISIBLE_SPACE.to_string()]);
+    }
+
+    #[test]
+    fn objects_are_counted_by_kind_in_order() {
+        let objects = [
+            "CustomResourceDefinition a.cert-manager.io",
+            "ClusterRole cert-manager-view",
+            "CustomResourceDefinition b.cert-manager.io",
+            "Role leader (namespace kube-system)",
+        ]
+        .map(String::from);
+        assert_eq!(
+            super::kind_counts(&objects),
+            "CustomResourceDefinition × 2, ClusterRole × 1, Role × 1"
+        );
+        assert_eq!(super::kind_counts(&[]), "");
     }
 }
