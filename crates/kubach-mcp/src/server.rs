@@ -15,16 +15,16 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value, json};
 
+use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
-use crate::ceiling::Ceiling;
 use crate::confirm::Confirmer;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
 use crate::rules::writes_secrets;
 use crate::session::Session;
-use crate::settings::{Profile, SecretAccess};
-use crate::tools::{self, CeilingDecision, Ctx, GrantDecision, ToolError};
+use crate::settings::Profile;
+use crate::tools::{self, AccessDecision, Ctx, GrantDecision, ToolError};
 use kubach_core::sync;
 
 /// Kubach's MCP server for one session. Cheap to clone.
@@ -81,18 +81,17 @@ impl McpServer {
         &self.inner.session
     }
 
-    /// Tools offered to the agent. Beyond the ceiling (profile, applying
-    /// changes, exec) a tool is still offered, marked as needing the
-    /// user's approval in Kubach, so the agent can ask (#417); on a
-    /// protected cluster it is hidden instead. Settings the agent cannot ask
-    /// to change (Secrets for the agent) hide their tools. The user's RBAC
-    /// does not hide anything: it is checked in the namespace a call names
-    /// (#401). Hidden tools are still refused by the policy if called.
+    /// Tools offered to the agent. Beyond the session's access (#15) a
+    /// tool is still offered, marked as needing the user's approval in
+    /// Kubach, so the agent can ask. Hidden: what the launch's `--profile`
+    /// excludes and revealing values on a context that hides them, since
+    /// nobody can be asked for those. The user's RBAC does not hide
+    /// anything: it is checked in the namespace a call names (#401). Hidden
+    /// tools are still refused by the policy if called.
     pub fn tools(&self) -> Vec<Tool> {
         let session = &self.inner.session;
         let scope = session.scope();
-        let settings = &scope.policy;
-        let have = session.ceiling();
+        let have = session.access();
         catalog()
             .into_iter()
             .filter_map(|spec| {
@@ -102,27 +101,22 @@ impl McpServer {
                         .catalog()
                         .find("metrics.k8s.io", "PodMetrics")
                         .is_some(),
-                    "list_secrets" | "check_secret" | "compare_secret_values" => {
-                        settings.secrets >= SecretAccess::Metadata
-                    }
-                    "get_secret_value" => settings.secrets == SecretAccess::Reveal,
-                    "request_secret_input" | "copy_secret" | "delete_secret" => {
-                        settings.secrets >= SecretAccess::Metadata
-                    }
+                    "get_secret_value" => scope.policy.reveal_allowed(),
                     _ => true,
                 };
-                if !shown {
+                let needed = tool_access(spec.name);
+                if !shown || needed.is_some_and(|needed| needed.profile > scope.profile) {
                     return None;
                 }
-                let note = match tool_ceiling(spec.name).and_then(|needed| have.missing(needed)) {
-                    None => None,
-                    Some(_) if settings.protected => return None,
-                    Some(missing) => Some(format!(
-                        " Requires your approval in Kubach: this needs {missing}, beyond this \
-                         session's ceiling ({have}); the first call asks the user to allow it \
-                         (for this session or always on this cluster)."
-                    )),
-                };
+                let note = needed
+                    .and_then(|needed| have.missing(needed))
+                    .map(|missing| {
+                        format!(
+                            " Requires your approval in Kubach: this needs {missing}, beyond this \
+                         session's access ({have}); the first call asks the user to allow it \
+                         (for this session or by default on this cluster)."
+                        )
+                    });
                 Some(spec.into_tool(note))
             })
             .collect()
@@ -151,14 +145,14 @@ impl McpServer {
             client_name: client,
             tool,
             decisions: std::sync::Mutex::new(Vec::new()),
-            ceilings: std::sync::Mutex::new(Vec::new()),
+            accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
             progress,
             namespace: std::sync::Mutex::new(None),
         };
         let result = tools::run(&ctx, tool, &args).await;
         let decisions = sync::into_inner(ctx.decisions);
-        let ceilings = sync::into_inner(ctx.ceilings);
+        let accesses = sync::into_inner(ctx.accesses);
         let namespace = sync::into_inner(ctx.namespace);
         let change = result.as_ref().ok().and_then(|output| output.audit.clone());
         let (decided_by, allowed, reason, code) = match &result {
@@ -192,8 +186,8 @@ impl McpServer {
             for decision in &decisions {
                 let _ = audit.record(&self.grant_entry(client, tool, decision));
             }
-            for decision in &ceilings {
-                let _ = audit.record(&self.ceiling_entry(client, tool, decision));
+            for decision in &accesses {
+                let _ = audit.record(&self.access_entry(client, tool, decision));
             }
             let mut masked_args = Value::Object(args);
             mask_audit_args(&mut masked_args);
@@ -265,8 +259,12 @@ impl McpServer {
             tool: format!("grant:{tool}"),
             args: serde_json::to_value(&decision.grant).unwrap_or(Value::Null),
             change: None,
-            decided_by: DecidedBy::User,
-            allowed: decision.outcome == "granted",
+            decided_by: if decision.outcome == "access" {
+                DecidedBy::Access
+            } else {
+                DecidedBy::User
+            },
+            allowed: matches!(decision.outcome, "granted" | "access"),
             reason: decision.reason.clone(),
             identity: self
                 .inner
@@ -277,16 +275,16 @@ impl McpServer {
         }
     }
 
-    /// The audit line of one answer about raising the ceiling (#417): what
-    /// was asked, on which context, and whether the settings were raised
-    /// for good (`always`).
-    fn ceiling_entry(&self, client: &str, tool: &str, decision: &CeilingDecision) -> AuditEntry {
+    /// The audit line of one answer about access (#15): what was asked, on
+    /// which context, and whether the context's minimum was raised too
+    /// (`always`).
+    fn access_entry(&self, client: &str, tool: &str, decision: &AccessDecision) -> AuditEntry {
         let scope = self.inner.session.scope();
         AuditEntry {
             time: Timestamp::now().to_string(),
             session: self.inner.session.id().to_owned(),
             client: client.to_owned(),
-            tool: format!("ceiling:{tool}"),
+            tool: format!("access:{tool}"),
             args: json!({
                 "raise": decision.raise,
                 "context": scope.context,
@@ -311,19 +309,25 @@ impl McpServer {
     pub fn instructions(&self) -> String {
         let session = &self.inner.session;
         let scope = session.scope();
-        let secrets = match scope.policy.secrets {
-            SecretAccess::None => "Secrets are not available.",
-            SecretAccess::Metadata => {
-                "Secret metadata and checks (no values) are available through list_secrets, \
-                 check_secret and compare_secret_values."
-            }
-            SecretAccess::Reveal => {
-                "Secret metadata and checks (no values) are available through list_secrets, \
-                 check_secret and compare_secret_values; get_secret_value reveals one Secret \
-                 after the user confirms it, so prefer the checks."
-            }
+        let access = session.access();
+        let reveal = if scope.policy.reveal_allowed() {
+            " get_secret_value reveals one Secret after the user confirms it, so prefer the \
+             checks."
+        } else {
+            " Secret values are hidden on this context."
         };
-        let writes = if writes_secrets(scope.profile, &scope.policy) {
+        let secrets = if access.secrets {
+            format!(
+                "Secret metadata and checks (no values) are available through list_secrets, \
+                 check_secret and compare_secret_values.{reveal}"
+            )
+        } else {
+            format!(
+                "Secrets (list_secrets, check_secret, compare_secret_values) need the user's \
+                 approval first.{reveal}"
+            )
+        };
+        let writes = if writes_secrets(Access::ALL.capped(scope.profile)) {
             " To create or change a Secret call request_secret_input: the user enters or \
              generates the values in Kubach and you get keys and sizes, never values; never ask \
              the user to paste a value into the chat. copy_secret and delete_secret are \
@@ -337,17 +341,13 @@ impl McpServer {
                 scope.namespaces.join(", ")
             )
         } else {
-            "The session starts without namespaces: call list_namespaces, then pass `namespace` \
-             to the tools; the user is asked to allow reading a namespace the first time."
+            "Pass `namespace` to the tools; list_namespaces shows the namespaces Kubach knows \
+             of. Any namespace works, as many as you need."
                 .to_owned()
         };
-        let ceiling = if scope.policy.protected {
-            " This context is a protected cluster: its ceiling is not raised on request."
-        } else {
-            " Tools beyond the ceiling are marked \"Requires your approval in Kubach\": calling \
-             one asks the user to raise the ceiling (for this session or always on this \
-             cluster); a refusal is final for the session."
-        };
+        let more = " Tools beyond your access are marked \"Requires your approval in Kubach\": \
+             calling one asks the user to allow it (for this session or by default on this \
+             cluster); a refusal is final for the session.";
         let helm = if self.helm().is_some() {
             " Helm: helm_search_charts and helm_show_values for charts of the repositories added \
              in Kubach (or an oci:// chart the user allows), helm_list_releases and \
@@ -357,14 +357,12 @@ impl McpServer {
             ""
         };
         format!(
-            "Kubach gives you access to Kubernetes namespaces of context {} up to the {} \
-             profile.{ceiling}{helm} {namespaces} Rights are granted by the user when a call first needs them \
-             (reading a namespace, revealing one Secret, changing a namespace) and hold until \
-             the session ends; a refused right is not asked again. Cluster-scoped resources and \
-             calls across all namespaces are not available. {secrets}{writes} Changes are \
-             previewed with a dry run and need the user's approval. Call `session_info` for \
-             details.",
-            scope.context, scope.profile
+            "Kubach gives you access to Kubernetes namespaces of context {}. Without asking you \
+             have {access}.{more}{helm} {namespaces} Cluster-scoped resources and calls across \
+             all namespaces are not available. {secrets}{writes} Changes, deletions and \
+             commands in containers are previewed and need the user's approval one by one. \
+             Call `session_info` for details.",
+            scope.context
         )
     }
 }
@@ -458,30 +456,24 @@ struct ToolSpec {
     destructive: bool,
 }
 
-/// What a tool needs of the ceiling, where the user may raise it (#417).
-/// A dry-run `apply_manifest` needs only the deploy profile.
-fn tool_ceiling(name: &str) -> Option<Ceiling> {
-    let ceiling = |profile, apply, exec| {
-        Some(Ceiling {
+/// What a tool needs of the access, where the user may raise it (#15).
+/// Custom resources are found by kind, at the call.
+fn tool_access(name: &str) -> Option<Access> {
+    let need = |profile, secrets| {
+        Some(Access {
             profile,
-            apply,
-            exec,
+            secrets,
+            crds: false,
         })
     };
     match name {
-        "get_logs" => ceiling(Profile::Debug, false, false),
-        "exec" => ceiling(Profile::Debug, false, true),
-        "apply_manifest" => ceiling(Profile::Deploy, false, false),
-        "scale"
-        | "rollout_restart"
-        | "delete_resource"
-        | "request_secret_input"
-        | "copy_secret"
-        | "delete_secret"
-        | "helm_install"
-        | "helm_upgrade"
-        | "helm_rollback"
-        | "helm_uninstall" => ceiling(Profile::Deploy, true, false),
+        "get_logs" | "exec" => need(Profile::Debug, false),
+        "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
+        | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
+        "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
+        "list_secrets" | "check_secret" | "compare_secret_values" | "get_secret_value" => {
+            need(Profile::ReadOnly, true)
+        }
         _ => None,
     }
 }
@@ -527,16 +519,15 @@ fn kind_props(extra: Value) -> Value {
 
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
-     one. The user is asked to allow reading a namespace the first time; list_namespaces shows \
-     the ones Kubach knows of";
+     one. Any namespace works; list_namespaces shows the ones Kubach knows of";
 
 fn catalog() -> Vec<ToolSpec> {
     let ns = json!({"namespace": {"type": "string", "description": NAMESPACE_HELP}});
     vec![
         ToolSpec {
             name: "session_info",
-            description: "Namespaces, profile, rights granted so far, expiry and, per namespace, \
-                          whether the API server enforces the boundary too.",
+            description: "Namespaces, access (minimal and now), rights so far, expiry and, per \
+                          namespace, whether the API server enforces the boundary too.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -545,8 +536,8 @@ fn catalog() -> Vec<ToolSpec> {
             name: "list_namespaces",
             description: "Names of the namespaces you can ask for, each with where Kubach knows it \
                           from (the cluster, or kubeconfig and recently opened in Kubach when \
-                          the user may not list namespaces) and whether reading it is allowed, \
-                          refused or asked on first use. Names only.",
+                          the user may not list namespaces) and whether it is allowed (in use), \
+                          available or refused. Names only.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -644,8 +635,8 @@ fn catalog() -> Vec<ToolSpec> {
                           upstream and downstream with `resource` and `depth`.",
             schema: object_schema(
                 json!({
-                    "namespace": {"type": "string", "description": "Optional; reading it is asked for like any namespace"},
-                    "namespaces": {"type": "array", "items": {"type": "string"}, "maxItems": 3, "description": "Several namespaces in one graph; reading each is asked for"},
+                    "namespace": {"type": "string", "description": "Optional; any namespace"},
+                    "namespaces": {"type": "array", "items": {"type": "string"}, "maxItems": 3, "description": "Several namespaces in one graph"},
                     "resource": {
                         "type": "object",
                         "description": "Only this resource with what routes to it and what it uses",
@@ -681,7 +672,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "properties": {
                             "kind": {"type": "string"},
                             "name": {"type": "string"},
-                            "namespace": {"type": "string", "description": "Optional; reading it is asked for like any namespace"},
+                            "namespace": {"type": "string", "description": "Optional; any namespace"},
                             "address": {"type": "string", "description": "An IP outside the cluster, instead of kind and name"},
                         },
                         "additionalProperties": false,
@@ -804,7 +795,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "key": {"type": "string"},
                         "otherName": {"type": "string"},
                         "otherKey": {"type": "string"},
-                        "otherNamespace": {"type": "string", "description": "Optional; reading it is asked for like any namespace"},
+                        "otherNamespace": {"type": "string", "description": "Optional; any namespace"},
                     });
                     p.as_object_mut()
                         .unwrap()
@@ -875,7 +866,7 @@ fn catalog() -> Vec<ToolSpec> {
                 {
                     let mut p = json!({
                         "name": {"type": "string"},
-                        "toNamespace": {"type": "string", "description": "Optional; reading it is asked for like any namespace"},
+                        "toNamespace": {"type": "string", "description": "Optional; any namespace"},
                         "toName": {"type": "string", "description": "Optional; the same name by default"},
                         "explanation": {"type": "string", "description": "Why, for the user"},
                     });

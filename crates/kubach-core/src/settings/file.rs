@@ -303,8 +303,8 @@ mod tests {
 
     use super::*;
     use crate::settings::{
-        ContextKey, ContextPolicy, DEFAULT_MCP_PORT, Language, Profile, PrometheusSource,
-        ThemePreference, security::ExecMode,
+        AgentLevel, ContextKey, ContextPolicy, DEFAULT_MCP_PORT, Language, PrometheusSource,
+        ThemePreference,
     };
 
     fn temp_path() -> (tempfile::TempDir, PathBuf) {
@@ -359,15 +359,19 @@ mod tests {
         settings.tools.helm_line = crate::tools::helm::HelmLine::Helm3;
         settings.security.set_policy(
             &ContextKey::new("minikube", "https://192.168.49.2:8443"),
-            ContextPolicy::development(),
+            ContextPolicy {
+                minimum_access: AgentLevel::Changes,
+                minimum_secrets: true,
+                hide_secret_values: false,
+                ..ContextPolicy::default()
+            },
         );
         settings.security.set_policy(
             &ContextKey::new("staging", "https://staging.example.com"),
             ContextPolicy {
-                mcp_enabled: true,
-                max_profile: Profile::Debug,
-                exec: ExecMode::ConfirmEach,
-                ..ContextPolicy::strict()
+                mcp_enabled: false,
+                minimum_access: AgentLevel::Debug,
+                ..ContextPolicy::default()
             },
         );
 
@@ -443,9 +447,8 @@ mod tests {
             .security
             .policy(&ContextKey::new("kind-dev", "https://127.0.0.1:6443"));
         assert!(policy.mcp_enabled);
-        // Missing keys of the entry keep strict defaults.
-        assert_eq!(policy.session_ttl_minutes, 30);
-        assert_eq!(policy.max_profile, Profile::ReadOnly);
+        // Missing keys of the entry keep the defaults.
+        assert_eq!(policy.minimum_access, AgentLevel::Read);
         // Files from before #96 hide Secret values.
         assert!(policy.hide_secret_values);
     }
@@ -462,7 +465,7 @@ mod tests {
             [[security.context]]
             context = "a"
             server = "https://a"
-            max_profile = "root"
+            minimum_access = "root"
             [[security.context]]
             context = "b"
             server = "https://b"
@@ -558,7 +561,7 @@ mod tests {
             [[security.context]]
             context = "prod"
             server = "https://prod"
-            exec = "always"
+            minimum_access = "always"
             [[security.context]]
             server = "https://nameless"
             "#,
@@ -625,7 +628,7 @@ mod tests {
         assert!(settings.agent.http_enabled);
         assert_eq!(settings.agent.http_port, DEFAULT_MCP_PORT);
 
-        // The broken entry falls back to the strict policy.
+        // The broken entry falls back to the default policy.
         let contexts: Vec<_> = settings
             .security
             .contexts
@@ -637,13 +640,13 @@ mod tests {
             settings
                 .security
                 .policy(&ContextKey::new("prod", "https://prod")),
-            ContextPolicy::strict()
+            ContextPolicy::default()
         );
     }
 
     #[test]
     fn development_policies_from_before_109_keep_showing_secret_values() {
-        use crate::settings::{Preset, SecretAction};
+        use crate::settings::{AgentAccess, SecretAction};
 
         // Written before `hide_secret_values` existed.
         let (_dir, path) = temp_path();
@@ -688,28 +691,27 @@ mod tests {
         let security = &loaded.settings.security;
 
         let minikube = security.policy(&ContextKey::new("minikube", "https://192.168.49.2:8443"));
-        // `agent_secrets` (#227) gets the default, not the preset's reveal.
+        // The old preset's ceiling is not the agent's minimum (#15).
         assert_eq!(
             minikube,
             ContextPolicy {
-                agent_secrets: crate::settings::AgentSecrets::MetadataAndChecks,
-                ..ContextPolicy::development()
+                hide_secret_values: false,
+                ..ContextPolicy::default()
             }
         );
-        assert_eq!(minikube.matching_preset(), None);
+        assert_eq!(minikube.minimum(), AgentAccess::default());
         assert!(minikube.allows_secret(SecretAction::Show));
 
         // Other old policies keep hiding values.
         let staging = security.policy(&ContextKey::new("staging", "https://staging.example.com"));
         assert!(staging.hide_secret_values);
-        assert_eq!(staging.matching_preset(), None);
+        assert_eq!(staging, ContextPolicy::default());
         // An explicit choice is kept.
         let kind = security.policy(&ContextKey::new("kind-dev", "https://127.0.0.1:6443"));
         assert!(kind.hide_secret_values);
-        assert_eq!(kind.matching_preset(), None);
-        // Contexts without settings stay strict.
+        // Contexts without settings get the defaults.
         let other = security.policy(&ContextKey::new("prod", "https://prod.example.com"));
-        assert_eq!(other.matching_preset(), Some(Preset::Strict));
+        assert_eq!(other, ContextPolicy::default());
         assert!(!other.allows_secret(SecretAction::Show));
 
         // Saved with the key, the choice survives later loads.

@@ -248,16 +248,6 @@ fn translated<T>(options: &[Choice<T>]) -> Vec<String> {
     options.iter().map(|(_, label)| label()).collect()
 }
 
-/// `30 min`, `1 h`, `1 h 30 min`, in the interface language.
-fn format_minutes(minutes: u32) -> SharedString {
-    match (minutes / 60, minutes % 60) {
-        (0, m) => t!("settings-duration-minutes", minutes = m),
-        (h, 0) => t!("settings-duration-hours", hours = h),
-        (h, m) => t!("settings-duration-hours-minutes", hours = h, minutes = m),
-    }
-    .into()
-}
-
 /// Search text of an entry: English keywords plus its title and
 /// description in the interface language, so either language finds it.
 fn searchable(keywords: &str, shown: &[&str]) -> String {

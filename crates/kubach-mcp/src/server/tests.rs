@@ -12,13 +12,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::access::Access;
 use crate::confirm::{DenyAll, RequestKind, ScriptedConfirmer};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::identity::Identity;
 use crate::rules::Capability;
 use crate::secret_write::{SecretInput, SecretOp, SecretRequest};
 use crate::session::Session;
-use crate::settings::{DeployMode, ExecMode, SecretAccess, SecurityPolicy};
+use crate::settings::SecurityPolicy;
 use crate::testutil::{NS, OTHER_NS, catalog, grants, permissive, scope_with};
 
 /// Records `METHOD path` (and the body) of every request. Serves one
@@ -581,7 +582,7 @@ async fn default_confirmer_denies() {
         scope,
         Identity::ClientOnly { client },
         catalog(),
-        HashSet::new(),
+        Capability::ALL.into_iter().collect(),
     );
     let server = McpServer::new(session, Arc::new(DenyAll), None);
     let outcome = server
@@ -734,18 +735,25 @@ async fn tools_beyond_the_ceiling_are_offered_marked() {
         );
     }
 
-    // A protected cluster hides what it will not raise.
-    let protected = SecurityPolicy {
-        deploy: DeployMode::DryRunOnly,
-        exec: ExecMode::Disabled,
-        protected: true,
-        ..permissive()
-    };
-    let deploy = fixture(Profile::Deploy, protected, false).await;
-    let names = tool_names(&deploy.server);
-    assert!(names.contains(&"apply_manifest".to_string()));
+    // `kubach mcp --profile debug` hides what it never allows (#15).
+    let api = FakeApi::start().await;
+    let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+    let capped = Session::from_parts(
+        crate::testutil::scope_capped(Profile::Debug, &permissive(), &[NS]),
+        Identity::ClientOnly { client },
+        catalog(),
+        Capability::ALL.into_iter().collect(),
+    );
+    let server = McpServer::new(capped, Arc::new(DenyAll), None);
+    let names = tool_names(&server);
     assert!(names.contains(&"get_logs".to_string()));
-    for hidden in ["exec", "scale", "rollout_restart", "delete_resource"] {
+    assert!(names.contains(&"exec".to_string()));
+    for hidden in [
+        "apply_manifest",
+        "scale",
+        "rollout_restart",
+        "delete_resource",
+    ] {
         assert!(!names.contains(&hidden.to_string()), "{hidden}");
     }
 }
@@ -781,10 +789,10 @@ async fn no_secret_without_the_users_answer() {
         .await;
     assert!(outcome.is_error);
     assert!(!outcome.text.contains("hunter2"));
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     assert!(f.api.requests().is_empty(), "{:?}", f.api.requests());
 
-    // The user allows reading, but no window answers for the Secret.
+    // No window answers for the Secret.
     let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
     f.server.session().set_grants(grants(&[Grant::read(NS)]));
     let server = McpServer::new(f.server.session().clone(), Arc::new(DenyAll), None);
@@ -813,10 +821,9 @@ async fn revealing_asks_for_that_secret_and_warns() {
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(outcome.text.contains("hunter2"), "{}", outcome.text);
-    assert_eq!(
-        grant_requests(&f),
-        [Grant::read(NS), Grant::secret(NS, "db")]
-    );
+    // Reading the namespace comes with the access (#15); only the Secret
+    // is asked for.
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     let warning = f
         .confirmer
         .requests()
@@ -840,7 +847,7 @@ async fn revealing_asks_for_that_secret_and_warns() {
     f.server
         .call("agent", "get_secret_value", args(json!({"name": "db"})))
         .await;
-    assert_eq!(grant_requests(&f).len(), 2);
+    assert_eq!(grant_requests(&f).len(), 1);
     f.server
         .call("agent", "get_secret_value", args(json!({"name": "api"})))
         .await;
@@ -873,7 +880,7 @@ async fn revealing_asks_for_that_secret_and_warns() {
 #[tokio::test]
 async fn reveal_off_tells_the_user_and_asks_nothing() {
     let policy = SecurityPolicy {
-        secrets: SecretAccess::Metadata,
+        hide_secret_values: true,
         ..permissive()
     };
     let f = session_fixture(Profile::ReadOnly, policy, true, false).await;
@@ -935,8 +942,8 @@ async fn checks_and_metadata_hold_no_values_or_hashes() {
         "{}",
         checked.text
     );
-    // Reading the namespace was the only question.
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    // No question at all: Secret access is in the minimum (#15).
+    assert!(grant_requests(&f).is_empty());
     let audit = std::fs::read_to_string(&f.audit_path).unwrap();
     assert!(!audit.contains("hunter2"), "{audit}");
 }
@@ -947,21 +954,55 @@ async fn a_refusal_is_not_asked_again() {
     for _ in 0..3 {
         let outcome = f
             .server
-            .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+            .call("agent", "get_secret_value", args(json!({"name": "db"})))
             .await;
         assert!(outcome.is_error);
     }
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     assert_eq!(
-        f.server.session().grants().state(&Grant::read(NS)),
+        f.server.session().grants().state(&Grant::secret(NS, "db")),
         Some(GrantState::Denied)
     );
     let last = f
         .server
-        .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+        .call("agent", "get_secret_value", args(json!({"name": "db"})))
         .await;
     assert!(last.text.contains("does not ask again"), "{}", last.text);
-    assert!(f.api.requests().is_empty());
+    assert!(
+        f.api.requests().iter().all(|r| !r.contains("secrets/db")),
+        "{:?}",
+        f.api.requests()
+    );
+}
+
+#[tokio::test]
+async fn reading_needs_no_question_and_is_audited() {
+    let f = session_fixture(Profile::ReadOnly, SecurityPolicy::default(), false, false).await;
+    let outcome = f
+        .server
+        .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(f.confirmer.requests().is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::read(NS)));
+    let lines = audit_lines(&f.audit_path);
+    let grant = lines
+        .iter()
+        .find(|l| l["tool"] == "grant:list_resources")
+        .expect("the right is audited");
+    assert_eq!(grant["decided_by"], "access");
+    assert_eq!(grant["result"], "access");
+    // Secrets at the minimum "read": not even metadata without asking.
+    let outcome = f
+        .server
+        .call("agent", "list_secrets", args(json!({})))
+        .await;
+    assert!(outcome.is_error);
+    assert!(matches!(
+        f.confirmer.requests()[0].kind,
+        RequestKind::Access { .. }
+    ));
+    assert!(f.api.requests().iter().all(|r| !r.contains("/secrets")));
 }
 
 #[tokio::test]
@@ -1018,13 +1059,15 @@ async fn revoking_read_takes_back_what_stands_on_it() {
 }
 
 #[tokio::test]
-async fn modify_spares_only_scale_and_restart_their_question() {
+async fn every_change_is_confirmed_and_rights_come_with_the_access() {
     let f = session_fixture(Profile::Deploy, permissive(), true, true).await;
     let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
     let outcome = f.server.call("agent", "scale", args(scale.clone())).await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    assert_eq!(grant_requests(&f), [Grant::read(NS), Grant::modify(NS)]);
-    assert_eq!(call_requests(&f), 0);
+    // No question for the namespace's rights (#15), each change confirmed.
+    assert!(grant_requests(&f).is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::modify(NS)));
+    assert_eq!(call_requests(&f), 1);
     f.server.call("agent", "scale", args(scale)).await;
     f.server
         .call(
@@ -1033,7 +1076,7 @@ async fn modify_spares_only_scale_and_restart_their_question() {
             args(json!({"kind": "Deployment", "name": "web"})),
         )
         .await;
-    assert_eq!(f.confirmer.requests().len(), 2, "no new questions");
+    assert_eq!(call_requests(&f), 3);
 
     // Delete, apply and exec are confirmed every time.
     let delete = json!({"kind": "Widget", "apiVersion": "example.com/v1", "name": "w"});
@@ -1043,7 +1086,7 @@ async fn modify_spares_only_scale_and_restart_their_question() {
     f.server
         .call("agent", "delete_resource", args(delete))
         .await;
-    assert_eq!(call_requests(&f), 2);
+    assert_eq!(call_requests(&f), 5);
     f.server
         .call(
             "agent",
@@ -1051,8 +1094,8 @@ async fn modify_spares_only_scale_and_restart_their_question() {
             args(json!({"pod": "web-0", "command": ["id"]})),
         )
         .await;
-    assert_eq!(call_requests(&f), 3);
-    assert_eq!(grant_requests(&f).len(), 2);
+    assert_eq!(call_requests(&f), 6);
+    assert!(grant_requests(&f).is_empty());
     // Exec carries the exact argv for the dialog (#194).
     assert_eq!(
         f.confirmer.requests().last().map(|request| &request.kind),
@@ -1068,7 +1111,7 @@ async fn client_only_confirms_every_change() {
     let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
     f.server.call("agent", "scale", args(scale.clone())).await;
     f.server.call("agent", "scale", args(scale)).await;
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert!(grant_requests(&f).is_empty());
     assert_eq!(call_requests(&f), 2);
 }
 
@@ -1233,12 +1276,8 @@ async fn grant_read_flag_reads_without_a_window() {
 
 #[tokio::test]
 async fn grant_read_flag_does_not_widen_the_settings() {
-    // Protected: beyond the ceiling the policy refuses without asking.
-    let policy = SecurityPolicy {
-        secrets: SecretAccess::None,
-        protected: true,
-        ..permissive()
-    };
+    // Beyond the minimum the flag gives nothing: without a window, refused.
+    let policy = SecurityPolicy::default();
     let (f, server) = launched_with_grant_read(Profile::ReadOnly, policy, false).await;
     for (tool, arguments) in [
         ("list_secrets", json!({})),
@@ -1254,11 +1293,7 @@ async fn grant_read_flag_does_not_widen_the_settings() {
         ("get_resource", json!({"kind": "Secret", "name": "db"})),
     ] {
         let outcome = server.call("agent", tool, args(arguments)).await;
-        assert!(
-            outcome.text.starts_with("denied by policy"),
-            "{tool}: {}",
-            outcome.text
-        );
+        assert!(outcome.is_error, "{tool}: {}", outcome.text);
     }
     assert!(f.api.requests().is_empty());
     // Only the session's own namespaces.
@@ -1273,47 +1308,6 @@ async fn grant_read_flag_does_not_widen_the_settings() {
 }
 
 #[tokio::test]
-async fn nothing_beyond_the_ceiling_of_a_protected_cluster_is_asked() {
-    let protected = SecurityPolicy {
-        protected: true,
-        ..permissive()
-    };
-    let f = session_fixture(Profile::ReadOnly, protected, true, true).await;
-    for (tool, arguments) in [
-        (
-            "scale",
-            json!({"kind": "Deployment", "name": "web", "replicas": 3}),
-        ),
-        ("exec", json!({"pod": "web-0", "command": ["id"]})),
-        ("get_logs", json!({"pod": "web-0"})),
-    ] {
-        let outcome = f.server.call("agent", tool, args(arguments)).await;
-        assert!(outcome.is_error, "{tool}");
-        assert!(
-            outcome.text.contains("protected cluster"),
-            "{}",
-            outcome.text
-        );
-    }
-    // Another namespace is never asked for either.
-    let outcome = f
-        .server
-        .call(
-            "agent",
-            "list_resources",
-            args(json!({"kind": "Pod", "namespace": OTHER_NS})),
-        )
-        .await;
-    assert!(
-        outcome.text.starts_with("denied by policy"),
-        "{}",
-        outcome.text
-    );
-    assert!(f.confirmer.requests().is_empty());
-    assert!(f.api.requests().is_empty());
-}
-
-#[tokio::test]
 async fn beyond_the_ceiling_the_user_is_asked_once() {
     let f = session_fixture(Profile::ReadOnly, permissive(), false, true).await;
     f.server.session().set_grants(grants(&[Grant::read(NS)]));
@@ -1324,24 +1318,17 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
         .await;
     assert!(outcome.is_error);
     assert!(
-        outcome.text.contains("did not allow the deploy profile"),
+        outcome.text.contains("did not allow changes"),
         "{}",
         outcome.text
     );
     let requests = f.confirmer.requests();
     assert_eq!(requests.len(), 1);
-    let RequestKind::Ceiling { raise, current, .. } = &requests[0].kind else {
+    let RequestKind::Access { raise, current, .. } = &requests[0].kind else {
         panic!("{:?}", requests[0].kind);
     };
-    assert_eq!(
-        *raise,
-        Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false
-        }
-    );
-    assert_eq!(*current, Ceiling::NONE);
+    assert_eq!(*raise, Access::profile(Profile::Deploy));
+    assert_eq!(*current, Access::ALL.capped(Profile::ReadOnly));
     assert_eq!(
         requests[0].summary,
         format!("claude-code asks for {raise} on minikube (namespace {NS})")
@@ -1354,7 +1341,7 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
     let lines = audit_lines(&f.audit_path);
     let ceiling = lines
         .iter()
-        .find(|l| l["tool"] == "ceiling:scale")
+        .find(|l| l["tool"] == "access:scale")
         .expect("the answer is audited");
     assert_eq!(ceiling["result"], "refused");
     assert_eq!(ceiling["args"]["raise"]["profile"], "deploy");
@@ -1384,26 +1371,22 @@ async fn an_allowed_raise_keeps_rights_and_confirmations() {
         .requests()
         .iter()
         .map(|r| match &r.kind {
-            RequestKind::Ceiling { .. } => "ceiling".to_owned(),
+            RequestKind::Access { .. } => "access".to_owned(),
             RequestKind::Grant { grant } => format!("grant {grant}"),
             RequestKind::Call => "call".to_owned(),
             other => format!("{other:?}"),
         })
         .collect();
-    // The raise, then the namespace's right, then the deletion itself.
-    assert_eq!(
-        kinds,
-        ["ceiling", &format!("grant change namespace {NS}"), "call"],
-        "{}",
-        outcome.text
-    );
+    // The access, then the deletion itself: the namespace's right comes
+    // with the access (#15).
+    assert_eq!(kinds, ["access", "call"], "{}", outcome.text);
     let session = f.server.session();
-    assert_eq!(session.ceiling().profile, Profile::Deploy);
+    assert_eq!(session.access().profile, Profile::Deploy);
     assert!(session.raises().saved);
     let lines = audit_lines(&f.audit_path);
     let ceiling = lines
         .iter()
-        .find(|l| l["tool"] == "ceiling:delete_resource")
+        .find(|l| l["tool"] == "access:delete_resource")
         .unwrap();
     assert_eq!(ceiling["result"], "always");
     assert_eq!(ceiling["args"]["savedToSettings"], true);
@@ -1832,8 +1815,7 @@ async fn a_temporary_service_account_may_change_only_approved_secrets() {
             g
         },
         NS,
-        Profile::Deploy,
-        &permissive(),
+        Access::ALL,
     );
     let named: Vec<_> = rules
         .iter()
@@ -1944,10 +1926,10 @@ async fn topology_around_a_resource() {
 
 #[tokio::test]
 async fn topology_without_secret_access_skips_secrets() {
-    let policy = SecurityPolicy {
-        secrets: SecretAccess::None,
-        ..permissive()
-    };
+    let policy = SecurityPolicy::with_minimum(Access {
+        secrets: false,
+        ..Access::ALL
+    });
     let f = fixture(Profile::ReadOnly, policy, false).await;
     let graph = topology_json(
         &f.server
@@ -1970,16 +1952,24 @@ async fn topology_without_secret_access_skips_secrets() {
 }
 
 #[tokio::test]
-async fn topology_asks_for_the_read_right_first() {
+async fn topology_sets_up_the_read_right_without_asking() {
     let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
     let outcome = f
         .server
         .call("agent", "get_topology", args(json!({})))
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    assert_eq!(grant_requests(&f), vec![Grant::read(NS)]);
+    assert!(grant_requests(&f).is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::read(NS)));
 
+    // Revoked by the user: refused, not asked again.
     let refused = session_fixture(Profile::ReadOnly, permissive(), false, false).await;
+    refused
+        .server
+        .session()
+        .revoke(&Grant::read(NS))
+        .await
+        .unwrap();
     let outcome = refused
         .server
         .call("agent", "get_topology", args(json!({})))
@@ -2141,11 +2131,7 @@ async fn list_namespaces_falls_back_to_what_kubach_knows() {
     assert_eq!(
         namespaces_of(&outcome.text),
         [
-            (
-                "team-a".into(),
-                "kubeconfig".into(),
-                "not-in-this-session".into()
-            ),
+            ("team-a".into(), "kubeconfig".into(), "available".into()),
             ("team-b".into(), "recently-opened".into(), "refused".into()),
             ("granted".into(), "session".into(), "allowed".into()),
         ]
@@ -2164,10 +2150,7 @@ async fn list_namespaces_lists_names_when_allowed() {
         {"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata", "metadata": {"name": "kube-system"}},
     ]});
     let (url, _) = answering("200 OK", list).await;
-    let several = SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    };
+    let several = permissive();
     let session = open_session(&url, &several, Vec::new());
     let server = McpServer::new(session, Arc::new(DenyAll), None);
     let outcome = server
@@ -2179,16 +2162,8 @@ async fn list_namespaces_lists_names_when_allowed() {
     assert_eq!(
         namespaces_of(&outcome.text),
         [
-            (
-                "team-a".into(),
-                "cluster".into(),
-                "asked-on-first-use".into()
-            ),
-            (
-                "kube-system".into(),
-                "cluster".into(),
-                "asked-on-first-use".into()
-            ),
+            ("team-a".into(), "cluster".into(), "available".into()),
+            ("kube-system".into(), "cluster".into(), "available".into()),
         ]
     );
     // Names only: no labels, annotations or anything else of the objects.
@@ -2205,17 +2180,13 @@ async fn a_pinned_session_lists_only_its_namespaces() {
     assert!(!outcome.is_error, "{}", outcome.text);
     assert_eq!(
         namespaces_of(&outcome.text),
-        [(
-            NS.into(),
-            "launch-arguments".into(),
-            "asked-on-first-use".into()
-        )]
+        [(NS.into(), "launch-arguments".into(), "available".into())]
     );
     assert!(f.api.requests().is_empty());
 }
 
 #[tokio::test]
-async fn the_first_call_in_a_namespace_asks_to_read_it() {
+async fn reading_any_namespace_asks_nothing() {
     let api = FakeApi::start().await;
     let session = open_session(&api.url, &permissive(), Vec::new());
     let confirmer = Arc::new(ScriptedConfirmer::approving());
@@ -2232,7 +2203,7 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
     );
     assert!(confirmer.requests().is_empty());
 
-    // Naming one asks for reading it, then reads.
+    // Naming one reads it without a question (#15), and sets it up.
     let outcome = server
         .call(
             "test-agent",
@@ -2241,18 +2212,14 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
         )
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    let asked = confirmer.requests();
-    assert_eq!(asked.len(), 1);
-    assert!(matches!(&asked[0].kind, RequestKind::Grant { grant } if *grant == Grant::read(NS)));
+    assert!(confirmer.requests().is_empty());
     assert_eq!(session.namespaces(), [NS]);
 
-    // Now it is the session's namespace; another one is refused without a
-    // question on a context with one namespace per session.
+    // Now it is the session's namespace; another one is read just as well.
     let outcome = server
         .call("test-agent", "list_resources", args(json!({"kind": "Pod"})))
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    let before = api.requests().len();
     let outcome = server
         .call(
             "test-agent",
@@ -2260,15 +2227,14 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
             args(json!({"kind": "Pod", "namespace": OTHER_NS})),
         )
         .await;
-    assert!(outcome.is_error && outcome.text.contains("one namespace per agent session"));
-    assert_eq!(confirmer.requests().len(), 1);
-    assert_eq!(api.requests().len(), before);
-    // And a granted session cannot be talked into a second one either.
-    let error = session
-        .decide(Grant::read(OTHER_NS), true)
-        .await
-        .unwrap_err();
-    assert!(matches!(error, crate::session::SessionError::SingleNamespace(ns) if ns == NS));
+    // Allowed: the fake API serves no Pods there, but no policy stopped it.
+    assert!(
+        !outcome.text.starts_with("denied by policy"),
+        "{}",
+        outcome.text
+    );
+    assert!(confirmer.requests().is_empty());
+    assert_eq!(session.namespaces(), [NS, OTHER_NS]);
 }
 
 #[tokio::test]
@@ -2277,7 +2243,21 @@ async fn escape_attempts_in_an_open_session_never_reach_the_api() {
     let session = open_session(&api.url, &permissive(), Vec::new());
     session.set_grants(Grants::all(&[NS]));
     let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
-    for (tool, arguments) in escape_attempts() {
+    // Another valid namespace is no escape in an open session (#15).
+    let legit = |arguments: &Value| {
+        let text = arguments.to_string();
+        [
+            format!("\"{OTHER_NS}\""),
+            "\"kube-system\"".to_owned(),
+            "\"all\"".to_owned(),
+        ]
+        .iter()
+        .any(|ns| text.contains(ns.as_str()))
+    };
+    for (tool, arguments) in escape_attempts()
+        .into_iter()
+        .filter(|(_, arguments)| !legit(arguments))
+    {
         let outcome = server
             .call("test-agent", tool, args(arguments.clone()))
             .await;

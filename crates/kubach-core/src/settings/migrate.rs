@@ -3,7 +3,6 @@
 use toml::{Table, Value};
 
 use super::model::SCHEMA_VERSION;
-use super::security::ContextPolicy;
 
 type Migration = fn(&mut Table);
 
@@ -17,18 +16,50 @@ const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 fn v0_to_v1(_: &mut Table) {}
 
 const HIDE_SECRET_VALUES: &str = "hide_secret_values";
-const AGENT_SECRETS: &str = "agent_secrets";
+
+/// The "Development" preset as it was stored before #109. Its agent keys
+/// are ignored since #15, but old files still have them.
+const OLD_DEVELOPMENT: &[(&str, OldValue)] = &[
+    ("mcp_enabled", OldValue::Bool(true)),
+    ("max_profile", OldValue::Str("deploy")),
+    ("temporary_objects", OldValue::Bool(true)),
+    ("deploy", OldValue::Str("apply-with-confirmation")),
+    ("exec", OldValue::Str("confirm-each")),
+    ("session_ttl_minutes", OldValue::Int(120)),
+    ("namespaces", OldValue::Str("multiple")),
+];
+
+/// Keys added to the preset later, with the preset's value; a file may
+/// lack them.
+const OLD_DEVELOPMENT_LATER: &[(&str, OldValue)] = &[
+    ("agent_secrets", OldValue::Str("reveal-on-request")),
+    ("require_server_enforced", OldValue::Bool(false)),
+    ("agent_other_kinds", OldValue::Bool(false)),
+    ("protected", OldValue::Bool(false)),
+];
+
+enum OldValue {
+    Bool(bool),
+    Str(&'static str),
+    Int(i64),
+}
+
+impl OldValue {
+    fn matches(&self, value: &Value) -> bool {
+        match (self, value) {
+            (Self::Bool(want), Value::Boolean(have)) => want == have,
+            (Self::Str(want), Value::String(have)) => want == have,
+            (Self::Int(want), Value::Integer(have)) => want == have,
+            _ => false,
+        }
+    }
+}
 
 /// Policies saved before `hide_secret_values` existed (#109) lack the key,
 /// which then defaults to hiding. One that was the Development preset gets
-/// `false`, as that preset shows Secret values now, so it stays
-/// Development. Other old policies keep hiding values, and contexts without
-/// a stored policy stay strict.
-///
-/// `agent_secrets` (#227) is younger still: a file without it may be the
-/// old Development preset as well, so it is compared as if it had the
-/// preset's value. The key itself is not added: like every policy without
-/// it, the context gets the default (metadata and checks, #227).
+/// `false`, as that preset showed Secret values, so the user keeps seeing
+/// them. Other old policies keep hiding values, and contexts without a
+/// stored policy hide them.
 ///
 /// Not a schema migration: the key is additive, and a version bump would
 /// make files of this version read-only for older Kubach. Every save writes
@@ -45,19 +76,12 @@ pub(super) fn show_secrets_of_old_development_policies(table: &mut Table) {
         if entry.contains_key(HIDE_SECRET_VALUES) {
             continue;
         }
-        let mut shown = entry.clone();
-        shown.insert(HIDE_SECRET_VALUES.into(), Value::Boolean(false));
-        if !shown.contains_key(AGENT_SECRETS) {
-            let preset = ContextPolicy::development();
-            if let Ok(Value::Table(table)) = Value::try_from(&preset)
-                && let Some(value) = table.get(AGENT_SECRETS)
-            {
-                shown.insert(AGENT_SECRETS.into(), value.clone());
-            }
-        }
-        let development = Value::Table(shown)
-            .try_into::<ContextPolicy>()
-            .is_ok_and(|policy| policy == ContextPolicy::development());
+        let development = OLD_DEVELOPMENT
+            .iter()
+            .all(|(key, want)| entry.get(*key).is_some_and(|have| want.matches(have)))
+            && OLD_DEVELOPMENT_LATER
+                .iter()
+                .all(|(key, want)| entry.get(*key).is_none_or(|have| want.matches(have)));
         if development {
             entry.insert(HIDE_SECRET_VALUES.into(), Value::Boolean(false));
         }

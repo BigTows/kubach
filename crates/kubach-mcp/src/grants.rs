@@ -1,16 +1,18 @@
 //! Rights granted on request within a session (#227, ADR 0005 "Права по
 //! запросу").
 //!
-//! A session starts with none. The first time the agent needs one, Kubach
-//! asks the user; the answer, yes or no, is kept for the rest of the
-//! session and dies with it (TTL, revocation, vault lock). The ladder:
+//! A session starts with none. Since #15 reading and changing a namespace
+//! are set up without a question when the session's access covers them
+//! (they carry the namespace's identity and Role); revealing a Secret is
+//! asked for that Secret. Answers are kept for the rest of the session and
+//! die with it (TTL, revocation, vault lock). The ladder:
 //!
 //! ```text
 //!  none ──► read(ns) ──► secret(ns, name) ──► modify(ns)
 //! ```
 //!
-//! Every step stays within the session's profile and the context's
-//! settings, which the policy checks first; a grant never widens them.
+//! Every step stays within the session's access, which the policy checks
+//! first; a grant never widens it.
 //! Grants belong to the session id, never to the client's self-reported
 //! name.
 

@@ -17,8 +17,8 @@ use std::time::Duration;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kubach_mcp::{
-    DeployMode, McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session,
-    SessionMode, SessionSpec,
+    McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session, SessionMode,
+    SessionSpec,
 };
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -55,8 +55,7 @@ async fn a_secret_through_a_pod_is_shown_and_confirmed() {
     let (base, context, namespace) = config().await;
     let policy = SecurityPolicy {
         temporary_objects: false,
-        deploy: DeployMode::ApplyAfterConfirmation,
-        ..SecurityPolicy::development()
+        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
     };
     let spec = SessionSpec {
         context,

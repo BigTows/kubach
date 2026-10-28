@@ -41,8 +41,6 @@ pub struct ContextEntry {
     pub source: String,
     /// "AI agent access" is on for it.
     pub agent_access: bool,
-    /// A protected cluster: `use_context` is refused (#417, #421).
-    pub protected: bool,
     /// Why it cannot be used now (vault locked…), if so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
@@ -137,8 +135,8 @@ impl SharedServer {
                     "contexts": contexts,
                     "current": current,
                     "howToUse": "Call use_context with a name: the user approves it in the Kubach \
-                        window. A context with agentAccess false or protected true is refused; \
-                        only the user changes that, in Kubach: Settings → Security.",
+                        window. A context with agentAccess false is refused; only the user \
+                        changes that, in Kubach: Settings → Security.",
                 });
                 Some((
                     serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -184,8 +182,8 @@ impl SharedServer {
             }
             "session_info" if self.get().is_none() => Some((
                 "No context chosen yet: call list_contexts, then use_context. The user approves \
-                 the context in the Kubach window; namespaces and other rights are asked for \
-                 later, when a call needs them."
+                 the context in the Kubach window; anything beyond the context's minimal \
+                 access is asked for later, when a call needs it."
                     .into(),
                 false,
                 false,
@@ -209,16 +207,16 @@ fn context_tools() -> Vec<Tool> {
         Tool::new(
             "list_contexts",
             "Kubernetes contexts Kubach knows (kubeconfig and its vault): name, API server, \
-             source, whether AI agent access is on and whether the cluster is protected. Names \
-             only, never credentials.",
+             source and whether AI agent access is on. Names only, never credentials.",
             Arc::new(object(json!({}), &[])),
         )
         .annotate(ToolAnnotations::new().read_only(true).destructive(false)),
         Tool::new(
             "use_context",
             "Work in a context from list_contexts. The user approves it in the Kubach window the \
-             first time; then the session starts without namespaces or rights, which are asked \
-             for when a call needs them. Choosing another context ends the current session.",
+             first time; then the session starts with the context's minimal access (by default \
+             reading built-in resources in any namespace), and more is asked for when a call \
+             needs it. Choosing another context ends the current session.",
             Arc::new(object(
                 json!({"context": {"type": "string", "description": "A name from list_contexts"}}),
                 &["context"],
@@ -246,8 +244,8 @@ impl ServerHandler for SharedServer {
             (Some(server), _) => server.instructions(),
             (None, true) => "Kubach gives access to Kubernetes clusters the user allows. No \
                  context is chosen yet: call list_contexts, then use_context; the user approves \
-                 it in the Kubach window. Namespaces and other rights are asked for later, when \
-                 a call needs them."
+                 it in the Kubach window. Anything beyond the context's minimal access is asked \
+                 for later, when a call needs it."
                 .to_owned(),
             (None, false) => format!("Kubach gives access to Kubernetes clusters. {NO_SESSION}"),
         };
@@ -334,7 +332,7 @@ mod tests {
                     server: "https://127.0.0.1:6443".into(),
                     source: "kubeconfig".into(),
                     agent_access: true,
-                    protected: false,
+
                     unavailable: None,
                     current: false,
                 }]

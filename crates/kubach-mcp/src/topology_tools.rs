@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::policy::{Allowed, Denial, DenialCode, KindRef, Request};
-use crate::settings::SecretAccess;
+
 use crate::tools::{Ctx, MAX_OUTPUT_BYTES, ToolError, ToolOutput, authorize, parse};
 
 /// Most objects listed per kind and namespace.
@@ -295,7 +295,7 @@ enum Fetched {
 /// One list per kind and namespace, all at once.
 async fn load(ctx: &Ctx<'_>, allowed: &Allowed, policies: bool) -> Loaded {
     let policy = ctx.session.policy();
-    let secrets = ctx.session.scope().policy.secrets >= SecretAccess::Metadata;
+    let secrets = ctx.session.access().secrets;
     let mut kinds: Vec<SourceKind> = SourceKind::ALL.to_vec();
     if policies {
         kinds.push(SourceKind::NetworkPolicy);
@@ -316,7 +316,7 @@ async fn load(ctx: &Ctx<'_>, allowed: &Allowed, policies: bool) -> Loaded {
             if secrets {
                 Ok(())
             } else {
-                Err("Secrets are not available to the agent on this context".to_owned())
+                Err("Secrets need the user's approval first (list_secrets asks)".to_owned())
             }
         } else {
             policy

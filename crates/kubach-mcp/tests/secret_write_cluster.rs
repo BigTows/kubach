@@ -19,8 +19,8 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
 use k8s_openapi::api::rbac::v1::Role;
 use kubach_mcp::{
-    AuditLog, DeployMode, McpServer, Profile, ScriptedConfirmer, SecretInput, SecurityPolicy,
-    Session, SessionMode, SessionSpec,
+    AuditLog, McpServer, Profile, ScriptedConfirmer, SecretInput, SecurityPolicy, Session,
+    SessionMode, SessionSpec,
 };
 use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -126,8 +126,7 @@ async fn secrets_are_written_through_the_user() {
     let (base, context, namespace) = config().await;
     let policy = SecurityPolicy {
         temporary_objects: true,
-        deploy: DeployMode::ApplyAfterConfirmation,
-        ..SecurityPolicy::development()
+        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
     };
     let spec = SessionSpec {
         context,
@@ -353,10 +352,8 @@ async fn copies_cross_namespaces_inside_kubach() {
     let (base, context, namespace) = config().await;
     let other = std::env::var("KUBACH_TEST_NAMESPACE_B").expect("KUBACH_TEST_NAMESPACE_B");
     let policy = SecurityPolicy {
-        deploy: DeployMode::ApplyAfterConfirmation,
-        multiple_namespaces: true,
         temporary_objects: false,
-        ..SecurityPolicy::development()
+        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
     };
     let spec = SessionSpec {
         context,

@@ -68,7 +68,6 @@ hotbar-row-namespace = Namespace
 hotbar-row-status = Status
 hotbar-row-shortcut = Shortcut
 hotbar-row-source = Source
-hotbar-row-security = Security
 hotbar-row-vault = Vault
 hotbar-row-problem = Problem
 hotbar-row-file = File
@@ -81,17 +80,6 @@ hotbar-state-connecting = Connecting…
 hotbar-state-connected = Connected, { $version }
 # $error: the connection error, from the cluster or kube-rs (English).
 hotbar-state-error = Error: { $error }
-# $list: what is looser, joined with commas (hotbar-loosened-*).
-hotbar-security-looser = Looser than strict: { $list }
-hotbar-loosened-profile = profile
-hotbar-loosened-temporary-objects = separate identity in the cluster
-hotbar-loosened-deploy = applying changes
-hotbar-loosened-exec = exec
-hotbar-loosened-session-ttl = session length
-hotbar-loosened-namespaces = several namespaces
-hotbar-loosened-secret-values = Secret values shown
-hotbar-loosened-agent-secret-values = Secret values revealed to the agent on request
-hotbar-loosened-agent-other-kinds = custom resources for the agent
 
 ## Hotbar menus
 

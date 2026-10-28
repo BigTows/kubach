@@ -161,7 +161,6 @@ pub(crate) fn context_entries(
             server: server.to_owned(),
             source: source.to_owned(),
             agent_access: stored.mcp_enabled,
-            protected: stored.protected,
             unavailable,
             current: false,
         });
@@ -196,7 +195,7 @@ pub(crate) fn context_entries(
 }
 
 /// Whether an agent may get `name` at all (#421): known, in an unlocked
-/// vault if it is imported, AI agent access on, not a protected cluster.
+/// vault if it is imported, AI agent access on.
 /// Returns its API server and whether it is in the vault.
 pub(crate) fn check_context_choice(
     settings: &settings::Settings,
@@ -229,12 +228,6 @@ pub(crate) fn check_context_choice(
         return Err(format!(
             "AI agent access is off for context `{name}`. Only the user turns it on, in Kubach: \
              Settings → Security → `{name}` → AI agent access"
-        ));
-    }
-    if stored.protected {
-        return Err(format!(
-            "context `{name}` is a protected cluster: an agent cannot choose it. Only the user \
-             can change that, in Kubach: Settings → Security → Protected cluster"
         ));
     }
     Ok((server, in_vault))
@@ -467,9 +460,9 @@ pub enum ServerStatus {
 }
 
 /// Something the user should know about an agent's request that is not a
-/// question: revealing a Secret where that is off, raising the ceiling of a
-/// protected cluster (#417), a raise that could not be saved. Shown as a
-/// notification with a way to the context's security settings.
+/// question: revealing a Secret where values are hidden, access that could
+/// not be saved as the default (#15). Shown as a notification with a way to
+/// the context's security settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
     pub title: Message,
@@ -497,6 +490,7 @@ pub struct SessionRow {
     pub context: String,
     /// Pinned at launch, else the namespaces the user allowed reading.
     pub namespaces: Vec<String>,
+    /// The session's access level now (#15).
     pub profile: Profile,
     pub mode: SessionMode,
     /// Who holds the boundary in each namespace (#401).
@@ -507,8 +501,8 @@ pub struct SessionRow {
     pub revoking: bool,
     /// The user's answers for rights (#227).
     pub grants: Vec<GrantEntry>,
-    /// The ceiling raised for this session (#417).
-    pub raised: Option<kubach_mcp::Ceiling>,
+    /// Access the user allowed beyond the minimum for this session (#15).
+    pub raised: Option<kubach_mcp::Access>,
 }
 
 /// One audit log line, as shown in the settings page.
@@ -808,7 +802,7 @@ impl AgentState {
                 clients: activity.clients,
                 context: scope.context.clone(),
                 namespaces: session.namespaces(),
-                profile: scope.profile,
+                profile: session.access().profile,
                 mode: session.mode(),
                 boundaries: session.boundaries(),
                 started_at: scope.started_at.to_string(),
@@ -1019,11 +1013,10 @@ impl AgentState {
         entries
     }
 
-    /// An HTTP agent chose `context` (#421). Settings, the vault and the
-    /// protected flag are checked first; then the user is asked in the
-    /// window, and only a yes starts the session (without namespaces and
-    /// rights, up to the context's ceiling, for its session length). It
-    /// replaces the previous HTTP session.
+    /// An HTTP agent chose `context` (#421). Settings and the vault are
+    /// checked first; then the user is asked in the window, and only a yes
+    /// starts the session (with the context's minimal access, until Kubach
+    /// quits, at most 8 h). It replaces the previous HTTP session.
     fn use_context(
         &mut self,
         context: String,
@@ -1096,9 +1089,9 @@ impl AgentState {
             context: context.clone(),
             server_url: server_url.clone(),
             namespaces: Vec::new(),
-            // A ceiling: every right within it is asked for (#227).
-            profile: policy.max_profile,
-            ttl: Some(policy.ttl_cap()),
+            // Not narrowed: more than the minimum is asked for (#15).
+            profile: Profile::Deploy,
+            ttl: None,
         };
         let helm = helm_env(&app_settings, !in_vault);
         let question = ConfirmationRequest {
@@ -1119,8 +1112,7 @@ impl AgentState {
             details: t!(
                 "agent-use-context-details",
                 context = context.as_str(),
-                profile = policy.max_profile.to_string(),
-                minutes = policy.ttl_cap().as_secs() / 60
+                access = access_label(policy.minimum)
             ),
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
@@ -1433,19 +1425,12 @@ impl AgentState {
                 .security
                 .policy(&ContextKey::new(request.context.clone(), server_url));
             let summary = request.summary.as_str();
-            let refusal = if !stored.mcp_enabled {
-                Some((
+            let refusal = (!stored.mcp_enabled).then(|| {
+                (
                     "AI agent access is off for this context",
                     msg!("agent-notice-mcp-off", summary = summary),
-                ))
-            } else if stored.protected {
-                Some((
-                    "the context is a protected cluster",
-                    msg!("agent-notice-protected-context", summary = summary),
-                ))
-            } else {
-                None
-            };
+                )
+            });
             if let Some((refusal, message)) = refusal {
                 self.notices.push_back(Notice {
                     title: msg!("agent-notice-refused"),
@@ -1460,33 +1445,20 @@ impl AgentState {
                 return;
             }
         }
-        if let RequestKind::Ceiling { server_url, .. } = &request.kind
+        if let RequestKind::Access {
+            raise, server_url, ..
+        } = &request.kind
             && let Some(settings) = settings
-            && settings
-                .security
-                .policy(&ContextKey::new(request.context.clone(), server_url))
-                .protected
         {
-            // The app's own settings decide, whatever the process thinks:
-            // a protected cluster is never raised from a session (#417).
-            self.notices.push_back(Notice {
-                title: msg!("agent-notice-protected"),
-                context: request.context.clone(),
-                message: msg!(
-                    "agent-notice-protected-ceiling",
-                    summary = request.summary.as_str()
-                ),
-            });
-            reply
-                .send(ConfirmationDecision::Rejected {
-                    reason: Some(format!(
-                        "context {} is a protected cluster; only the user can change that in \
-                         Settings → Security",
-                        request.context
-                    )),
-                })
-                .ok();
-            return;
+            // Allowed by default meanwhile, from another session (#15): the
+            // app's own settings decide, and the user is not asked twice.
+            let stored = settings
+                .security
+                .policy(&ContextKey::new(request.context.clone(), server_url));
+            if SecurityPolicy::from(&stored).minimum.covers(*raise) {
+                reply.send(ConfirmationDecision::Approved).ok();
+                return;
+            }
         }
         self.next_pending += 1;
         self.pending.push_back(Pending {
@@ -1497,17 +1469,17 @@ impl AgentState {
         });
     }
 
-    /// Answers confirmation `id`. "Always allow on this cluster" on a
-    /// ceiling request raises the context's settings here, with a trace of
-    /// what, when and from which session (#417); if they cannot be saved
-    /// the answer becomes "for this session" and the user is told.
+    /// Answers confirmation `id`. "Allow by default" on an access request
+    /// raises the context's minimal access here, with a trace of what, when
+    /// and from which session (#15); if the settings cannot be saved the
+    /// answer becomes "for this session" and the user is told.
     pub fn resolve(&mut self, id: u64, decision: ConfirmationDecision, cx: &mut Context<Self>) {
         if let Some(ix) = self.pending.iter().position(|p| p.id == id)
             && let Some(mut pending) = self.pending.remove(ix)
             && let Some(reply) = pending.reply.take()
         {
             let decision = match (&decision, &pending.request.kind) {
-                (ConfirmationDecision::ApprovedAlways, RequestKind::Ceiling { .. }) => {
+                (ConfirmationDecision::ApprovedAlways, RequestKind::Access { .. }) => {
                     self.save_raise(&pending.request, cx)
                 }
                 (ConfirmationDecision::ApprovedAlways, _) => ConfirmationDecision::Approved,
@@ -1521,14 +1493,14 @@ impl AgentState {
         cx.notify();
     }
 
-    /// Raises the ceiling of the request's context in the settings for
-    /// good. Returns the answer for the agent's session.
+    /// Raises the minimal access of the request's context in the settings
+    /// for good. Returns the answer for the agent's session.
     fn save_raise(
         &mut self,
         request: &ConfirmationRequest,
         cx: &mut Context<Self>,
     ) -> ConfirmationDecision {
-        let RequestKind::Ceiling {
+        let RequestKind::Access {
             raise, server_url, ..
         } = &request.kind
         else {
@@ -1543,28 +1515,23 @@ impl AgentState {
             });
             return ConfirmationDecision::Approved;
         };
-        let profile = match raise.profile {
-            Profile::ReadOnly => settings::Profile::ReadOnly,
-            Profile::Debug => settings::Profile::Debug,
-            Profile::Deploy => settings::Profile::Deploy,
+        let access = settings::AgentAccess {
+            level: raise.profile.into(),
+            secrets: raise.secrets,
+            crds: raise.crds,
         };
         let time = k8s_openapi::jiff::Timestamp::now().to_string();
-        let mut changes = Vec::new();
         store.update(cx, |store, cx| {
             store.edit(cx, |settings| {
-                changes = settings.security.raise_ceiling(
+                settings.security.raise_minimum(
                     &key,
-                    (profile, raise.apply, raise.exec),
+                    access,
                     &request.session_id,
                     &request.client,
                     &time,
                 );
             })
         });
-        if changes.is_empty() && store.read(cx).get().security.policy(&key).protected {
-            // Protected meanwhile: allow nothing beyond this session.
-            return ConfirmationDecision::Approved;
-        }
         ConfirmationDecision::ApprovedAlways
     }
 
@@ -1680,6 +1647,45 @@ pub fn clock(time: &str) -> String {
         .nth(1)
         .map(|rest| rest.chars().take(8).collect())
         .unwrap_or_else(|| time.to_owned())
+}
+
+/// An access level (#15) in the interface language, named like the choices
+/// of Settings → Security.
+pub fn level_label(profile: Profile) -> String {
+    match profile {
+        Profile::ReadOnly => t!("settings-minimum-read"),
+        Profile::Debug => t!("settings-minimum-debug"),
+        Profile::Deploy => t!("settings-minimum-changes"),
+    }
+}
+
+/// What `access` covers, in the interface language: the level, plus
+/// Secrets and custom resources when it has them.
+pub fn access_label(access: kubach_mcp::Access) -> String {
+    let mut parts = vec![level_label(access.profile)];
+    if access.secrets {
+        parts.push(t!("agent-access-secrets"));
+    }
+    if access.crds {
+        parts.push(t!("agent-access-crds"));
+    }
+    parts.join(" + ")
+}
+
+/// What an access request asks for: only the parts beyond what the
+/// session has, so a request for Secrets alone does not read as "Read".
+pub fn raise_label(raise: kubach_mcp::Access) -> String {
+    let mut parts = Vec::new();
+    if raise.profile > Profile::ReadOnly {
+        parts.push(level_label(raise.profile));
+    }
+    if raise.secrets {
+        parts.push(t!("agent-access-secrets"));
+    }
+    if raise.crds {
+        parts.push(t!("agent-access-crds"));
+    }
+    parts.join(" + ")
 }
 
 #[cfg(test)]
@@ -1827,26 +1833,25 @@ users:
             &dev,
             ContextPolicy {
                 mcp_enabled: false,
-                ..ContextPolicy::strict()
+                ..ContextPolicy::default()
             },
         );
         let error = choose(&settings, "dev").unwrap_err();
         assert!(error.contains("AI agent access is off"), "{error}");
-        settings.security.set_policy(&dev, ContextPolicy::strict());
-        settings.security.set_policy(
-            &ContextKey::new("prod", "https://prod.example.com"),
-            ContextPolicy {
-                mcp_enabled: true,
-                protected: true,
-                ..ContextPolicy::strict()
-            },
-        );
+        settings.security.set_policy(&dev, ContextPolicy::default());
         assert_eq!(
             choose(&settings, "dev").unwrap(),
             ("https://127.0.0.1:6443".to_owned(), false)
         );
-        let error = choose(&settings, "prod").unwrap_err();
-        assert!(error.contains("protected cluster"), "{error}");
+        // Settings written before #15 with `protected = true`: ignored.
+        let old: kubach_core::settings::SecuritySettings = serde_json::from_value(
+            serde_json::json!({"context": [{"context": "prod", "server": "https://prod.example.com",
+                "protected": true, "max_profile": "deploy"}]}),
+        )
+        .unwrap();
+
+        settings.security = old;
+        assert!(choose(&settings, "prod").is_ok());
         let error = choose(&settings, "vaulted").unwrap_err();
         assert!(error.contains("vault, which is locked"), "{error}");
         let error = choose(&settings, "nope").unwrap_err();
@@ -1856,9 +1861,9 @@ users:
             super::context_entries(&settings, Some(&contexts), &none, &["vaulted".to_owned()]);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["dev", "prod", "vaulted"]);
-        assert!(entries[0].agent_access && !entries[0].protected);
-        assert!(entries[1].protected);
+        assert!(entries[0].agent_access && entries[1].agent_access);
         assert!(entries[2].unavailable.is_some());
+
         // Names and servers only: no credentials.
         let json = serde_json::to_string(&entries).unwrap();
         assert!(!json.contains("secret-token"), "{json}");

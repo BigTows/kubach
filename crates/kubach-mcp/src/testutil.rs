@@ -4,8 +4,9 @@ use kubach_core::discovery::ApiCatalog;
 use kube::api::ApiResource;
 use kube::discovery::{ApiCapabilities, Scope};
 
+use crate::access::Access;
 use crate::scope::{SessionScope, SessionSpec};
-use crate::settings::{DeployMode, ExecMode, Profile, SecurityPolicy};
+use crate::settings::{Profile, SecurityPolicy};
 
 pub const NS: &str = "kubach-test-mcp";
 pub const OTHER_NS: &str = "kubach-test-mcp-other";
@@ -129,24 +130,30 @@ pub fn catalog() -> ApiCatalog {
     ])
 }
 
-/// Everything enabled, so tests can narrow one setting at a time.
+/// Everything in the minimum and Secret values shown, so tests can narrow
+/// one thing at a time; `scope(profile)` caps it at `profile`.
 pub fn permissive() -> SecurityPolicy {
-    SecurityPolicy {
-        deploy: DeployMode::ApplyAfterConfirmation,
-        exec: ExecMode::OneShot,
-        other_kinds: true,
-        ..SecurityPolicy::development()
-    }
+    SecurityPolicy::with_minimum(Access::ALL)
 }
 
+/// A session that has `profile` without asking: the policy's minimum
+/// capped there. More is asked for (#15); the launch caps nothing.
 pub fn scope_with(profile: Profile, policy: &SecurityPolicy, namespaces: &[&str]) -> SessionScope {
+    let mut policy = policy.clone();
+    policy.minimum = policy.minimum.capped(profile);
+    scope_capped(Profile::Deploy, &policy, namespaces)
+}
+
+/// A session launched with `--profile cap` on `policy`.
+pub fn scope_capped(cap: Profile, policy: &SecurityPolicy, namespaces: &[&str]) -> SessionScope {
     SessionScope::new(
         &SessionSpec {
             context: "minikube".into(),
             server_url: "https://127.0.0.1:8443".into(),
             namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
-            profile,
+            profile: cap,
             ttl: None,
+
             hints: Vec::new(),
         },
         policy,

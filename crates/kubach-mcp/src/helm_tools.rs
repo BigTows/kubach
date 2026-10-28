@@ -4,7 +4,7 @@
 //! Reading: charts of the repositories added in Kubach (and of an `oci://`
 //! reference the user allowed), a chart's default values, the releases of a
 //! namespace and a release's history. Changing: install, upgrade, rollback
-//! and uninstall, each `parse → policy (ceiling, read(ns), modify(ns)) →
+//! and uninstall, each `parse → policy (access, read(ns), modify(ns)) →
 //! chart source → server-side dry run → the user approves in Kubach → helm
 //! runs with live phases → result`.
 //!
