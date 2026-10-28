@@ -314,3 +314,163 @@ fn a_cluster_only_kubeconfig_carries_no_credentials() {
     assert!(value["clusters"][0]["cluster"]["certificate-authority-data"].is_string());
     assert!(!text.contains("user-token"));
 }
+
+/// What `helm template` prints for a chart with CRDs, RBAC and a webhook.
+const RENDERED: &str = "\
+---
+# Source: demo/crds/widgets.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+# Source: demo/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: demo-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demo
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: demo-hook
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-extra
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+";
+
+fn paths(findings: &[Finding]) -> Vec<&str> {
+    findings.iter().map(|f| f.path.as_str()).collect()
+}
+
+#[test]
+fn template_finds_cluster_objects_and_rbac_before_the_dry_run() {
+    let findings = beyond_service_account(&[RENDERED], NS, &catalog()).unwrap();
+    assert_eq!(
+        paths(&findings),
+        [
+            "CustomResourceDefinition widgets.example.com",
+            "ClusterRole demo-reader",
+            "Role demo",
+            "RoleBinding demo",
+            "ValidatingWebhookConfiguration demo-hook",
+            "Namespace demo-extra",
+        ]
+    );
+    // A plain chart has nothing a ServiceAccount cannot do.
+    let plain = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n";
+    assert!(
+        beyond_service_account(&[plain, ""], NS, &catalog())
+            .unwrap()
+            .is_empty()
+    );
+    // An object in another namespace is refused, not asked about.
+    let elsewhere = format!(
+        "{plain}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n  namespace: {OTHER_NS}\n"
+    );
+    assert_eq!(
+        beyond_service_account(&[&elsewhere], NS, &catalog())
+            .unwrap_err()
+            .code,
+        DenialCode::Namespace
+    );
+}
+
+#[test]
+fn an_upgrade_counts_the_objects_of_the_current_revision() {
+    // The new chart dropped its ClusterRole: helm deletes it on upgrade.
+    let new = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n";
+    let current = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n---\n\
+                   apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
+                   name: old-reader\n";
+    let findings = beyond_service_account(&[new, current], NS, &catalog()).unwrap();
+    assert_eq!(paths(&findings), ["ClusterRole old-reader"]);
+    // An object in both is listed once.
+    let findings = beyond_service_account(&[current, current], NS, &catalog()).unwrap();
+    assert_eq!(findings.len(), 1);
+}
+
+#[test]
+fn only_a_service_account_asks_for_the_users_credentials() {
+    let findings = beyond_service_account(&[RENDERED], NS, &catalog()).unwrap();
+    assert!(needs_user_credentials(
+        SessionMode::TemporaryServiceAccount,
+        &findings
+    ));
+    assert!(!needs_user_credentials(
+        SessionMode::TemporaryServiceAccount,
+        &[]
+    ));
+    // Client-only and impersonation keep their identity and the usual tick.
+    for mode in [SessionMode::ClientOnly, SessionMode::Impersonation] {
+        assert!(!needs_user_credentials(mode, &findings), "{mode:?}");
+    }
+}
+
+#[test]
+fn without_the_tick_the_agent_learns_which_objects() {
+    let text = user_refusal(
+        &[
+            "CustomResourceDefinition widgets.example.com".into(),
+            "Role demo".into(),
+        ],
+        Some("rejected by the user"),
+    );
+    assert!(text.contains("did not allow"), "{text}");
+    assert!(text.contains("Nothing ran"), "{text}");
+    assert!(
+        text.contains("CustomResourceDefinition widgets.example.com, Role demo"),
+        "{text}"
+    );
+    assert!(text.contains("(rejected by the user)"), "{text}");
+}
+
+#[test]
+fn helm_changes_of_older_peers_run_as_the_session() {
+    let change = HelmChange {
+        action: HelmAction::Install,
+        release: "web".into(),
+        chart: "podinfo/podinfo".into(),
+        version: None,
+        revision: None,
+        values: String::new(),
+        objects: vec!["Deployment web".into()],
+        cluster_objects: Vec::new(),
+        create_namespace: false,
+        identity: "serviceaccount:ns/sa".into(),
+        credentials: HelmCredentials::AskUser,
+        user_objects: vec!["ClusterRole demo".into()],
+    };
+    let mut json = serde_json::to_value(&change).unwrap();
+    assert_eq!(json["credentials"], "ask-user");
+    let back: HelmChange = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back, change);
+    let object = json.as_object_mut().unwrap();
+    object.remove("credentials");
+    object.remove("userObjects");
+    let old: HelmChange = serde_json::from_value(json).unwrap();
+    assert_eq!(old.credentials, HelmCredentials::Session);
+    assert!(old.user_objects.is_empty());
+}

@@ -19,8 +19,15 @@
 //!   namespace — never the user's credentials where the session has
 //!   another identity;
 //! - cluster-scoped objects of a chart (CRDs, ClusterRoles, webhooks, PVs,
-//!   StorageClasses…) are refused unless the user ticks them explicitly in
-//!   the dialog, and always under a ServiceAccount;
+//!   StorageClasses…) and RBAC inside the namespace need the user's
+//!   explicit tick in the dialog. A temporary ServiceAccount cannot create
+//!   them, so under one Kubach finds them first without the cluster —
+//!   `helm template` for install and upgrade (plus the current revision of
+//!   an upgrade), the revision's manifest for rollback and uninstall — and
+//!   asks the user to run this one call with their own kubeconfig
+//!   credentials (#18): an unticked box, then, for install and upgrade, the
+//!   dry run under those credentials and the usual window with its diff.
+//!   Without the tick nothing runs and the agent is told which objects;
 //! - charts only from repositories already added in Kubach, or an `oci://`
 //!   repository the user allows for the session; never a path or URL;
 //! - values only as YAML the agent passes (never a file path), masked by
@@ -28,7 +35,7 @@
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +43,7 @@ use k8s_openapi::api::rbac::v1::PolicyRule;
 use kubach_core::discovery::ApiCatalog;
 use kubach_core::helm::cli::{
     self as helm_cli, HelmCliError, HelmCommand, HelmTarget, HelmWatch, InstallRequest, SecretEnv,
-    ShowKind, UpgradeChart, UpgradeOutcome, UpgradeRequest,
+    ShowKind, TemplateRequest, UpgradeChart, UpgradeOutcome, UpgradeRequest,
 };
 use kubach_core::helm::repo::{self, HelmPaths, IndexState, SearchOptions};
 use kubach_core::helm::{
@@ -84,6 +91,16 @@ const CLUSTER_KINDS: &[&str] = &[
     "CSIDriver",
 ];
 
+/// Who runs a call the user allowed under their own credentials (#18), for
+/// the dialog and the audit log.
+pub const USER_IDENTITY: &str =
+    "user: your kubeconfig credentials, allowed for this helm call only";
+
+/// Why such a call runs as the user, for the audit log.
+const USER_REASON: &str = "the chart has cluster-scoped objects or RBAC that the namespace's \
+                           temporary ServiceAccount cannot create; the user allowed this one call \
+                           under their own credentials";
+
 /// What the session knows about the user's `helm`: the binary Kubach uses
 /// (settings, `PATH` or downloaded), the kubeconfig files of the context
 /// for client-only namespaces (`None`: the context is not in a file, such
@@ -116,6 +133,26 @@ impl HelmAction {
     }
 }
 
+/// Whose credentials a Helm change runs with (#18).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HelmCredentials {
+    /// The namespace's identity ([`HelmChange::identity`]).
+    #[default]
+    Session,
+    /// The question whether this one call may run with the user's own
+    /// kubeconfig credentials: the UI lists [`HelmChange::user_objects`],
+    /// warns, and keeps the approve button off until the user ticks an
+    /// unticked box. For install and upgrade nothing has touched the
+    /// cluster yet: a yes leads to the dry run under the user's
+    /// credentials and a second window with its diff.
+    AskUser,
+    /// The user allowed their credentials for this call already: the
+    /// window with the dry run's diff, which the UI marks as running as
+    /// the user.
+    User,
+}
+
 /// A Helm change as the user approves it (#418).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +180,13 @@ pub struct HelmChange {
     /// Under which identity helm runs (`serviceaccount:…`, `user`…).
     #[serde(default)]
     pub identity: String,
+    /// Whose credentials run it (#18).
+    #[serde(default)]
+    pub credentials: HelmCredentials,
+    /// Why the user's credentials are asked for: the cluster-scoped
+    /// objects and RBAC a temporary ServiceAccount cannot create or delete.
+    #[serde(default)]
+    pub user_objects: Vec<String>,
 }
 
 // ------------------------------------------------------------- arguments
@@ -403,10 +447,11 @@ pub(crate) fn check_objects(
                 return Err(Denial::new(
                     DenialCode::ClusterScoped,
                     format!(
-                        "the chart creates the cluster-scoped {} {}; in this namespace helm runs \
-                         as the session's ServiceAccount, which cannot create cluster-scoped \
-                         objects. Turn it off in the values (CRDs: crds.enabled/installCRDs \
-                         false) or ask the user to install it from Kubach's Helm screen",
+                        "the server-side dry run shows the cluster-scoped {} {}, which helm \
+                         template did not render; in this namespace helm runs as the session's \
+                         ServiceAccount, which cannot create cluster-scoped objects. Turn it off \
+                         in the values (CRDs: crds.enabled/installCRDs false) or ask the user to \
+                         install it from Kubach's Helm screen",
                         resource.kind, resource.name
                     ),
                 ));
@@ -425,8 +470,8 @@ pub(crate) fn check_objects(
                 return Err(Denial::new(
                     DenialCode::ForbiddenKind,
                     format!(
-                        "the chart creates {} {}; the session's ServiceAccount cannot grant \
-                         RBAC rights. Turn it off in the values (rbac.create: false) or ask the \
+                        "the server-side dry run shows {} {}, which helm template did not \
+                         render; the session's ServiceAccount cannot grant RBAC rights. Turn it off in the values (rbac.create: false) or ask the \
                          user to install it from Kubach's Helm screen",
                         resource.kind, resource.name
                     ),
@@ -447,6 +492,52 @@ pub(crate) fn check_objects(
         preview.objects.push(shown);
     }
     Ok(preview)
+}
+
+/// The cluster-scoped objects and RBAC of `manifests` (#18): what a
+/// temporary ServiceAccount cannot create or delete, checked as for the
+/// user (an object in another namespace is still refused). Each object
+/// once, in order.
+pub(crate) fn beyond_service_account(
+    manifests: &[&str],
+    namespace: &str,
+    catalog: &ApiCatalog,
+) -> Result<Vec<Finding>, Denial> {
+    let mut findings: Vec<Finding> = Vec::new();
+    for manifest in manifests {
+        let preview = check_objects(
+            &manifest_resources(manifest),
+            namespace,
+            catalog,
+            SessionMode::ClientOnly,
+        )?;
+        for finding in preview.findings {
+            if !findings.iter().any(|known| known.path == finding.path) {
+                findings.push(finding);
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// Whether a call must ask for the user's credentials (#18): only under a
+/// temporary ServiceAccount, and only for objects it cannot handle.
+/// Client-only and impersonated namespaces keep their own identity and
+/// the usual tick per finding.
+pub(crate) fn needs_user_credentials(mode: SessionMode, findings: &[Finding]) -> bool {
+    mode == SessionMode::TemporaryServiceAccount && !findings.is_empty()
+}
+
+/// What the agent is told when the user does not allow their credentials.
+pub(crate) fn user_refusal(objects: &[String], reason: Option<&str>) -> String {
+    format!(
+        "the user did not allow this helm call to run with their own credentials{}. Nothing ran. \
+         The namespace's temporary ServiceAccount cannot create or delete: {}. Turn these off \
+         in the values (CRDs: crds.enabled/installCRDs false; RBAC: rbac.create false) and call \
+         again, or ask the user to do it from Kubach's Helm screen",
+        reason.map(|r| format!(" ({r})")).unwrap_or_default(),
+        objects.join(", ")
+    )
 }
 
 /// Rules a temporary ServiceAccount gets while an approved helm call runs:
@@ -628,8 +719,20 @@ const IDENTITY_VARS: &[&str] = &[
     "HELM_KUBECONTEXT",
 ];
 
-async fn helm_run(ctx: &Ctx<'_>, env: &HelmEnv, namespace: &str) -> Result<HelmRun, ToolError> {
-    let access = ctx.session.helm_access(namespace).await?;
+/// `as_user`: the user allowed this one call under their own kubeconfig
+/// credentials (#18), whatever the namespace's identity; it then runs as
+/// in a client-only namespace.
+async fn helm_run(
+    ctx: &Ctx<'_>,
+    env: &HelmEnv,
+    namespace: &str,
+    as_user: bool,
+) -> Result<HelmRun, ToolError> {
+    let access = if as_user {
+        HelmAccess::User
+    } else {
+        ctx.session.helm_access(namespace).await?
+    };
     let mut vars: Vec<(&'static str, Option<OsString>)> =
         IDENTITY_VARS.iter().map(|name| (*name, None)).collect();
     let set =
@@ -645,7 +748,11 @@ async fn helm_run(ctx: &Ctx<'_>, env: &HelmEnv, namespace: &str) -> Result<HelmR
                 .into(),
         )
     };
-    let identity = ctx.session.describe_identity(Some(namespace));
+    let identity = if as_user {
+        USER_IDENTITY.to_owned()
+    } else {
+        ctx.session.describe_identity(Some(namespace))
+    };
     let (context, kubeconfig, dir) = match access {
         HelmAccess::Token { kubeconfig, token } => {
             let dir = tempfile::Builder::new()
@@ -697,14 +804,16 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 /// Widens the ServiceAccount's Role for helm while `work` runs, and puts
-/// it back afterwards whatever happened.
+/// it back afterwards whatever happened. Nothing to widen when helm runs
+/// as the user (`as_user`, #18).
 async fn with_helm_role<T>(
     ctx: &Ctx<'_>,
     namespace: &str,
     kinds: &[(String, String)],
+    as_user: bool,
     work: impl Future<Output = Result<T, ToolError>>,
 ) -> Result<T, ToolError> {
-    if ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
+    if as_user || ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
         return work.await;
     }
     ctx.session
@@ -1000,6 +1109,11 @@ async fn approve(
             _ => format!(" ({})", change.chart),
         }
     );
+    let summary = match change.credentials {
+        HelmCredentials::Session => summary,
+        HelmCredentials::AskUser => format!("{summary} with your own kubeconfig credentials"),
+        HelmCredentials::User => format!("{summary}, running with your kubeconfig credentials"),
+    };
     let request = ConfirmationRequest {
         kind: RequestKind::Helm {
             helm: Box::new(change),
@@ -1043,19 +1157,159 @@ async fn current_release(ctx: &Ctx<'_>, namespace: &str, release: &str) -> Optio
         .ok()
 }
 
-fn preview_from(ctx: &Ctx<'_>, release: &Release, namespace: &str) -> Result<Preview, ToolError> {
+/// A release's manifest with its hooks.
+fn release_manifest(release: &Release) -> String {
     let mut manifest = release.manifest.expose().clone();
     for hook in &release.hooks {
         manifest.push_str("\n---\n");
         manifest.push_str(hook.manifest.expose());
     }
-    check_objects(
-        &manifest_resources(&manifest),
-        namespace,
-        ctx.session.catalog(),
-        ctx.session.mode_in(namespace),
-    )
+    manifest
+}
+
+/// The objects of `release` checked for the call: as for the user when
+/// the user allowed their credentials (`as_user`, #18), otherwise for the
+/// namespace's identity.
+///
+/// Manifests are parsed on the blocking pool, not the async worker's
+/// stack: the deeply nested schemas of CRDs recurse deep (#18).
+async fn preview_from(
+    ctx: &Ctx<'_>,
+    release: &Release,
+    namespace: &str,
+    as_user: bool,
+) -> Result<Preview, ToolError> {
+    let mode = if as_user {
+        SessionMode::ClientOnly
+    } else {
+        ctx.session.mode_in(namespace)
+    };
+    let manifest = release_manifest(release);
+    let namespace = namespace.to_owned();
+    let catalog = ctx.session.catalog().clone();
+    kubach_core::runtime::blocking(move || {
+        check_objects(&manifest_resources(&manifest), &namespace, &catalog, mode)
+    })
+    .await
     .map_err(ToolError::from)
+}
+
+/// What the namespace's temporary ServiceAccount could not do among
+/// `manifests` (#18); empty for any other identity. Parsed on the
+/// blocking pool, as in [`preview_from`].
+async fn user_findings(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    manifests: &[&str],
+) -> Result<Vec<Finding>, ToolError> {
+    if ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
+        return Ok(Vec::new());
+    }
+    let manifests: Vec<String> = manifests.iter().map(|text| (*text).to_owned()).collect();
+    let namespace = namespace.to_owned();
+    let catalog = ctx.session.catalog().clone();
+    kubach_core::runtime::blocking(move || {
+        let manifests: Vec<&str> = manifests.iter().map(String::as_str).collect();
+        beyond_service_account(&manifests, &namespace, &catalog)
+    })
+    .await
+    .map_err(ToolError::from)
+}
+
+/// `Kind name` of each object `helm template` rendered, parsed on the
+/// blocking pool.
+async fn rendered_objects(rendered: Option<&str>) -> Vec<String> {
+    let text = rendered.unwrap_or_default().to_owned();
+    kubach_core::runtime::blocking(move || {
+        manifest_resources(&text)
+            .iter()
+            .map(|r| format!("{} {}", r.kind, r.name))
+            .collect()
+    })
+    .await
+}
+
+/// The chart as `helm template` renders it on the client (#18), under a
+/// temporary ServiceAccount only. `None` when it does not render there (a
+/// chart that needs the cluster's capabilities): the server-side dry run
+/// under the ServiceAccount then still refuses what it cannot create.
+async fn rendered(ctx: &Ctx<'_>, binary: &Path, request: &TemplateRequest) -> Option<String> {
+    if ctx.session.mode_in(&request.namespace) != SessionMode::TemporaryServiceAccount {
+        return None;
+    }
+    helm_cli::template(Some(binary), request, helm_cli::DEFAULT_TIMEOUT)
+        .await
+        .ok()
+}
+
+/// Asks the user to run this one call under their own kubeconfig
+/// credentials (#18); `findings` are why. A no, or no answer, is a refusal
+/// that names the objects; a yes is recorded for the audit log.
+async fn ask_user_credentials(
+    ctx: &Ctx<'_>,
+    env: &HelmEnv,
+    allowed: &Allowed,
+    mut change: HelmChange,
+    details: String,
+    findings: &[Finding],
+) -> Result<(), ToolError> {
+    let objects: Vec<String> = findings.iter().map(|f| f.path.clone()).collect();
+    if env.kubeconfig.is_none() {
+        return Err(Denial::new(
+            DenialCode::ClusterScoped,
+            format!(
+                "the namespace's temporary ServiceAccount cannot create or delete: {}; running \
+                 helm with the user's credentials needs this context in a kubeconfig file, and \
+                 it is not (a vault context). Turn these off in the values or ask the user to do \
+                 it from Kubach's Helm screen",
+                objects.join(", ")
+            ),
+        )
+        .into());
+    }
+    change.credentials = HelmCredentials::AskUser;
+    change.identity = USER_IDENTITY.to_owned();
+    change.user_objects = objects.clone();
+    match approve(ctx, allowed, change, details, Vec::new()).await {
+        Ok(()) => {
+            *sync::lock(&ctx.identity) = Some(USER_IDENTITY.to_owned());
+            Ok(())
+        }
+        Err(ToolError::Rejected(reason)) => Err(ToolError::Rejected(Some(user_refusal(
+            &objects,
+            reason.as_deref(),
+        )))),
+        Err(other) => Err(other),
+    }
+}
+
+/// What the next step does after a yes to the user's credentials.
+const DRY_RUN_NEXT: &str = "If you allow it, Kubach runs the server-side dry run with your \
+                            credentials and shows its objects and diff in the next window; \
+                            nothing changes until you approve that one.";
+
+fn bullet_list(prefix: &str, objects: &[String]) -> String {
+    objects
+        .iter()
+        .map(|object| format!("  {prefix} {object}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A changed release, with the audit record of a call that ran under the
+/// user's credentials (#18).
+fn changed_as(text: String, as_user: bool, findings: &[Finding]) -> ToolOutput {
+    ToolOutput {
+        text,
+        confirmed: true,
+        audit: as_user.then(|| {
+            json!({
+                "ranAs": "user",
+                "why": USER_REASON,
+                "objects": findings.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            })
+        }),
+    }
 }
 
 pub(crate) async fn install(
@@ -1091,7 +1345,6 @@ pub(crate) async fn install(
     }
     ensure_source(ctx, &source).await?;
     let binary = require_binary(&env)?;
-    let run = helm_run(ctx, &env, &namespace).await?;
     let request = InstallRequest {
         release: a.release.clone(),
         chart: a.chart.trim().to_owned(),
@@ -1099,8 +1352,51 @@ pub(crate) async fn install(
         values: Sensitive::new(values.clone()),
         create_namespace: a.create_namespace,
     };
-    // The server-side dry run, under the namespace's identity.
-    let preview_release = with_helm_role(ctx, &namespace, &[], async {
+    let base_change = HelmChange {
+        action: HelmAction::Install,
+        release: a.release.clone(),
+        chart: a.chart.trim().to_owned(),
+        version: a.version.clone(),
+        revision: None,
+        values: masked_values_yaml(&values),
+        objects: Vec::new(),
+        cluster_objects: Vec::new(),
+        create_namespace: a.create_namespace,
+        identity: String::new(),
+        credentials: HelmCredentials::Session,
+        user_objects: Vec::new(),
+    };
+    // Under a temporary ServiceAccount, the chart's cluster-scoped objects
+    // and RBAC are found on the client first (#18).
+    let template = TemplateRequest {
+        release: a.release.clone(),
+        namespace: namespace.clone(),
+        chart: UpgradeChart::Reference {
+            chart: request.chart.clone(),
+            version: a.version.clone(),
+        },
+        values: request.values.clone(),
+        is_upgrade: false,
+    };
+    let rendered = rendered(ctx, &binary, &template).await;
+    let user = user_findings(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    if as_user {
+        let objects = rendered_objects(rendered.as_deref()).await;
+        let details = format!(
+            "Objects of helm template (rendered without the cluster):\n{}\n\n{DRY_RUN_NEXT}",
+            bullet_list("+", &objects)
+        );
+        let change = HelmChange {
+            objects,
+            ..base_change.clone()
+        };
+        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+    }
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
+    // The server-side dry run, under the namespace's identity or, allowed
+    // above, the user's.
+    let preview_release = with_helm_role(ctx, &namespace, &[], as_user, async {
         match helm_cli::install(
             Some(&binary),
             &run.target,
@@ -1116,7 +1412,7 @@ pub(crate) async fn install(
         }
     })
     .await?;
-    let mut preview = preview_from(ctx, &preview_release, &namespace)?;
+    let mut preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
     if a.create_namespace {
         preview
             .cluster
@@ -1128,34 +1424,30 @@ pub(crate) async fn install(
         });
     }
     let change = HelmChange {
-        action: HelmAction::Install,
-        release: a.release.clone(),
-        chart: a.chart.trim().to_owned(),
         version: a
             .version
             .clone()
             .or_else(|| Some(preview_release.chart.version.clone())),
-        revision: None,
-        values: masked_values_yaml(&values),
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
-        create_namespace: a.create_namespace,
         identity: run.identity.clone(),
+        credentials: if as_user {
+            HelmCredentials::User
+        } else {
+            HelmCredentials::Session
+        },
+        user_objects: user.iter().map(|f| f.path.clone()).collect(),
+        ..base_change
     };
     let details = format!(
         "Objects of the server-side dry run:\n{}",
-        preview
-            .objects
-            .iter()
-            .map(|object| format!("  + {object}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        bullet_list("+", &preview.objects)
     );
     approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     // A fresh token: the user may have taken minutes to answer.
-    let run = helm_run(ctx, &env, &namespace).await?;
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
-    let output = with_helm_role(ctx, &namespace, &preview.kinds, async {
+    let output = with_helm_role(ctx, &namespace, &preview.kinds, as_user, async {
         helm_cli::install_watched(
             Some(&binary),
             &run.target,
@@ -1174,21 +1466,17 @@ pub(crate) async fn install(
     };
     let release = current_release(ctx, &namespace, &a.release).await;
     let phases = sync::lock(&phases).clone();
-    Ok(changed(result_text(
-        HelmAction::Install,
-        release.as_ref(),
-        &preview,
-        &phases,
-        &output,
-    )))
-}
-
-fn changed(text: String) -> ToolOutput {
-    ToolOutput {
-        text,
-        confirmed: true,
-        audit: None,
-    }
+    Ok(changed_as(
+        result_text(
+            HelmAction::Install,
+            release.as_ref(),
+            &preview,
+            &phases,
+            &output,
+        ),
+        as_user,
+        &user,
+    ))
 }
 
 pub(crate) async fn upgrade(
@@ -1222,8 +1510,8 @@ pub(crate) async fn upgrade(
         ensure_source(ctx, source).await?;
     }
     let binary = require_binary(&env)?;
-    let run = helm_run(ctx, &env, &namespace).await?;
-    let (current, request) = with_helm_role(ctx, &namespace, &[], async {
+    // The release's storage is read under the namespace's identity.
+    let (current, request) = with_helm_role(ctx, &namespace, &[], false, async {
         let releases = Releases::new(ctx.session.client_in(&namespace)?);
         let current = releases
             .get(&namespace, &a.release, None)
@@ -1256,7 +1544,59 @@ pub(crate) async fn upgrade(
         ))
     })
     .await?;
-    let preview_release = with_helm_role(ctx, &namespace, &[], async {
+    let chart = a.chart.clone().unwrap_or_else(|| {
+        format!(
+            "the chart kept in the release ({})",
+            current.chart.reference()
+        )
+    });
+    let base_change = HelmChange {
+        action: HelmAction::Upgrade,
+        release: a.release.clone(),
+        chart,
+        version: a.version.clone(),
+        revision: None,
+        values: masked_values_yaml(request.values.expose()),
+        objects: Vec::new(),
+        cluster_objects: Vec::new(),
+        create_namespace: false,
+        identity: String::new(),
+        credentials: HelmCredentials::Session,
+        user_objects: Vec::new(),
+    };
+    // Under a temporary ServiceAccount: what the new chart renders on the
+    // client and what the current revision holds (an upgrade deletes what
+    // the chart no longer has) (#18).
+    let template = TemplateRequest {
+        release: a.release.clone(),
+        namespace: namespace.clone(),
+        chart: request.chart.clone(),
+        values: request.values.clone(),
+        is_upgrade: true,
+    };
+    let rendered = rendered(ctx, &binary, &template).await;
+    let current_manifest = release_manifest(&current);
+    let user = user_findings(
+        ctx,
+        &namespace,
+        &[rendered.as_deref().unwrap_or_default(), &current_manifest],
+    )
+    .await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    if as_user {
+        let objects = rendered_objects(rendered.as_deref()).await;
+        let details = format!(
+            "Objects of helm template (rendered without the cluster):\n{}\n\n{DRY_RUN_NEXT}",
+            bullet_list("+", &objects)
+        );
+        let change = HelmChange {
+            objects,
+            ..base_change.clone()
+        };
+        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+    }
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
+    let preview_release = with_helm_role(ctx, &namespace, &[], as_user, async {
         match helm_cli::upgrade(
             Some(&binary),
             &run.target,
@@ -1272,30 +1612,25 @@ pub(crate) async fn upgrade(
         }
     })
     .await?;
-    let preview = preview_from(ctx, &preview_release, &namespace)?;
+    let preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
     let diff = masked_diff(
         current.manifest.expose(),
         preview_release.manifest.expose(),
         &format!("revision {}", current.revision),
         "after the upgrade",
     );
-    let chart = a.chart.clone().unwrap_or_else(|| {
-        format!(
-            "the chart kept in the release ({})",
-            current.chart.reference()
-        )
-    });
     let change = HelmChange {
-        action: HelmAction::Upgrade,
-        release: a.release.clone(),
-        chart,
         version: Some(preview_release.chart.version.clone()),
-        revision: None,
-        values: masked_values_yaml(request.values.expose()),
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
-        create_namespace: false,
         identity: run.identity.clone(),
+        credentials: if as_user {
+            HelmCredentials::User
+        } else {
+            HelmCredentials::Session
+        },
+        user_objects: user.iter().map(|f| f.path.clone()).collect(),
+        ..base_change
     };
     let details = if diff.trim().is_empty() {
         "The dry run changes no object.".to_owned()
@@ -1304,9 +1639,9 @@ pub(crate) async fn upgrade(
     };
     approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     // A fresh token: the user may have taken minutes to answer.
-    let run = helm_run(ctx, &env, &namespace).await?;
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
-    let output = with_helm_role(ctx, &namespace, &preview.kinds, async {
+    let output = with_helm_role(ctx, &namespace, &preview.kinds, as_user, async {
         helm_cli::upgrade_watched(
             Some(&binary),
             &run.target,
@@ -1325,13 +1660,17 @@ pub(crate) async fn upgrade(
     };
     let release = current_release(ctx, &namespace, &a.release).await;
     let phases = sync::lock(&phases).clone();
-    Ok(changed(result_text(
-        HelmAction::Upgrade,
-        release.as_ref(),
-        &preview,
-        &phases,
-        &output,
-    )))
+    Ok(changed_as(
+        result_text(
+            HelmAction::Upgrade,
+            release.as_ref(),
+            &preview,
+            &phases,
+            &output,
+        ),
+        as_user,
+        &user,
+    ))
 }
 
 pub(crate) async fn rollback(
@@ -1351,8 +1690,7 @@ pub(crate) async fn rollback(
     let namespace = allowed.namespace.clone();
     let env = env(ctx)?;
     let binary = require_binary(&env)?;
-    let run = helm_run(ctx, &env, &namespace).await?;
-    let (current, target) = with_helm_role(ctx, &namespace, &[], async {
+    let (current, target) = with_helm_role(ctx, &namespace, &[], false, async {
         let releases = Releases::new(ctx.session.client_in(&namespace)?);
         let current = releases
             .get(&namespace, &a.release, None)
@@ -1365,13 +1703,27 @@ pub(crate) async fn rollback(
         Ok((current, target))
     })
     .await?;
-    let preview = preview_from(ctx, &target, &namespace)?;
+    // The revision rolled back to, and the current one: a rollback deletes
+    // what the target no longer has (#18).
+    let user = user_findings(
+        ctx,
+        &namespace,
+        &[&release_manifest(&target), &release_manifest(&current)],
+    )
+    .await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    let preview = preview_from(ctx, &target, &namespace, as_user).await?;
     let diff = masked_diff(
         current.manifest.expose(),
         target.manifest.expose(),
         &format!("revision {}", current.revision),
         &format!("revision {}", target.revision),
     );
+    let identity = if as_user {
+        USER_IDENTITY.to_owned()
+    } else {
+        ctx.session.describe_identity(Some(&namespace))
+    };
     let change = HelmChange {
         action: HelmAction::Rollback,
         release: a.release.clone(),
@@ -1386,19 +1738,27 @@ pub(crate) async fn rollback(
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
         create_namespace: false,
-        identity: run.identity.clone(),
+        identity,
+        credentials: HelmCredentials::Session,
+        user_objects: Vec::new(),
     };
     let details = if diff.trim().is_empty() {
         "The rollback changes no object.".to_owned()
     } else {
         diff
     };
-    approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
+    // Nothing runs before this window: one question covers both the
+    // user's credentials and the rollback.
+    if as_user {
+        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+    } else {
+        approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
+    }
     // A fresh token: the user may have taken minutes to answer.
-    let run = helm_run(ctx, &env, &namespace).await?;
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let command = HelmCommand::rollback(&run.target, &a.release, a.revision).with_progress();
-    let output = with_helm_role(ctx, &namespace, &preview.kinds, async {
+    let output = with_helm_role(ctx, &namespace, &preview.kinds, as_user, async {
         helm_cli::run_watched(
             Some(&binary),
             &command,
@@ -1411,13 +1771,17 @@ pub(crate) async fn rollback(
     .await?;
     let release = current_release(ctx, &namespace, &a.release).await;
     let phases = sync::lock(&phases).clone();
-    Ok(changed(result_text(
-        HelmAction::Rollback,
-        release.as_ref(),
-        &preview,
-        &phases,
-        &output,
-    )))
+    Ok(changed_as(
+        result_text(
+            HelmAction::Rollback,
+            release.as_ref(),
+            &preview,
+            &phases,
+            &output,
+        ),
+        as_user,
+        &user,
+    ))
 }
 
 pub(crate) async fn uninstall(
@@ -1437,15 +1801,22 @@ pub(crate) async fn uninstall(
     let namespace = allowed.namespace.clone();
     let env = env(ctx)?;
     let binary = require_binary(&env)?;
-    let run = helm_run(ctx, &env, &namespace).await?;
-    let current = with_helm_role(ctx, &namespace, &[], async {
+    let current = with_helm_role(ctx, &namespace, &[], false, async {
         Releases::new(ctx.session.client_in(&namespace)?)
             .get(&namespace, &a.release, None)
             .await
             .map_err(store_error)
     })
     .await?;
-    let preview = preview_from(ctx, &current, &namespace)?;
+    // Uninstalling deletes the revision's cluster-scoped objects too (#18).
+    let user = user_findings(ctx, &namespace, &[&release_manifest(&current)]).await?;
+    let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &user);
+    let preview = preview_from(ctx, &current, &namespace, as_user).await?;
+    let identity = if as_user {
+        USER_IDENTITY.to_owned()
+    } else {
+        ctx.session.describe_identity(Some(&namespace))
+    };
     let change = HelmChange {
         action: HelmAction::Uninstall,
         release: a.release.clone(),
@@ -1456,7 +1827,9 @@ pub(crate) async fn uninstall(
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
         create_namespace: false,
-        identity: run.identity.clone(),
+        identity,
+        credentials: HelmCredentials::Session,
+        user_objects: Vec::new(),
     };
     let mut details = String::from("Objects deleted with the release:\n");
     for object in &preview.objects {
@@ -1465,12 +1838,16 @@ pub(crate) async fn uninstall(
     if a.keep_history {
         details.push_str("Its revisions stay (--keep-history).\n");
     }
-    approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
+    if as_user {
+        ask_user_credentials(ctx, &env, &allowed, change, details, &user).await?;
+    } else {
+        approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
+    }
     // A fresh token: the user may have taken minutes to answer.
-    let run = helm_run(ctx, &env, &namespace).await?;
+    let run = helm_run(ctx, &env, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let command = HelmCommand::uninstall(&run.target, &a.release, a.keep_history).with_progress();
-    let output = with_helm_role(ctx, &namespace, &preview.kinds, async {
+    let output = with_helm_role(ctx, &namespace, &preview.kinds, as_user, async {
         helm_cli::run_watched(
             Some(&binary),
             &command,
@@ -1482,13 +1859,11 @@ pub(crate) async fn uninstall(
     })
     .await?;
     let phases = sync::lock(&phases).clone();
-    Ok(changed(result_text(
-        HelmAction::Uninstall,
-        None,
-        &preview,
-        &phases,
-        &output,
-    )))
+    Ok(changed_as(
+        result_text(HelmAction::Uninstall, None, &preview, &phases, &output),
+        as_user,
+        &user,
+    ))
 }
 
 #[cfg(test)]
