@@ -73,6 +73,9 @@
 - Writes, exec and Secret reveals each need your confirmation, or can be limited to
   dry run and diff.
 - Every call goes to an audit log, which never contains Secret values.
+- Helm for the agent: search, install, upgrade, rollback and uninstall, each with a dry-run
+  diff you approve. `helm_upgrade` takes a `valuesPatch` that Kubach merges into the
+  release's values, and `helm_get_values` shows them with secrets masked.
 - Topology tools for the agent: `get_topology` and `can_reach`.
 - Port-forward for the agent (`port_forward_start`, `port_forward_list`,
   `port_forward_stop`): `127.0.0.1` only, each forward confirmed, shown under

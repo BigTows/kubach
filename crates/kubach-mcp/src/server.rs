@@ -364,9 +364,12 @@ impl McpServer {
              cluster); a refusal is final for the session.";
         let helm = if self.helm().is_some() {
             " Helm: helm_search_charts and helm_show_values for charts of the repositories added \
-             in Kubach (or an oci:// chart the user allows), helm_list_releases and \
-             helm_release_history; helm_install, helm_upgrade, helm_rollback and helm_uninstall \
-             run a server-side dry run that the user approves in Kubach. A chart with \
+             in Kubach (or an oci:// chart the user allows), helm_list_releases, \
+             helm_release_history and helm_get_values (a release's values, secrets masked); \
+             helm_install, helm_upgrade, helm_rollback and helm_uninstall run a server-side dry \
+             run that the user approves in Kubach. To change a few values of a release, pass \
+             only them to helm_upgrade as valuesPatch: Kubach merges it into the release's \
+             values (values replaces them all). A chart with \
              cluster-scoped objects (CRDs, ClusterRoles, webhooks), RBAC or objects in other \
              namespaces (such as leader election in kube-system): Kubach asks the user, and may \
              ask to run that one call with their own credentials."
@@ -973,6 +976,29 @@ fn catalog() -> Vec<ToolSpec> {
             destructive: false,
         },
         ToolSpec {
+            name: "helm_get_values",
+            description: "The values a Helm release (or one revision) was given, like helm get \
+                          values: values under sensitive names and strings that look like keys \
+                          or tokens are masked as *** (N bytes); maskedKeys lists them. The \
+                          chart's defaults are in helm_show_values. To change a few keys, pass \
+                          only them to helm_upgrade as valuesPatch.",
+            schema: object_schema(
+                {
+                    let mut p = json!({
+                        "release": {"type": "string"},
+                        "revision": {"type": "integer", "minimum": 1, "description": "A revision of helm_release_history; the latest by default"},
+                    });
+                    p.as_object_mut()
+                        .unwrap()
+                        .extend(ns.as_object().unwrap().clone());
+                    p
+                },
+                &["release"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
             name: "helm_install",
             description: "Install a chart as a release in the namespace with Kubach's helm. Kubach \
                           runs a server-side dry run, shows the user the chart, version, values \
@@ -1004,9 +1030,13 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "helm_upgrade",
-            description: "Upgrade a release: a new chart or version and/or new values (YAML; they \
-                          replace the release's values; without values it keeps its own). The \
-                          user sees the dry-run diff and approves. Cluster-scoped objects, \
+            description: "Upgrade a release: a new chart or version and/or new values. For a few \
+                          changes use valuesPatch: only the changed keys, which Kubach merges \
+                          into the release's values (mappings merge, lists and scalars are \
+                          replaced, null removes a key) and answers with the masked values \
+                          diff; values replace all of the release's values; with neither it \
+                          keeps its own. The user sees the values and dry-run diffs and \
+                          approves. Cluster-scoped objects, \
                           RBAC or objects in other namespaces in the new chart or the current \
                           revision: Kubach asks the user, and may ask to run this call with \
                           their own credentials first.",
@@ -1016,7 +1046,8 @@ fn catalog() -> Vec<ToolSpec> {
                         "release": {"type": "string"},
                         "chart": {"type": "string", "description": "repo/chart or oci://…; the chart kept in the release by default"},
                         "version": {"type": "string"},
-                        "values": {"type": "string", "description": "Values as one YAML mapping"},
+                        "values": {"type": "string", "description": "Values as one YAML mapping; they replace all of the release's values. Not with valuesPatch"},
+                        "valuesPatch": {"type": "string", "description": "Only the changes, as one YAML mapping merged into the release's values (null removes a key). Not with values"},
                     });
                     p.as_object_mut()
                         .unwrap()

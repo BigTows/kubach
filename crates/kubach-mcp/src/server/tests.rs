@@ -86,6 +86,31 @@ fn secret() -> Value {
     })
 }
 
+/// Helm's storage Secret of revision 2 of release `web` (#22): values with
+/// a password, a token under an innocent name and a list of keys.
+fn helm_storage() -> Value {
+    use base64::Engine as _;
+    let release = json!({
+        "name": "web", "namespace": NS, "version": 2,
+        "info": {"status": "deployed", "description": "Upgrade complete"},
+        "chart": {"metadata": {"name": "podinfo", "version": "6.15.0"}},
+        "config": {
+            "replicaCount": 2,
+            "auth": {"password": "hunter2-in-values", "user": "app"},
+            "extra": {"webhook": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJrdWJhY2gifQ.c2lnbmF0dXJlLXZhbHVl"},
+            "apiKeys": ["first-key-in-values"],
+        },
+        "manifest": "---\nkind: Deployment\n",
+    });
+    let payload = kubach_core::helm::encode_release(&release);
+    json!({
+        "apiVersion": "v1", "kind": "Secret", "type": "helm.sh/release.v1",
+        "metadata": {"name": "sh.helm.release.v1.web.v2", "namespace": NS,
+                     "labels": {"owner": "helm", "name": "web", "version": "2"}},
+        "data": {"release": base64::engine::general_purpose::STANDARD.encode(payload)},
+    })
+}
+
 /// Lists the topology tools read (#327): Deployment `web` with its
 /// ReplicaSet, Service `web` (80 → 8080) selecting it, ConfigMap
 /// `app-config`, Ingress `web` and a default-deny NetworkPolicy.
@@ -194,9 +219,18 @@ impl FakeApi {
                         let target = format!("/apis/apps/v1/namespaces/{NS}/deployments/web");
                         let secrets = format!("/api/v1/namespaces/{NS}/secrets");
                         let pods = format!("/api/v1/namespaces/{NS}/pods");
-                        let (status, body) = if (method == "GET"
-                            || method == "PATCH"
-                            || method == "DELETE")
+                        let storage = format!("{secrets}/sh.helm.release.v1.web.v");
+                        let (status, body) = if method == "GET" && path == format!("{storage}2") {
+                            ("200 OK", helm_storage().to_string())
+                        } else if method == "GET" && path == format!("{storage}9") {
+                            (
+                                "403 Forbidden",
+                                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                       "message": "secrets is forbidden", "reason": "Forbidden",
+                                       "code": 403})
+                                .to_string(),
+                            )
+                        } else if (method == "GET" || method == "PATCH" || method == "DELETE")
                             && path.starts_with(&format!("{secrets}/db"))
                             && !path.starts_with(&format!("{secrets}/db-"))
                         {
@@ -2293,6 +2327,7 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
         "helm_show_values",
         "helm_list_releases",
         "helm_release_history",
+        "helm_get_values",
     ] {
         assert!(
             !description(read).contains("Requires your approval"),
@@ -2311,6 +2346,8 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
         );
     }
     assert!(f.server.instructions().contains("helm_install"));
+    assert!(f.server.instructions().contains("helm_get_values"));
+    assert!(description("helm_upgrade").contains("valuesPatch"));
     // A path or an unknown repository is refused before anything runs.
     let outcome = f
         .server
@@ -2327,4 +2364,70 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
     );
     assert!(f.confirmer.requests().is_empty());
     assert!(f.api.requests().is_empty());
+}
+
+#[tokio::test]
+async fn helm_get_values_masks_secrets_and_never_falls_back() {
+    let f = fixture(Profile::ReadOnly, permissive(), true).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv::default());
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_get_values",
+            args(json!({"release": "web", "revision": 2, "namespace": NS})),
+        )
+        .await;
+    assert!(!outcome.is_error, "the read failed");
+    for secret in [
+        "hunter2-in-values",
+        "first-key-in-values",
+        "eyJhbGciOiJIUzI1NiJ9",
+    ] {
+        assert!(!outcome.text.contains(secret), "a value is not masked");
+    }
+    let answer: Value = serde_json::from_str(&outcome.text).unwrap();
+    assert_eq!(answer["revision"], 2);
+    assert_eq!(answer["chart"], "podinfo-6.15.0");
+    let values = answer["values"].as_str().unwrap();
+    assert!(values.contains("replicaCount: 2"), "{values}");
+    assert!(values.contains("user: app"), "{values}");
+    assert_eq!(
+        answer["maskedKeys"],
+        json!(["apiKeys[0]", "auth.password", "extra.webhook"])
+    );
+    // Reading needs nothing but read(ns), and asks nothing.
+    assert!(f.confirmer.requests().is_empty());
+
+    // The namespace's identity may not read the storage: a clear refusal,
+    // and no other credentials are tried.
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_get_values",
+            args(json!({"release": "web", "revision": 9, "namespace": NS})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .text
+            .contains("does not read them with other credentials"),
+        "{}",
+        outcome.text
+    );
+    let reads: Vec<String> = f
+        .api
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains("sh.helm.release"))
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            format!("GET /api/v1/namespaces/{NS}/secrets/sh.helm.release.v1.web.v2"),
+            format!("GET /api/v1/namespaces/{NS}/secrets/sh.helm.release.v1.web.v9"),
+        ]
+    );
 }

@@ -76,6 +76,7 @@ agent-access-crds = 自定义资源
 agent-field-tool = 工具
 agent-field-session = 会话
 agent-helm-values = Values（敏感键已遮蔽）
+agent-helm-values-diff = Values 变更（敏感值已遮蔽）
 agent-helm-objects = 对象
 agent-helm-as-user-title = 使用您的凭据运行此 helm 调用？
 agent-helm-as-user-warning = 此 helm 调用将使用您 kubeconfig 中的凭据运行，而不是会话的临时 ServiceAccount。只有您自己的 RBAC 会限制它，并且仅限这一次调用。

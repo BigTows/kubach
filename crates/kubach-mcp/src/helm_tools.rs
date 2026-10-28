@@ -35,7 +35,11 @@
 //! - charts only from repositories already added in Kubach, or an `oci://`
 //!   repository the user allows for the session; never a path or URL;
 //! - values only as YAML the agent passes (never a file path), masked by
-//!   key name in the dialog, the audit log and answers.
+//!   key name in the dialog, the audit log and answers;
+//! - a release's current values never reach the agent whole (#22):
+//!   `helm_get_values` returns them masked by key name and by what looks
+//!   like a key or token, and `helm_upgrade` with `valuesPatch` merges the
+//!   patch in Kubach and answers with the masked diff of the values only.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -196,6 +200,11 @@ pub struct HelmChange {
     /// allowed to the session (`modify(ns)`) before the user is asked.
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// How the release's values change (#22): a unified diff, values of
+    /// sensitive keys and secret-looking strings masked. Empty when they
+    /// stay as they are.
+    #[serde(default)]
+    pub values_diff: String,
 }
 
 // ------------------------------------------------------------- arguments
@@ -251,6 +260,16 @@ struct UpgradeArgs {
     chart: Option<String>,
     version: Option<String>,
     values: Option<String>,
+    /// Changes merged into the release's values by Kubach (#22).
+    values_patch: Option<String>,
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetValuesArgs {
+    release: String,
+    revision: Option<u32>,
     namespace: Option<String>,
 }
 
@@ -357,32 +376,202 @@ pub(crate) fn parse_values(text: &str) -> Result<Value, Denial> {
         .map_or_else(|| Value::Object(Map::new()), |doc| doc.value))
 }
 
-/// Values with sensitive keys (`password`, `token`, `auth`…) masked as
-/// `*** (N bytes)`, at any depth.
+/// Shortest string [`looks_like_secret`] takes for a bare key or token.
+pub(crate) const SECRET_MIN_LEN: usize = 32;
+
+/// Whether a value that is not under a sensitive name still looks like a
+/// secret (#22): a PEM block, a JWT, or one word of at least
+/// [`SECRET_MIN_LEN`] characters that is hex (with digits and letters) or
+/// base64 / base64url (with upper case, lower case and digits). Names,
+/// hosts, image references and paths have dots, colons or a single case,
+/// so they stay readable; a false positive only hides a value.
+pub(crate) fn looks_like_secret(text: &str) -> bool {
+    let text = text.trim();
+    if text.contains("-----BEGIN ") {
+        return true;
+    }
+    let base64url = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    let parts: Vec<&str> = text.split('.').collect();
+    if text.len() >= 20
+        && text.starts_with("eyJ")
+        && parts.len() == 3
+        && base64url(parts[0])
+        && base64url(parts[1])
+        && (parts[2].is_empty() || base64url(parts[2]))
+    {
+        return true;
+    }
+    if text.len() < SECRET_MIN_LEN {
+        return false;
+    }
+    let digits = text.chars().any(|c| c.is_ascii_digit());
+    if digits
+        && text.chars().all(|c| c.is_ascii_hexdigit())
+        && text.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    let body = text.trim_end_matches('=');
+    body.len() >= SECRET_MIN_LEN
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_'))
+        && digits
+        && body.chars().any(|c| c.is_ascii_uppercase())
+        && body.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// `*** (N bytes)` for a masked value.
+fn values_placeholder(value: &Value) -> Value {
+    let size = match value {
+        Value::String(text) => text.len(),
+        Value::Null => 0,
+        other => other.to_string().len(),
+    };
+    Value::String(format!("*** ({size} bytes)"))
+}
+
+/// Values masked at any depth: every scalar under a sensitive key
+/// (`password`, `token`, `auth`…; in a list under one too) and every string
+/// that [`looks_like_secret`] becomes `*** (N bytes)`; other strings go
+/// through text masking.
 pub(crate) fn mask_values(value: &mut Value) {
+    mask_values_at(value, "", false, &mut Vec::new());
+}
+
+/// [`mask_values`], returning the paths it masked (`auth.password`,
+/// `tokens[0]`), for `helm_get_values`.
+pub(crate) fn mask_values_listed(value: &mut Value) -> Vec<String> {
+    let mut masked = Vec::new();
+    mask_values_at(value, "", false, &mut masked);
+    masked
+}
+
+fn mask_values_at(value: &mut Value, path: &str, sensitive: bool, masked: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                if is_sensitive_name(key) && !value.is_object() && !value.is_array() {
-                    let size = match &*value {
-                        Value::String(text) => text.len(),
-                        Value::Null => 0,
-                        other => other.to_string().len(),
-                    };
-                    *value = Value::String(format!("*** ({size} bytes)"));
+            for (key, child) in map.iter_mut() {
+                let child_path = if path.is_empty() {
+                    key.clone()
                 } else {
-                    mask_values(value);
-                }
+                    format!("{path}.{key}")
+                };
+                mask_values_at(child, &child_path, is_sensitive_name(key), masked);
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(mask_values),
-        Value::String(text) => {
-            if let std::borrow::Cow::Owned(masked) = mask_text(text) {
-                *text = masked;
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                mask_values_at(item, &format!("{path}[{index}]"), sensitive, masked);
             }
+        }
+        Value::String(text) if !sensitive && !looks_like_secret(text) => {
+            if let std::borrow::Cow::Owned(text_masked) = mask_text(text) {
+                *text = text_masked;
+            }
+        }
+        Value::String(_) => {
+            *value = values_placeholder(value);
+            masked.push(path.to_owned());
+        }
+        _ if sensitive => {
+            *value = values_placeholder(value);
+            masked.push(path.to_owned());
         }
         _ => {}
     }
+}
+
+/// Merges `patch` into `values` (#22), as a JSON merge patch: mappings
+/// merge key by key at any depth, scalars and lists replace the value
+/// whole, and `null` removes the key from the release's values (the
+/// chart's default applies again).
+pub(crate) fn merge_values(values: &mut Value, patch: &Value) {
+    let Value::Object(patch) = patch else {
+        *values = patch.clone();
+        return;
+    };
+    if !values.is_object() {
+        *values = Value::Object(Map::new());
+    }
+    let Value::Object(target) = values else {
+        unreachable!("set to a mapping above");
+    };
+    for (key, change) in patch {
+        match change {
+            Value::Null => {
+                target.remove(key);
+            }
+            Value::Object(_) => merge_values(
+                target
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Map::new())),
+                change,
+            ),
+            other => {
+                target.insert(key.clone(), other.clone());
+            }
+        }
+    }
+}
+
+/// Marks a masked value of `new` that hides a changed value, which would
+/// otherwise look the same on both sides: `*** (N bytes, changed)`.
+fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_masked: &mut Value) {
+    match (old, new, old_masked, new_masked) {
+        (Value::Object(old), Value::Object(new), Value::Object(old_m), Value::Object(new_m)) => {
+            for (key, masked) in new_m.iter_mut() {
+                if let (Some(o), Some(n), Some(om)) = (old.get(key), new.get(key), old_m.get(key)) {
+                    mark_changed(o, n, om, masked);
+                }
+            }
+        }
+        (Value::Array(old), Value::Array(new), Value::Array(old_m), Value::Array(new_m))
+            if old.len() == new.len() =>
+        {
+            for (index, masked) in new_m.iter_mut().enumerate() {
+                mark_changed(&old[index], &new[index], &old_m[index], masked);
+            }
+        }
+        (old, new, old_masked, Value::String(text))
+            if old != new && Some(text.as_str()) == old_masked.as_str() =>
+        {
+            *text = if text.starts_with("*** (") {
+                format!("{}, changed)", text.trim_end_matches(')'))
+            } else {
+                format!("{text} [changed, masked]")
+            };
+        }
+        _ => {}
+    }
+}
+
+/// The diff of a release's values (#22), both sides masked as by
+/// [`mask_values`]; a masked value that changed is marked so. Empty when
+/// nothing changes. What the dialog shows and the agent gets: never the
+/// values themselves.
+pub(crate) fn masked_values_diff(
+    old: &Value,
+    new: &Value,
+    old_label: &str,
+    new_label: &str,
+) -> String {
+    let mut old_masked = old.clone();
+    mask_values(&mut old_masked);
+    let mut new_masked = new.clone();
+    mask_values(&mut new_masked);
+    mark_changed(old, new, &old_masked, &mut new_masked);
+    let diff = unified_diff(
+        &kubach_core::helm::values_to_yaml(&old_masked),
+        &kubach_core::helm::values_to_yaml(&new_masked),
+        old_label,
+        new_label,
+    );
+    truncate(&diff, 64 * 1024).into_owned()
 }
 
 /// Values YAML as shown and audited: masked, or an outline when it does
@@ -1002,12 +1191,20 @@ fn result_text(
     preview: &Preview,
     phases: &[String],
     output: &str,
+    values_diff: Option<&str>,
 ) -> String {
     let mut out = json!({
         "action": action,
         "objects": preview.objects,
         "phases": phases,
     });
+    if let Some(diff) = values_diff {
+        out["valuesDiff"] = json!(if diff.trim().is_empty() {
+            "the values did not change"
+        } else {
+            diff
+        });
+    }
     if let Some(release) = release {
         out["release"] = json!(release.name);
         out["namespace"] = json!(release.namespace);
@@ -1192,6 +1389,68 @@ pub(crate) async fn history(
         "release": a.release,
         "namespace": allowed.namespace,
         "revisions": rows,
+    });
+    Ok(ToolOutput::read(
+        serde_json::to_string_pretty(&out).unwrap_or_default(),
+    ))
+}
+
+/// The values a release (or one revision of it) was given (#22), masked as
+/// by [`mask_values`]: by key name, and strings that look like a key or a
+/// token. Read under the same identity as [`history`]; where it cannot
+/// read Helm's storage Secrets the agent is told so, and Kubach does not
+/// try other credentials.
+pub(crate) async fn get_values(
+    ctx: &Ctx<'_>,
+    args: &Map<String, Value>,
+) -> Result<ToolOutput, ToolError> {
+    let a: GetValuesArgs = parse(args)?;
+    helm_cli::check_release_name(&a.release)
+        .map_err(|error| Denial::new(DenialCode::InvalidName, error.to_string()))?;
+    let allowed = authorize(
+        ctx,
+        &Request::HelmRead {
+            namespace: a.namespace,
+        },
+    )
+    .await?;
+    let namespace = allowed.namespace.clone();
+    let client = ctx.session.client_in(&namespace)?;
+    let release = Releases::new(client)
+        .get(&namespace, &a.release, a.revision)
+        .await
+        .map_err(|error| match store_error(error) {
+            ToolError::Api { code, message } => ToolError::Api {
+                code,
+                message: format!(
+                    "{message}. The session's identity in {namespace} ({}) cannot read them, \
+                     and Kubach does not read them with other credentials. With access to \
+                     Secrets for the session (list_secrets asks the user for it) it can; \
+                     otherwise ask the user to look at the values in Kubach's Helm screen",
+                    ctx.session.describe_identity(Some(&namespace))
+                ),
+            },
+            other => other,
+        })?;
+    let values = release.user_values.expose().clone();
+    let (yaml, masked) = kubach_core::runtime::blocking(move || {
+        let mut values = values;
+        let mut masked = mask_values_listed(&mut values);
+        masked.sort();
+        (kubach_core::helm::values_to_yaml(&values), masked)
+    })
+    .await;
+    let out = json!({
+        "release": release.name,
+        "namespace": namespace,
+        "revision": release.revision,
+        "chart": release.chart.reference(),
+        "values": truncate(&yaml, crate::tools::MAX_OUTPUT_BYTES),
+        "maskedKeys": masked,
+        "note": "Values the release was given (not the chart's defaults: see helm_show_values). \
+                 Values under sensitive names and strings that look like keys or tokens are \
+                 masked as *** (N bytes) and cannot be read. To change a few keys, pass only \
+                 them to helm_upgrade as valuesPatch; Kubach merges it into these values.",
     });
     Ok(ToolOutput::read(
         serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -1465,8 +1724,12 @@ fn changed_as(
     as_user: bool,
     findings: &[Finding],
     namespaces: Vec<String>,
+    values_diff: Option<&str>,
 ) -> ToolOutput {
     let mut audit = json!({ "namespaces": namespaces });
+    if let Some(diff) = values_diff {
+        audit["valuesDiff"] = json!(diff);
+    }
     if as_user {
         audit["ranAs"] = json!("user");
         audit["why"] = json!(USER_REASON);
@@ -1542,6 +1805,7 @@ pub(crate) async fn install(
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
         namespaces: Vec::new(),
+        values_diff: String::new(),
     };
     // Under a temporary ServiceAccount, the chart's cluster-scoped objects
     // and RBAC are found on the client first (#18).
@@ -1656,11 +1920,104 @@ pub(crate) async fn install(
             &preview,
             &phases,
             &output,
+            None,
         ),
         as_user,
         &scan.findings,
         touched(&namespace, &others),
+        None,
     ))
+}
+
+/// How an upgrade changes the release's values (#22).
+#[derive(Debug)]
+pub(crate) enum ValuesEdit {
+    /// Neither `values` nor `valuesPatch`: the release keeps its own.
+    Keep,
+    /// `values`: they replace the release's.
+    Replace(String),
+    /// `valuesPatch`: merged into the release's by Kubach.
+    Patch(Value),
+}
+
+impl ValuesEdit {
+    fn is_patch(&self) -> bool {
+        matches!(self, Self::Patch(_))
+    }
+}
+
+/// Checks the values arguments of an upgrade before anything is asked:
+/// `values` and `valuesPatch` together are an input error (#22).
+pub(crate) fn values_edit(values: Option<&str>, patch: Option<&str>) -> Result<ValuesEdit, Denial> {
+    match (values, patch) {
+        (Some(_), Some(_)) => Err(Denial::new(
+            DenialCode::InvalidInput,
+            "pass either values (they replace the release's values) or valuesPatch (only the \
+             changes, merged into the release's values), not both",
+        )),
+        (Some(values), None) => {
+            parse_values(values)?;
+            Ok(ValuesEdit::Replace(values.to_owned()))
+        }
+        (None, Some(patch)) => parse_values(patch)
+            .map(ValuesEdit::Patch)
+            .map_err(|denial| {
+                Denial::new(
+                    denial.code,
+                    denial.message.replacen("values", "valuesPatch", 1),
+                )
+            }),
+        (None, None) => Ok(ValuesEdit::Keep),
+    }
+}
+
+/// An upgrade's values: what helm gets, what the dialog shows (masked) and
+/// the masked diff against the current revision.
+pub(crate) struct UpgradeValues {
+    pub yaml: Sensitive<String>,
+    pub masked: String,
+    pub diff: String,
+}
+
+/// The values of an upgrade from `edit` and the current revision, merged,
+/// masked and diffed on the blocking pool (#22).
+pub(crate) fn upgrade_values_now(
+    edit: ValuesEdit,
+    current: &Value,
+    revision: u32,
+) -> UpgradeValues {
+    let (new, yaml) = match edit {
+        ValuesEdit::Keep => (current.clone(), None),
+        // The agent's text goes to helm as it is.
+        ValuesEdit::Replace(text) => (
+            parse_values(&text).unwrap_or_else(|_| Value::Object(Map::new())),
+            Some(text),
+        ),
+        ValuesEdit::Patch(patch) => {
+            let mut merged = current.clone();
+            merge_values(&mut merged, &patch);
+            (merged, None)
+        }
+    };
+    let yaml = yaml.unwrap_or_else(|| kubach_core::helm::values_to_yaml(&new));
+    let mut masked = new.clone();
+    mask_values(&mut masked);
+    UpgradeValues {
+        masked: kubach_core::helm::values_to_yaml(&masked),
+        diff: masked_values_diff(
+            current,
+            &new,
+            &format!("values of revision {revision}"),
+            "values after the upgrade",
+        ),
+        yaml: Sensitive::new(yaml),
+    }
+}
+
+async fn upgrade_values(edit: ValuesEdit, current: &Release) -> UpgradeValues {
+    let values = current.user_values.expose().clone();
+    let revision = current.revision;
+    kubach_core::runtime::blocking(move || upgrade_values_now(edit, &values, revision)).await
 }
 
 pub(crate) async fn upgrade(
@@ -1678,9 +2035,7 @@ pub(crate) async fn upgrade(
         )?),
         None => None,
     };
-    if let Some(values) = &a.values {
-        parse_values(values)?;
-    }
+    let edit = values_edit(a.values.as_deref(), a.values_patch.as_deref())?;
     let allowed = authorize(
         ctx,
         &Request::HelmChange {
@@ -1695,7 +2050,7 @@ pub(crate) async fn upgrade(
     }
     let binary = require_binary(&env)?;
     // The release's storage is read under the namespace's identity.
-    let (current, request) = with_helm_role(ctx, &namespace, &[], false, async {
+    let (current, upgrade_chart) = with_helm_role(ctx, &namespace, &[], false, async {
         let releases = Releases::new(ctx.session.client_in(&namespace)?);
         let current = releases
             .get(&namespace, &a.release, None)
@@ -1713,21 +2068,16 @@ pub(crate) async fn upgrade(
                     .map_err(store_error)?,
             ),
         };
-        // Without new values the release keeps its own.
-        let values = match &a.values {
-            Some(values) => values.clone(),
-            None => kubach_core::helm::values_to_yaml(current.user_values.expose()),
-        };
-        Ok((
-            current,
-            UpgradeRequest {
-                release: a.release.clone(),
-                chart,
-                values: Sensitive::new(values),
-            },
-        ))
+        Ok((current, chart))
     })
     .await?;
+    let patched = edit.is_patch();
+    let values = upgrade_values(edit, &current).await;
+    let request = UpgradeRequest {
+        release: a.release.clone(),
+        chart: upgrade_chart,
+        values: values.yaml,
+    };
     let chart = a.chart.clone().unwrap_or_else(|| {
         format!(
             "the chart kept in the release ({})",
@@ -1740,7 +2090,7 @@ pub(crate) async fn upgrade(
         chart,
         version: a.version.clone(),
         revision: None,
-        values: masked_values_yaml(request.values.expose()),
+        values: values.masked,
         objects: Vec::new(),
         cluster_objects: Vec::new(),
         create_namespace: false,
@@ -1748,6 +2098,7 @@ pub(crate) async fn upgrade(
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
         namespaces: Vec::new(),
+        values_diff: values.diff.clone(),
     };
     // Under a temporary ServiceAccount: what the new chart renders on the
     // client and what the current revision holds (an upgrade deletes what
@@ -1859,10 +2210,12 @@ pub(crate) async fn upgrade(
             &preview,
             &phases,
             &output,
+            patched.then_some(values.diff.as_str()),
         ),
         as_user,
         &scan.findings,
         touched(&namespace, &others),
+        patched.then_some(values.diff.as_str()),
     ))
 }
 
@@ -1938,6 +2291,7 @@ pub(crate) async fn rollback(
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
         namespaces: others.clone(),
+        values_diff: String::new(),
     };
     let details = if diff.trim().is_empty() {
         "The rollback changes no object.".to_owned()
@@ -1975,10 +2329,12 @@ pub(crate) async fn rollback(
             &preview,
             &phases,
             &output,
+            None,
         ),
         as_user,
         &scan.findings,
         touched(&namespace, &others),
+        None,
     ))
 }
 
@@ -2031,6 +2387,7 @@ pub(crate) async fn uninstall(
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
         namespaces: others.clone(),
+        values_diff: String::new(),
     };
     let mut details = String::from("Objects deleted with the release:\n");
     for object in &preview.objects {
@@ -2061,10 +2418,18 @@ pub(crate) async fn uninstall(
     .await?;
     let phases = sync::lock(&phases).clone();
     Ok(changed_as(
-        result_text(HelmAction::Uninstall, None, &preview, &phases, &output),
+        result_text(
+            HelmAction::Uninstall,
+            None,
+            &preview,
+            &phases,
+            &output,
+            None,
+        ),
         as_user,
         &scan.findings,
         touched(&namespace, &others),
+        None,
     ))
 }
 
