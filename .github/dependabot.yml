@@ -10,6 +10,11 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # resvg pins its own usvg: bumped one at a time, two usvg versions
+      # end up in the build and it doesn't compile (#5, #6). A dependency
+      # goes to the first group it matches, so this one comes first.
+      resvg:
+        patterns: [resvg, usvg]
       cargo:
         update-types: [minor, patch]
 
