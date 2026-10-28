@@ -1260,18 +1260,23 @@ fn delete_secret(name: &str) -> Request {
 #[test]
 fn secret_writes_need_deploy_applied_changes_and_metadata() {
     let all = [Grant::read(NS), Grant::modify(NS)];
-    for request in [
+    for (case, request) in [
         write(SecretOp::Create, None),
         write(SecretOp::Update, None),
         copy(None, Some("pull-copy")),
         delete_secret("db"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // The case number, not the request: CodeQL takes a Secret request
+        // in a message for a logged Secret.
         let allowed = checked(Profile::Deploy, &permissive(), &all, SERVER, &request).unwrap();
-        assert_eq!(allowed.confirmation, Confirmation::Required, "{request:?}");
+        assert_eq!(allowed.confirmation, Confirmation::Required, "case {case}");
         assert!(request.is_mutating());
         for profile in [Profile::ReadOnly, Profile::Debug] {
             let denial = checked(profile, &permissive(), &all, SERVER, &request).unwrap_err();
-            assert_eq!(denial.code, DenialCode::NeedsAccess, "{request:?}");
+            assert_eq!(denial.code, DenialCode::NeedsAccess, "case {case}");
         }
         let no_secrets = no_secrets();
         let denial = checked(Profile::Deploy, &no_secrets, &all, SERVER, &request).unwrap_err();
