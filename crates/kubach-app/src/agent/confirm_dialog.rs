@@ -672,6 +672,15 @@ impl Render for ConfirmView {
                                 cx,
                             ))
                         })
+                        // Namespaces besides the release's (#21).
+                        .when(!helm.namespaces.is_empty(), |this| {
+                            this.child(field(
+                                t!("agent-field-other-namespaces"),
+                                helm.namespaces.join(", "),
+                                label_width,
+                                cx,
+                            ))
+                        })
                         .child(field(
                             t!("agent-field-runs-as"),
                             helm.identity.clone(),

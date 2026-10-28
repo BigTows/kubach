@@ -840,7 +840,7 @@ Settings → Tools, иначе `PATH`, иначе скачанный Kubach; б�
   остальное — маскированием текста. Upgrade без values сохраняет values релиза.
 - **Превью**: `helm install|upgrade --dry-run=server` под идентичностью namespace; для rollback —
   манифест целевой ревизии, для uninstall — манифест текущей. Объекты проверяются: всё в
-  namespace сессии (иначе отказ); кластерные (CRD, ClusterRole/Binding, webhooks, PV,
+  namespace сессии (иначе отказ; с #21 — находка, см. ниже); кластерные (CRD, ClusterRole/Binding, webhooks, PV,
   StorageClass, Namespace, … — по discovery или списку для ещё не обслуживаемых kind'ов) и
   Role/RoleBinding чарта — `dangerous`-находки, которые пользователь отмечает отдельной
   галочкой «I understand…», иначе кнопка недоступна. `--create-namespace` — только как находка
@@ -882,7 +882,7 @@ scope`, до проверки объектов и окна дело не дох�
   к кластеру никто не обращается). Для upgrade к ним добавляется манифест текущей ревизии с
   хуками (upgrade удаляет то, чего в новом чарте нет). Rollback — целевая и текущая ревизии,
   uninstall — текущая (он удаляет её объекты). Ищутся кластерные объекты и Role/RoleBinding;
-  объект в чужом namespace по-прежнему отказ. Манифесты разбираются в blocking-пуле: глубокие
+  объект в чужом namespace по-прежнему отказ (с #21 — тоже находка). Манифесты разбираются в blocking-пуле: глубокие
   схемы CRD переполняли стек async-воркера.
 - **Двухшаговый вопрос для install/upgrade.** Шаг 1 — окно Helm с `credentials: ask-user`:
   список найденных объектов, предупреждение «этот вызов helm выполнится от ваших учётных данных
@@ -907,6 +907,42 @@ scope`, до проверки объектов и окна дело не дох�
   only`, в `change` — `ranAs: user`, причина и объекты.
 - **Только клиент и impersonation** не меняются: там идентичность namespace и галочка на каждую
   находку, как раньше.
+
+**Изменение (#21).** `helm_upgrade` cert-manager в namespace `cert-manager` отклонялся жёстко:
+чарт по умолчанию кладёт Role и RoleBinding для leader election в `kube-system`, а проверка
+объектов разрешала только namespace релиза, и права сессии на другой namespace не помогали.
+Теперь объект в чужом namespace — не отказ, а такая же находка, как объект уровня кластера:
+- **Поиск** — тот же, что в #18: `helm template` (и текущая ревизия для upgrade), целевая и
+  текущая ревизии для rollback, текущая для uninstall, затем серверный dry-run. Объект
+  namespaced-kind'а с `metadata.namespace`, отличным от namespace релиза, показывается как
+  «Role cert-manager-cainjector:leaderelection (namespace kube-system)». Имя namespace
+  проверяется как DNS-метка (иначе отказ без вопроса). Kind'ы чужого namespace не попадают в
+  «права helm» Role SA релиза.
+- **Права сессии на каждый такой namespace** — до любого вопроса пользователю и до любого
+  изменяющего вызова: для каждого namespace выполняется тот же `authorize`, что у других
+  инструментов (`Request::HelmChange` с этим namespace): `read(ns)`, затем `modify(ns)` там,
+  где границу держит API-сервер (с #15 выдаются автоматически в пределах уровня доступа и
+  настраивают идентичность namespace, как при первом обращении к нему; в client-only — только
+  `read(ns)`, а каждое изменение подтверждается). Сессия, закреплённая `--namespace`,
+  отказывает без вопроса. Отказ → агент получает перечень объектов этого namespace и причину;
+  ничего не выполнено. Для install и upgrade права проверяются и после серверного dry-run: он
+  может показать то, чего не было в `helm template`.
+- **Идентичность**: временный SA одного namespace не может менять другой, поэтому под SA
+  объект в чужом namespace — ещё одна причина запускать вызов от учётных данных пользователя по
+  согласию (окно `credentials: ask-user` из #18, тот же двухшаговый поток для install/upgrade и
+  одно окно для rollback/uninstall). Если такой объект виден только серверному dry-run под SA —
+  отказ с объяснением. В client-only и impersonation — идентичность namespace релиза, обычное
+  окно Helm с diff и галочка «I understand…» на эти объекты.
+- **Окно**: в `HelmChange.namespaces` — затронутые namespace кроме namespace релиза; окно
+  показывает их строкой «Also changes», в заголовке — «…, also changing kube-system».
+- **`--create-namespace`** — по-прежнему только для namespace релиза; чужие namespace должны
+  существовать.
+- **Аудит**: у каждого изменения Helm в `change.namespaces` — все затронутые namespace,
+  namespace релиза первым (у вызова от пользователя там же `ranAs`, причина и объекты);
+  `namespace` записи остаётся namespace релиза, решения о правах на чужие namespace пишутся
+  строками `grant:<tool>`, как у других инструментов.
+- **Описания инструментов** для агента: вместо «may only touch the release namespace» —
+  «Kubach asks the user».
 
 ## Контекст выбирает агент (#421)
 

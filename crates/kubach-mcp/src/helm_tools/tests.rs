@@ -113,9 +113,67 @@ fn objects_stay_in_the_namespace() {
             .kinds
             .contains(&("apps".into(), "deployments".into()))
     );
-    let elsewhere = [resource("v1", "ConfigMap", "c", Some(OTHER_NS))];
-    let denial = check_objects(&elsewhere, NS, &catalog(), SessionMode::ClientOnly).unwrap_err();
+    assert!(preview.elsewhere.is_empty());
+}
+
+#[test]
+fn objects_in_other_namespaces_need_a_tick_and_are_named_with_their_namespace() {
+    let objects = [
+        resource("apps/v1", "Deployment", "web", None),
+        resource("v1", "ConfigMap", "c", Some(OTHER_NS)),
+        resource(
+            "rbac.authorization.k8s.io/v1",
+            "Role",
+            "web:leaderelection",
+            Some("kube-system"),
+        ),
+    ];
+    for mode in [SessionMode::ClientOnly, SessionMode::Impersonation] {
+        let preview = check_objects(&objects, NS, &catalog(), mode).unwrap();
+        assert_eq!(
+            preview.objects,
+            [
+                "Deployment web".to_owned(),
+                format!("ConfigMap c (namespace {OTHER_NS})"),
+                "Role web:leaderelection (namespace kube-system)".to_owned(),
+            ]
+        );
+        assert_eq!(
+            paths(&preview.findings),
+            [
+                format!("ConfigMap c (namespace {OTHER_NS})").as_str(),
+                "Role web:leaderelection (namespace kube-system)",
+            ]
+        );
+        assert!(
+            preview.findings[1].message.contains("grants rights"),
+            "{:?}",
+            preview.findings
+        );
+        assert_eq!(
+            other_namespaces(&preview.elsewhere),
+            [OTHER_NS.to_owned(), "kube-system".to_owned()]
+        );
+        // The ServiceAccount's Role never gets the other namespace's kinds.
+        assert!(!preview.kinds.contains(&("".into(), "configmaps".into())));
+        assert!(preview.cluster.is_empty());
+    }
+    // A temporary ServiceAccount of NS cannot change another namespace.
+    let denial = check_objects(
+        &objects,
+        NS,
+        &catalog(),
+        SessionMode::TemporaryServiceAccount,
+    )
+    .unwrap_err();
     assert_eq!(denial.code, DenialCode::Namespace);
+    assert!(denial.message.contains(OTHER_NS), "{}", denial.message);
+    // A name that is no namespace is refused without asking.
+    for bad in ["*", "../kube-system", "Kube-System", "a b"] {
+        let objects = [resource("v1", "ConfigMap", "c", Some(bad))];
+        let denial = check_objects(&objects, NS, &catalog(), SessionMode::ClientOnly).unwrap_err();
+        assert_eq!(denial.code, DenialCode::Namespace, "{bad}");
+    }
 }
 
 #[test]
@@ -367,7 +425,9 @@ fn paths(findings: &[Finding]) -> Vec<&str> {
 
 #[test]
 fn template_finds_cluster_objects_and_rbac_before_the_dry_run() {
-    let findings = beyond_service_account(&[RENDERED], NS, &catalog()).unwrap();
+    let findings = beyond_service_account(&[RENDERED], NS, &catalog())
+        .unwrap()
+        .findings;
     assert_eq!(
         paths(&findings),
         [
@@ -381,21 +441,149 @@ fn template_finds_cluster_objects_and_rbac_before_the_dry_run() {
     );
     // A plain chart has nothing a ServiceAccount cannot do.
     let plain = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n";
-    assert!(
-        beyond_service_account(&[plain, ""], NS, &catalog())
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        beyond_service_account(&[plain, ""], NS, &catalog()).unwrap(),
+        Scan::default()
     );
-    // An object in another namespace is refused, not asked about.
+    // An object in another namespace is asked about (#21), not refused.
     let elsewhere = format!(
         "{plain}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n  namespace: {OTHER_NS}\n"
     );
+    let scan = beyond_service_account(&[&elsewhere], NS, &catalog()).unwrap();
     assert_eq!(
-        beyond_service_account(&[&elsewhere], NS, &catalog())
-            .unwrap_err()
-            .code,
-        DenialCode::Namespace
+        paths(&scan.findings),
+        [format!("ConfigMap c (namespace {OTHER_NS})").as_str()]
     );
+    assert_eq!(other_namespaces(&scan.elsewhere), [OTHER_NS.to_owned()]);
+    assert!(needs_user_credentials(
+        SessionMode::TemporaryServiceAccount,
+        &scan.findings
+    ));
+}
+
+/// cert-manager's leader election Role, which it puts into kube-system.
+const LEADER_ELECTION: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cm-cainjector
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cm-cainjector:leaderelection
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cm-cainjector:leaderelection
+  namespace: kube-system
+";
+
+#[test]
+fn an_upgrade_finds_other_namespaces_in_the_current_revision_too() {
+    // The new values move leader election home; helm still deletes the
+    // current revision's Role in kube-system.
+    let new = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cm-cainjector\n";
+    let scan = beyond_service_account(&[new, LEADER_ELECTION], NS, &catalog()).unwrap();
+    assert_eq!(
+        paths(&scan.findings),
+        [
+            "Role cm-cainjector:leaderelection (namespace kube-system)",
+            "RoleBinding cm-cainjector:leaderelection (namespace kube-system)",
+        ]
+    );
+    assert_eq!(
+        other_namespaces(&scan.elsewhere),
+        ["kube-system".to_owned()]
+    );
+    // Both revisions hold it: listed once.
+    let twice =
+        beyond_service_account(&[LEADER_ELECTION, LEADER_ELECTION], NS, &catalog()).unwrap();
+    assert_eq!(twice.elsewhere.len(), 2);
+    assert_eq!(twice.findings.len(), 2);
+    // The audit log names the release namespace first, then the others.
+    assert_eq!(
+        touched(NS, &other_namespaces(&scan.elsewhere)),
+        [NS.to_owned(), "kube-system".to_owned()]
+    );
+    assert_eq!(touched(NS, &[]), [NS.to_owned()]);
+}
+
+#[test]
+fn another_namespace_needs_the_sessions_rights_there() {
+    let catalog = catalog();
+    let other = Request::HelmChange {
+        namespace: Some(OTHER_NS.into()),
+        release: "web".into(),
+    };
+    // A session on request: reading, then changing the other namespace,
+    // as for any tool there; the release namespace's rights do not count.
+    let scope = scope_with(Profile::Deploy, &permissive(), &[]);
+    let mut have = vec![Grant::read(NS), Grant::modify(NS)];
+    for expected in [Grant::read(OTHER_NS), Grant::modify(OTHER_NS)] {
+        let denial = Policy::new(
+            &scope,
+            &catalog,
+            false,
+            grants(&have),
+            SessionMode::TemporaryServiceAccount,
+        )
+        .check(&other)
+        .unwrap_err();
+        assert_eq!(denial.code, DenialCode::NeedsGrant);
+        assert_eq!(denial.grant, Some(expected.clone()));
+        have.push(expected);
+    }
+    let allowed = Policy::new(
+        &scope,
+        &catalog,
+        false,
+        grants(&have),
+        SessionMode::TemporaryServiceAccount,
+    )
+    .check(&other)
+    .unwrap();
+    assert_eq!(allowed.namespace, OTHER_NS);
+    // Client only: reading it is the right; each change is confirmed.
+    let client = Policy::new(
+        &scope,
+        &catalog,
+        false,
+        grants(&[Grant::read(OTHER_NS)]),
+        SessionMode::ClientOnly,
+    );
+    assert!(client.check(&other).is_ok());
+    // A pinned session refuses it without asking.
+    let pinned = scope_with(Profile::Deploy, &permissive(), &[NS]);
+    let denial = Policy::new(
+        &pinned,
+        &catalog,
+        false,
+        grants(&have),
+        SessionMode::TemporaryServiceAccount,
+    )
+    .check(&other)
+    .unwrap_err();
+    assert_eq!(denial.code, DenialCode::Namespace);
+}
+
+#[test]
+fn a_refused_namespace_names_its_objects() {
+    let text = elsewhere_refusal(
+        "kube-system",
+        NS,
+        &["Role cm-cainjector:leaderelection (namespace kube-system)".into()],
+        "namespace \"kube-system\" is outside this session",
+    );
+    assert!(text.contains("Nothing ran"), "{text}");
+    assert!(
+        text.contains("Role cm-cainjector:leaderelection (namespace kube-system)"),
+        "{text}"
+    );
+    assert!(text.contains("outside the release namespace"), "{text}");
+    assert!(text.contains("outside this session"), "{text}");
 }
 
 #[test]
@@ -405,16 +593,22 @@ fn an_upgrade_counts_the_objects_of_the_current_revision() {
     let current = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n---\n\
                    apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
                    name: old-reader\n";
-    let findings = beyond_service_account(&[new, current], NS, &catalog()).unwrap();
+    let findings = beyond_service_account(&[new, current], NS, &catalog())
+        .unwrap()
+        .findings;
     assert_eq!(paths(&findings), ["ClusterRole old-reader"]);
     // An object in both is listed once.
-    let findings = beyond_service_account(&[current, current], NS, &catalog()).unwrap();
+    let findings = beyond_service_account(&[current, current], NS, &catalog())
+        .unwrap()
+        .findings;
     assert_eq!(findings.len(), 1);
 }
 
 #[test]
 fn only_a_service_account_asks_for_the_users_credentials() {
-    let findings = beyond_service_account(&[RENDERED], NS, &catalog()).unwrap();
+    let findings = beyond_service_account(&[RENDERED, LEADER_ELECTION], NS, &catalog())
+        .unwrap()
+        .findings;
     assert!(needs_user_credentials(
         SessionMode::TemporaryServiceAccount,
         &findings
@@ -462,6 +656,7 @@ fn helm_changes_of_older_peers_run_as_the_session() {
         identity: "serviceaccount:ns/sa".into(),
         credentials: HelmCredentials::AskUser,
         user_objects: vec!["ClusterRole demo".into()],
+        namespaces: vec!["kube-system".into()],
     };
     let mut json = serde_json::to_value(&change).unwrap();
     assert_eq!(json["credentials"], "ask-user");
@@ -470,7 +665,9 @@ fn helm_changes_of_older_peers_run_as_the_session() {
     let object = json.as_object_mut().unwrap();
     object.remove("credentials");
     object.remove("userObjects");
+    object.remove("namespaces");
     let old: HelmChange = serde_json::from_value(json).unwrap();
     assert_eq!(old.credentials, HelmCredentials::Session);
     assert!(old.user_objects.is_empty());
+    assert!(old.namespaces.is_empty());
 }
