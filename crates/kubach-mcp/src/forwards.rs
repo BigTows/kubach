@@ -12,8 +12,10 @@
 //! (`pods/portforward`) and is confirmed in the window, one by one like
 //! exec. A temporary ServiceAccount's Role gets `pods/portforward` only
 //! while a forward runs in its namespace. Forwards end with the session
-//! (TTL, closing, the app quitting), with `read(ns)` revoked, or when the
-//! user stops them; each start and stop is in the audit log.
+//! (TTL, closing, the app quitting), when the agent disconnects from the
+//! app's HTTP endpoint (#34, [`crate::presence`]), with `read(ns)` revoked,
+//! or when the user stops them; each start and stop is in the audit log.
+//! They are never remembered for the app's next run.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +33,7 @@ use serde_json::{Map, Value, json};
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
 use crate::confirm::RequestKind;
 use crate::policy::{Denial, DenialCode, ForwardPortRef, Request};
+use crate::session::Session;
 use crate::tools::{Ctx, ToolError, ToolOutput, authorize, confirm_as, ensure_rbac, parse};
 
 /// Most forwards one session keeps open at a time.
@@ -47,6 +50,8 @@ pub enum StopReason {
     SessionEnded,
     /// The user revoked reading its namespace.
     Revoked,
+    /// The agent disconnected from the app's HTTP endpoint (#34).
+    Disconnected,
 }
 
 impl StopReason {
@@ -56,6 +61,7 @@ impl StopReason {
             Self::User => "user",
             Self::SessionEnded => "session-ended",
             Self::Revoked => "revoked",
+            Self::Disconnected => "disconnected",
         }
     }
 }
@@ -162,6 +168,14 @@ impl SessionForwards {
         }
     }
 
+    /// Namespaces the session forwards in.
+    fn namespaces(&self) -> Vec<String> {
+        sync::lock(&self.tracked)
+            .values()
+            .map(|forward| forward.namespace.clone())
+            .collect()
+    }
+
     /// Stops every forward of the session.
     pub fn stop_all(&self, reason: StopReason) {
         let ids: Vec<ForwardId> = sync::lock(&self.tracked).keys().copied().collect();
@@ -216,6 +230,10 @@ impl SessionForwards {
                 DecidedBy::User,
                 "the user revoked reading the namespace of this forward",
             ),
+            StopReason::Disconnected => (
+                DecidedBy::None,
+                "the agent disconnected from Kubach (closed its MCP session, or was silent too long)",
+            ),
             StopReason::SessionEnded | StopReason::Agent => (DecidedBy::None, "the session ended"),
         };
         let _ = audit.record(&AuditEntry {
@@ -251,6 +269,25 @@ impl Drop for SessionForwards {
             manager.stop(*id);
         }
     }
+}
+
+/// The agent of `session` disconnected (#34): its forwards stop, and the
+/// temporary Role loses `pods/portforward` again. The session itself goes
+/// on, for the agent reconnecting. Returns how many forwards stopped.
+pub(crate) async fn stop_disconnected(session: &Session) -> usize {
+    let forwards = session.forwards();
+    let count = forwards.count();
+    if count == 0 {
+        return 0;
+    }
+    let mut namespaces = forwards.namespaces();
+    namespaces.sort();
+    namespaces.dedup();
+    forwards.stop_all(StopReason::Disconnected);
+    for namespace in namespaces {
+        session.end_forward(&namespace).await;
+    }
+    count
 }
 
 // ------------------------------------------------------------- tools
@@ -357,7 +394,8 @@ pub(crate) async fn start(
         format!(
             "Namespace: {namespace}\nTarget: {target}\nRemote port: {}\nLocal: 127.0.0.1, {local}\n\
              Session: {} ({}, context {})\nOnly this machine can connect. The forward ends with \
-             the session; you can stop it any time under Port forwards.",
+             the session or when the agent disconnects, and is not restored after Kubach \
+             restarts; you can stop it any time under Port forwards.",
             a.port,
             ctx.session.id(),
             ctx.client_name,

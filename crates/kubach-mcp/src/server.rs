@@ -1126,7 +1126,9 @@ fn catalog() -> Vec<ToolSpec> {
                           to a ready pod of a Service or Deployment, to check a service from \
                           inside (health endpoint, metrics, a database while debugging). Needs \
                           the user's approval. Returns the forward's id and 127.0.0.1:<port>; \
-                          the forward ends with the session.",
+                          the forward ends with the session, or when you disconnect from Kubach \
+                          (over HTTP: close the MCP session, or two minutes without an open \
+                          connection or a request).",
             schema: object_schema(
                 {
                     let mut p = json!({

@@ -9,13 +9,18 @@
 //! - The **bridge** for `kubach mcp` processes on the same listener, under
 //!   its own token (#191): the MCP token, which HTTP agents hold, opens
 //!   only [`MCP_PATH`], the bridge token only [`BRIDGE_PATH`].
+//! - The app's endpoint watches whether its agents are still connected
+//!   ([`crate::presence`], #34) and stops the session's port-forwards once
+//!   they are gone.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt as _;
 use rmcp::ServiceExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -27,6 +32,7 @@ use std::sync::Arc;
 use rmcp::ServerHandler;
 
 use crate::bridge::{self, BRIDGE_PATH, BridgeHandler, random_token};
+use crate::presence::{DISCONNECT_GRACE, Presence, SESSION_HEADER};
 use crate::server::McpServer;
 use crate::shared::SharedServer;
 
@@ -135,7 +141,7 @@ async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Re
 /// Serves `server` on `127.0.0.1:<port>` (`0` picks a free port) with a
 /// fresh random token.
 pub async fn serve_http(server: McpServer, port: u16) -> Result<HttpEndpoint, TransportError> {
-    serve(server, port, random_token(), None).await
+    serve(server, port, random_token(), None, None).await
 }
 
 /// What the app's HTTP server needs.
@@ -160,7 +166,90 @@ pub async fn serve_shared_http(
     server: SharedServer,
     options: HttpOptions,
 ) -> Result<HttpEndpoint, TransportError> {
-    serve(server, options.port, options.token, options.bridge).await
+    serve_shared_with_grace(server, options, DISCONNECT_GRACE).await
+}
+
+/// [`serve_shared_http`] with the agents counted gone after `grace`.
+pub(crate) async fn serve_shared_with_grace(
+    server: SharedServer,
+    options: HttpOptions,
+    grace: Duration,
+) -> Result<HttpEndpoint, TransportError> {
+    let watch = Watch {
+        server: server.clone(),
+        presence: Arc::new(Presence::default()),
+        grace,
+    };
+    serve(
+        server,
+        options.port,
+        options.token,
+        options.bridge,
+        Some(watch),
+    )
+    .await
+}
+
+/// Watches the agents of a shared endpoint (#34).
+struct Watch {
+    server: SharedServer,
+    presence: Arc<Presence>,
+    grace: Duration,
+}
+
+impl Watch {
+    /// Stops the current session's port-forwards whenever the agents are
+    /// gone, until `cancel`.
+    async fn run(self, cancel: CancellationToken) {
+        // Often enough that a lost agent's forwards stop soon after the
+        // grace period.
+        let tick = (self.grace / 4).clamp(Duration::from_millis(20), Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = self.presence.idle_or(tick) => {}
+            }
+            if !self.presence.gone(self.grace, tokio::time::Instant::now()) {
+                continue;
+            }
+            if let Some(server) = self.server.get() {
+                crate::forwards::stop_disconnected(server.session()).await;
+            }
+        }
+    }
+}
+
+/// Counts the request as open until its response body is done (an SSE
+/// stream: until the client goes), and notes the MCP sessions it opens
+/// and closes.
+async fn track_presence(
+    State(presence): State<Arc<Presence>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let asked = session_id(request.headers());
+    let visit = presence.enter();
+    let response = next.run(request).await;
+    presence.answered(
+        &method,
+        asked.as_deref(),
+        response.status(),
+        session_id(response.headers()).as_deref(),
+    );
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::from_stream(body.into_data_stream().map(move |chunk| {
+        let _open = &visit;
+        chunk
+    }));
+    Response::from_parts(parts, body)
+}
+
+fn session_id(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn serve<S>(
@@ -168,6 +257,7 @@ async fn serve<S>(
     port: u16,
     token: String,
     bridge: Option<BridgeOptions>,
+    watch: Option<Watch>,
 ) -> Result<HttpEndpoint, TransportError>
 where
     S: ServerHandler + Clone + Send + Sync + 'static,
@@ -188,9 +278,14 @@ where
         ));
     }
     // Each token opens only its own routes.
-    let mut router = axum::Router::new()
-        .nest_service(MCP_PATH, service)
-        .layer(middleware::from_fn_with_state(token.clone(), require_token));
+    let mut router = axum::Router::new().nest_service(MCP_PATH, service);
+    if let Some(watch) = &watch {
+        router = router.layer(middleware::from_fn_with_state(
+            watch.presence.clone(),
+            track_presence,
+        ));
+    }
+    let mut router = router.layer(middleware::from_fn_with_state(token.clone(), require_token));
     if let Some(BridgeOptions {
         handler,
         token: bridge_token,
@@ -204,6 +299,9 @@ where
         );
     }
 
+    if let Some(watch) = watch {
+        tokio::spawn(watch.run(cancel.child_token()));
+    }
     let shutdown = cancel.clone();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, router)

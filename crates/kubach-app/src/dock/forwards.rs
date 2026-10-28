@@ -7,6 +7,10 @@
 //!
 //! A paused forward (#476) keeps its local port and forwards nothing; it
 //! stays remembered as paused and comes back paused on the next run.
+//!
+//! An AI agent's forward (#17) runs in the same manager but is never
+//! remembered (#34): it ends with its agent, and pausing, resuming or
+//! stopping it here does not store it either.
 
 use std::collections::HashSet;
 
@@ -233,7 +237,7 @@ impl Forwards {
                 Err(error) => return Err(error.to_string()),
             };
             this.update(cx, |this, cx| {
-                if let Some(context) = context {
+                if let Some(context) = context.filter(|_| remembered(&info)) {
                     let saved = SavedForward {
                         context,
                         namespace: info.namespace.clone(),
@@ -256,7 +260,9 @@ impl Forwards {
     }
 
     /// A forward started in a context: remembered for the next run,
-    /// replacing a restore of the same target.
+    /// replacing a restore of the same target. Only these are in
+    /// [`saved`](Self::saved), so pausing or stopping an agent's forward
+    /// never stores it.
     fn started(
         &mut self,
         info: &ForwardInfo,
@@ -507,6 +513,12 @@ impl Forwards {
     }
 }
 
+/// Whether `info` may be remembered for the next run: the user's own
+/// forwards, never an AI agent's (#34).
+fn remembered(info: &ForwardInfo) -> bool {
+    info.agent.is_none()
+}
+
 /// Forgets a forward in the application state.
 fn forget(saved: &SavedForward, cx: &mut App) {
     if let Some(store) = StateStore::try_global(cx) {
@@ -532,9 +544,38 @@ pub fn find_forward<'a>(
 #[cfg(test)]
 mod tests {
     use kubach_core::ConnectionState;
-    use kubach_core::streams::StreamError;
+    use kubach_core::streams::{ForwardAgent, ForwardInfo, ForwardState, StreamError};
 
-    use super::{Step, restore_error, restore_step};
+    use super::{Step, remembered, restore_error, restore_step};
+
+    #[test]
+    fn an_agents_forward_is_never_remembered() {
+        let mut info = ForwardInfo {
+            id: 1,
+            namespace: "web".into(),
+            source: "svc/web".into(),
+            source_port: 80,
+            pod: "web-0".into(),
+            remote_port: 8080,
+            local_addr: "127.0.0.1:18080".parse().unwrap(),
+            state: ForwardState::Ready,
+            active_connections: 0,
+            total_connections: 0,
+            error_count: 0,
+            last_error: None,
+            paused: false,
+            agent: None,
+        };
+        assert!(remembered(&info));
+        info.agent = Some(ForwardAgent {
+            context: "minikube".into(),
+            client: "agent".into(),
+            session: "s".into(),
+        });
+        assert!(!remembered(&info));
+        info.paused = true;
+        assert!(!remembered(&info));
+    }
 
     #[test]
     fn restores_wait_for_their_context_and_connect_it_once() {
