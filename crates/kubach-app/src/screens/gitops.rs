@@ -31,6 +31,7 @@ use super::namespaces::selected_names;
 use super::panel_width;
 use super::plugin_text::column_title_of;
 use super::rows;
+use super::table_sort;
 use crate::cluster::{CatalogState, Cluster};
 
 /// Managed resources listed in the details; the rest is counted.
@@ -369,6 +370,7 @@ impl GitOpsScreen {
                     .ok();
             })
         });
+        table_sort::remember(&table, table_sort::screen("gitops"), cx);
         self.table = Some((table, show_namespace));
         self.update_rows(cx);
     }

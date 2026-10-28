@@ -10,6 +10,7 @@ use kubach_ui::{EmptyState, FilterBar, ResourceTable, name_matches};
 
 use super::super::helm_release::{release_columns, release_key, release_row};
 use super::super::namespace_picker::NamespacePicker;
+use super::super::table_sort;
 use super::{HelmScreen, Load};
 
 impl HelmScreen {
@@ -61,6 +62,7 @@ impl HelmScreen {
                 },
             )
         });
+        table_sort::remember(&table, table_sort::screen("helm.releases"), cx);
         self.table = Some((table, show_namespace));
         self.update_rows(cx);
     }

@@ -29,6 +29,7 @@ use super::namespaces::selected_names;
 use super::panel_width;
 use super::rbac as rbac_rows;
 use super::security::{self as security_rows, PodFinding};
+use super::table_sort;
 use crate::cluster::{CatalogState, Cluster};
 
 const DETAILS_WIDTH: Pixels = px(380.);
@@ -505,6 +506,7 @@ impl AccessScreen {
         let this = cx.entity().downgrade();
         if self.rules_table.is_none() {
             let table = cx.new(|cx| ResourceTable::new(rbac_rows::rule_columns(), window, cx));
+            table_sort::remember(&table, table_sort::screen("access.rules"), cx);
             self.rules_table = Some(table);
             self.update_rule_rows(cx);
         }
@@ -522,6 +524,7 @@ impl AccessScreen {
                     },
                 )
             });
+            table_sort::remember(&table, table_sort::screen("access.grants"), cx);
             self.grants_table = Some(table);
             self.update_grant_rows(cx);
         }
@@ -546,6 +549,7 @@ impl AccessScreen {
                     },
                 )
             });
+            table_sort::remember(&table, table_sort::screen("access.findings"), cx);
             self.findings_table = Some((with_namespace, table));
             self.selected_finding = None;
             self.update_findings_rows(cx);

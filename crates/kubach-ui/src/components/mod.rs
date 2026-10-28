@@ -106,8 +106,8 @@ pub use port_chip::PortChip;
 pub use replica_bar::{ReplicaBar, ReplicaCell};
 pub use resource_table::ColumnOrderEvent;
 pub use resource_table::{
-    CellAlign, CheckState, ResourceCell, ResourceColumn, ResourceRow, ResourceTable,
-    ResourceTableEvent,
+    CellAlign, CheckState, ColumnSort, ResourceCell, ResourceColumn, ResourceRow, ResourceTable,
+    ResourceTableEvent, SortDirection, TableSortEvent,
 };
 pub use secret_input::{FilePickField, GeneratorControls, SecretField, UntrustedText, step_length};
 pub use segment_tabs::{SegmentTab, SegmentTabs};
