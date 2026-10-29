@@ -1606,11 +1606,9 @@ fn provided(set: &[(&str, &str)], remove: &[&str]) -> SecretInput {
 /// No value, plain or base64, in `text`.
 fn assert_no_values(text: &str, values: &[&str]) {
     for value in values {
-        assert!(!text.contains(value), "{value} leaked: {text}");
-        assert!(
-            !text.contains(&b64(value)),
-            "base64 of {value} leaked: {text}"
-        );
+        // The messages print neither the value nor the text holding it.
+        assert!(!text.contains(value), "a value leaked");
+        assert!(!text.contains(&b64(value)), "a base64 value leaked");
     }
 }
 

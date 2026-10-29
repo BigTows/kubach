@@ -190,21 +190,21 @@ async fn secrets_are_written_through_the_user() {
 
     // The Role: create without names, nothing named yet.
     let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
-    let secret_rules: Vec<_> = rules
+    let granted: Vec<_> = rules
         .iter()
         .filter(|r| r.resources.as_deref() == Some(&["secrets".to_owned()][..]))
         .collect();
     assert!(
-        secret_rules
+        granted
             .iter()
             .any(|r| r.verbs == ["create"] && r.resource_names.is_none()),
-        "{secret_rules:?}"
+        "{granted:?}"
     );
     assert!(
-        !secret_rules
+        !granted
             .iter()
             .any(|r| r.verbs.iter().any(|v| v == "patch" || v == "delete")),
-        "{secret_rules:?}"
+        "{granted:?}"
     );
     // The session identity cannot patch a Secret nobody approved.
     let as_session: Api<Secret> =
