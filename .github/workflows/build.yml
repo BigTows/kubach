@@ -219,6 +219,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -236,6 +237,21 @@ jobs:
               packaging/arch/PKGBUILD > dist/PKGBUILD
           (cd dist && sha256sum -- * > SHA256SUMS)
           cat dist/SHA256SUMS
+      # The release text is the description of the develop → main pull
+      # request merged here; without one, GitHub's generated notes.
+      - name: Release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.base.ref == "main")][0].body // ""' > "$RUNNER_TEMP/notes.md" || true
+          if [ -s "$RUNNER_TEMP/notes.md" ] && grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
       # Creates the tag on this commit. Tags made with GITHUB_TOKEN don't
       # start another run.
       - uses: softprops/action-gh-release@v3
@@ -244,5 +260,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Kubach ${{ env.VERSION }}
           files: dist/*
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.generated == 'false' && format('{0}/notes.md', runner.temp) || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.generated == 'true' }}
           fail_on_unmatched_files: true
