@@ -94,11 +94,14 @@ Each build is available for both x64 and arm64.
 | OS | Package | Notes |
 |---|---|---|
 | **macOS** 11+ | `Kubach-<version>-macos-<arch>.dmg` | Signed with Developer ID and notarized |
-| **Windows** 10+ | `.msi` installer or portable `.zip` | Not code-signed yet: SmartScreen may show a warning |
+| **Windows** 10+ | `.msi` installer or portable `.zip` | Code signing via SignPath Foundation is on the way: until then SmartScreen may show a warning |
 | **Debian / Ubuntu** | `.deb` | `sudo apt install ./kubach_*.deb` |
 | **Fedora / RHEL / openSUSE** | `.rpm` | `sudo dnf install ./kubach-*.rpm` |
 | **Arch Linux** | `.pkg.tar.zst` or `PKGBUILD` (`kubach-bin`) | `sudo pacman -U kubach-*.pkg.tar.zst` |
 | **Any Linux** | `.AppImage` or `.tar.gz` | Needs glibc 2.35+ and a Vulkan driver |
+
+**Code signing:** free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
 
 Every push to `main` also produces fresh builds as
 [Actions artifacts](https://github.com/BigTows/kubach/actions/workflows/build.yml).

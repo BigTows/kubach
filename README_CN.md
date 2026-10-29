@@ -81,11 +81,14 @@
 | 系统 | 安装包 | 说明 |
 |---|---|---|
 | **macOS** 11+ | `Kubach-<version>-macos-<arch>.dmg` | 已使用 Developer ID 签名并经过公证 |
-| **Windows** 10+ | `.msi` 安装程序或便携版 `.zip` | 暂未进行代码签名：SmartScreen 可能会发出警告 |
+| **Windows** 10+ | `.msi` 安装程序或便携版 `.zip` | 正在通过 SignPath Foundation 申请代码签名：在此之前 SmartScreen 可能会发出警告 |
 | **Debian / Ubuntu** | `.deb` | `sudo apt install ./kubach_*.deb` |
 | **Fedora / RHEL / openSUSE** | `.rpm` | `sudo dnf install ./kubach-*.rpm` |
 | **Arch Linux** | `.pkg.tar.zst` 或 `PKGBUILD`（`kubach-bin`） | `sudo pacman -U kubach-*.pkg.tar.zst` |
 | **任意 Linux** | `.AppImage` 或 `.tar.gz` | 需要 glibc 2.35+ 和 Vulkan 驱动 |
+
+**代码签名：**由 [SignPath.io](https://about.signpath.io) 免费提供代码签名，
+证书由 [SignPath Foundation](https://signpath.org) 颁发。
 
 每次推送到 `main` 都会生成最新构建，可在
 [Actions 产物](https://github.com/BigTows/kubach/actions/workflows/build.yml)中下载。
