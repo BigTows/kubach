@@ -97,16 +97,13 @@ impl Keyring {
         self.keys.iter().map(fingerprint).collect()
     }
 
-    /// Checks the armored detached `signature` over `data` and returns the
+    /// Checks the detached `signature` (armored `.asc`, or binary `.sig`
+    /// as the AWS CLI publishes) over `data` and returns the
     /// signer. The issuer must be a primary key of the keyring or one of
     /// its signing subkeys with a valid binding; the key must not be
     /// revoked or expired at the signature's creation time.
     pub fn verify(&self, signature: &[u8], data: impl Read) -> Result<Signer, SignatureError> {
-        let text = std::str::from_utf8(signature)
-            .map_err(|_| SignatureError::Malformed("not an armored signature".into()))?;
-        let (signature, _) = DetachedSignature::from_string(text)
-            .map_err(|e| SignatureError::Malformed(e.to_string()))?;
-        let signature = signature.signature;
+        let signature = parse_detached(signature)?;
         if !matches!(
             signature.typ(),
             Some(SignatureType::Binary | SignatureType::Text)
@@ -187,6 +184,19 @@ impl Keyring {
         }
         None
     }
+}
+
+/// An armored or binary detached signature.
+fn parse_detached(bytes: &[u8]) -> Result<Signature, SignatureError> {
+    let malformed = |e: pgp::errors::Error| SignatureError::Malformed(e.to_string());
+    let armored = std::str::from_utf8(bytes)
+        .ok()
+        .filter(|text| text.trim_start().starts_with("-----BEGIN PGP"));
+    let detached = match armored {
+        Some(text) => DetachedSignature::from_string(text).map_err(malformed)?.0,
+        None => DetachedSignature::from_bytes(bytes).map_err(malformed)?,
+    };
+    Ok(detached.signature)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -324,12 +334,42 @@ pub(crate) mod test_keys {
         .to_armored_bytes(Default::default())
         .unwrap()
     }
+
+    /// A binary detached signature (`.sig`, as the AWS CLI publishes).
+    pub fn sign_binary(key: &SignedSecretKey, data: &[u8]) -> Vec<u8> {
+        use pgp::ser::Serialize as _;
+        DetachedSignature::sign_binary_data(
+            ChaCha8Rng::seed_from_u64(7),
+            &key.primary_key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            data,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_keys::{armored_public, secret_key, sign};
+    use super::test_keys::{armored_public, secret_key, sign, sign_binary};
     use super::*;
+
+    #[test]
+    fn verifies_binary_signatures() {
+        let key = secret_key("AWS-like <cli@example.com>", 9);
+        let keyring = Keyring::from_armored(&armored_public(&key));
+        let data = b"awscli-exe-linux-x86_64.zip contents";
+        let signature = sign_binary(&key, data);
+        assert!(!signature.starts_with(b"-----BEGIN"));
+        let signer = keyring.verify(&signature, &data[..]).unwrap();
+        assert_eq!(signer.user_id, "AWS-like <cli@example.com>");
+        assert!(matches!(
+            keyring.verify(&signature, &b"tampered"[..]),
+            Err(SignatureError::Invalid { .. })
+        ));
+    }
 
     #[test]
     fn verifies_and_names_the_signer() {

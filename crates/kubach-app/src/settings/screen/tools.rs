@@ -1,6 +1,6 @@
 //! The "External tools" page: the helm binary, the copy Kubach downloads
-//! (#131), its release line, latest version and signature (#403) and chart
-//! icons.
+//! (#131), its release line, latest version and signature (#403), chart
+//! icons, and the cloud CLIs of "Import from cloud" (#38).
 
 use std::path::PathBuf;
 
@@ -8,8 +8,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::*;
 use kubach_core::settings::{HelmBinary, HelmSource, Settings, Tools};
-use kubach_core::tools::Verification;
+use kubach_core::tools::cli::{self, CliSource, CliTool};
 use kubach_core::tools::helm::{HelmLine, unix_now};
+use kubach_core::tools::{Platform, Verification};
 use kubach_i18n::t;
 use kubach_ui::{ConfirmDialog, PathRow, SelectRow, SettingRow, ToggleRow, format_age};
 
@@ -109,7 +110,7 @@ impl SettingsScreen {
                     s.helm.load_chart_icons = on
                 })),
         ));
-        vec![group]
+        vec![group, cloud_group(cx)]
     }
 
     /// Which Helm release line Kubach downloads.
@@ -156,6 +157,146 @@ fn helm_in_use_row(
         source = source,
         version = version
     ))
+}
+
+/// The cloud CLIs: which one is used, the copy Kubach downloaded and how
+/// it was checked, and buttons to download or remove it (#38).
+fn cloud_group(cx: &mut App) -> Group {
+    let mut group = Group::new(t!("cloud-tools-group"));
+    let Some(downloads) = tools::global(cx) else {
+        return group;
+    };
+    for tool in CliTool::ALL {
+        group = group.entry(Entry::new(
+            searchable(
+                "cloud cli gcloud google gke yc yandex aws eks download import",
+                &[&t!("cloud-tools-group"), tool.title()],
+            ),
+            cli_row(tool, &downloads, cx),
+        ));
+    }
+    group
+}
+
+/// How a downloaded cloud CLI was checked, as a sentence.
+fn cli_verification_text(verification: Option<&Verification>) -> String {
+    match verification {
+        Some(Verification {
+            signer: Some(signer),
+            ..
+        }) => t!("helm-tools-signed-by", signer = signer.to_string()),
+        Some(Verification {
+            package_signer: Some(signer),
+            ..
+        }) => t!("cloud-tools-package-signed", signer = signer.clone()),
+        Some(Verification {
+            published_at: Some(source),
+            ..
+        }) => t!("cloud-tools-checked-published", source = source.clone()),
+        Some(Verification {
+            unchecked: true, ..
+        }) => t!("cloud-tools-unchecked"),
+        _ => String::new(),
+    }
+}
+
+fn cli_row(tool: CliTool, downloads: &Entity<ToolDownloads>, cx: &mut App) -> SettingRow {
+    let id = |suffix: &str| SharedString::from(format!("cli-{}-{suffix}", tool.name()));
+    let row = SettingRow::new(id("row"), tool.title());
+    let downloadable = Platform::current().is_some_and(|p| tool.downloadable(p));
+    let in_use = cli::locate(tool);
+    let downloaded = cli::downloaded(tool);
+    let mut lines = Vec::new();
+    match &in_use {
+        Some(binary) => {
+            let version = downloads
+                .update(cx, |d, cx| d.cli_version(tool, &binary.path, cx))
+                .map_or_else(|| t!("helm-tools-version-unknown"), |v| v.to_string());
+            let path = binary.path.display().to_string();
+            lines.push(match binary.source {
+                CliSource::Path => t!("cloud-tools-in-path", path = path, version = version),
+                CliSource::Downloaded => {
+                    t!(
+                        "cloud-tools-in-use-downloaded",
+                        path = path,
+                        version = version
+                    )
+                }
+            });
+        }
+        None => lines.push(t!("cloud-tools-missing")),
+    }
+    if let Some(installed) = &downloaded {
+        lines.push(t!(
+            "cloud-tools-downloaded",
+            version = installed.version.clone(),
+            verification = cli_verification_text(installed.verification().as_ref())
+        ));
+    }
+    if !downloadable {
+        lines.push(t!(
+            "cloud-tools-unsupported",
+            tool = tool.title(),
+            url = tool.install_page()
+        ));
+    }
+    let state = downloads.read(cx);
+    let running = state.cli_running(tool);
+    let error = state.cli_error(tool);
+    let mut controls = div().flex().gap_1();
+    if downloadable {
+        let downloads = downloads.clone();
+        let label = if downloaded.is_some() {
+            t!("cloud-tools-update")
+        } else {
+            t!("cloud-tools-download")
+        };
+        controls = controls.child(
+            Button::new(id("download"))
+                .outline()
+                .small()
+                .label(label)
+                .tooltip(t!("cloud-cli-download-tooltip"))
+                .disabled(running.is_some())
+                .on_click(move |_, _, cx| downloads.update(cx, |d, cx| d.start_cli(tool, cx))),
+        );
+    }
+    if downloaded.is_some() {
+        let downloads = downloads.clone();
+        controls = controls.child(
+            Button::new(id("remove"))
+                .ghost()
+                .small()
+                .label(t!("helm-tools-remove"))
+                .disabled(running.is_some())
+                .on_click(move |_, window, cx| {
+                    let downloads = downloads.clone();
+                    ConfirmDialog::open(window, cx, move |_, _| {
+                        let downloads = downloads.clone();
+                        ConfirmDialog::new(t!("cloud-tools-remove-title", tool = tool.title()))
+                            .message(t!("cloud-tools-remove-message", tool = tool.command()))
+                            .confirm_label(t!("helm-tools-remove"))
+                            .danger()
+                            .on_confirm(move |_, cx| {
+                                downloads.update(cx, |d, cx| d.remove_cli(tool, cx));
+                            })
+                    });
+                }),
+        );
+    }
+    let row = row.description(lines.join(" ")).control(controls);
+    if let Some(progress) = running {
+        row.below(tools::cli_progress(
+            id("progress"),
+            downloads,
+            tool,
+            progress,
+        ))
+    } else if let Some(error) = error {
+        row.below(div().text_xs().text_color(cx.theme().danger).child(error))
+    } else {
+        row
+    }
 }
 
 /// How the downloaded copy was checked, as a sentence.
@@ -321,7 +462,7 @@ mod tests {
     use kubach_core::tools::Verification;
     use kubach_core::tools::signature::Signer;
 
-    use super::verification_text;
+    use super::{cli_verification_text, verification_text};
 
     #[test]
     fn says_how_the_copy_was_checked() {
@@ -346,5 +487,24 @@ mod tests {
         assert!(verification_text(Some(&pinned)).starts_with("Checked by the SHA-256 pinned"));
         assert!(verification_text(Some(&pinned)).contains("can't reach github.com"));
         assert_eq!(verification_text(None), "Checked by SHA-256.");
+    }
+
+    #[test]
+    fn says_how_a_cloud_cli_was_checked() {
+        let published = Verification {
+            published_at: Some("https://docs.cloud.google.com/sdk/docs/x".into()),
+            ..Default::default()
+        };
+        assert!(cli_verification_text(Some(&published)).contains("docs.cloud.google.com"));
+        let package = Verification {
+            package_signer: Some("Developer ID Installer: AMZN Mobile LLC (94KV3E626L)".into()),
+            ..Default::default()
+        };
+        assert!(cli_verification_text(Some(&package)).contains("94KV3E626L"));
+        let unchecked = Verification {
+            unchecked: true,
+            ..Default::default()
+        };
+        assert!(cli_verification_text(Some(&unchecked)).starts_with("Not checked"));
     }
 }

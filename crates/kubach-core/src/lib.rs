@@ -3,6 +3,7 @@
 pub mod ansi;
 pub mod apply;
 pub mod cache;
+pub mod cloud;
 pub mod cluster;
 pub mod data_keys;
 #[cfg(debug_assertions)]

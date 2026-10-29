@@ -34,7 +34,7 @@ const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest wait for the next chunk of a response.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const TEMP_PREFIX: &str = ".download-";
+pub(super) const TEMP_PREFIX: &str = ".download-";
 /// Redirects followed per request (GitHub release assets redirect once).
 const MAX_REDIRECTS: usize = 5;
 /// How a downloaded copy was checked, next to its binary.
@@ -202,6 +202,18 @@ pub struct Verification {
     /// Why the signature of a pinned version was not checked or did not
     /// verify (the pinned SHA-256 was enough to install it).
     pub signature_note: Option<String>,
+    /// Where the SHA-256 the archive matched was published (cloud CLIs,
+    /// #38): the vendor's page, not a hash pinned in Kubach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// The code signature of a macOS package, e.g. `Developer ID
+    /// Installer: AMZN Mobile LLC (94KV3E626L)` (#38).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_signer: Option<String>,
+    /// The vendor publishes no checksum or signature: the archive was only
+    /// protected by HTTPS from the vendor's own server (#38).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchecked: bool,
 }
 
 /// Bytes received so far; `total` from `Content-Length` when sent.
@@ -506,6 +518,7 @@ async fn download_for(
         pinned: pinned.is_some(),
         signer,
         signature_note,
+        ..Verification::default()
     };
 
     let installed = install_archive(
@@ -556,7 +569,7 @@ async fn fetch_signatures(
 }
 
 /// Checks the detached `signature` of the file at `path`.
-fn verify_file_signature(
+pub(super) fn verify_file_signature(
     keyring: &Keyring,
     signature: &[u8],
     path: &Path,
@@ -619,7 +632,7 @@ fn install_archive(
     })
 }
 
-fn file_name(url: &str) -> Result<String, DownloadError> {
+pub(super) fn file_name(url: &str) -> Result<String, DownloadError> {
     url.rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
@@ -628,20 +641,20 @@ fn file_name(url: &str) -> Result<String, DownloadError> {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> io::Result<()> {
+pub(super) fn make_executable(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(not(unix))]
-fn make_executable(_: &Path) -> io::Result<()> {
+pub(super) fn make_executable(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
 /// Removes `com.apple.quarantine` if the system added it, so Gatekeeper
 /// does not block the binary. Needs no extra rights: the file is ours.
 #[cfg(target_os = "macos")]
-fn clear_quarantine(path: &Path) {
+pub(super) fn clear_quarantine(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
@@ -657,16 +670,16 @@ fn clear_quarantine(path: &Path) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clear_quarantine(_: &Path) {}
+pub(super) fn clear_quarantine(_: &Path) {}
 
 /// A file being written that hashes what goes through it.
-struct HashingFile {
+pub(super) struct HashingFile {
     file: fs::File,
     hasher: Sha256,
 }
 
 impl HashingFile {
-    fn create(path: &Path) -> io::Result<Self> {
+    pub(super) fn create(path: &Path) -> io::Result<Self> {
         Ok(Self {
             file: fs::File::create_new(path)?,
             hasher: Sha256::new(),
@@ -674,7 +687,7 @@ impl HashingFile {
     }
 
     /// Flushes to disk and returns the hex SHA-256.
-    fn finish(self) -> io::Result<String> {
+    pub(super) fn finish(self) -> io::Result<String> {
         self.file.sync_all()?;
         Ok(hex(&self.hasher.finalize()))
     }
@@ -1023,6 +1036,7 @@ mod tests {
             pinned: version == TOOL.version,
             signer: None,
             signature_note: None,
+            ..Verification::default()
         };
         let installed = install_archive(
             &TOOL,

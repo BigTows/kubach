@@ -11,6 +11,7 @@
 //! them anywhere but the encrypted file (export aside, which the user asks
 //! for explicitly).
 
+mod cloud;
 mod dialogs;
 mod manual;
 

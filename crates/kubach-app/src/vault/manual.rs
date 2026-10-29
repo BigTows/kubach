@@ -919,6 +919,12 @@ impl ManualForm {
                 .child(input(t!("manual-region"), None, &self.eks_region))
                 .child(input(t!("manual-profile"), None, &self.eks_profile)),
             Some(ExecTemplate::Gke) => div().child(note(t!("manual-gke-note"))),
+            Some(ExecTemplate::Yandex) => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(input(t!("manual-profile"), None, &self.eks_profile))
+                .child(note(t!("manual-yc-note"))),
             Some(ExecTemplate::Aks) => div()
                 .flex()
                 .flex_col()

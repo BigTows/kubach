@@ -1,0 +1,65 @@
+[
+  {
+    "id": "cat0000000000000dev",
+    "folder_id": "b1gfolder000000000a",
+    "created_at": "2025-03-03T10:11:12Z",
+    "name": "dev",
+    "status": "RUNNING",
+    "health": "HEALTHY",
+    "network_id": "enp0000000000000net",
+    "master": {
+      "zonal_master": {
+        "zone_id": "ru-central1-a",
+        "internal_v4_address": "10.128.0.27",
+        "external_v4_address": "158.160.10.20"
+      },
+      "locations": [
+        {
+          "zone_id": "ru-central1-a",
+          "subnet_id": "e9b0000000000000sub"
+        }
+      ],
+      "etcd_cluster_size": "1",
+      "version": "1.30",
+      "endpoints": {
+        "internal_v4_endpoint": "https://10.128.0.27",
+        "external_v4_endpoint": "https://158.160.10.20"
+      },
+      "master_auth": {
+        "cluster_ca_certificate": "-----BEGIN CERTIFICATE-----\nMIIC5zCCAc+gAwIBAgIBADANBgkqhkiG9w0BAQsFADAVMRMwEQYDVQQDEwprdWJl\n-----END CERTIFICATE-----\n"
+      },
+      "version_info": {
+        "current_version": "1.30"
+      }
+    },
+    "ip_allocation_policy": {
+      "cluster_ipv4_cidr_block": "10.112.0.0/16",
+      "service_ipv4_cidr_block": "10.96.0.0/16"
+    },
+    "service_account_id": "aje0000000000000sa1",
+    "node_service_account_id": "aje0000000000000sa2",
+    "release_channel": "REGULAR"
+  },
+  {
+    "id": "cat0000000000000prd",
+    "folder_id": "b1gfolder000000000a",
+    "created_at": "2025-04-04T10:11:12Z",
+    "name": "prod",
+    "status": "RUNNING",
+    "health": "HEALTHY",
+    "master": {
+      "regional_master": {
+        "region_id": "ru-central1",
+        "internal_v4_address": "10.130.0.5"
+      },
+      "version": "1.31",
+      "endpoints": {
+        "internal_v4_endpoint": "https://10.130.0.5"
+      },
+      "master_auth": {
+        "cluster_ca_certificate": "-----BEGIN CERTIFICATE-----\nMIIC5zCCAc+gAwIBAgIBADANBgkqhkiG9w0BAQsFADAVMRMwEQYDVQQDEwprdWJm\n-----END CERTIFICATE-----\n"
+      }
+    },
+    "release_channel": "STABLE"
+  }
+]
