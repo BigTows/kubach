@@ -1,3 +1,7 @@
+// No console window next to the app on Windows. `kubach mcp` still talks
+// over the stdio pipes its client hands it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod action_context;
 mod agent;
 mod app_icon;
@@ -30,6 +34,7 @@ fn main() -> std::process::ExitCode {
     // `kubach mcp`: the MCP server over stdio, no window.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("mcp") {
+        attach_parent_console();
         return agent::run_cli(&args[1..]);
     }
 
@@ -85,6 +90,24 @@ fn main() -> std::process::ExitCode {
             kubach_ui::a11y_check::start(cx);
         });
     std::process::ExitCode::SUCCESS
+}
+
+/// Run from a terminal, the Windows GUI build has no console of its own:
+/// `kubach mcp` subcommands print to the terminal they were started from.
+/// Left alone when a client hands over its stdio pipes.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+        // SAFETY: plain calls without pointers.
+        unsafe {
+            if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+    }
 }
 
 /// The menu bar in the current language; set again after a language switch.
