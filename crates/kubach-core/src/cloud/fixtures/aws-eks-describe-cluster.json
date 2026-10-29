@@ -1,0 +1,42 @@
+{
+    "cluster": {
+        "name": "main",
+        "arn": "arn:aws:eks:eu-west-1:123456789012:cluster/main",
+        "createdAt": "2025-02-10T11:24:33.512000+01:00",
+        "version": "1.31",
+        "endpoint": "https://0123456789ABCDEF0123456789ABCDEF.gr7.eu-west-1.eks.amazonaws.com",
+        "roleArn": "arn:aws:iam::123456789012:role/eks-cluster-role",
+        "resourcesVpcConfig": {
+            "subnetIds": [
+                "subnet-0a1b2c3d4e5f60001",
+                "subnet-0a1b2c3d4e5f60002"
+            ],
+            "securityGroupIds": [],
+            "clusterSecurityGroupId": "sg-0a1b2c3d4e5f60003",
+            "vpcId": "vpc-0a1b2c3d4e5f60004",
+            "endpointPublicAccess": true,
+            "endpointPrivateAccess": true,
+            "publicAccessCidrs": [
+                "0.0.0.0/0"
+            ]
+        },
+        "kubernetesNetworkConfig": {
+            "serviceIpv4Cidr": "172.20.0.0/16",
+            "ipFamily": "ipv4"
+        },
+        "identity": {
+            "oidc": {
+                "issuer": "https://oidc.eks.eu-west-1.amazonaws.com/id/0123456789ABCDEF0123456789ABCDEF"
+            }
+        },
+        "status": "ACTIVE",
+        "certificateAuthority": {
+            "data": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJ"
+        },
+        "platformVersion": "eks.12",
+        "tags": {},
+        "accessConfig": {
+            "authenticationMode": "API_AND_CONFIG_MAP"
+        }
+    }
+}

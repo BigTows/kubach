@@ -3,12 +3,14 @@
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::PopupMenuItem;
-use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
+use gpui_kit::component::{Disableable as _, IconName, Sizable as _, WindowExt as _};
 use gpui_kit::*;
 use kubach_core::ConnectionState;
 use kubach_core::status_bar::{self, McpStatus};
+use kubach_core::tools::cli::{self, CliTool};
 use kubach_i18n::t;
 use kubach_ui::{EmptyState, MultiSelection, OperationsList, StatusBar, StatusBarItem, Tone};
 
@@ -329,26 +331,95 @@ impl Workspace {
             .into_any_element(),
             ConnectionState::Error(error) => {
                 let entity = self.cluster.clone();
+                let retry = Button::new("reconnect")
+                    .outline()
+                    .small()
+                    .icon(IconName::RefreshCw)
+                    .label(t!("workspace-retry"))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |cluster, cx| cluster.reconnect(cx));
+                    });
+                let (fix, fix_error) = contexts
+                    .exec_command(&context.name)
+                    .is_some_and(cli::is_gke_plugin)
+                    .then(|| self.render_gke_plugin_fix(cx))
+                    .flatten()
+                    .map_or((None, None), |(button, error)| (Some(button), error));
                 EmptyState::new(
                     IconName::CircleX,
                     t!("workspace-connect-failed", context = context.name.as_str()),
                 )
                 .description(error.clone())
                 .action(
-                    Button::new("reconnect")
-                        .outline()
-                        .small()
-                        .icon(IconName::RefreshCw)
-                        .label(t!("workspace-retry"))
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |cluster, cx| cluster.reconnect(cx));
-                        }),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .children(fix)
+                                .child(retry),
+                        )
+                        .children(fix_error),
                 )
                 .into_any_element()
             }
             // Shown by the Overview screen (#414).
             ConnectionState::Connected { .. } => div().into_any_element(),
         }
+    }
+
+    /// A context whose `gke-gcloud-auth-plugin` is missing (#38): a button
+    /// that installs it with gcloud and reconnects, or opens Settings →
+    /// Tools to download gcloud first; plus why the last install failed.
+    fn render_gke_plugin_fix(&self, cx: &App) -> Option<(Button, Option<Div>)> {
+        if cli::gke_plugin_dir().is_some() {
+            return None;
+        }
+        let Some(gcloud) = cli::locate(CliTool::Gcloud) else {
+            let button = Button::new("gke-open-tools")
+                .outline()
+                .small()
+                .label(t!("workspace-gke-open-tools"))
+                .on_click(|_, _, cx| {
+                    open_settings(SettingsTarget::section(SettingsSection::Tools), cx)
+                });
+            return Some((button, None));
+        };
+        let downloads = crate::tools::global(cx)?;
+        let state = downloads.read(cx);
+        let installing = state.plugin_installing();
+        let failed = state.plugin_error().map(|error| {
+            div()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(t!("cloud-gke-plugin-failed", error = error.to_string()))
+        });
+        let cluster = self.cluster.clone();
+        let button = Button::new("gke-install-plugin")
+            .primary()
+            .small()
+            .label(if installing {
+                t!("cloud-gke-plugin-installing")
+            } else {
+                t!("cloud-gke-plugin-install")
+            })
+            .disabled(installing)
+            .on_click(move |_, _, cx| {
+                let (gcloud, cluster) = (gcloud.path.clone(), cluster.clone());
+                downloads.update(cx, |downloads, cx| {
+                    downloads.install_gke_plugin(
+                        gcloud,
+                        move |cx| cluster.update(cx, |cluster, cx| cluster.reconnect(cx)),
+                        cx,
+                    );
+                });
+            });
+        Some((button, failed))
     }
 
     /// Whether the active context is connected: the Overview screen

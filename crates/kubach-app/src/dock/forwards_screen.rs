@@ -13,7 +13,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use kubach_core::state::SavedForward;
+use kubach_core::state::{SavedForward, SortOrder, TableSort, screen_table_key};
 use kubach_core::streams::{ForwardInfo, ForwardState, short_kind};
 use kubach_i18n::t;
 use kubach_ui::{EmptyState, PageHeader, SegmentTab, SegmentTabs, StatusDot, Tone, TruncatedText};
@@ -21,6 +21,10 @@ use kubach_ui::{EmptyState, PageHeader, SegmentTab, SegmentTabs, StatusDot, Tone
 use super::forwards::{Forwards, RestoreStatus};
 use super::target::http_scheme;
 use crate::screens::Reveal;
+use crate::state::StateStore;
+
+/// The screen's sort in the application state (#33).
+const SORT_SCREEN: &str = "forwards";
 
 /// Open the details of an object a forward goes to, in `context` (the
 /// active one when `None`).
@@ -80,6 +84,27 @@ impl SortBy {
             SortBy::Status => t!("dock-forwards-sort-status"),
             SortBy::Target => t!("dock-forwards-sort-target"),
         }
+    }
+
+    /// Stable key in the application state.
+    fn key(self) -> &'static str {
+        match self {
+            SortBy::Port => "port",
+            SortBy::Status => "status",
+            SortBy::Target => "target",
+        }
+    }
+
+    /// The sort remembered as `sort`; the default for one this version
+    /// does not know.
+    fn remembered(sort: Option<&TableSort>) -> Self {
+        sort.and_then(|sort| Self::ALL.into_iter().find(|by| by.key() == sort.column))
+            .unwrap_or_default()
+    }
+
+    /// How the sort is remembered; `None` for the default.
+    fn stored(self) -> Option<TableSort> {
+        (self != Self::default()).then(|| TableSort::new(self.key(), SortOrder::Ascending))
     }
 }
 
@@ -385,7 +410,25 @@ fn forward_row(
     ];
     let target = format!("{}/{}:{}", info.namespace, info.source, info.source_port);
     let connections = SharedString::from(t!("dock-forwards-connections-tooltip"));
-    let mut details = vec![
+    let mut details = Vec::new();
+    // An AI agent's forward (#17): whose, so the user can stop it.
+    if let Some(agent) = &info.agent {
+        let tooltip = SharedString::from(t!(
+            "dock-forwards-agent-tooltip",
+            client = agent.client.as_str(),
+            session = agent.session.as_str()
+        ));
+        details.push(
+            div()
+                .id(SharedString::from(format!("forward-agent-{id}")))
+                .flex_none()
+                .text_color(cx.theme().warning)
+                .child(t!("dock-forwards-agent", client = agent.client.as_str()))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .into_any_element(),
+        );
+    }
+    details.push(
         div()
             .id(SharedString::from(format!("forward-connections-{id}")))
             .flex_none()
@@ -396,7 +439,7 @@ fn forward_row(
             ))
             .tooltip(move |window, cx| Tooltip::new(connections.clone()).build(window, cx))
             .into_any_element(),
-    ];
+    );
     // A pod source is its own pod.
     if !info.source.starts_with("pod/") {
         details.push(
@@ -639,9 +682,15 @@ pub struct ForwardsScreen {
 impl ForwardsScreen {
     pub fn new(forwards: Entity<Forwards>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&forwards, |_, _, cx| cx.notify());
+        let key = screen_table_key(SORT_SCREEN);
+        let sort = SortBy::remembered(
+            StateStore::try_global(cx)
+                .as_ref()
+                .and_then(|store| store.read(cx).get().table_sort(&key)),
+        );
         Self {
             forwards,
-            sort: SortBy::default(),
+            sort,
             _subscription: subscription,
         }
     }
@@ -711,6 +760,14 @@ impl ForwardsScreen {
                     screen
                         .update(cx, |screen, cx| {
                             screen.sort = by;
+                            if let Some(store) = StateStore::try_global(cx) {
+                                let key = screen_table_key(SORT_SCREEN);
+                                store.update(cx, |store, cx| {
+                                    store.edit(cx, |state| {
+                                        state.remember_table_sort(&key, by.stored())
+                                    })
+                                });
+                            }
                             cx.notify();
                         })
                         .ok();
@@ -765,7 +822,24 @@ impl EventEmitter<RevealForward> for ForwardsScreen {}
 
 #[cfg(test)]
 mod tests {
+    use kubach_core::state::{SortOrder, TableSort};
+
     use super::{RowKey, SortBy, reveal_of, reveal_of_label, sort_keys};
+
+    #[test]
+    fn sort_is_remembered_by_key_and_unknown_ones_give_the_default() {
+        for by in SortBy::ALL {
+            assert_eq!(SortBy::remembered(by.stored().as_ref()), by);
+        }
+        assert_eq!(SortBy::Port.stored(), None);
+        assert_eq!(
+            SortBy::Status.stored(),
+            Some(TableSort::new("status", SortOrder::Ascending))
+        );
+        assert_eq!(SortBy::remembered(None), SortBy::Port);
+        let gone = TableSort::new("bandwidth", SortOrder::Ascending);
+        assert_eq!(SortBy::remembered(Some(&gone)), SortBy::Port);
+    }
 
     #[test]
     fn sources_open_their_objects() {

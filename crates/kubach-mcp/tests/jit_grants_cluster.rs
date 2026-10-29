@@ -48,7 +48,7 @@ async fn role_follows_grants() {
     let (base, context, namespace) = config().await;
     let policy = SecurityPolicy {
         temporary_objects: true,
-        ..SecurityPolicy::development()
+        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
     };
     let spec = SessionSpec {
         context,

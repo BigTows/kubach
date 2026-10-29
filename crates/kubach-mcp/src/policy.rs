@@ -6,16 +6,16 @@
 //! as an [`Allowed`] plan with the namespace, kind and manifests to use; the
 //! tool layer only ever acts on that plan.
 //!
-//! Rights on request (#227): the profile and the settings are the ceiling,
-//! the session's [`Grants`] what the user allowed so far. A request within
-//! the ceiling that needs a right nobody answered for yet is denied with
-//! [`DenialCode::NeedsGrant`] naming the right; the tool layer asks the user
-//! and checks again. A right beyond the ceiling is never asked for.
+//! Minimal access (#15): the context's settings give the agent an
+//! [`Access`] it has without asking, the user may raise it from the session
+//! ([`DenialCode::NeedsAccess`]), and `kubach mcp --profile` may cap it.
+//! Within the access, the session's [`Grants`] are the per-namespace
+//! mechanism: `read(ns)` and `modify(ns)` are granted by the tool layer
+//! without a question (they set up the namespace's identity), revealing one
+//! Secret is asked for that Secret ([`DenialCode::NeedsGrant`]).
 //!
-//! Namespaces on request (#401): a session pinned at launch keeps to its
-//! namespaces; otherwise the agent names any valid namespace and reading it
-//! is the first right asked for. With one namespace per session (the
-//! context's setting) the first namespace granted is the only one.
+//! Namespaces (#401): a session pinned at launch keeps to its namespaces;
+//! otherwise the agent names any valid namespace, as many as it needs.
 //! Cluster-scoped resources and all-namespace calls stay refused; only
 //! [`Request::ListNamespaces`] reads namespace names.
 
@@ -28,13 +28,13 @@ use kubach_core::secrets::mask::is_core_secret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ceiling::{Ceiling, Raises};
+use crate::access::{Access, Raises};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::names;
 use crate::rules::{is_readable, is_writable};
 use crate::scope::{SessionMode, SessionScope};
 use crate::secret_write::{self, CREATE_TYPES, MAX_KEYS, SecretOp};
-use crate::settings::{Profile, SecretAccess};
+use crate::settings::Profile;
 
 /// Largest manifest bundle accepted by `apply`.
 pub const MAX_APPLY_BYTES: usize = 512 * 1024;
@@ -50,6 +50,27 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 /// Longest exec command, all arguments together, in bytes. Keeps the
 /// confirmation dialog readable in full (#194).
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
+/// Lowest local port an agent's port-forward may take (#17): well-known
+/// ports stay with the system and the user.
+pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
+
+/// The remote port of a port-forward as the agent names it: a number, or
+/// a port name (`http`) looked up on the target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ForwardPortRef {
+    Number(u16),
+    Name(String),
+}
+
+impl fmt::Display for ForwardPortRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Number(port) => write!(f, "{port}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
 
 /// A kind as the agent names it: `Deployment`, `deployments`, optionally
 /// with `apiVersion` to disambiguate.
@@ -133,6 +154,15 @@ pub enum Request {
         container: Option<String>,
         namespace: Option<String>,
         command: Vec<String>,
+    },
+    /// `port_forward_start` (#17): a local port on `127.0.0.1` to a pod,
+    /// or to a ready pod of a Service or Deployment. `target` is
+    /// `pod/<name>`, `service/<name>` or `deployment/<name>`.
+    PortForward {
+        namespace: Option<String>,
+        target: String,
+        port: ForwardPortRef,
+        local_port: Option<u16>,
     },
     /// Secret names, types, keys, sizes and who uses them; no values.
     SecretList {
@@ -233,23 +263,23 @@ pub enum DenialCode {
     InvalidName,
     InvalidInput,
     Manifest,
-    /// Within the ceiling, but the user has not answered for this right yet:
-    /// [`Denial::grant`] names it. The tool layer asks and checks again.
+    /// A right in a namespace nobody answered for yet: [`Denial::grant`]
+    /// names it. `read(ns)` and `modify(ns)` within the access are granted
+    /// without a question; revealing a Secret is asked. The tool layer acts
+    /// and checks again.
     NeedsGrant,
     /// The user refused (or revoked) a right this request needs.
     GrantDenied,
-    /// Revealing Secret values is off for this context; the user is told.
+    /// Secret values are hidden on this context; the user is told.
     RevealDisabled,
-    /// Beyond the session's ceiling (profile, applying changes, exec), but
-    /// the user may raise it (#417): [`Denial::ceiling`] names what is
-    /// missing. The tool layer asks and checks again.
-    NeedsCeiling,
-    /// The user refused to raise the ceiling this far in this session.
-    CeilingRefused,
-    /// Beyond the ceiling of a protected cluster: never asked (#417).
-    Protected,
-    /// The user's own RBAC does not allow it in this namespace; raising the
-    /// ceiling would not help, so nobody is asked.
+    /// Beyond the session's access (#15), but the user may allow it:
+    /// [`Denial::access`] names what is missing. The tool layer asks and
+    /// checks again.
+    NeedsAccess,
+    /// The user refused this access in this session.
+    AccessRefused,
+    /// The user's own RBAC does not allow it in this namespace; more access
+    /// would not help, so nobody is asked.
     Rbac,
 }
 
@@ -261,10 +291,10 @@ pub struct Denial {
     /// refused ([`DenialCode::GrantDenied`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant: Option<Grant>,
-    /// What the ceiling lacks ([`DenialCode::NeedsCeiling`],
-    /// [`DenialCode::CeilingRefused`], [`DenialCode::Protected`]).
+    /// What the access lacks ([`DenialCode::NeedsAccess`],
+    /// [`DenialCode::AccessRefused`]).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ceiling: Option<Ceiling>,
+    pub access: Option<Access>,
 }
 
 impl Denial {
@@ -273,16 +303,16 @@ impl Denial {
             code,
             message: message.into(),
             grant: None,
-            ceiling: None,
+            access: None,
         }
     }
 
     fn needs(grant: Grant) -> Self {
         Self {
             code: DenialCode::NeedsGrant,
-            message: format!("the user has to allow this session to {grant}"),
+            message: format!("this session needs the right to {grant}"),
             grant: Some(grant),
-            ceiling: None,
+            access: None,
         }
     }
 
@@ -294,7 +324,7 @@ impl Denial {
                  this session"
             ),
             grant: Some(grant),
-            ceiling: None,
+            access: None,
         }
     }
 }
@@ -399,14 +429,14 @@ pub struct Policy<'a> {
     closed: bool,
     grants: Grants,
     modes: NamespaceModes,
-    /// The user's answers about raising the ceiling (#417).
+    /// The user's answers about access (#15).
     raises: Raises,
 }
 
 impl<'a> Policy<'a> {
-    /// `grants` are the user's answers so far; the mode of a namespace
-    /// decides whether a granted `modify(ns)` spares `scale` and
-    /// `rollout_restart` their own confirmation (never in client-only mode).
+    /// `grants` are the session's rights so far; the mode of a namespace
+    /// decides whether a change needs `modify(ns)` (only where the API
+    /// server holds the boundary).
     pub fn new(
         scope: &'a SessionScope,
         catalog: &'a ApiCatalog,
@@ -424,78 +454,90 @@ impl<'a> Policy<'a> {
         }
     }
 
-    /// With the session's answers about raising the ceiling (#417).
+    /// With the session's answers about access (#15).
     pub fn with_raises(mut self, raises: Raises) -> Self {
         self.raises = raises;
         self
     }
 
-    /// The ceiling the session starts with: its profile and the settings.
-    pub fn base_ceiling(&self) -> Ceiling {
-        Ceiling::of(self.scope.profile, &self.scope.policy)
+    /// What the session has without asking: the context's minimum, capped
+    /// by the launch's profile.
+    pub fn minimum(&self) -> Access {
+        self.scope.policy.minimum.capped(self.scope.profile)
     }
 
-    /// The ceiling now: the base, raised by what the user allowed.
-    pub fn ceiling(&self) -> Ceiling {
-        self.base_ceiling().join(self.raises.granted)
+    /// The access now: the minimum, raised by what the user allowed, capped
+    /// by the launch's profile.
+    pub fn access(&self) -> Access {
+        self.scope
+            .policy
+            .minimum
+            .join(self.raises.granted)
+            .capped(self.scope.profile)
     }
 
-    /// What `request` needs of the ceiling, where the user may raise it.
-    pub fn needed_ceiling(request: &Request) -> Option<Ceiling> {
-        let ceiling = |profile, apply, exec| {
-            Some(Ceiling {
+    /// What `request` needs of the access, where the user may raise it.
+    /// Custom resources are found by kind, in [`Policy::read_kind`].
+    pub fn needed_access(request: &Request) -> Option<Access> {
+        let need = |profile, secrets| {
+            Some(Access {
                 profile,
-                apply,
-                exec,
+                secrets,
+                crds: false,
             })
         };
         match request {
-            Request::Logs { .. } => ceiling(Profile::Debug, false, false),
-            Request::Exec { .. } => ceiling(Profile::Debug, false, true),
-            Request::Apply { dry_run, .. } => ceiling(Profile::Deploy, !dry_run, false),
-            Request::Scale { .. }
+            Request::Logs { .. } | Request::Exec { .. } | Request::PortForward { .. } => {
+                need(Profile::Debug, false)
+            }
+            Request::Apply { .. }
+            | Request::Scale { .. }
             | Request::Restart { .. }
             | Request::Delete { .. }
-            | Request::SecretWrite { .. }
+            | Request::HelmChange { .. } => need(Profile::Deploy, false),
+            Request::SecretWrite { .. }
             | Request::SecretCopy { .. }
-            | Request::SecretDelete { .. }
-            | Request::HelmChange { .. } => ceiling(Profile::Deploy, true, false),
+            | Request::SecretDelete { .. } => need(Profile::Deploy, true),
+            Request::SecretList { .. }
+            | Request::SecretCheck { .. }
+            | Request::SecretCompare { .. }
+            | Request::SecretReveal { .. } => need(Profile::ReadOnly, true),
             _ => None,
         }
     }
 
-    /// Whether `needed` lies within the ceiling, or else why not: the user
-    /// may be asked ([`DenialCode::NeedsCeiling`]), refused it already, or
-    /// the cluster is protected.
-    pub fn within_ceiling(&self, needed: Ceiling, what: &str) -> Result<(), Denial> {
-        let have = self.ceiling();
+    /// Whether `needed` lies within the access, or else why not: beyond
+    /// the launch's cap (never asked), refused already, or to be asked
+    /// ([`DenialCode::NeedsAccess`]).
+    pub fn within_access(&self, needed: Access, what: &str) -> Result<(), Denial> {
+        let have = self.access();
         let Some(missing) = have.missing(needed) else {
             return Ok(());
         };
         let context = &self.scope.context;
-        let (code, message) = if self.scope.policy.protected {
-            (
-                DenialCode::Protected,
+        if needed.profile > self.scope.profile {
+            return Err(Denial::new(
+                DenialCode::Profile,
                 format!(
-                    "{what} needs {missing}, beyond this session's ceiling ({have}). Context \
-                     {context} is a protected cluster: Kubach does not ask to raise the agent's \
-                     ceiling there. Only the user can change that, in Kubach: Settings → Security \
-                     → Protected cluster"
+                    "{what} needs the {} profile, and this session was started with --profile {}; \
+                     it never gets more. Start kubach mcp with a broader --profile or without it",
+                    needed.profile, self.scope.profile
                 ),
-            )
-        } else if self.raises.is_refused(missing) {
+            ));
+        }
+        let (code, message) = if self.raises.is_refused(missing) {
             (
-                DenialCode::CeilingRefused,
+                DenialCode::AccessRefused,
                 format!(
-                    "{what} needs {missing}; the user did not allow raising the agent's ceiling \
-                     on {context} in this session and is not asked again"
+                    "{what} needs {missing}; the user did not allow it on {context} in this \
+                     session and is not asked again"
                 ),
             )
         } else {
             (
-                DenialCode::NeedsCeiling,
+                DenialCode::NeedsAccess,
                 format!(
-                    "{what} needs {missing}, beyond this session's ceiling ({have}); the user has \
+                    "{what} needs {missing}, beyond this session's access ({have}); the user has \
                      to allow it in Kubach"
                 ),
             )
@@ -504,7 +546,7 @@ impl<'a> Policy<'a> {
             code,
             message,
             grant: None,
-            ceiling: Some(missing),
+            access: Some(missing),
         })
     }
 
@@ -517,8 +559,8 @@ impl<'a> Policy<'a> {
     pub fn check(&self, request: &Request) -> Result<Allowed, Denial> {
         self.alive()?;
         self.profile_allows(request)?;
-        let mut allowed = self.check_request(request)?;
-        self.granted(request, &mut allowed)?;
+        let allowed = self.check_request(request)?;
+        self.granted(request, &allowed)?;
         Ok(allowed)
     }
 
@@ -538,6 +580,9 @@ impl<'a> Policy<'a> {
             | Request::Top { .. }
             | Request::SecretList { .. }
             | Request::SecretCheck { .. } => vec![read],
+            // Reading the namespace; the Role gets `pods/portforward` only
+            // while a forward runs, and every forward is confirmed (#17).
+            Request::PortForward { .. } => vec![read],
             Request::Topology { .. } => allowed
                 .namespaces
                 .iter()
@@ -598,7 +643,7 @@ impl<'a> Policy<'a> {
         }
     }
 
-    fn granted(&self, request: &Request, allowed: &mut Allowed) -> Result<(), Denial> {
+    fn granted(&self, request: &Request, allowed: &Allowed) -> Result<(), Denial> {
         for grant in self.required_grants(request, allowed) {
             match self.grants.state(&grant) {
                 Some(GrantState::Granted) => {}
@@ -606,12 +651,8 @@ impl<'a> Policy<'a> {
                 None => return Err(Denial::needs(grant)),
             }
         }
-        // A granted `modify(ns)` covers scaling and restarts, nothing else.
-        if matches!(request, Request::Scale { .. } | Request::Restart { .. })
-            && self.server_enforced(&allowed.namespace)
-        {
-            allowed.confirmation = Confirmation::NotNeeded;
-        }
+        // Every change stays confirmed one by one, scaling and restarts
+        // included: no per-namespace "ok" spares them since #15.
         Ok(())
     }
 
@@ -744,6 +785,31 @@ impl<'a> Policy<'a> {
                     container_name(container)?;
                 }
                 check_command(command)?;
+                allowed.confirmation = Confirmation::Required;
+                Ok(allowed)
+            }
+            Request::PortForward {
+                namespace,
+                target,
+                port,
+                local_port,
+            } => {
+                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                let (kind, name) = forward_target(target)?;
+                allowed.kind = Some(self.read_kind(&KindRef::new(kind))?);
+                allowed.name = Some(object_name(name)?);
+                check_forward_port(port)?;
+                if let Some(local) = local_port
+                    && *local < MIN_FORWARD_LOCAL_PORT
+                {
+                    return Err(Denial::new(
+                        DenialCode::InvalidInput,
+                        format!(
+                            "localPort must be {MIN_FORWARD_LOCAL_PORT} to 65535; leave it out \
+                             for any free port"
+                        ),
+                    ));
+                }
                 allowed.confirmation = Confirmation::Required;
                 Ok(allowed)
             }
@@ -924,48 +990,37 @@ impl<'a> Policy<'a> {
     }
 
     fn profile_allows(&self, request: &Request) -> Result<(), Denial> {
-        let settings = &self.scope.policy;
-        // Settings the agent cannot ask to change (#227, #230).
-        match request {
-            Request::SecretList { .. }
-            | Request::SecretCheck { .. }
-            | Request::SecretCompare { .. }
-            | Request::SecretWrite { .. }
-            | Request::SecretCopy { .. }
-            | Request::SecretDelete { .. }
-                if settings.secrets < SecretAccess::Metadata =>
-            {
-                return Err(Denial::new(
-                    DenialCode::Settings,
-                    "Secrets are not available to the agent on this context",
-                ));
-            }
-            Request::SecretReveal { .. } if settings.secrets != SecretAccess::Reveal => {
-                return Err(Denial::new(
-                    DenialCode::RevealDisabled,
-                    "revealing Secret values to the agent is off for this context. Only the \
-                     user can turn it on, in Kubach: Settings → Security → Secrets for the \
-                     agent. Use list_secrets and check_secret, which need no values",
-                ));
-            }
-            _ => {}
+        // A setting the agent cannot ask to change: what the user may not
+        // see, the agent does not get either (#96).
+        if matches!(request, Request::SecretReveal { .. }) && !self.scope.policy.reveal_allowed() {
+            return Err(Denial::new(
+                DenialCode::RevealDisabled,
+                "Secret values are hidden on this context, from the user and the agent alike. \
+                 Only the user can show them, in Kubach: Settings → Security → Hide Secret \
+                 values. Use list_secrets and check_secret, which need no values",
+            ));
         }
-        // The ceiling, which the user may raise on request (#417).
-        let Some(needed) = Self::needed_ceiling(request) else {
+        // The access, which the user may raise on request (#15).
+        let Some(needed) = Self::needed_access(request) else {
             return Ok(());
         };
         let what = match request {
             Request::Logs { .. } => "reading logs",
             Request::Exec { .. } => "exec",
+            Request::PortForward { .. } => "port-forward",
             Request::Apply { dry_run: true, .. } => "a dry-run apply",
             Request::Apply { .. } => "apply",
             Request::SecretWrite { .. }
             | Request::SecretCopy { .. }
             | Request::SecretDelete { .. } => "writing Secrets",
+            Request::SecretList { .. }
+            | Request::SecretCheck { .. }
+            | Request::SecretCompare { .. } => "Secret metadata",
+            Request::SecretReveal { .. } => "revealing a Secret",
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };
-        self.within_ceiling(needed, what)
+        self.within_access(needed, what)
     }
 
     /// Namespaces the session works in: the pinned ones, else those the
@@ -982,10 +1037,8 @@ impl<'a> Policy<'a> {
     }
 
     /// The namespace to act in. Without one named: the session's only
-    /// namespace. A named one must be a valid name, one of the pinned
-    /// namespaces if the launch pinned them, and, with one namespace per
-    /// session, the one already in use. Reading it is then asked for as a
-    /// right (#401).
+    /// namespace. A named one must be a valid name and one of the pinned
+    /// namespaces if the launch pinned them (#401).
     pub fn namespace(&self, requested: Option<&str>) -> Result<String, Denial> {
         let in_use = self.namespaces_in_use();
         let Some(namespace) = requested else {
@@ -994,7 +1047,7 @@ impl<'a> Policy<'a> {
                 [] => Err(Denial::new(
                     DenialCode::Namespace,
                     "pass `namespace`: this session has none yet. list_namespaces shows the \
-                     namespaces Kubach knows of; the user is asked the first time you read one",
+                     namespaces Kubach knows of",
                 )),
                 many => Err(Denial::new(
                     DenialCode::Namespace,
@@ -1024,23 +1077,12 @@ impl<'a> Policy<'a> {
                 format!("{namespace:?} is not a namespace name"),
             ));
         }
-        if !self.scope.policy.multiple_namespaces
-            && let Some(other) = in_use.iter().find(|other| *other != namespace)
-        {
-            return Err(Denial::new(
-                DenialCode::Namespace,
-                format!(
-                    "this context allows one namespace per agent session, and this session \
-                     already uses {other}. Only the user can allow several, in Kubach: Settings \
-                     → Security → Namespaces per agent session"
-                ),
-            ));
-        }
         Ok(namespace.to_owned())
     }
 
     /// A kind the agent may read: served, namespaced, not a Secret, and in
-    /// the built-in allowlist unless the context allows other kinds (#192).
+    /// the built-in allowlist unless the session has custom resources
+    /// (#192, asked for on request since #15).
     pub fn read_kind(&self, kind: &KindRef) -> Result<ResourceKind, Denial> {
         let resolved = self.find_kind(kind)?;
         if !resolved.namespaced {
@@ -1058,28 +1100,31 @@ impl<'a> Policy<'a> {
                 "Secrets are not available to the agent",
             ));
         }
-        if !self.scope.policy.other_kinds && !is_readable(&resolved.api.group, &resolved.api.plural)
-        {
-            return Err(other_kinds_off(&resolved));
+        if !is_readable(&resolved.api.group, &resolved.api.plural) {
+            self.within_access(
+                Access {
+                    crds: true,
+                    ..Access::NONE
+                },
+                &format!("{} ({})", resolved.api.kind, resolved.api.api_version),
+            )?;
         }
         Ok(resolved)
     }
 
     /// A kind the agent may change: readable, not an identity object, and
-    /// in the built-in allowlist unless the context allows other kinds.
+    /// in the built-in allowlist unless the session has custom resources.
     fn write_kind(&self, kind: &KindRef) -> Result<ResourceKind, Denial> {
         let resolved = self.read_kind(kind)?;
         ensure_writable(&resolved.api.group, &resolved.api.kind)?;
-        if !self.scope.policy.other_kinds && !is_writable(&resolved.api.group, &resolved.api.plural)
-        {
-            return Err(Denial::new(
-                DenialCode::ForbiddenKind,
-                format!(
-                    "the agent may read but not change {} objects; only the user can allow \
-                     other kinds, in Kubach: Settings → Security → Allow other kinds (CRDs)",
-                    resolved.api.kind
-                ),
-            ));
+        if !is_writable(&resolved.api.group, &resolved.api.plural) {
+            self.within_access(
+                Access {
+                    crds: true,
+                    ..Access::NONE
+                },
+                &format!("changing {} objects", resolved.api.kind),
+            )?;
         }
         Ok(resolved)
     }
@@ -1291,19 +1336,6 @@ impl<'a> Policy<'a> {
     }
 }
 
-/// Why a kind outside the built-in allowlist is refused.
-fn other_kinds_off(kind: &ResourceKind) -> Denial {
-    Denial::new(
-        DenialCode::ForbiddenKind,
-        format!(
-            "{} ({}) is not among the kinds available to the agent on this context; only the \
-             user can allow other kinds, in Kubach: Settings → Security → Allow other kinds \
-             (CRDs)",
-            kind.api.kind, kind.api.api_version
-        ),
-    )
-}
-
 /// Kinds the agent may never write: Secrets and anything that changes who
 /// can do what (ServiceAccounts, RBAC).
 fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
@@ -1369,6 +1401,52 @@ fn secret_keys(keys: &[String]) -> Result<(), Denial> {
         }
     }
     Ok(())
+}
+
+/// The kind and name of a port-forward target: `pod/<name>`,
+/// `service/<name>` or `deployment/<name>` (also `pods`, `po`, `svc`,
+/// `deploy`), as in the forward dialog of the app (#17).
+pub fn forward_target(target: &str) -> Result<(&'static str, &str), Denial> {
+    let invalid = || {
+        Denial::new(
+            DenialCode::InvalidInput,
+            "target must be pod/<name>, service/<name> or deployment/<name>",
+        )
+    };
+    let (kind, name) = target.split_once('/').ok_or_else(invalid)?;
+    let kind = match kind.to_ascii_lowercase().as_str() {
+        "pod" | "pods" | "po" => "Pod",
+        "service" | "services" | "svc" => "Service",
+        "deployment" | "deployments" | "deploy" => "Deployment",
+        _ => return Err(invalid()),
+    };
+    Ok((kind, name))
+}
+
+/// A remote port: a number from 1, or a port name (`IANA_SVC_NAME`: up to
+/// 15 lowercase letters, digits and inner dashes, with a letter).
+fn check_forward_port(port: &ForwardPortRef) -> Result<(), Denial> {
+    let valid = match port {
+        ForwardPortRef::Number(number) => *number > 0,
+        ForwardPortRef::Name(name) => {
+            (1..=15).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && name.bytes().any(|b| b.is_ascii_lowercase())
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Denial::new(
+            DenialCode::InvalidInput,
+            "port must be a port number (1-65535) or a port name such as http",
+        ))
+    }
 }
 
 fn container_name(name: &str) -> Result<(), Denial> {

@@ -65,7 +65,8 @@ settings-group-sessions = Активные сессии
 settings-sessions-description = Сессии HTTP и `kubach mcp` с правами, которые вы им дали. Отзыв сессии или права запрещает следующие вызовы; процесс `kubach mcp` узнаёт об этом за несколько секунд. Отозванное право в этой сессии больше не спрашивается.
 settings-sessions-http-waiting = HTTP-агенты: контекст ещё не выбран. Агент выберет его через use_context, и Kubach спросит вас перед началом.
 settings-sessions-none = Нет активных сессий.
-settings-session-title = { $context } · до уровня «{ $profile }»
+# $profile: один из settings-minimum-*.
+settings-session-title = { $context } · { $profile }
 settings-session-no-calls = вызовов пока нет
 settings-session-pid = kubach mcp, pid { $pid }
 settings-session-vault = хранилище, закончится при блокировке
@@ -76,9 +77,15 @@ settings-session-details =
         [few] { $origin } · { $clients } · { $calls } вызова · с { $since } · закончится через { $left }
        *[other] { $origin } · { $clients } · { $calls } вызовов · с { $since } · закончится через { $left }
     }
-settings-session-no-namespace = Namespace пока нет: спросим, когда агент впервые прочитает какой-нибудь.
-settings-session-raised = Потолок повышен для этой сессии: { $raised }
+settings-session-no-namespace = Namespace пока нет: появится, когда агент впервые обратится к какому-нибудь.
+# $raised: что разрешено сверх минимума, например «Изменения».
+settings-session-raised = Разрешено для этой сессии: { $raised }
 settings-session-no-grants = Права пока не выданы.
+# $list: изменения, о которых пользователь просил не спрашивать, например «масштабирование в cert-manager» (#30).
+settings-session-remembered = Без вопросов: { $list }
+# $action: agent-action-*, $namespace: где.
+settings-session-remembered-item = { $action } в { $namespace }
+settings-ask-again = Снова спрашивать
 settings-boundary-client-only = ограничения только в Kubach
 settings-boundary-impersonation = ограничения в Kubach и API-сервере (impersonation)
 settings-boundary-temporary-sa = ограничения в Kubach и API-сервере (временный ServiceAccount)

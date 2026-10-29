@@ -8,8 +8,7 @@ use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::{IconName, WindowExt as _};
 use gpui_kit::*;
 use kubach_core::kubeconfig::{FileProblem, FileState, Source};
-use kubach_core::settings::security::Loosened;
-use kubach_core::settings::{ContextKey, HotbarPrefs, Settings};
+use kubach_core::settings::HotbarPrefs;
 use kubach_core::{ConnectionState, ContextInfo};
 use kubach_i18n::t;
 use kubach_ui::tokens::TITLEBAR_HEIGHT;
@@ -29,46 +28,6 @@ use super::status::state_tone;
 /// Hotbar arrangement from settings (defaults without them).
 pub(super) fn hotbar_prefs(cx: &App) -> HotbarPrefs {
     crate::hotbar::prefs(cx)
-}
-
-/// Whether the security policy of `context` is looser than the strict
-/// defaults (e.g. MCP sessions allowed).
-pub(super) fn security_relaxed(
-    settings: Option<&Settings>,
-    context: &ContextInfo,
-) -> Vec<Loosened> {
-    settings.map_or_else(Vec::new, |settings| {
-        let key = ContextKey::new(
-            context.name.clone(),
-            context.server.as_deref().unwrap_or_default(),
-        );
-        settings.security.policy(&key).loosened()
-    })
-}
-
-/// What is looser, in the interface language, for "Looser than strict: …".
-pub(crate) fn loosened_label(loosened: Loosened) -> String {
-    match loosened {
-        Loosened::McpEnabled => t!("hotbar-loosened-mcp"),
-        Loosened::MaxProfile => t!("hotbar-loosened-profile"),
-        Loosened::TemporaryObjects => t!("hotbar-loosened-temporary-objects"),
-        Loosened::Deploy => t!("hotbar-loosened-deploy"),
-        Loosened::Exec => t!("hotbar-loosened-exec"),
-        Loosened::SessionTtl => t!("hotbar-loosened-session-ttl"),
-        Loosened::Namespaces => t!("hotbar-loosened-namespaces"),
-        Loosened::SecretValues => t!("hotbar-loosened-secret-values"),
-        Loosened::AgentSecretValues => t!("hotbar-loosened-agent-secret-values"),
-        Loosened::AgentOtherKinds => t!("hotbar-loosened-agent-other-kinds"),
-    }
-}
-
-/// The tooltip row that explains the warning badge.
-fn relaxed_row(relaxed: &[Loosened]) -> (SharedString, SharedString) {
-    let list: Vec<_> = relaxed.iter().map(|l| loosened_label(*l)).collect();
-    (
-        t!("hotbar-row-security").into(),
-        t!("hotbar-security-looser", list = list.join(", ")).into(),
-    )
 }
 
 /// Action of a hotbar tile menu item on the tile's context.
@@ -429,11 +388,7 @@ impl Workspace {
                 };
                 let source = sources.and_then(|sources| sources.source(&name));
                 let state = cluster.state_of(&name);
-                let relaxed = security_relaxed(settings.as_ref(), context);
-                let mut rows = tooltip_rows(context, source, state, ix);
-                if !relaxed.is_empty() {
-                    rows.push(relaxed_row(&relaxed));
-                }
+                let rows = tooltip_rows(context, source, state, ix);
                 Some(
                     HotbarTile::new(name.clone(), tile_label(&prefs, &name))
                         .color(tile_color(&prefs, &name))
@@ -446,7 +401,6 @@ impl Workspace {
                                     .is_some_and(Source::is_imported)
                                     .then_some(Lucide::Lock)),
                         )
-                        .badge((!relaxed.is_empty()).then_some(IconName::TriangleAlert))
                         .tooltip(name.clone(), rows),
                 )
             })

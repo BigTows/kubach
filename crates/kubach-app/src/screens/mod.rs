@@ -27,6 +27,7 @@ mod rbac;
 mod rows;
 mod secret;
 mod security;
+mod table_sort;
 mod topology;
 mod usage;
 

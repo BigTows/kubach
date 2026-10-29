@@ -73,7 +73,13 @@
 - Writes, exec and Secret reveals each need your confirmation, or can be limited to
   dry run and diff.
 - Every call goes to an audit log, which never contains Secret values.
+- Helm for the agent: search, install, upgrade, rollback and uninstall, each with a dry-run
+  diff you approve. `helm_upgrade` takes a `valuesPatch` that Kubach merges into the
+  release's values, and `helm_get_values` shows them with secrets masked.
 - Topology tools for the agent: `get_topology` and `can_reach`.
+- Port-forward for the agent (`port_forward_start`, `port_forward_list`,
+  `port_forward_stop`): `127.0.0.1` only, each forward confirmed, shown under
+  **Port forwards** and stopped with the session.
 - Connects over stdio (`kubach mcp`) or HTTP on `127.0.0.1` with a bearer token.
 
 **Feels like home**
@@ -99,8 +105,14 @@ Every push to `main` also produces fresh builds as
 
 ### Connect your AI agent
 
-First turn on agent access for a context in **Settings → Security**. Access is off by
-default.
+Agent access is on by default for every context. Without asking, the agent may only
+read built-in resources (pods, deployments, services, events…) in any namespace; no
+Secrets. Anything more (logs and exec, changes, Secrets, custom resources) it has to
+ask for, and you answer in the Kubach window: for this session, or with
+**Allow by default** to raise the context's minimal access for good. Changes, deletions
+and every exec command are still confirmed one by one, and nothing exceeds your own
+RBAC. Turn access off, or set or reset the minimal access, per context in
+**Settings → Security**.
 
 Kubach can register itself with your agent. It shows the config file and the change,
 applies them after you confirm, and keeps your other servers along with a backup of
@@ -117,8 +129,7 @@ You can also run the stdio server yourself and tune the session:
 ```sh
 kubach mcp                                   # the agent picks a context; Kubach asks you first
 kubach mcp --context prod --namespace shop   # pin a context and a namespace (repeat -n for more)
-kubach mcp -c staging -p read-only --ttl 2h  # cap the profile and the session length
-kubach mcp -c dev -n web --grant-read        # allow reads up front: they work without the app
+kubach mcp -c staging -p read-only --ttl 2h  # never more than reading, end after 2 hours
 kubach mcp --help
 ```
 
@@ -126,11 +137,11 @@ kubach mcp --help
 |---|---|
 | `-c, --context NAME` | kubeconfig context (without any option, the agent chooses and you approve) |
 | `-n, --namespace NS` | limit the session to a namespace; repeat for several |
-| `-p, --profile` | `read-only`, `debug` or `deploy`: the most the session may ask for |
-| `--ttl` | session length: `30m`, `2h`, `1h30m` (30 minutes by default) |
-| `--grant-read` | allow reading the session's namespaces without asking; Secrets and changes are still confirmed |
+| `-p, --profile` | `read-only`, `debug` or `deploy`: a cap for this process; requests above it are refused without asking |
+| `--ttl` | session length: `30m`, `2h`, `1h30m` (8 hours by default and at most) |
+| `--grant-read` | kept for compatibility; reading is always part of the minimal access |
 
-Rights requests and changes are confirmed in the Kubach window, so keep the app running
+Access requests and changes are confirmed in the Kubach window, so keep the app running
 with **Settings → AI agent → HTTP server** turned on. The same HTTP server can serve
 agents directly at `http://127.0.0.1:<port>/mcp` with a bearer token. Ready-made
 commands with your path, port and token are under **Settings → AI agent → Connect an agent**.

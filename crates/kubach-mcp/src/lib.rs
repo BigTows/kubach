@@ -13,14 +13,16 @@
 //!   app runs for `kubach mcp`.
 //! - [`confirm`], [`audit`], [`masking`]: human-in-the-loop, local audit
 //!   log, credential masking; [`secret_write`]: Secrets written through
-//!   the user, whose values the agent never sees (#230).
+//!   the user, whose values the agent never sees (#230); [`remember`]:
+//!   "don't ask again this session" for one kind of change (#30).
 //!
 //! UI-free: depends on `kubach-core` only.
 
+pub mod access;
 pub mod audit;
 pub mod bridge;
-pub mod ceiling;
 pub mod confirm;
+pub mod forwards;
 pub mod grants;
 pub mod helm_tools;
 pub mod hosted;
@@ -28,7 +30,9 @@ pub mod identity;
 pub mod masking;
 pub mod names;
 pub mod policy;
+pub mod presence;
 pub mod proxy;
+pub mod remember;
 pub mod rules;
 pub mod scope;
 pub mod server;
@@ -45,15 +49,16 @@ mod topology_tools;
 #[cfg(test)]
 mod testutil;
 
+pub use access::{Access, Raises};
 pub use audit::{AuditEntry, AuditLog, DecidedBy};
-pub use ceiling::{Ceiling, Raises};
 pub use confirm::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
 };
 pub use grants::{Grant, GrantEntry, GrantState, Grants};
-pub use helm_tools::{HelmAction, HelmChange, HelmEnv};
+pub use helm_tools::{HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY};
 pub use identity::{Identity, sweep_expired};
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
+pub use remember::{Remembered, RememberedAction, rememberable};
 pub use scope::{NamespaceHint, NamespaceSource, SessionMode, SessionScope, SessionSpec};
 pub use secret_write::{
     KeySize, SecretInput, SecretOp, SecretRequest, SecretSource, SecretUser, check_input,
@@ -61,7 +66,7 @@ pub use secret_write::{
 pub use server::{CallOutcome, McpServer};
 pub use session::{Activity, BoundaryInfo, Session, SessionError};
 pub use settings::{
-    DeployMode, ExecMode, ImpersonationTarget, Profile, SecretAccess, SecurityPolicy,
+    DEFAULT_SESSION_TTL, ImpersonationTarget, MAX_SESSION_TTL, Profile, SecurityPolicy,
     SecurityPolicySource,
 };
 pub use shared::{ContextChooser, ContextEntry, SharedServer};

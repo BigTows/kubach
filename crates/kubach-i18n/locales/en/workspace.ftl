@@ -58,6 +58,9 @@ workspace-connect = Connect
 workspace-connecting = Connecting to { $context }…
 workspace-connect-failed = Can't connect to { $context }
 workspace-retry = Retry
+workspace-gke-plugin-missing = gke-gcloud-auth-plugin is not installed. GKE contexts need it to sign in; Kubach can install it with gcloud.
+workspace-gke-gcloud-missing = gke-gcloud-auth-plugin and the Google Cloud CLI are not installed. Download the Google Cloud CLI in Settings → Tools; the plugin is installed with it.
+workspace-gke-open-tools = Open Settings → Tools
 
 ## Hotbar tile tooltips
 
@@ -68,7 +71,6 @@ hotbar-row-namespace = Namespace
 hotbar-row-status = Status
 hotbar-row-shortcut = Shortcut
 hotbar-row-source = Source
-hotbar-row-security = Security
 hotbar-row-vault = Vault
 hotbar-row-problem = Problem
 hotbar-row-file = File
@@ -81,18 +83,6 @@ hotbar-state-connecting = Connecting…
 hotbar-state-connected = Connected, { $version }
 # $error: the connection error, from the cluster or kube-rs (English).
 hotbar-state-error = Error: { $error }
-# $list: what is looser, joined with commas (hotbar-loosened-*).
-hotbar-security-looser = Looser than strict: { $list }
-hotbar-loosened-mcp = AI agent access
-hotbar-loosened-profile = profile
-hotbar-loosened-temporary-objects = separate identity in the cluster
-hotbar-loosened-deploy = applying changes
-hotbar-loosened-exec = exec
-hotbar-loosened-session-ttl = session length
-hotbar-loosened-namespaces = several namespaces
-hotbar-loosened-secret-values = Secret values shown
-hotbar-loosened-agent-secret-values = Secret values revealed to the agent on request
-hotbar-loosened-agent-other-kinds = custom resources for the agent
 
 ## Hotbar menus
 

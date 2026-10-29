@@ -2,9 +2,9 @@
 //! user's decision.
 //!
 //! The app implements [`Confirmer`] with a UI prompt. Confirmation never
-//! widens rights: only calls that already passed the policy reach it, and a
-//! right is asked for only within the session's ceiling (#227). The same
-//! request travels over the bridge for `kubach mcp` processes.
+//! widens rights by itself: only calls that already passed the policy reach
+//! it, and more access is asked for as such (#15). The same request
+//! travels over the bridge for `kubach mcp` processes.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use kubach_core::plugin::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::ceiling::Ceiling;
+use crate::access::Access;
 use crate::grants::Grant;
 use crate::helm_tools::HelmChange;
 use crate::policy::Finding;
@@ -35,13 +35,23 @@ pub enum RequestKind {
     /// spelled out, and not as a diff (#194). `details` holds the same
     /// command as one shell line.
     Exec { command: Vec<String> },
-    /// A right for the rest of the session (#227). For a Secret the UI must
-    /// show the warning that the value leaves for the model's provider.
+    /// One port-forward of the agent (#17), confirmed every time:
+    /// `127.0.0.1:<local_port>` (any free port when `None`) to `port`
+    /// (number or name) of `target` (`pod/web-0`, `service/web`). TCP only.
+    PortForward {
+        target: String,
+        port: String,
+        local_port: Option<u16>,
+    },
+    /// A right for the rest of the session (#227): since #15 only revealing
+    /// one Secret, and the UI must show the warning that the value leaves
+    /// for the model's provider.
     Grant { grant: Grant },
-    /// Not a question: the agent asked to reveal a Secret on a context where
-    /// that is off. The UI tells the user (with a way to the context's
-    /// security settings) and answers [`ConfirmationDecision::Denied`] at
-    /// once; the setting is changed only in Settings, never from here.
+    /// Not a question: the agent asked to reveal a Secret on a context
+    /// whose Secret values are hidden. The UI tells the user (with a way to
+    /// the context's security settings) and answers
+    /// [`ConfirmationDecision::Denied`] at once; the setting is changed
+    /// only in Settings, never from here.
     RevealBlocked { name: String },
     /// Writing a Secret through the user (#230). For
     /// [`SecretOp::takes_values`](crate::secret_write::SecretOp::takes_values)
@@ -51,16 +61,17 @@ pub enum RequestKind {
     /// explanation come from the agent: the UI shows them as untrusted
     /// text, and never offers "remember".
     Secret { secret: Box<SecretRequest> },
-    /// Raising the agent's ceiling on this context (#417): `raise` is what
-    /// the call needs beyond `current`. Answered with
+    /// Access beyond what the agent has on this context (#15): `raise` is
+    /// what the call needs beyond `current`. Answered with
     /// [`ConfirmationDecision::Approved`] (until the session ends),
     /// [`ConfirmationDecision::ApprovedAlways`] (the app raised the
-    /// context's settings too: "Always allow on this cluster", unticked by
-    /// default) or a rejection. The app refuses at once, without asking,
-    /// when its settings mark the context as a protected cluster.
-    Ceiling {
-        raise: Ceiling,
-        current: Ceiling,
+    /// context's minimal access too: "Allow by default", unticked by
+    /// default) or a rejection. The app approves at once, without asking,
+    /// when the context's minimum in its settings already covers `raise`
+    /// (allowed by default from another session).
+    Access {
+        raise: Access,
+        current: Access,
         /// API server of the context: settings are keyed by both.
         server_url: String,
     },
@@ -75,8 +86,7 @@ pub enum RequestKind {
     /// The agent chose this context with `use_context` (#421): a yes
     /// starts a session there, without namespaces or rights. `context` of
     /// the request names it; `session_id` is empty, no session runs yet.
-    /// The app refuses at once when its settings have AI agent access off
-    /// or mark the context as a protected cluster.
+    /// The app refuses at once when its settings have AI agent access off.
     UseContext {
         server_url: String,
         /// `kubeconfig` or `vault`.
@@ -106,8 +116,10 @@ pub struct ConfirmationRequest {
     /// privileged, ServiceAccount change…). The UI must not hide them.
     pub dangerous: Vec<Finding>,
     pub mode: SessionMode,
-    /// "Remember this decision" may be offered. Never in client-only mode
-    /// (ADR 0005).
+    /// "Don't ask again this session" may be offered for this kind of
+    /// change in this namespace (#30): set by Kubach from
+    /// [`rememberable`](crate::remember::rememberable), never in client-only
+    /// mode (ADR 0005). The UI checks that function too.
     pub allow_remember: bool,
 }
 
@@ -115,10 +127,15 @@ pub struct ConfirmationRequest {
 #[serde(tag = "decision", rename_all = "kebab-case")]
 pub enum ConfirmationDecision {
     Approved,
-    /// Approved, and the app raised the context's ceiling in the settings
-    /// for good ([`RequestKind::Ceiling`] only; any other request answered
-    /// this way counts as a plain approval).
+    /// Approved, and the app raised the context's minimal access in the
+    /// settings for good ([`RequestKind::Access`] only; any other request
+    /// answered this way counts as a plain approval).
     ApprovedAlways,
+    /// Approved, and the user ticked "don't ask again this session" for
+    /// this kind of change in this namespace (#30). Kubach remembers it
+    /// only for a request it marked [`ConfirmationRequest::allow_remember`];
+    /// any other request answered this way counts as a plain approval.
+    ApprovedForSession,
     /// The values the user entered or generated for a
     /// [`RequestKind::Secret`] form (#230). They are written by Kubach and
     /// never reach the agent, the audit log or `Debug` output; the answer
@@ -140,7 +157,10 @@ pub enum ConfirmationDecision {
 
 impl ConfirmationDecision {
     pub fn is_approved(&self) -> bool {
-        matches!(self, Self::Approved | Self::ApprovedAlways)
+        matches!(
+            self,
+            Self::Approved | Self::ApprovedAlways | Self::ApprovedForSession
+        )
     }
 
     /// The user answered no themselves.
@@ -150,7 +170,10 @@ impl ConfirmationDecision {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Approved | Self::ApprovedAlways | Self::Provided { .. } => None,
+            Self::Approved
+            | Self::ApprovedAlways
+            | Self::ApprovedForSession
+            | Self::Provided { .. } => None,
             Self::Denied { reason } | Self::Rejected { reason } => reason.as_deref(),
         }
     }
@@ -185,8 +208,10 @@ impl Confirmer for DenyAll {
 #[derive(Debug)]
 pub struct ScriptedConfirmer {
     approve: bool,
-    /// Ticks "Always allow on this cluster" for ceiling requests.
+    /// Ticks "Allow by default" for access requests.
     always: bool,
+    /// Ticks "Don't ask again this session" where offered (#30).
+    remember: bool,
     /// What an approving confirmer enters into Secret forms.
     input: Option<SecretInput>,
     requests: Mutex<Vec<ConfirmationRequest>>,
@@ -197,6 +222,7 @@ impl ScriptedConfirmer {
         Self {
             approve: true,
             always: false,
+            remember: false,
             input: None,
             requests: Mutex::new(Vec::new()),
         }
@@ -206,6 +232,7 @@ impl ScriptedConfirmer {
         Self {
             approve: false,
             always: false,
+            remember: false,
             input: None,
             requests: Mutex::new(Vec::new()),
         }
@@ -219,10 +246,19 @@ impl ScriptedConfirmer {
         }
     }
 
-    /// Approves everything, ceiling requests with "Always allow".
+    /// Approves everything, access requests with "Allow by default".
     pub fn approving_always() -> Self {
         Self {
             always: true,
+            ..Self::approving()
+        }
+    }
+
+    /// Approves everything, ticking "Don't ask again this session" where
+    /// the request offers it (#30).
+    pub fn approving_for_session() -> Self {
+        Self {
+            remember: true,
             ..Self::approving()
         }
     }
@@ -252,9 +288,11 @@ impl Confirmer for ScriptedConfirmer {
                     reason: Some("cancelled by test".into()),
                 },
             }
-        } else if self.approve && self.always && matches!(request.kind, RequestKind::Ceiling { .. })
+        } else if self.approve && self.always && matches!(request.kind, RequestKind::Access { .. })
         {
             ConfirmationDecision::ApprovedAlways
+        } else if self.approve && self.remember && request.allow_remember {
+            ConfirmationDecision::ApprovedForSession
         } else if self.approve {
             ConfirmationDecision::Approved
         } else {
@@ -339,6 +377,10 @@ mod tests {
         let back: ConfirmationRequest =
             serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
         assert_eq!(back, exec);
+        let remembered: ConfirmationDecision =
+            serde_json::from_str(r#"{"decision":"approved-for-session"}"#).unwrap();
+        assert_eq!(remembered, ConfirmationDecision::ApprovedForSession);
+        assert!(remembered.is_approved());
         let rejected: ConfirmationDecision =
             serde_json::from_str(r#"{"decision":"rejected","reason":null}"#).unwrap();
         assert!(rejected.is_rejected() && !rejected.is_approved());

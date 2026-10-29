@@ -41,6 +41,7 @@ use super::helm::HelmScreen;
 use super::helm_install::{HelmInstall, InstallEvent, InstallInput, InstallSource, show};
 use super::helm_release::validation_text;
 use super::namespace_picker::Namespaces;
+use super::table_sort;
 use crate::images::RemoteImages;
 use crate::settings::AppSettings;
 
@@ -214,14 +215,16 @@ impl HelmCharts {
 
     fn new_table(window: &mut Window, cx: &mut Context<Self>) -> Entity<ResourceTable> {
         let charts = cx.entity().downgrade();
-        cx.new(|cx| {
+        let table = cx.new(|cx| {
             ResourceTable::new(chart_columns(), window, cx).on_select(move |row, window, cx| {
                 let key = row.key.to_string();
                 charts
                     .update(cx, |this, cx| this.open_card_by_key(&key, window, cx))
                     .ok();
             })
-        })
+        });
+        table_sort::remember(&table, table_sort::screen("helm.charts"), cx);
+        table
     }
 
     /// Repositories as last read.

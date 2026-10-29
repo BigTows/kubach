@@ -35,6 +35,7 @@ use kubach_ui::{
 };
 
 use super::activity::ScreenActivity;
+use super::table_sort;
 use crate::cluster::{CatalogState, Cluster};
 use crate::settings::AppSettings;
 
@@ -483,6 +484,7 @@ impl KustomizeScreen {
                         .ok();
                 })
             });
+            table_sort::remember(&table, table_sort::screen("kustomize"), cx);
             self.table = Some(table);
             self.update_rows(cx);
         }

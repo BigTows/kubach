@@ -43,6 +43,20 @@ impl HotbarPrefs {
         ordered
     }
 
+    /// The tile to open instead of `name` once it is hidden: the next
+    /// visible one, else the previous one; `None` when no other tile is
+    /// visible.
+    pub fn neighbor(&self, names: &[String], name: &str) -> Option<String> {
+        let ordered = self.ordered(names);
+        let ix = ordered.iter().position(|other| other == name)?;
+        let shown = |other: &&String| !self.hidden.contains(*other);
+        ordered[ix + 1..]
+            .iter()
+            .find(shown)
+            .or_else(|| ordered[..ix].iter().rev().find(shown))
+            .cloned()
+    }
+
     /// Hidden contexts that still exist, in order.
     pub fn hidden_of(&self, names: &[String]) -> Vec<String> {
         let mut ordered = self.ordered(names);
@@ -223,6 +237,21 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    #[test]
+    fn neighbor_is_the_next_visible_tile_else_the_previous() {
+        let all = names(&["a", "b", "c", "d"]);
+        // "b" was just hidden, "c" before.
+        let prefs = HotbarPrefs {
+            hidden: ["b".to_owned(), "c".to_owned()].into(),
+            ..Default::default()
+        };
+        assert_eq!(prefs.neighbor(&all, "b").as_deref(), Some("d"));
+        assert_eq!(prefs.neighbor(&all, "a").as_deref(), Some("d"));
+        assert_eq!(prefs.neighbor(&all, "d").as_deref(), Some("a"));
+        assert_eq!(prefs.neighbor(&all, "gone"), None);
+        assert_eq!(prefs.neighbor(&names(&["b"]), "b"), None);
     }
 
     #[test]

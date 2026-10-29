@@ -65,15 +65,22 @@ settings-group-sessions = 活动会话
 settings-sessions-description = HTTP 和 `kubach mcp` 会话及你授予它们的权限。撤销会话或权限会拒绝之后的调用；`kubach mcp` 进程会在几秒内得知。已撤销的权限在该会话中不会再次询问。
 settings-sessions-http-waiting = HTTP 代理：尚未选择 context。代理会用 use_context 选择，Kubach 会在开始前询问你。
 settings-sessions-none = 没有活动会话。
-settings-session-title = { $context } · 最多 { $profile }
+# $profile: settings-minimum-* 之一。
+settings-session-title = { $context } · { $profile }
 settings-session-no-calls = 尚无调用
 settings-session-pid = kubach mcp，pid { $pid }
 settings-session-vault = 保险库，锁定时结束
 settings-session-namespace-not-read = { $namespace }：尚未读取
 settings-session-details = { $origin } · { $clients } · { $calls } 次调用 · 自 { $since } 起 · { $left } 后结束
-settings-session-no-namespace = 还没有 namespace：代理第一次读取时会询问。
-settings-session-raised = 此会话的上限已提升：{ $raised }
+settings-session-no-namespace = 还没有 namespace：代理第一次使用某个 namespace 时设置。
+# $raised: 超出最低权限而允许的内容，例如“更改”。
+settings-session-raised = 此会话已允许：{ $raised }
 settings-session-no-grants = 尚未授予权限。
+# $list：用户选择不再询问的更改，例如“cert-manager 中的扩缩容”(#30)。
+settings-session-remembered = 无需询问：{ $list }
+# $action：agent-action-*，$namespace：位置。
+settings-session-remembered-item = { $namespace } 中的{ $action }
+settings-ask-again = 重新询问
 settings-boundary-client-only = 仅在 Kubach 中限制
 settings-boundary-impersonation = 在 Kubach 和 API 服务器中限制（impersonation）
 settings-boundary-temporary-sa = 在 Kubach 和 API 服务器中限制（临时 ServiceAccount）

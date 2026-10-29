@@ -108,6 +108,13 @@ impl ImportPlan {
         Ok(Self::new(config, review, taken))
     }
 
+    /// Plans importing a config Kubach built itself (clusters imported
+    /// from a cloud, #38); it refers to no local files.
+    pub fn from_kubeconfig(config: Kubeconfig, taken: &HashSet<String>) -> Self {
+        let review = ConfigReview::of(&config, None);
+        Self::new(config, review, taken)
+    }
+
     fn new(mut config: Kubeconfig, review: ConfigReview, taken: &HashSet<String>) -> Self {
         let current = config.current_context.as_deref().and_then(|current| {
             config
@@ -611,7 +618,8 @@ contexts:
         std::fs::write(&token, "local-secret\n").unwrap();
         let yaml = CONFIG.replace(
             "user: { token: s3cr3t }",
-            &format!("user: {{ tokenFile: \"{}\" }}", token.display()),
+            // Single quotes: a Windows path's backslashes are no escapes.
+            &format!("user: {{ tokenFile: '{}' }}", token.display()),
         );
         let mut plan = ImportPlan::from_yaml(&yaml, &HashSet::new()).unwrap();
         assert!(plan.unread_files());
@@ -663,7 +671,7 @@ clusters:
     cluster: {{ server: "https://c.invalid", certificate-authority: ca.crt }}
 users:
   - name: u
-    user: {{ tokenFile: "{}" }}
+    user: {{ tokenFile: '{}' }}
 contexts:
   - name: x
     context: {{ cluster: c, user: u }}

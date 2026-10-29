@@ -126,6 +126,22 @@ pub struct InstallRequest {
     pub create_namespace: bool,
 }
 
+/// `helm template` of a chart: the objects it would create, rendered on the
+/// client without touching a cluster (#18).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplateRequest {
+    pub release: String,
+    /// `.Release.Namespace` (`--namespace`); no cluster is contacted.
+    pub namespace: String,
+    pub chart: UpgradeChart,
+    /// User values as YAML, on stdin (`--values -`).
+    pub values: Sensitive<String>,
+    /// Renders as for an upgrade (`--is-upgrade`), without the chart's
+    /// `crds/` directory, which `helm upgrade` leaves alone. An install
+    /// renders those CRDs too (`--include-crds`).
+    pub is_upgrade: bool,
+}
+
 /// Basic auth of a chart repository for `helm repo add`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepoCredentials {
@@ -226,6 +242,41 @@ impl HelmCommand {
         .for_release(release);
         command.stdin = Some(request.values.clone());
         command
+    }
+
+    /// `helm template <release> <chart>` with the values on stdin. Client
+    /// side only: no `--validate`, no kube context, so no credentials are
+    /// used; `.Capabilities` are helm's defaults and `lookup` finds nothing.
+    /// `chart_dir` is where a stored chart was written (see [`Self::upgrade`]).
+    pub fn template(request: &TemplateRequest, chart_dir: Option<&Path>) -> Self {
+        let mut args: Vec<OsString> = vec!["template".into()];
+        let chart: OsString = match (&request.chart, chart_dir) {
+            (UpgradeChart::Stored(_), Some(dir)) => dir.into(),
+            (UpgradeChart::Stored(chart), None) => format!("<stored {}>", chart.reference()).into(),
+            (UpgradeChart::Reference { chart, version }, _) => {
+                if let Some(version) = non_empty(version.as_deref()) {
+                    args.extend(["--version".into(), version.into()]);
+                }
+                chart.trim().into()
+            }
+        };
+        args.extend(["--values", "-", "--namespace"].map(OsString::from));
+        args.push(request.namespace.clone().into());
+        args.push(if request.is_upgrade {
+            "--is-upgrade".into()
+        } else {
+            "--include-crds".into()
+        });
+        let release = request.release.trim();
+        push_positional(&mut args, [release.into(), chart]);
+        Self {
+            args,
+            env: Vec::new(),
+            stdin: Some(request.values.clone()),
+            secret_env: SecretEnv::default(),
+            refusal: None,
+        }
+        .for_release(release)
     }
 
     /// `helm repo add <name> <url>`: writes the user's `repositories.yaml`
@@ -595,20 +646,7 @@ pub async fn upgrade_watched(
 ) -> Result<UpgradeOutcome, HelmCliError> {
     check_release_name(&request.release).map_err(HelmCliError::Refused)?;
     // Kept until helm is done; the directory is removed on drop.
-    let mut chart_dir = None;
-    if let UpgradeChart::Stored(chart) = &request.chart {
-        chart
-            .usable()
-            .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
-        let dir = tempfile::Builder::new()
-            .prefix("kubach-chart-")
-            .tempdir()
-            .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
-        let path = chart
-            .write_to(dir.path())
-            .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
-        chart_dir = Some((dir, path));
-    }
+    let chart_dir = write_stored(&request.chart)?;
     let command = HelmCommand::upgrade(
         target,
         request,
@@ -619,6 +657,43 @@ pub async fn upgrade_watched(
     drop(chart_dir);
     let output = output?;
     outcome(output, dry_run)
+}
+
+/// Writes the chart kept in a release to a private temporary directory
+/// for helm; `None` for a chart reference.
+fn write_stored(
+    chart: &UpgradeChart,
+) -> Result<Option<(tempfile::TempDir, PathBuf)>, HelmCliError> {
+    let UpgradeChart::Stored(chart) = chart else {
+        return Ok(None);
+    };
+    chart
+        .usable()
+        .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
+    let dir = tempfile::Builder::new()
+        .prefix("kubach-chart-")
+        .tempdir()
+        .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
+    let path = chart
+        .write_to(dir.path())
+        .map_err(|error| HelmCliError::StoredChart(error.to_string()))?;
+    Ok(Some((dir, path)))
+}
+
+/// Runs `helm template` for `request` (#18): the manifest the chart
+/// renders, CRDs and hooks included, without contacting a cluster.
+pub async fn template(
+    helm: Option<&Path>,
+    request: &TemplateRequest,
+    timeout: Duration,
+) -> Result<String, HelmCliError> {
+    check_release_name(request.release.trim()).map_err(HelmCliError::Refused)?;
+    let chart_dir = write_stored(&request.chart)?;
+    let command =
+        HelmCommand::template(request, chart_dir.as_ref().map(|(_, path)| path.as_path()));
+    let output = run(helm, &command, timeout).await;
+    drop(chart_dir);
+    output
 }
 
 /// Runs `command`, with `--debug` and its phases when watched.
@@ -908,6 +983,53 @@ mod tests {
         assert_eq!(args(&shown).last().unwrap(), "<stored web-1.2.0>");
         let real = HelmCommand::upgrade(&target(&[]), &stored, Some(Path::new("/tmp/x")), false);
         assert_eq!(args(&real).last().unwrap(), "/tmp/x");
+    }
+
+    #[test]
+    fn template_renders_on_the_client_only() {
+        let mut request = TemplateRequest {
+            release: "web".into(),
+            namespace: "apps".into(),
+            chart: UpgradeChart::Reference {
+                chart: "bitnami/nginx".into(),
+                version: Some("18.1.0".into()),
+            },
+            values: Sensitive::new("replicaCount: 2\n".into()),
+            is_upgrade: false,
+        };
+        let command = HelmCommand::template(&request, None);
+        assert_eq!(
+            args(&command),
+            [
+                "template",
+                "--version",
+                "18.1.0",
+                "--values",
+                "-",
+                "--namespace",
+                "apps",
+                "--include-crds",
+                "--",
+                "web",
+                "bitnami/nginx",
+            ]
+        );
+        // No context, kubeconfig or credentials: nothing reaches a cluster.
+        assert!(command.env.is_empty());
+        assert!(command.secret_env.expose().is_empty());
+        assert_eq!(
+            command.stdin.as_ref().unwrap().expose(),
+            "replicaCount: 2\n"
+        );
+        request.chart = UpgradeChart::Stored(stored_chart());
+        request.is_upgrade = true;
+        let stored = HelmCommand::template(&request, Some(Path::new("/tmp/x")));
+        let shown = args(&stored);
+        assert!(shown.contains(&"--is-upgrade".to_owned()));
+        assert!(!shown.contains(&"--include-crds".to_owned()));
+        assert_eq!(shown.last().unwrap(), "/tmp/x");
+        request.release = "--kube-apiserver=x".into();
+        assert!(HelmCommand::template(&request, None).refusal.is_some());
     }
 
     fn install_request() -> InstallRequest {

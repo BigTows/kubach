@@ -109,8 +109,10 @@ pub fn mask_audit_args(args: &mut Value) {
         *text = masked_manifest(text);
     }
     // Helm values (#418): parsed and masked by key name, like a manifest.
-    if let Some(Value::String(text)) = args.get_mut("values") {
-        *text = crate::helm_tools::masked_values_yaml(text);
+    for key in ["values", "valuesPatch"] {
+        if let Some(Value::String(text)) = args.get_mut(key) {
+            *text = crate::helm_tools::masked_values_yaml(text);
+        }
     }
     mask_json_strings(args);
 }

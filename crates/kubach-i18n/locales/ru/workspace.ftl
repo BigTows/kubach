@@ -54,6 +54,9 @@ workspace-connect = Подключить
 workspace-connecting = Подключение к { $context }…
 workspace-connect-failed = Не удаётся подключиться к { $context }
 workspace-retry = Повторить
+workspace-gke-plugin-missing = gke-gcloud-auth-plugin не установлен. Он нужен контекстам GKE для входа; Kubach может установить его через gcloud.
+workspace-gke-gcloud-missing = Не установлены ни gke-gcloud-auth-plugin, ни Google Cloud CLI. Скачайте Google Cloud CLI в Настройки → Tools, плагин установится вместе с ним.
+workspace-gke-open-tools = Открыть Настройки → Tools
 
 ## Подсказки плиток хотбара
 
@@ -64,7 +67,6 @@ hotbar-row-namespace = Namespace
 hotbar-row-status = Статус
 hotbar-row-shortcut = Сочетание
 hotbar-row-source = Источник
-hotbar-row-security = Безопасность
 hotbar-row-vault = Хранилище
 hotbar-row-problem = Проблема
 hotbar-row-file = Файл
@@ -75,17 +77,6 @@ hotbar-state-disconnected = Отключено
 hotbar-state-connecting = Подключение…
 hotbar-state-connected = Подключено, { $version }
 hotbar-state-error = Ошибка: { $error }
-hotbar-security-looser = Мягче строгих настроек: { $list }
-hotbar-loosened-mcp = доступ ИИ-агента
-hotbar-loosened-profile = профиль
-hotbar-loosened-temporary-objects = отдельная идентичность в кластере
-hotbar-loosened-deploy = применение изменений
-hotbar-loosened-exec = exec
-hotbar-loosened-session-ttl = длительность сессии
-hotbar-loosened-namespaces = несколько namespace
-hotbar-loosened-secret-values = показ значений Secret
-hotbar-loosened-agent-secret-values = значения Secret раскрываются агенту по запросу
-hotbar-loosened-agent-other-kinds = пользовательские ресурсы для агента
 
 ## Меню хотбара
 

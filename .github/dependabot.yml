@@ -1,0 +1,28 @@
+# Dependency updates go to develop, like every other change; they reach
+# main with the next release pull request. Security updates (enabled in the
+# repository settings) also open against develop: it is the default branch.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # resvg pins its own usvg: bumped one at a time, two usvg versions
+      # end up in the build and it doesn't compile (#5, #6). A dependency
+      # goes to the first group it matches, so this one comes first.
+      resvg:
+        patterns: [resvg, usvg]
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directories: [/, /.github/actions/*]
+    target-branch: develop
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

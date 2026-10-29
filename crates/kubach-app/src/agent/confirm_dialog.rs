@@ -12,7 +12,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, Wind
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_i18n::t;
-use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, RequestKind};
+use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentials, RequestKind};
 use kubach_ui::measure;
 
 use super::{AgentState, Notice, countdown, global, secret_dialog};
@@ -68,7 +68,8 @@ fn title(request: &ConfirmationRequest) -> String {
             grant: Grant::Modify { .. },
         } => t!("agent-title-modify"),
         RequestKind::Exec { .. } => t!("agent-title-exec"),
-        RequestKind::Ceiling { .. } => t!("agent-title-ceiling"),
+        RequestKind::PortForward { .. } => t!("agent-title-port-forward"),
+        RequestKind::Access { .. } => t!("agent-title-access"),
         RequestKind::Helm { helm } => match helm.action {
             kubach_mcp::HelmAction::Install => t!("agent-title-helm-install"),
             kubach_mcp::HelmAction::Upgrade => t!("agent-title-helm-upgrade"),
@@ -209,6 +210,53 @@ fn command_block(command: &[String], cx: &App) -> impl IntoElement + use<> {
         }))
 }
 
+/// Height the dialog's title, paddings, margins and our buttons take
+/// around the scrolling body.
+const DIALOG_CHROME: f32 = 220.;
+
+/// Height of the "don't ask again" row by the buttons and its gap (#30).
+const REMEMBER_ROW: f32 = 32.;
+
+/// "CustomResourceDefinition × 6, ClusterRole × 12": objects counted by
+/// kind (the first word of each), in the order they first appear.
+fn kind_counts(objects: &[String]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for object in objects {
+        let kind = object.split_whitespace().next().unwrap_or_default();
+        match counts.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(kind, n)| format!("{kind} × {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Lines of a unified diff, colored as git does: added green, removed
+/// red, hunk headers muted. Long lines wrap: nothing hides past the edge.
+fn diff_lines(text: &str, cx: &App) -> Vec<Div> {
+    let theme = cx.theme();
+    text.lines()
+        .map(|line| {
+            let color = if line.starts_with("+++") || line.starts_with("---") {
+                theme.foreground
+            } else if line.starts_with('+') {
+                theme.success
+            } else if line.starts_with('-') {
+                theme.danger
+            } else if line.starts_with("@@") {
+                theme.muted_foreground
+            } else {
+                theme.foreground
+            };
+            div().text_color(color).child(line.to_owned())
+        })
+        .collect()
+}
+
 fn show_next(agent: Entity<AgentState>, window: &mut Window, cx: &mut App) {
     let state = agent.read(cx);
     if let Some(shown) = state.shown {
@@ -253,9 +301,19 @@ struct ConfirmView {
     /// The user ticked "I understand" for the dangerous findings; the
     /// approve button waits for it (#194).
     acknowledged: bool,
-    /// "Always allow on this cluster" on a ceiling request (#417); off
-    /// until the user ticks it.
+    /// "Allow by default" on an access request (#15); off until the user
+    /// ticks it.
     always: bool,
+    /// "Run this helm call with my credentials" (#18); off until the user
+    /// ticks it, and the approve button waits for it.
+    as_user: bool,
+    /// The whole values of a Helm change, folded under the values diff.
+    show_values: bool,
+    /// Every object behind "run with my credentials", folded under counts.
+    show_user_objects: bool,
+    /// "Don't ask again until the session ends" for this kind of change in
+    /// this namespace (#30); off until the user ticks it.
+    remember: bool,
     _observe: Subscription,
 }
 
@@ -267,6 +325,10 @@ impl ConfirmView {
             id,
             acknowledged: false,
             always: false,
+            as_user: false,
+            show_values: false,
+            show_user_objects: false,
+            remember: false,
             _observe: observe,
         }
     }
@@ -293,9 +355,7 @@ fn label_width(window: &Window, cx: &App) -> Pixels {
         t!("agent-field-revision"),
         t!("agent-field-runs-as"),
         t!("agent-field-asks-for"),
-        t!("agent-field-ceiling"),
-        t!("agent-field-tool"),
-        t!("agent-field-session"),
+        t!("agent-field-access-now"),
     ];
     measure::label_column_width(
         labels.iter().map(String::as_str),
@@ -418,9 +478,9 @@ impl Render for ConfirmView {
             request.kind,
             RequestKind::ChartSource { .. } | RequestKind::UseContext { .. }
         );
-        // Raising the ceiling (#417).
-        let ceiling = match &request.kind {
-            RequestKind::Ceiling { raise, current, .. } => Some((*raise, *current)),
+        // Access beyond the minimum (#15).
+        let access = match &request.kind {
+            RequestKind::Access { raise, current, .. } => Some((*raise, *current)),
             _ => None,
         };
         // Copying or deleting a Secret (#230).
@@ -438,7 +498,7 @@ impl Render for ConfirmView {
             // Exec is a command, not a diff: no colors, every argument apart.
             RequestKind::Exec { command } => Some(command_block(command, cx).into_any_element()),
             _ => (grant.is_none()
-                && ceiling.is_none()
+                && access.is_none()
                 && !source
                 && !request.details.trim().is_empty())
             .then(|| {
@@ -451,17 +511,7 @@ impl Render for ConfirmView {
                     .bg(theme.muted)
                     .font_family(theme.mono_font_family.clone())
                     .text_xs()
-                    .children(request.details.lines().map(|line| {
-                        let color = if line.starts_with('+') && !line.starts_with("+++") {
-                            theme.success
-                        } else if line.starts_with('-') && !line.starts_with("---") {
-                            theme.danger
-                        } else {
-                            theme.foreground
-                        };
-                        // Long lines wrap: nothing hides past the right edge.
-                        div().text_color(color).child(line.to_owned())
-                    }))
+                    .children(diff_lines(&request.details, cx))
                     .into_any_element()
             }),
         };
@@ -501,7 +551,62 @@ impl Render for ConfirmView {
                     cx.notify();
                 }))
         });
-        let approve_blocked = needs_ack && !self.acknowledged;
+        // Helm under the user's own credentials (#18): the question with an
+        // unticked box, or the warning once allowed.
+        let credentials = helm
+            .as_ref()
+            .map(|helm| helm.credentials)
+            .unwrap_or_default();
+        let ask_user = credentials == HelmCredentials::AskUser;
+        let as_user_block = helm.as_ref().and_then(|helm| match helm.credentials {
+            HelmCredentials::Session => None,
+            HelmCredentials::AskUser => Some(warning_block(
+                t!("agent-helm-as-user-title"),
+                [
+                    t!("agent-helm-as-user-warning"),
+                    t!("agent-helm-as-user-objects"),
+                ]
+                .into_iter()
+                .chain(if self.show_user_objects {
+                    helm.user_objects
+                        .iter()
+                        .map(|object| format!("  - {object}"))
+                        .collect()
+                } else {
+                    vec![kind_counts(&helm.user_objects)]
+                })
+                .collect(),
+                theme.danger,
+                cx,
+            )),
+            HelmCredentials::User => Some(warning_block(
+                t!("agent-helm-runs-as-user-title"),
+                vec![t!("agent-helm-runs-as-user")],
+                theme.danger,
+                cx,
+            )),
+        });
+        let show_all_objects = (ask_user && !self.show_user_objects).then(|| {
+            Button::new("confirm-show-user-objects")
+                .ghost()
+                .xsmall()
+                .label(t!("agent-helm-as-user-show-all"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_user_objects = true;
+                    cx.notify();
+                }))
+        });
+        let as_user_tick = ask_user.then(|| {
+            Checkbox::new("confirm-as-user")
+                .label(t!("agent-helm-as-user-tick"))
+                .checked(self.as_user)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.as_user = *checked;
+                    cx.notify();
+                }))
+        });
+        let has_dangerous = has_dangerous || credentials != HelmCredentials::Session;
+        let approve_blocked = (needs_ack && !self.acknowledged) || (ask_user && !self.as_user);
         // What a yes to a right means; for a Secret, the warning.
         let meaning = grant.as_ref().map(|_| {
             if secret {
@@ -521,13 +626,42 @@ impl Render for ConfirmView {
             }
         });
         let always = self.always;
+        let show_values = self.show_values;
+        // Offered only where Kubach marked the request and the kind of
+        // change may be remembered at all (#30): never for deletions,
+        // Secrets, Helm with the user's credentials, dangerous fields or a
+        // client-only namespace.
+        let remember_offer = request
+            .allow_remember
+            .then(|| kubach_mcp::rememberable(&request))
+            .flatten();
+        let remember = remember_offer.is_some() && self.remember;
+        let remember_tick = remember_offer.map(|offer| {
+            Checkbox::new("confirm-remember")
+                .label(t!(
+                    "agent-remember",
+                    action = super::remembered_action_label(offer.action),
+                    namespace = offer.namespace.as_str()
+                ))
+                .checked(remember)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.remember = *checked;
+                    cx.notify();
+                }))
+        });
         let (reject, approve) = match (&grant, &secret_change) {
-            _ if ceiling.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
-            _ if ceiling.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
+            _ if access.is_some() && always => (t!("agent-deny"), t!("agent-allow-always")),
+            _ if access.is_some() => (t!("agent-deny"), t!("agent-allow-session")),
             _ if source => (t!("agent-deny"), t!("agent-allow-session")),
             _ if helm.is_some() => (
                 t!("agent-reject"),
                 match helm.as_ref().map(|helm| helm.action) {
+                    // A yes leads to the dry run first, not the change (#18).
+                    Some(kubach_mcp::HelmAction::Install | kubach_mcp::HelmAction::Upgrade)
+                        if ask_user =>
+                    {
+                        t!("agent-helm-dry-run-as-user")
+                    }
                     Some(kubach_mcp::HelmAction::Install) => t!("agent-helm-install"),
                     Some(kubach_mcp::HelmAction::Upgrade) => t!("agent-helm-upgrade"),
                     Some(kubach_mcp::HelmAction::Rollback) => t!("agent-helm-rollback"),
@@ -550,211 +684,270 @@ impl Render for ConfirmView {
                 .children(secret_dialog::users(secret, cx))
         });
 
+        // The buttons stay in sight: everything above them scrolls. The
+        // dialog itself is at most the viewport less its margins, and its
+        // title, paddings and our buttons take the rest, with the "don't
+        // ask again" row next to the buttons when it is there (#30).
+        let chrome = DIALOG_CHROME
+            + if remember_tick.is_some() {
+                REMEMBER_ROW
+            } else {
+                0.
+            };
+        let body_height = (window.viewport_size().height - px(chrome)).max(px(120.));
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(secret_parts)
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(request.summary.clone()),
-            )
-            .child(
-                div()
+                    .id("confirm-body")
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(field_with_note(
-                        t!("agent-field-agent"),
-                        request.client.clone(),
-                        t!("agent-client-unverified"),
-                        label_width,
-                        cx,
-                    ))
-                    .when(!request.context.is_empty(), |this| {
-                        this.child(field(
-                            t!("agent-field-context"),
-                            request.context.clone(),
-                            label_width,
-                            cx,
-                        ))
-                    })
-                    .child(field(
-                        t!("agent-field-namespace"),
-                        request.namespace.clone(),
-                        label_width,
-                        cx,
-                    ))
-                    .when_some(grant.as_ref(), |this, grant| {
-                        this.child(field(
-                            t!("agent-field-right"),
-                            grant.to_string(),
-                            label_width,
-                            cx,
-                        ))
-                    })
-                    .when_some(helm.as_ref(), |this, helm| {
-                        this.child(field(
-                            t!("agent-field-release"),
-                            helm.release.clone(),
-                            label_width,
-                            cx,
-                        ))
-                        .child(field(
-                            t!("agent-field-chart"),
-                            helm.chart.clone(),
-                            label_width,
-                            cx,
-                        ))
-                        .when_some(helm.version.clone(), |this, version| {
-                            this.child(field(t!("agent-field-version"), version, label_width, cx))
-                        })
-                        .when_some(helm.revision, |this, revision| {
-                            this.child(field(
-                                t!("agent-field-revision"),
-                                revision.to_string(),
+                    .gap_3()
+                    .max_h(body_height)
+                    .overflow_y_scroll()
+                    .children(secret_parts)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(request.summary.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(field_with_note(
+                                t!("agent-field-agent"),
+                                request.client.clone(),
+                                t!("agent-client-unverified"),
                                 label_width,
                                 cx,
                             ))
-                        })
-                        .child(field(
-                            t!("agent-field-runs-as"),
-                            helm.identity.clone(),
-                            label_width,
-                            cx,
-                        ))
-                    })
-                    .when_some(ceiling, |this, (raise, current)| {
-                        this.child(field(
-                            t!("agent-field-asks-for"),
-                            raise.to_string(),
-                            label_width,
-                            cx,
-                        ))
-                        .child(field(
-                            t!("agent-field-ceiling"),
-                            current.to_string(),
-                            label_width,
-                            cx,
-                        ))
-                    })
-                    .child(field(
-                        t!("agent-field-tool"),
-                        request.tool.clone(),
-                        label_width,
-                        cx,
-                    ))
-                    .child(field(
-                        t!("agent-field-session"),
-                        request.session_id.clone(),
-                        label_width,
-                        cx,
-                    )),
-            )
-            .children(meaning)
-            .when(source, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(request.details.clone()),
-                )
-            })
-            .when_some(helm.as_ref(), |this, helm| {
-                let block = |id: &'static str, title: String, text: String| {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .id(id)
-                                .max_h(px(160.))
-                                .overflow_y_scroll()
-                                .p_2()
-                                .rounded_md()
-                                .bg(theme.muted)
-                                .font_family(theme.mono_font_family.clone())
-                                .text_xs()
-                                .text_color(theme.foreground)
-                                .child(text),
-                        )
-                };
-                this.when(!helm.values.trim().is_empty(), |this| {
-                    this.child(block(
-                        "confirm-helm-values",
-                        t!("agent-helm-values"),
-                        helm.values.clone(),
-                    ))
-                })
-                .when(!helm.objects.is_empty(), |this| {
-                    this.child(block(
-                        "confirm-helm-objects",
-                        t!("agent-helm-objects"),
-                        helm.objects.join("\n"),
-                    ))
-                })
-            })
-            .when(ceiling.is_some(), |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(request.details.clone()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            Checkbox::new("confirm-always")
-                                .label(t!("agent-always"))
-                                .checked(always)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.always = *checked;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if always {
-                                    theme.warning
-                                } else {
-                                    theme.muted_foreground
+                            .when(!request.context.is_empty(), |this| {
+                                this.child(field(
+                                    t!("agent-field-context"),
+                                    request.context.clone(),
+                                    label_width,
+                                    cx,
+                                ))
+                            })
+                            .child(field(
+                                t!("agent-field-namespace"),
+                                request.namespace.clone(),
+                                label_width,
+                                cx,
+                            ))
+                            .when_some(grant.as_ref(), |this, grant| {
+                                this.child(field(
+                                    t!("agent-field-right"),
+                                    grant.to_string(),
+                                    label_width,
+                                    cx,
+                                ))
+                            })
+                            .when_some(helm.as_ref(), |this, helm| {
+                                this.child(field(
+                                    t!("agent-field-release"),
+                                    helm.release.clone(),
+                                    label_width,
+                                    cx,
+                                ))
+                                .child(field(
+                                    t!("agent-field-chart"),
+                                    helm.chart.clone(),
+                                    label_width,
+                                    cx,
+                                ))
+                                .when_some(helm.version.clone(), |this, version| {
+                                    this.child(field(
+                                        t!("agent-field-version"),
+                                        version,
+                                        label_width,
+                                        cx,
+                                    ))
                                 })
-                                .child(t!("agent-always-note", context = request.context.as_str())),
-                        ),
-                )
-            })
-            .when_some(degraded, |this, warning| {
-                this.child(warning_block(
-                    t!("agent-limits-off"),
-                    vec![warning, t!("agent-limits-off-note")],
-                    theme.warning,
-                    cx,
-                ))
-            })
-            .when(client_only && !degraded_shown, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child(t!("agent-client-only")),
-                )
-            })
-            .children(dangerous)
-            .children(acknowledge)
-            .children(details)
+                                .when_some(helm.revision, |this, revision| {
+                                    this.child(field(
+                                        t!("agent-field-revision"),
+                                        revision.to_string(),
+                                        label_width,
+                                        cx,
+                                    ))
+                                })
+                                // Namespaces besides the release's (#21).
+                                .when(!helm.namespaces.is_empty(), |this| {
+                                    this.child(field(
+                                        t!("agent-field-other-namespaces"),
+                                        helm.namespaces.join(", "),
+                                        label_width,
+                                        cx,
+                                    ))
+                                })
+                                .child(field(
+                                    t!("agent-field-runs-as"),
+                                    helm.identity.clone(),
+                                    label_width,
+                                    cx,
+                                ))
+                            })
+                            .when_some(access, |this, (raise, current)| {
+                                this.child(field(
+                                    t!("agent-field-asks-for"),
+                                    super::raise_label(raise),
+                                    label_width,
+                                    cx,
+                                ))
+                                .child(field(
+                                    t!("agent-field-access-now"),
+                                    super::access_label(current),
+                                    label_width,
+                                    cx,
+                                ))
+                            })
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(t!(
+                                "agent-tool-session",
+                                tool = request.tool.as_str(),
+                                session = request.session_id.as_str()
+                            ))),
+                    )
+                    .children(meaning)
+                    .when(source, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(request.details.clone()),
+                        )
+                    })
+                    .when_some(helm.as_ref(), |this, helm| {
+                        let block = |id: &'static str, title: String, content: AnyElement| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .id(id)
+                                        .max_h(px(160.))
+                                        .overflow_y_scroll()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(theme.muted)
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_xs()
+                                        .text_color(theme.foreground)
+                                        .child(content),
+                                )
+                        };
+                        // How the release's values change (#22), masked.
+                        this.when(!helm.values_diff.trim().is_empty(), |this| {
+                            this.child(block(
+                                "confirm-helm-values-diff",
+                                t!("agent-helm-values-diff"),
+                                div()
+                                    .children(diff_lines(&helm.values_diff, cx))
+                                    .into_any_element(),
+                            ))
+                        })
+                        .when(!helm.values.trim().is_empty(), |this| {
+                            // With a values diff the whole values are folded.
+                            if helm.values_diff.trim().is_empty() || show_values {
+                                this.child(block(
+                                    "confirm-helm-values",
+                                    t!("agent-helm-values"),
+                                    helm.values.clone().into_any_element(),
+                                ))
+                            } else {
+                                this.child(
+                                    div().child(
+                                        Button::new("confirm-show-values")
+                                            .ghost()
+                                            .xsmall()
+                                            .label(t!("agent-helm-values-show"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_values = true;
+                                                cx.notify();
+                                            })),
+                                    ),
+                                )
+                            }
+                        })
+                        .when(!helm.objects.is_empty(), |this| {
+                            this.child(block(
+                                "confirm-helm-objects",
+                                t!("agent-helm-objects"),
+                                helm.objects.join("\n").into_any_element(),
+                            ))
+                        })
+                    })
+                    .when(access.is_some(), |this| {
+                        this.child(div().text_sm().text_color(theme.muted_foreground).child(t!(
+                            "agent-access-details",
+                            context = request.context.as_str()
+                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    Checkbox::new("confirm-always")
+                                        .label(t!("agent-always"))
+                                        .checked(always)
+                                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                            this.always = *checked;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if always {
+                                            theme.warning
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(t!(
+                                            "agent-always-note",
+                                            context = request.context.as_str()
+                                        )),
+                                ),
+                        )
+                    })
+                    .when_some(degraded, |this, warning| {
+                        this.child(warning_block(
+                            t!("agent-limits-off"),
+                            vec![warning, t!("agent-limits-off-note")],
+                            theme.warning,
+                            cx,
+                        ))
+                    })
+                    .when(client_only && !degraded_shown, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.warning)
+                                .child(t!("agent-client-only")),
+                        )
+                    })
+                    .children(as_user_block)
+                    .children(show_all_objects)
+                    .children(as_user_tick)
+                    .children(dangerous)
+                    .children(acknowledge)
+                    .children(details),
+            )
+            // Next to the buttons, in sight without scrolling.
+            .children(remember_tick)
             .child(
                 div()
                     .flex()
@@ -804,6 +997,8 @@ impl Render for ConfirmView {
                                 }
                                 let decision = if this.always {
                                     ConfirmationDecision::ApprovedAlways
+                                } else if remember {
+                                    ConfirmationDecision::ApprovedForSession
                                 } else {
                                     ConfirmationDecision::Approved
                                 };
@@ -888,5 +1083,21 @@ mod tests {
         assert_eq!(shown, format!("a\\nb{VISIBLE_SPACE}"));
         let escaped: Vec<&str> = ranges.iter().map(|r| &shown[r.clone()]).collect();
         assert_eq!(escaped, ["\\n", &VISIBLE_SPACE.to_string()]);
+    }
+
+    #[test]
+    fn objects_are_counted_by_kind_in_order() {
+        let objects = [
+            "CustomResourceDefinition a.cert-manager.io",
+            "ClusterRole cert-manager-view",
+            "CustomResourceDefinition b.cert-manager.io",
+            "Role leader (namespace kube-system)",
+        ]
+        .map(String::from);
+        assert_eq!(
+            super::kind_counts(&objects),
+            "CustomResourceDefinition × 2, ClusterRole × 1, Role × 1"
+        );
+        assert_eq!(super::kind_counts(&[]), "");
     }
 }

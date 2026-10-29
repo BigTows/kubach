@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use crate::ceiling::Ceiling;
+use crate::access::Access;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
 use crate::grants::Grant;
 use crate::helm_tools;
@@ -33,12 +33,11 @@ use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Request, service_account_changes,
     walk_fields,
 };
+use crate::remember::{RememberNote, rememberable};
 use crate::scope::NamespaceSource;
-use crate::scope::SessionMode;
 use crate::secret_tools;
 use crate::secret_write;
 use crate::session::{Session, SessionError};
-use crate::settings::{Profile, SecretAccess};
 use crate::topology_tools;
 use kubach_core::sync;
 
@@ -153,8 +152,8 @@ pub(crate) struct Ctx<'a> {
     pub tool: &'a str,
     /// Rights the user answered for during this call, for the audit log.
     pub decisions: std::sync::Mutex<Vec<GrantDecision>>,
-    /// Answers about raising the ceiling during this call (#417).
-    pub ceilings: std::sync::Mutex<Vec<CeilingDecision>>,
+    /// Answers about access during this call (#15).
+    pub accesses: std::sync::Mutex<Vec<AccessDecision>>,
     /// The user's `helm`, for the Helm tools (#418).
     pub helm: Option<std::sync::Arc<crate::helm_tools::HelmEnv>>,
     /// Live phases of a long call (helm), for MCP progress notifications.
@@ -162,13 +161,20 @@ pub(crate) struct Ctx<'a> {
     /// The namespace the call acts in once the policy allowed it, for the
     /// identity in the audit log.
     pub namespace: std::sync::Mutex<Option<String>>,
+    /// Who the call ran as when not the namespace's identity: a helm call
+    /// the user allowed under their own credentials (#18).
+    pub identity: std::sync::Mutex<Option<String>>,
+    /// Whether the change ran on an earlier "don't ask again" or the user
+    /// ticked it now (#30), for the audit log and the agent.
+    pub remembered: std::sync::Mutex<Option<RememberNote>>,
 }
 
 /// One answer for a right, as the audit log records it: never a value.
 #[derive(Clone, Debug)]
 pub(crate) struct GrantDecision {
     pub grant: Grant,
-    /// `granted`, `refused` (remembered) or `no-answer` (asked again later).
+    /// `access` (within the session's access, no question), `granted`,
+    /// `refused` (remembered) or `no-answer` (asked again later).
     pub outcome: &'static str,
     pub reason: Option<String>,
 }
@@ -176,10 +182,10 @@ pub(crate) struct GrantDecision {
 /// Receives the phases of a long call as they happen.
 pub(crate) type Progress = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
-/// One answer about raising the ceiling, for the audit log (#417).
+/// One answer about access, for the audit log (#15).
 #[derive(Clone, Debug)]
-pub(crate) struct CeilingDecision {
-    pub raise: Ceiling,
+pub(crate) struct AccessDecision {
+    pub raise: Access,
     pub namespace: Option<String>,
     /// `session`, `always` (the settings were raised too), `refused`,
     /// `no-answer` or `error`.
@@ -312,12 +318,14 @@ fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
 
 // ------------------------------------------------------------- rights
 
-/// Calls in one request may ask for at most this many rights (reading two
-/// namespaces, or reading and revealing, or reading and changing).
-const MAX_GRANTS_PER_CALL: usize = 3;
+/// Calls in one request may need at most this many rights and access
+/// questions (a level and custom resources, reading two namespaces and
+/// changing one).
+const MAX_GRANTS_PER_CALL: usize = 6;
 
-/// The policy's verdict on `request`, asking the user for the rights it
-/// needs on the way (#227).
+/// The policy's verdict on `request`, setting up the rights it needs
+/// within the access and asking the user for the rest on the way (#227,
+/// #15).
 pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowed, ToolError> {
     for _ in 0..=MAX_GRANTS_PER_CALL {
         match ctx.session.policy().check(request) {
@@ -333,11 +341,11 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
                 };
                 ask_grant(ctx, request, grant).await?;
             }
-            Err(denial) if denial.code == DenialCode::NeedsCeiling => {
-                let Some(raise) = denial.ceiling else {
+            Err(denial) if denial.code == DenialCode::NeedsAccess => {
+                let Some(raise) = denial.access else {
                     return Err(denial.into());
                 };
-                ask_ceiling(ctx, request, raise).await?;
+                ask_access(ctx, request, raise).await?;
             }
             Err(denial) if denial.code == DenialCode::RevealDisabled => {
                 tell_reveal_blocked(ctx, request).await;
@@ -363,56 +371,26 @@ fn grant_summary(client: &str, grant: &Grant) -> String {
 }
 
 /// What a yes means, for the dialog.
-fn grant_details(session: &Session, grant: &Grant) -> String {
-    let scope = session.scope();
+fn grant_details(grant: &Grant) -> String {
     match grant {
-        Grant::Read { namespace } => {
-            let mut parts = vec![format!(
-                "Until the session ends the agent may read the resources of {namespace} within \
-                 the {} profile",
-                scope.profile
-            )];
-            if scope.profile >= Profile::Debug {
-                parts.push("container logs".into());
-            }
-            if scope.policy.secrets >= SecretAccess::Metadata {
-                parts.push(
-                    "Secret names, types, keys, sizes and checks done inside Kubach (no values)"
-                        .into(),
-                );
-            }
-            let system = if is_system_namespace(namespace) {
-                format!("{namespace} is a system namespace of the cluster. ")
-            } else {
-                String::new()
-            };
-            format!(
-                "{system}{}. Secret values stay hidden.",
-                parts.join(", plus ")
-            )
-        }
         Grant::Secret { .. } => "The values will be sent into the model's context and, as a \
              rule, to the LLM provider. This cannot be taken back. Rotate this Secret once the \
              work is done. Only this Secret, only in this session."
             .into(),
-        Grant::Modify { namespace } => format!(
-            "Until the session ends the agent may scale and restart workloads in {namespace} \
-             without asking again. apply_manifest, delete_resource and exec are still confirmed \
-             one by one."
-        ),
+        // Not asked since #15; kept for the bridge's older questions.
+        Grant::Read { namespace } | Grant::Modify { namespace } => {
+            format!("Rights of the session in namespace {namespace}.")
+        }
     }
 }
 
-/// `kube-system`, `kube-public`, `kube-node-lease` and the like.
-fn is_system_namespace(namespace: &str) -> bool {
-    namespace.starts_with("kube-")
-}
-
-/// Asks the user for `grant` and records the answer in the session. Only
-/// one question per session is open at a time. While waiting for it the
-/// session may have changed (the right answered, another namespace granted
-/// where only one is allowed), so the policy is asked again first and the
-/// question goes out only if `request` still needs this very right.
+/// Sets up `grant` for `request`: reading and changing a namespace come
+/// with the session's access and are granted without a question (#15,
+/// they set up the namespace's identity); revealing a Secret is asked for
+/// that Secret, and the answer recorded in the session. Only one question
+/// per session is open at a time. While waiting for it the session may
+/// have changed, so the policy is asked again first and the question goes
+/// out only if `request` still needs this very right.
 async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(), ToolError> {
     let _asking = ctx.session.asking().await;
     match ctx.session.policy().check(request) {
@@ -420,6 +398,23 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
             if denial.code == DenialCode::NeedsGrant && denial.grant == Some(grant.clone()) => {}
         // Answered meanwhile or refused now; the caller checks again.
         _ => return Ok(()),
+    }
+    if !matches!(grant, Grant::Secret { .. }) {
+        let result = ctx.session.decide(grant.clone(), true).await;
+        let (outcome, reason) = match &result {
+            Ok(()) => ("access", None),
+            Err(error) => ("error", Some(error.to_string())),
+        };
+        sync::lock(&ctx.decisions).push(GrantDecision {
+            grant: grant.clone(),
+            outcome,
+            reason,
+        });
+        return result.map_err(|error| {
+            ToolError::Failed(format!(
+                "Kubach could not set up the right to {grant}: {error}"
+            ))
+        });
     }
     let request = ConfirmationRequest {
         kind: RequestKind::Grant {
@@ -431,7 +426,7 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
         tool: ctx.tool.to_owned(),
         namespace: grant.namespace().to_owned(),
         summary: grant_summary(ctx.client_name, &grant),
-        details: grant_details(ctx.session, &grant),
+        details: grant_details(&grant),
         dangerous: Vec::new(),
         mode: ctx.session.mode_in(grant.namespace()),
         allow_remember: false,
@@ -452,7 +447,9 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
         });
     };
     match decision {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => {
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => {
             if let Err(error) = ctx.session.decide(grant.clone(), true).await {
                 let message = format!(
                     "the user allowed this session to {grant}, but Kubach could not grant it: \
@@ -484,8 +481,8 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
     }
 }
 
-/// The namespace a request names, if any; shown in the ceiling question
-/// for context only (the namespace's own rights are asked separately).
+/// The namespace a request names, if any; shown in the access question
+/// for context only.
 fn named_namespace(request: &Request) -> Option<&str> {
     match request {
         Request::List { namespace, .. }
@@ -498,6 +495,7 @@ fn named_namespace(request: &Request) -> Option<&str> {
         | Request::Restart { namespace, .. }
         | Request::Delete { namespace, .. }
         | Request::Exec { namespace, .. }
+        | Request::PortForward { namespace, .. }
         | Request::SecretList { namespace, .. }
         | Request::SecretCheck { namespace, .. }
         | Request::SecretCompare { namespace, .. }
@@ -511,33 +509,32 @@ fn named_namespace(request: &Request) -> Option<&str> {
     }
 }
 
-/// Asks the user to raise the session's ceiling by `raise` (#417) and
+/// Asks the user to allow `raise` beyond the session's access (#15) and
 /// records the answer. One question per session at a time; the policy is
-/// asked again first, as for rights. "Always allow on this cluster" is the
-/// app's to apply to the settings; the session only learns that it did.
-pub(crate) async fn ask_ceiling(
+/// asked again first, as for rights. "Allow by default" is the app's to
+/// apply to the settings; the session only learns that it did.
+pub(crate) async fn ask_access(
     ctx: &Ctx<'_>,
     request: &Request,
-    raise: Ceiling,
+    raise: Access,
 ) -> Result<(), ToolError> {
     let _asking = ctx.session.asking().await;
     match ctx.session.policy().check(request) {
-        Err(denial) if denial.code == DenialCode::NeedsCeiling && denial.ceiling == Some(raise) => {
-        }
+        Err(denial) if denial.code == DenialCode::NeedsAccess && denial.access == Some(raise) => {}
         _ => return Ok(()),
     }
-    ask_ceiling_now(ctx, named_namespace(request), raise).await
+    ask_access_now(ctx, named_namespace(request), raise).await
 }
 
-/// [`ask_ceiling`] without the policy check, for callers that checked and
+/// [`ask_access`] without the policy check, for callers that checked and
 /// hold [`Session::asking`].
-pub(crate) async fn ask_ceiling_now(
+pub(crate) async fn ask_access_now(
     ctx: &Ctx<'_>,
     namespace: Option<&str>,
-    raise: Ceiling,
+    raise: Access,
 ) -> Result<(), ToolError> {
     let scope = ctx.session.scope();
-    let current = ctx.session.ceiling();
+    let current = ctx.session.access();
     let namespace = namespace
         .map(str::to_owned)
         .or_else(|| ctx.session.policy().namespace(None).ok())
@@ -548,7 +545,7 @@ pub(crate) async fn ask_ceiling_now(
         format!(" (namespace {namespace})")
     };
     let question = ConfirmationRequest {
-        kind: RequestKind::Ceiling {
+        kind: RequestKind::Access {
             raise,
             current,
             server_url: scope.server_url.clone(),
@@ -563,12 +560,10 @@ pub(crate) async fn ask_ceiling_now(
             ctx.client_name, scope.context
         ),
         details: format!(
-            "The agent's ceiling on {context} is {current}. Allowing raises it to {} until this \
-             session ends; with \"Always allow on this cluster\" the context's security settings \
-             are raised for good. Either way every change, deletion and command is still \
-             confirmed one by one with its dry run, each namespace is still asked for, and \
-             nothing exceeds your own RBAC.",
-            current.join(raise),
+            "Without asking, the agent has {current} on {context}. Allowing adds this until the \
+             session ends; with \"Allow by default\" the context's minimal access is raised for \
+             good. Either way every change, deletion and command is still confirmed one by one, \
+             and nothing exceeds your own RBAC.",
             context = scope.context,
         ),
         dangerous: Vec::new(),
@@ -588,7 +583,7 @@ pub(crate) async fn ask_ceiling_now(
         .into());
     }
     let record = |outcome: &'static str, reason: Option<String>| {
-        sync::lock(&ctx.ceilings).push(CeilingDecision {
+        sync::lock(&ctx.accesses).push(AccessDecision {
             raise,
             namespace: (!namespace.is_empty()).then(|| namespace.clone()),
             outcome,
@@ -596,11 +591,13 @@ pub(crate) async fn ask_ceiling_now(
         });
     };
     match decision {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => {
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => {
             let always = decision == ConfirmationDecision::ApprovedAlways;
-            if let Err(error) = ctx.session.decide_ceiling(raise, true, always).await {
+            if let Err(error) = ctx.session.decide_access(raise, true, always).await {
                 let message = format!(
-                    "the user allowed {raise}, but Kubach could not raise the session's ceiling: \
+                    "the user allowed {raise}, but Kubach could not raise the session's access: \
                      {error}"
                 );
                 record("error", Some(message.clone()));
@@ -610,7 +607,7 @@ pub(crate) async fn ask_ceiling_now(
             Ok(())
         }
         ConfirmationDecision::Rejected { reason } => {
-            let _ = ctx.session.decide_ceiling(raise, false, false).await;
+            let _ = ctx.session.decide_access(raise, false, false).await;
             record("refused", reason.clone());
             Err(ToolError::Rejected(Some(format!(
                 "the user did not allow {raise} on {} in this session{}; Kubach does not ask \
@@ -622,12 +619,12 @@ pub(crate) async fn ask_ceiling_now(
         ConfirmationDecision::Denied { reason } => {
             record("no-answer", reason.clone());
             Err(ToolError::Rejected(Some(format!(
-                "no answer from the user to raising the ceiling to {raise}{}",
+                "no answer from the user about {raise}{}",
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
             ))))
         }
         ConfirmationDecision::Provided { .. } => {
-            let reason = Some("unexpected answer to a question about the ceiling".to_owned());
+            let reason = Some("unexpected answer to a question about access".to_owned());
             record("no-answer", reason.clone());
             Err(ToolError::Rejected(reason))
         }
@@ -636,7 +633,7 @@ pub(crate) async fn ask_ceiling_now(
 
 /// Refuses a call the user's own RBAC does not allow in its namespace:
 /// `SelfSubjectAccessReview` under the user's credentials, cached for the
-/// session. Raising the agent's ceiling never adds RBAC rights, so this is
+/// session. More access for the agent never adds RBAC rights, so this is
 /// a plain refusal, not a question.
 pub(crate) async fn ensure_rbac(
     ctx: &Ctx<'_>,
@@ -798,6 +795,7 @@ pub(crate) async fn run(
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
         "helm_release_history" => helm_tools::history(ctx, args).await,
+        "helm_get_values" => helm_tools::get_values(ctx, args).await,
         "helm_install" => helm_tools::install(ctx, args).await,
         "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
         "helm_rollback" => helm_tools::rollback(ctx, args).await,
@@ -888,6 +886,9 @@ pub(crate) async fn run(
                 .clamp(1, MAX_EXEC_TIMEOUT);
             exec(ctx, &allowed, a.container.as_deref(), &a.command, timeout).await
         }
+        "port_forward_start" => crate::forwards::start(ctx, args).await,
+        "port_forward_list" => crate::forwards::list(ctx, args).await,
+        "port_forward_stop" => crate::forwards::stop(ctx, args).await,
         "list_secrets" => {
             let a: SecretListArgs = parse(args)?;
             let request = Request::SecretList {
@@ -1084,33 +1085,35 @@ fn session_info(session: &Session) -> String {
         "context": scope.context,
         "namespaces": session.namespaces(),
         "pinnedNamespaces": scope.pinned(),
-        "namespacesPerSession": if scope.policy.multiple_namespaces { "several" } else { "one" },
-        "maxProfile": session.ceiling().profile,
-        "ceiling": {
-            "settings": crate::ceiling::Ceiling::of(scope.profile, &scope.policy),
-            "now": session.ceiling(),
+        "access": {
+            "minimum": session.minimum(),
+            "now": session.access(),
             "raisedForThisSession": session.raises().granted,
             "savedToSettings": session.raises().saved,
-            "protectedCluster": scope.policy.protected,
-            "howToRaise": if scope.policy.protected {
-                "This context is a protected cluster: the ceiling is not raised on request; \
-                 only the user can change the settings in Kubach."
-            } else {
-                "Tools beyond the ceiling are marked \"Requires your approval in Kubach\": \
-                 call them and the user is asked to allow it, for this session or always on this \
-                 cluster. Changes are still confirmed one by one."
-            },
+            "launchProfileCap": scope.profile,
+            "howToRaise": "Tools beyond the access are marked \"Requires your approval in \
+                Kubach\": call them and the user is asked to allow it, for this session or by \
+                default on this cluster. Changes are still confirmed one by one.",
+        },
+        "secretValues": if scope.policy.reveal_allowed() {
+            "revealed one Secret at a time after the user confirms it"
+        } else {
+            "hidden on this context"
         },
         "boundaries": boundaries,
         "expiresAt": scope.expires_at.to_string(),
-        "deploy": if session.ceiling().apply { "apply-after-confirmation" } else { "dry-run-only" },
-        "exec": session.ceiling().exec,
-        "secrets": scope.policy.secrets,
         "grants": session.grants().entries(),
-        "rightsOnRequest": "The session starts without namespaces. Name a namespace in a call \
-            (list_namespaces shows the ones Kubach knows of); the user is asked to allow reading \
-            it the first time. Revealing one Secret and changing a namespace are asked for the \
-            same way. Answers hold until the session ends; a refused right is not asked again.",
+        "notAskedAgain": session.remembered(),
+        "notAskedAgainRules": "The user may tick \"don't ask again\" in Kubach for one kind of \
+            change in one namespace (scale, rollout_restart, apply_manifest, exec, \
+            port_forward_start, helm_install, helm_upgrade, helm_rollback); such calls then run \
+            without a window until the session ends, and the result says so. Deleting, Secrets, \
+            Helm with the user's credentials or beyond its namespace and changes with dangerous \
+            fields are always asked.",
+        "namespaceRules": "Name any namespace in a call (list_namespaces shows the ones Kubach \
+            knows of); reading built-in resources there needs no question. Revealing one Secret \
+            is asked for that Secret; a refusal holds until the session ends.",
+
     });
     serde_json::to_string_pretty(&info).unwrap_or_default()
 }
@@ -1186,7 +1189,7 @@ async fn list_namespaces(session: &Session) -> String {
             let access = match grants.state(&Grant::read(name.clone())) {
                 Some(crate::grants::GrantState::Granted) => "allowed",
                 Some(crate::grants::GrantState::Denied) => "refused",
-                None if policy.namespace(Some(&name)).is_ok() => "asked-on-first-use",
+                None if policy.namespace(Some(&name)).is_ok() => "available",
                 None => "not-in-this-session",
             };
             json!({"name": name, "source": source, "access": access})
@@ -1196,8 +1199,8 @@ async fn list_namespaces(session: &Session) -> String {
         "namespaces": namespaces,
         "complete": complete,
         "note": note,
-        "howToUse": "Pass `namespace` to a tool. Reading a namespace is asked from the user the \
-            first time; a refused namespace is not asked again in this session.",
+        "howToUse": "Pass `namespace` to a tool: reading built-in resources needs no question, \
+            in as many namespaces as you need.",
     });
     serde_json::to_string_pretty(&out).unwrap_or_default()
 }
@@ -1608,7 +1611,7 @@ async fn confirm(
     .await
 }
 
-async fn confirm_as(
+pub(crate) async fn confirm_as(
     ctx: &Ctx<'_>,
     kind: RequestKind,
     allowed: &Allowed,
@@ -1629,18 +1632,49 @@ async fn confirm_as(
         details,
         dangerous,
         mode: ctx.session.mode_in(&allowed.namespace),
-        allow_remember: ctx.session.mode_in(&allowed.namespace) != SessionMode::ClientOnly,
+        allow_remember: false,
     };
+    approve_change(
+        ctx,
+        request,
+        "the session ended while waiting for confirmation",
+    )
+    .await
+}
+
+/// Asks the user to approve a change, unless they said not to ask again
+/// about this kind of change in this namespace in this session (#30).
+/// [`rememberable`] decides whether the request offers that at all; a
+/// "don't ask again" ticked now is kept unless something was forgotten
+/// while the user decided.
+pub(crate) async fn approve_change(
+    ctx: &Ctx<'_>,
+    mut request: ConfirmationRequest,
+    ended: &str,
+) -> Result<(), ToolError> {
+    let remember = rememberable(&request);
+    request.allow_remember = remember.is_some();
+    if let Some(remembered) = &remember
+        && ctx.session.is_remembered(remembered)
+    {
+        *sync::lock(&ctx.remembered) = Some(RememberNote::Used(remembered.clone()));
+        return Ok(());
+    }
+    let epoch = ctx.session.remember_epoch();
     let decision = ask(ctx.confirmer, &request).await;
     // The session may have ended while the user was deciding.
     if !ctx.session.is_active() {
-        return Err(Denial::new(
-            DenialCode::SessionEnded,
-            "the session ended while waiting for confirmation",
-        )
-        .into());
+        return Err(Denial::new(DenialCode::SessionEnded, ended).into());
     }
     match decision {
+        ConfirmationDecision::ApprovedForSession => {
+            if let Some(remembered) = remember
+                && ctx.session.remember(remembered.clone(), epoch)
+            {
+                *sync::lock(&ctx.remembered) = Some(RememberNote::Saved(remembered));
+            }
+            Ok(())
+        }
         ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => Ok(()),
         ConfirmationDecision::Denied { reason } | ConfirmationDecision::Rejected { reason } => {
             Err(ToolError::Rejected(reason))

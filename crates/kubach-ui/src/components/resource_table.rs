@@ -341,10 +341,19 @@ impl ResourceRow {
     }
 }
 
+/// Direction a [`ResourceTable`] is sorted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SortDirection {
+pub enum SortDirection {
     Ascending,
     Descending,
+}
+
+/// What a [`ResourceTable`] is sorted by: a column [`key`](ResourceColumn::key)
+/// and a direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnSort {
+    pub column: SharedString,
+    pub direction: SortDirection,
 }
 
 /// State of a checkbox, or of the header checkbox over all rows.
@@ -449,6 +458,8 @@ struct ResourceTableDelegate {
     checks: CheckSet,
     /// Tells the owning table that the checked rows changed.
     on_checked: Option<CheckedHandler>,
+    /// Tells the owning table that a header click changed the sort.
+    on_sorted: Option<CheckedHandler>,
     /// Re-renders the table while it shows ages.
     ages: AgeTicker,
 }
@@ -466,6 +477,7 @@ impl ResourceTableDelegate {
             checkable: false,
             checks: CheckSet::default(),
             on_checked: None,
+            on_sorted: None,
             ages: AgeTicker::default(),
         }
     }
@@ -611,6 +623,30 @@ impl ResourceTableDelegate {
             _ if natural => None,
             _ => Some((col_ix, SortDirection::Ascending)),
         };
+        self.apply_sort();
+    }
+
+    /// The sort as a column key; `None` in the caller's order.
+    fn column_sort(&self) -> Option<ColumnSort> {
+        let (ix, direction) = self.sort?;
+        Some(ColumnSort {
+            column: self.columns.get(ix)?.key.clone(),
+            direction,
+        })
+    }
+
+    /// Sorts by the column `key`. A column that is gone or not sortable
+    /// leaves the caller's order, as does `None`. Ascending by the column
+    /// the rows come sorted by is that order too.
+    fn set_column_sort(&mut self, sort: Option<(&str, SortDirection)>) {
+        self.sort = sort.and_then(|(key, direction)| {
+            let ix = self
+                .columns
+                .iter()
+                .position(|column| column.sortable && column.key.as_ref() == key)?;
+            let natural = self.columns[ix].natural && direction == SortDirection::Ascending;
+            (!natural).then_some((ix, direction))
+        });
         self.apply_sort();
     }
 
@@ -815,6 +851,9 @@ impl TableDelegate for ResourceTableDelegate {
                         let selected = selected_key(state);
                         state.delegate_mut().toggle_sort(col_ix);
                         restore_selection(state, selected, cx);
+                        if let Some(handler) = state.delegate().on_sorted.clone() {
+                            cx.defer(move |cx| handler(cx));
+                        }
                         cx.notify();
                     }))
             });
@@ -1013,6 +1052,15 @@ pub enum ColumnOrderEvent {
 
 impl EventEmitter<ColumnOrderEvent> for ResourceTable {}
 
+/// The user changed the sort of a [`ResourceTable`] by a header click.
+#[derive(Clone, Debug)]
+pub enum TableSortEvent {
+    /// Holds the new sort; `None` is the caller's (default) order.
+    Changed(Option<ColumnSort>),
+}
+
+impl EventEmitter<TableSortEvent> for ResourceTable {}
+
 impl ResourceTable {
     pub fn new(
         mut columns: Vec<ResourceColumn>,
@@ -1031,6 +1079,15 @@ impl ResourceTable {
         let owner = cx.weak_entity();
         delegate.on_checked = Some(Rc::new(move |cx: &mut App| {
             owner.update(cx, |table, cx| table.emit_checked(cx)).ok();
+        }));
+        let owner = cx.weak_entity();
+        delegate.on_sorted = Some(Rc::new(move |cx: &mut App| {
+            owner
+                .update(cx, |table, cx| {
+                    let sort = table.sort(cx);
+                    cx.emit(TableSortEvent::Changed(sort));
+                })
+                .ok();
         }));
         let owner = cx.weak_entity();
         delegate.on_reset = Some(Rc::new(move |_: &mut Window, cx: &mut App| {
@@ -1114,6 +1171,23 @@ impl ResourceTable {
         });
         cx.emit(ColumnOrderEvent::Reset);
         cx.notify();
+    }
+
+    /// What the rows are sorted by; `None` in the caller's order.
+    pub fn sort(&self, cx: &App) -> Option<ColumnSort> {
+        self.state.read(cx).delegate().column_sort()
+    }
+
+    /// Sorts by the column with key `column`, e.g. a remembered sort. A
+    /// column that is gone or not sortable, or `None`, gives the caller's
+    /// order. Keeps the selected row; emits nothing.
+    pub fn set_sort(&mut self, sort: Option<(&str, SortDirection)>, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let selected = selected_key(state);
+            state.delegate_mut().set_column_sort(sort);
+            restore_selection(state, selected, cx);
+            cx.notify();
+        });
     }
 
     /// Replaces the rows, keeping the sort, the selected row and the checked
@@ -1230,7 +1304,10 @@ impl Render for ResourceTable {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` exports a `test` attribute that would shadow std's.
-    use super::{CheckState, ResourceCell, ResourceColumn, ResourceRow, ResourceTableDelegate};
+    use super::{
+        CheckState, ColumnSort, ResourceCell, ResourceColumn, ResourceRow, ResourceTableDelegate,
+        SortDirection,
+    };
 
     fn delegate() -> ResourceTableDelegate {
         let mut delegate = ResourceTableDelegate::new(vec![
@@ -1288,6 +1365,53 @@ mod tests {
         assert_eq!(keys(&delegate), ["c", "b", "a"]);
         delegate.toggle_sort(0);
         assert_eq!(keys(&delegate), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn sort_is_set_and_read_by_column_key() {
+        let mut delegate = delegate();
+        assert_eq!(delegate.column_sort(), None);
+        delegate.set_column_sort(Some(("restarts", SortDirection::Descending)));
+        assert_eq!(keys(&delegate), ["b", "a", "c"]);
+        assert_eq!(
+            delegate.column_sort(),
+            Some(ColumnSort {
+                column: "restarts".into(),
+                direction: SortDirection::Descending,
+            })
+        );
+        delegate.toggle_sort(0);
+        assert_eq!(delegate.column_sort().unwrap().column.as_ref(), "name");
+        delegate.set_column_sort(None);
+        assert_eq!(delegate.column_sort(), None);
+        assert_eq!(keys(&delegate), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn missing_or_unsortable_columns_give_the_default_order() {
+        let mut delegate = ResourceTableDelegate::new(vec![
+            ResourceColumn::new("name", "Name").sortable(),
+            ResourceColumn::new("note", "Note"),
+            ResourceColumn::new("age", "Age").sorted(),
+        ]);
+        delegate.set_rows(vec![
+            ResourceRow::new("b", [ResourceCell::text("b"), ResourceCell::text("y")]),
+            ResourceRow::new("a", [ResourceCell::text("a"), ResourceCell::text("x")]),
+        ]);
+        delegate.set_column_sort(Some(("name", SortDirection::Ascending)));
+        assert_eq!(keys(&delegate), ["a", "b"]);
+        // A column of another version, a hidden one or one not sortable.
+        for key in ["restarts", "note", ""] {
+            delegate.set_column_sort(Some(("name", SortDirection::Ascending)));
+            delegate.set_column_sort(Some((key, SortDirection::Descending)));
+            assert_eq!(delegate.column_sort(), None, "{key}");
+            assert_eq!(keys(&delegate), ["b", "a"]);
+        }
+        // Ascending by the column the rows come sorted by is the default.
+        delegate.set_column_sort(Some(("age", SortDirection::Ascending)));
+        assert_eq!(delegate.column_sort(), None);
+        delegate.set_column_sort(Some(("age", SortDirection::Descending)));
+        assert_eq!(delegate.column_sort().unwrap().column.as_ref(), "age");
     }
 
     #[test]

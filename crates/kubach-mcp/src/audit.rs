@@ -23,6 +23,11 @@ pub enum DecidedBy {
     None,
     /// Granted by the launch arguments (`kubach mcp --grant-read`).
     LaunchArgs,
+    /// Granted within the session's access without a question (#15).
+    Access,
+    /// Approved without a window: the user said not to ask again about
+    /// this kind of change in this namespace in this session (#30).
+    Remembered,
 }
 
 /// One audit record.
@@ -41,6 +46,10 @@ pub struct AuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<Value>,
     pub decided_by: DecidedBy,
+    /// "Don't ask again this session" (#30): `used` when the change ran
+    /// without a window, `saved` when the user ticked it for this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remembered: Option<String>,
     pub allowed: bool,
     /// Denial or error message, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +247,7 @@ mod tests {
             args: json!({"kind": "Pod"}),
             change: None,
             decided_by: DecidedBy::Policy,
+            remembered: None,
             allowed: false,
             reason: Some("namespace".into()),
             identity: "user".into(),

@@ -1,16 +1,18 @@
 //! Rights granted on request within a session (#227, ADR 0005 "Права по
 //! запросу").
 //!
-//! A session starts with none. The first time the agent needs one, Kubach
-//! asks the user; the answer, yes or no, is kept for the rest of the
-//! session and dies with it (TTL, revocation, vault lock). The ladder:
+//! A session starts with none. Since #15 reading and changing a namespace
+//! are set up without a question when the session's access covers them
+//! (they carry the namespace's identity and Role); revealing a Secret is
+//! asked for that Secret. Answers are kept for the rest of the session and
+//! die with it (TTL, revocation, vault lock). The ladder:
 //!
 //! ```text
 //!  none ──► read(ns) ──► secret(ns, name) ──► modify(ns)
 //! ```
 //!
-//! Every step stays within the session's profile and the context's
-//! settings, which the policy checks first; a grant never widens them.
+//! Every step stays within the session's access, which the policy checks
+//! first; a grant never widens it.
 //! Grants belong to the session id, never to the client's self-reported
 //! name.
 
@@ -114,6 +116,11 @@ pub struct Grants {
     /// in the window. A temporary ServiceAccount gets `patch`/`delete` on
     /// these names only, while `modify(ns)` stands.
     secret_writes: std::collections::BTreeSet<(String, String)>,
+    /// Namespaces where the agent has a port-forward open (#17). Not a
+    /// right of its own: every forward is confirmed in the window. A
+    /// temporary ServiceAccount gets `pods/portforward` there while
+    /// `read(ns)` stands and a forward runs.
+    forwarding: std::collections::BTreeSet<String>,
 }
 
 impl Grants {
@@ -154,6 +161,24 @@ impl Grants {
             let namespace = grant.namespace();
             self.secret_writes.retain(|(ns, _)| ns != namespace);
         }
+        if matches!(grant, Grant::Read { .. }) {
+            self.forwarding.remove(grant.namespace());
+        }
+    }
+
+    /// Marks whether the agent has a port-forward open in `namespace`
+    /// (#17). Returns `false` if nothing changed.
+    pub fn set_forwarding(&mut self, namespace: &str, open: bool) -> bool {
+        if open {
+            self.forwarding.insert(namespace.to_owned())
+        } else {
+            self.forwarding.remove(namespace)
+        }
+    }
+
+    /// Whether the agent has a port-forward open in `namespace`.
+    pub fn is_forwarding(&self, namespace: &str) -> bool {
+        self.forwarding.contains(namespace)
     }
 
     /// Records that the user approved writing Secret `namespace/name`.

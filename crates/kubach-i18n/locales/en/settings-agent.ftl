@@ -69,8 +69,8 @@ settings-group-sessions = Active sessions
 settings-sessions-description = HTTP and `kubach mcp` sessions with the rights you granted them. Revoking a session or a right denies the next calls; a `kubach mcp` process learns about it within a few seconds. A revoked right is not asked for again in that session.
 settings-sessions-http-waiting = HTTP agents: no context chosen yet. The agent picks one with use_context, and Kubach asks you before it starts.
 settings-sessions-none = No active sessions.
-# $profile: one of settings-profile-*.
-settings-session-title = { $context } · up to { $profile }
+# $profile: one of settings-minimum-*.
+settings-session-title = { $context } · { $profile }
 settings-session-no-calls = no calls yet
 settings-session-pid = kubach mcp, pid { $pid }
 settings-session-vault = vault, ends when it locks
@@ -81,10 +81,15 @@ settings-session-details =
         [one] { $origin } · { $clients } · { $calls } call · since { $since } · ends in { $left }
        *[other] { $origin } · { $clients } · { $calls } calls · since { $since } · ends in { $left }
     }
-settings-session-no-namespace = No namespace yet: asked for when the agent first reads one.
-# $raised: the raised ceiling as recorded, e.g. "deploy, apply after confirmation".
-settings-session-raised = Ceiling raised for this session: { $raised }
+settings-session-no-namespace = No namespace yet: set up when the agent first works in one.
+# $raised: what was allowed beyond the minimum, e.g. "Changes".
+settings-session-raised = Allowed for this session: { $raised }
 settings-session-no-grants = No rights granted yet.
+# $list: kinds of change the user said not to ask about, e.g. "scaling in cert-manager" (#30).
+settings-session-remembered = Without asking: { $list }
+# $action: agent-action-*, $namespace: where.
+settings-session-remembered-item = { $action } in { $namespace }
+settings-ask-again = Ask again
 settings-boundary-client-only = limits only in Kubach
 settings-boundary-impersonation = limits in Kubach and the API server (impersonation)
 settings-boundary-temporary-sa = limits in Kubach and the API server (temporary ServiceAccount)

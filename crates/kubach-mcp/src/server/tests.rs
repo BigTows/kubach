@@ -12,13 +12,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::access::Access;
 use crate::confirm::{DenyAll, RequestKind, ScriptedConfirmer};
 use crate::grants::{Grant, GrantState, Grants};
 use crate::identity::Identity;
 use crate::rules::Capability;
 use crate::secret_write::{SecretInput, SecretOp, SecretRequest};
 use crate::session::Session;
-use crate::settings::{DeployMode, ExecMode, SecretAccess, SecurityPolicy};
+use crate::settings::SecurityPolicy;
 use crate::testutil::{NS, OTHER_NS, catalog, grants, permissive, scope_with};
 
 /// Records `METHOD path` (and the body) of every request. Serves one
@@ -82,6 +83,31 @@ fn secret() -> Value {
         "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
         "metadata": {"name": "db", "namespace": NS, "uid": "2", "resourceVersion": "1"},
         "data": {"password": "aHVudGVyMg==", "copy": "aHVudGVyMg==", "url": "cG9zdGdyZXM6Ly9hcHA6aHVudGVyMkBkYjo1NDMyL3Nob3A="},
+    })
+}
+
+/// Helm's storage Secret of revision 2 of release `web` (#22): values with
+/// a password, a token under an innocent name and a list of keys.
+fn helm_storage() -> Value {
+    use base64::Engine as _;
+    let release = json!({
+        "name": "web", "namespace": NS, "version": 2,
+        "info": {"status": "deployed", "description": "Upgrade complete"},
+        "chart": {"metadata": {"name": "podinfo", "version": "6.15.0"}},
+        "config": {
+            "replicaCount": 2,
+            "auth": {"password": "hunter2-in-values", "user": "app"},
+            "extra": {"webhook": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJrdWJhY2gifQ.c2lnbmF0dXJlLXZhbHVl"},
+            "apiKeys": ["first-key-in-values"],
+        },
+        "manifest": "---\nkind: Deployment\n",
+    });
+    let payload = kubach_core::helm::encode_release(&release);
+    json!({
+        "apiVersion": "v1", "kind": "Secret", "type": "helm.sh/release.v1",
+        "metadata": {"name": "sh.helm.release.v1.web.v2", "namespace": NS,
+                     "labels": {"owner": "helm", "name": "web", "version": "2"}},
+        "data": {"release": base64::engine::general_purpose::STANDARD.encode(payload)},
     })
 }
 
@@ -193,9 +219,18 @@ impl FakeApi {
                         let target = format!("/apis/apps/v1/namespaces/{NS}/deployments/web");
                         let secrets = format!("/api/v1/namespaces/{NS}/secrets");
                         let pods = format!("/api/v1/namespaces/{NS}/pods");
-                        let (status, body) = if (method == "GET"
-                            || method == "PATCH"
-                            || method == "DELETE")
+                        let storage = format!("{secrets}/sh.helm.release.v1.web.v");
+                        let (status, body) = if method == "GET" && path == format!("{storage}2") {
+                            ("200 OK", helm_storage().to_string())
+                        } else if method == "GET" && path == format!("{storage}9") {
+                            (
+                                "403 Forbidden",
+                                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                       "message": "secrets is forbidden", "reason": "Forbidden",
+                                       "code": 403})
+                                .to_string(),
+                            )
+                        } else if (method == "GET" || method == "PATCH" || method == "DELETE")
                             && path.starts_with(&format!("{secrets}/db"))
                             && !path.starts_with(&format!("{secrets}/db-"))
                         {
@@ -385,6 +420,7 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
             ("get_logs", json!({"pod": "web-0", "namespace": ns})),
             ("top_pods", json!({"namespace": ns})),
             ("exec", json!({"pod": "web-0", "namespace": ns, "command": ["id"]})),
+            ("port_forward_start", json!({"target": "pod/web-0", "port": 8080, "namespace": ns})),
             ("scale", json!({"kind": "Deployment", "name": "web", "namespace": ns, "replicas": 5})),
             ("rollout_restart", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
             ("delete_resource", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
@@ -581,7 +617,7 @@ async fn default_confirmer_denies() {
         scope,
         Identity::ClientOnly { client },
         catalog(),
-        HashSet::new(),
+        Capability::ALL.into_iter().collect(),
     );
     let server = McpServer::new(session, Arc::new(DenyAll), None);
     let outcome = server
@@ -734,18 +770,25 @@ async fn tools_beyond_the_ceiling_are_offered_marked() {
         );
     }
 
-    // A protected cluster hides what it will not raise.
-    let protected = SecurityPolicy {
-        deploy: DeployMode::DryRunOnly,
-        exec: ExecMode::Disabled,
-        protected: true,
-        ..permissive()
-    };
-    let deploy = fixture(Profile::Deploy, protected, false).await;
-    let names = tool_names(&deploy.server);
-    assert!(names.contains(&"apply_manifest".to_string()));
+    // `kubach mcp --profile debug` hides what it never allows (#15).
+    let api = FakeApi::start().await;
+    let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+    let capped = Session::from_parts(
+        crate::testutil::scope_capped(Profile::Debug, &permissive(), &[NS]),
+        Identity::ClientOnly { client },
+        catalog(),
+        Capability::ALL.into_iter().collect(),
+    );
+    let server = McpServer::new(capped, Arc::new(DenyAll), None);
+    let names = tool_names(&server);
     assert!(names.contains(&"get_logs".to_string()));
-    for hidden in ["exec", "scale", "rollout_restart", "delete_resource"] {
+    assert!(names.contains(&"exec".to_string()));
+    for hidden in [
+        "apply_manifest",
+        "scale",
+        "rollout_restart",
+        "delete_resource",
+    ] {
         assert!(!names.contains(&hidden.to_string()), "{hidden}");
     }
 }
@@ -781,10 +824,10 @@ async fn no_secret_without_the_users_answer() {
         .await;
     assert!(outcome.is_error);
     assert!(!outcome.text.contains("hunter2"));
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     assert!(f.api.requests().is_empty(), "{:?}", f.api.requests());
 
-    // The user allows reading, but no window answers for the Secret.
+    // No window answers for the Secret.
     let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
     f.server.session().set_grants(grants(&[Grant::read(NS)]));
     let server = McpServer::new(f.server.session().clone(), Arc::new(DenyAll), None);
@@ -813,10 +856,9 @@ async fn revealing_asks_for_that_secret_and_warns() {
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(outcome.text.contains("hunter2"), "{}", outcome.text);
-    assert_eq!(
-        grant_requests(&f),
-        [Grant::read(NS), Grant::secret(NS, "db")]
-    );
+    // Reading the namespace comes with the access (#15); only the Secret
+    // is asked for.
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     let warning = f
         .confirmer
         .requests()
@@ -840,7 +882,7 @@ async fn revealing_asks_for_that_secret_and_warns() {
     f.server
         .call("agent", "get_secret_value", args(json!({"name": "db"})))
         .await;
-    assert_eq!(grant_requests(&f).len(), 2);
+    assert_eq!(grant_requests(&f).len(), 1);
     f.server
         .call("agent", "get_secret_value", args(json!({"name": "api"})))
         .await;
@@ -873,7 +915,7 @@ async fn revealing_asks_for_that_secret_and_warns() {
 #[tokio::test]
 async fn reveal_off_tells_the_user_and_asks_nothing() {
     let policy = SecurityPolicy {
-        secrets: SecretAccess::Metadata,
+        hide_secret_values: true,
         ..permissive()
     };
     let f = session_fixture(Profile::ReadOnly, policy, true, false).await;
@@ -935,8 +977,8 @@ async fn checks_and_metadata_hold_no_values_or_hashes() {
         "{}",
         checked.text
     );
-    // Reading the namespace was the only question.
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    // No question at all: Secret access is in the minimum (#15).
+    assert!(grant_requests(&f).is_empty());
     let audit = std::fs::read_to_string(&f.audit_path).unwrap();
     assert!(!audit.contains("hunter2"), "{audit}");
 }
@@ -947,21 +989,55 @@ async fn a_refusal_is_not_asked_again() {
     for _ in 0..3 {
         let outcome = f
             .server
-            .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+            .call("agent", "get_secret_value", args(json!({"name": "db"})))
             .await;
         assert!(outcome.is_error);
     }
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert_eq!(grant_requests(&f), [Grant::secret(NS, "db")]);
     assert_eq!(
-        f.server.session().grants().state(&Grant::read(NS)),
+        f.server.session().grants().state(&Grant::secret(NS, "db")),
         Some(GrantState::Denied)
     );
     let last = f
         .server
-        .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+        .call("agent", "get_secret_value", args(json!({"name": "db"})))
         .await;
     assert!(last.text.contains("does not ask again"), "{}", last.text);
-    assert!(f.api.requests().is_empty());
+    assert!(
+        f.api.requests().iter().all(|r| !r.contains("secrets/db")),
+        "{:?}",
+        f.api.requests()
+    );
+}
+
+#[tokio::test]
+async fn reading_needs_no_question_and_is_audited() {
+    let f = session_fixture(Profile::ReadOnly, SecurityPolicy::default(), false, false).await;
+    let outcome = f
+        .server
+        .call("agent", "list_resources", args(json!({"kind": "Pod"})))
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(f.confirmer.requests().is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::read(NS)));
+    let lines = audit_lines(&f.audit_path);
+    let grant = lines
+        .iter()
+        .find(|l| l["tool"] == "grant:list_resources")
+        .expect("the right is audited");
+    assert_eq!(grant["decided_by"], "access");
+    assert_eq!(grant["result"], "access");
+    // Secrets at the minimum "read": not even metadata without asking.
+    let outcome = f
+        .server
+        .call("agent", "list_secrets", args(json!({})))
+        .await;
+    assert!(outcome.is_error);
+    assert!(matches!(
+        f.confirmer.requests()[0].kind,
+        RequestKind::Access { .. }
+    ));
+    assert!(f.api.requests().iter().all(|r| !r.contains("/secrets")));
 }
 
 #[tokio::test]
@@ -1018,13 +1094,15 @@ async fn revoking_read_takes_back_what_stands_on_it() {
 }
 
 #[tokio::test]
-async fn modify_spares_only_scale_and_restart_their_question() {
+async fn every_change_is_confirmed_and_rights_come_with_the_access() {
     let f = session_fixture(Profile::Deploy, permissive(), true, true).await;
     let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
     let outcome = f.server.call("agent", "scale", args(scale.clone())).await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    assert_eq!(grant_requests(&f), [Grant::read(NS), Grant::modify(NS)]);
-    assert_eq!(call_requests(&f), 0);
+    // No question for the namespace's rights (#15), each change confirmed.
+    assert!(grant_requests(&f).is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::modify(NS)));
+    assert_eq!(call_requests(&f), 1);
     f.server.call("agent", "scale", args(scale)).await;
     f.server
         .call(
@@ -1033,7 +1111,7 @@ async fn modify_spares_only_scale_and_restart_their_question() {
             args(json!({"kind": "Deployment", "name": "web"})),
         )
         .await;
-    assert_eq!(f.confirmer.requests().len(), 2, "no new questions");
+    assert_eq!(call_requests(&f), 3);
 
     // Delete, apply and exec are confirmed every time.
     let delete = json!({"kind": "Widget", "apiVersion": "example.com/v1", "name": "w"});
@@ -1043,7 +1121,7 @@ async fn modify_spares_only_scale_and_restart_their_question() {
     f.server
         .call("agent", "delete_resource", args(delete))
         .await;
-    assert_eq!(call_requests(&f), 2);
+    assert_eq!(call_requests(&f), 5);
     f.server
         .call(
             "agent",
@@ -1051,8 +1129,8 @@ async fn modify_spares_only_scale_and_restart_their_question() {
             args(json!({"pod": "web-0", "command": ["id"]})),
         )
         .await;
-    assert_eq!(call_requests(&f), 3);
-    assert_eq!(grant_requests(&f).len(), 2);
+    assert_eq!(call_requests(&f), 6);
+    assert!(grant_requests(&f).is_empty());
     // Exec carries the exact argv for the dialog (#194).
     assert_eq!(
         f.confirmer.requests().last().map(|request| &request.kind),
@@ -1068,7 +1146,7 @@ async fn client_only_confirms_every_change() {
     let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
     f.server.call("agent", "scale", args(scale.clone())).await;
     f.server.call("agent", "scale", args(scale)).await;
-    assert_eq!(grant_requests(&f), [Grant::read(NS)]);
+    assert!(grant_requests(&f).is_empty());
     assert_eq!(call_requests(&f), 2);
 }
 
@@ -1233,12 +1311,8 @@ async fn grant_read_flag_reads_without_a_window() {
 
 #[tokio::test]
 async fn grant_read_flag_does_not_widen_the_settings() {
-    // Protected: beyond the ceiling the policy refuses without asking.
-    let policy = SecurityPolicy {
-        secrets: SecretAccess::None,
-        protected: true,
-        ..permissive()
-    };
+    // Beyond the minimum the flag gives nothing: without a window, refused.
+    let policy = SecurityPolicy::default();
     let (f, server) = launched_with_grant_read(Profile::ReadOnly, policy, false).await;
     for (tool, arguments) in [
         ("list_secrets", json!({})),
@@ -1254,11 +1328,7 @@ async fn grant_read_flag_does_not_widen_the_settings() {
         ("get_resource", json!({"kind": "Secret", "name": "db"})),
     ] {
         let outcome = server.call("agent", tool, args(arguments)).await;
-        assert!(
-            outcome.text.starts_with("denied by policy"),
-            "{tool}: {}",
-            outcome.text
-        );
+        assert!(outcome.is_error, "{tool}: {}", outcome.text);
     }
     assert!(f.api.requests().is_empty());
     // Only the session's own namespaces.
@@ -1273,47 +1343,6 @@ async fn grant_read_flag_does_not_widen_the_settings() {
 }
 
 #[tokio::test]
-async fn nothing_beyond_the_ceiling_of_a_protected_cluster_is_asked() {
-    let protected = SecurityPolicy {
-        protected: true,
-        ..permissive()
-    };
-    let f = session_fixture(Profile::ReadOnly, protected, true, true).await;
-    for (tool, arguments) in [
-        (
-            "scale",
-            json!({"kind": "Deployment", "name": "web", "replicas": 3}),
-        ),
-        ("exec", json!({"pod": "web-0", "command": ["id"]})),
-        ("get_logs", json!({"pod": "web-0"})),
-    ] {
-        let outcome = f.server.call("agent", tool, args(arguments)).await;
-        assert!(outcome.is_error, "{tool}");
-        assert!(
-            outcome.text.contains("protected cluster"),
-            "{}",
-            outcome.text
-        );
-    }
-    // Another namespace is never asked for either.
-    let outcome = f
-        .server
-        .call(
-            "agent",
-            "list_resources",
-            args(json!({"kind": "Pod", "namespace": OTHER_NS})),
-        )
-        .await;
-    assert!(
-        outcome.text.starts_with("denied by policy"),
-        "{}",
-        outcome.text
-    );
-    assert!(f.confirmer.requests().is_empty());
-    assert!(f.api.requests().is_empty());
-}
-
-#[tokio::test]
 async fn beyond_the_ceiling_the_user_is_asked_once() {
     let f = session_fixture(Profile::ReadOnly, permissive(), false, true).await;
     f.server.session().set_grants(grants(&[Grant::read(NS)]));
@@ -1324,24 +1353,17 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
         .await;
     assert!(outcome.is_error);
     assert!(
-        outcome.text.contains("did not allow the deploy profile"),
+        outcome.text.contains("did not allow changes"),
         "{}",
         outcome.text
     );
     let requests = f.confirmer.requests();
     assert_eq!(requests.len(), 1);
-    let RequestKind::Ceiling { raise, current, .. } = &requests[0].kind else {
+    let RequestKind::Access { raise, current, .. } = &requests[0].kind else {
         panic!("{:?}", requests[0].kind);
     };
-    assert_eq!(
-        *raise,
-        Ceiling {
-            profile: Profile::Deploy,
-            apply: true,
-            exec: false
-        }
-    );
-    assert_eq!(*current, Ceiling::NONE);
+    assert_eq!(*raise, Access::profile(Profile::Deploy));
+    assert_eq!(*current, Access::ALL.capped(Profile::ReadOnly));
     assert_eq!(
         requests[0].summary,
         format!("claude-code asks for {raise} on minikube (namespace {NS})")
@@ -1354,7 +1376,7 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
     let lines = audit_lines(&f.audit_path);
     let ceiling = lines
         .iter()
-        .find(|l| l["tool"] == "ceiling:scale")
+        .find(|l| l["tool"] == "access:scale")
         .expect("the answer is audited");
     assert_eq!(ceiling["result"], "refused");
     assert_eq!(ceiling["args"]["raise"]["profile"], "deploy");
@@ -1384,26 +1406,22 @@ async fn an_allowed_raise_keeps_rights_and_confirmations() {
         .requests()
         .iter()
         .map(|r| match &r.kind {
-            RequestKind::Ceiling { .. } => "ceiling".to_owned(),
+            RequestKind::Access { .. } => "access".to_owned(),
             RequestKind::Grant { grant } => format!("grant {grant}"),
             RequestKind::Call => "call".to_owned(),
             other => format!("{other:?}"),
         })
         .collect();
-    // The raise, then the namespace's right, then the deletion itself.
-    assert_eq!(
-        kinds,
-        ["ceiling", &format!("grant change namespace {NS}"), "call"],
-        "{}",
-        outcome.text
-    );
+    // The access, then the deletion itself: the namespace's right comes
+    // with the access (#15).
+    assert_eq!(kinds, ["access", "call"], "{}", outcome.text);
     let session = f.server.session();
-    assert_eq!(session.ceiling().profile, Profile::Deploy);
+    assert_eq!(session.access().profile, Profile::Deploy);
     assert!(session.raises().saved);
     let lines = audit_lines(&f.audit_path);
     let ceiling = lines
         .iter()
-        .find(|l| l["tool"] == "ceiling:delete_resource")
+        .find(|l| l["tool"] == "access:delete_resource")
         .unwrap();
     assert_eq!(ceiling["result"], "always");
     assert_eq!(ceiling["args"]["savedToSettings"], true);
@@ -1588,11 +1606,9 @@ fn provided(set: &[(&str, &str)], remove: &[&str]) -> SecretInput {
 /// No value, plain or base64, in `text`.
 fn assert_no_values(text: &str, values: &[&str]) {
     for value in values {
-        assert!(!text.contains(value), "{value} leaked: {text}");
-        assert!(
-            !text.contains(&b64(value)),
-            "base64 of {value} leaked: {text}"
-        );
+        // The messages print neither the value nor the text holding it.
+        assert!(!text.contains(value), "a value leaked");
+        assert!(!text.contains(&b64(value)), "a base64 value leaked");
     }
 }
 
@@ -1832,8 +1848,7 @@ async fn a_temporary_service_account_may_change_only_approved_secrets() {
             g
         },
         NS,
-        Profile::Deploy,
-        &permissive(),
+        Access::ALL,
     );
     let named: Vec<_> = rules
         .iter()
@@ -1944,10 +1959,10 @@ async fn topology_around_a_resource() {
 
 #[tokio::test]
 async fn topology_without_secret_access_skips_secrets() {
-    let policy = SecurityPolicy {
-        secrets: SecretAccess::None,
-        ..permissive()
-    };
+    let policy = SecurityPolicy::with_minimum(Access {
+        secrets: false,
+        ..Access::ALL
+    });
     let f = fixture(Profile::ReadOnly, policy, false).await;
     let graph = topology_json(
         &f.server
@@ -1970,16 +1985,24 @@ async fn topology_without_secret_access_skips_secrets() {
 }
 
 #[tokio::test]
-async fn topology_asks_for_the_read_right_first() {
+async fn topology_sets_up_the_read_right_without_asking() {
     let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
     let outcome = f
         .server
         .call("agent", "get_topology", args(json!({})))
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    assert_eq!(grant_requests(&f), vec![Grant::read(NS)]);
+    assert!(grant_requests(&f).is_empty());
+    assert!(f.server.session().grants().is_granted(&Grant::read(NS)));
 
+    // Revoked by the user: refused, not asked again.
     let refused = session_fixture(Profile::ReadOnly, permissive(), false, false).await;
+    refused
+        .server
+        .session()
+        .revoke(&Grant::read(NS))
+        .await
+        .unwrap();
     let outcome = refused
         .server
         .call("agent", "get_topology", args(json!({})))
@@ -2141,11 +2164,7 @@ async fn list_namespaces_falls_back_to_what_kubach_knows() {
     assert_eq!(
         namespaces_of(&outcome.text),
         [
-            (
-                "team-a".into(),
-                "kubeconfig".into(),
-                "not-in-this-session".into()
-            ),
+            ("team-a".into(), "kubeconfig".into(), "available".into()),
             ("team-b".into(), "recently-opened".into(), "refused".into()),
             ("granted".into(), "session".into(), "allowed".into()),
         ]
@@ -2164,10 +2183,7 @@ async fn list_namespaces_lists_names_when_allowed() {
         {"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata", "metadata": {"name": "kube-system"}},
     ]});
     let (url, _) = answering("200 OK", list).await;
-    let several = SecurityPolicy {
-        multiple_namespaces: true,
-        ..permissive()
-    };
+    let several = permissive();
     let session = open_session(&url, &several, Vec::new());
     let server = McpServer::new(session, Arc::new(DenyAll), None);
     let outcome = server
@@ -2179,16 +2195,8 @@ async fn list_namespaces_lists_names_when_allowed() {
     assert_eq!(
         namespaces_of(&outcome.text),
         [
-            (
-                "team-a".into(),
-                "cluster".into(),
-                "asked-on-first-use".into()
-            ),
-            (
-                "kube-system".into(),
-                "cluster".into(),
-                "asked-on-first-use".into()
-            ),
+            ("team-a".into(), "cluster".into(), "available".into()),
+            ("kube-system".into(), "cluster".into(), "available".into()),
         ]
     );
     // Names only: no labels, annotations or anything else of the objects.
@@ -2205,17 +2213,13 @@ async fn a_pinned_session_lists_only_its_namespaces() {
     assert!(!outcome.is_error, "{}", outcome.text);
     assert_eq!(
         namespaces_of(&outcome.text),
-        [(
-            NS.into(),
-            "launch-arguments".into(),
-            "asked-on-first-use".into()
-        )]
+        [(NS.into(), "launch-arguments".into(), "available".into())]
     );
     assert!(f.api.requests().is_empty());
 }
 
 #[tokio::test]
-async fn the_first_call_in_a_namespace_asks_to_read_it() {
+async fn reading_any_namespace_asks_nothing() {
     let api = FakeApi::start().await;
     let session = open_session(&api.url, &permissive(), Vec::new());
     let confirmer = Arc::new(ScriptedConfirmer::approving());
@@ -2232,7 +2236,7 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
     );
     assert!(confirmer.requests().is_empty());
 
-    // Naming one asks for reading it, then reads.
+    // Naming one reads it without a question (#15), and sets it up.
     let outcome = server
         .call(
             "test-agent",
@@ -2241,18 +2245,14 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
         )
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    let asked = confirmer.requests();
-    assert_eq!(asked.len(), 1);
-    assert!(matches!(&asked[0].kind, RequestKind::Grant { grant } if *grant == Grant::read(NS)));
+    assert!(confirmer.requests().is_empty());
     assert_eq!(session.namespaces(), [NS]);
 
-    // Now it is the session's namespace; another one is refused without a
-    // question on a context with one namespace per session.
+    // Now it is the session's namespace; another one is read just as well.
     let outcome = server
         .call("test-agent", "list_resources", args(json!({"kind": "Pod"})))
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
-    let before = api.requests().len();
     let outcome = server
         .call(
             "test-agent",
@@ -2260,15 +2260,14 @@ async fn the_first_call_in_a_namespace_asks_to_read_it() {
             args(json!({"kind": "Pod", "namespace": OTHER_NS})),
         )
         .await;
-    assert!(outcome.is_error && outcome.text.contains("one namespace per agent session"));
-    assert_eq!(confirmer.requests().len(), 1);
-    assert_eq!(api.requests().len(), before);
-    // And a granted session cannot be talked into a second one either.
-    let error = session
-        .decide(Grant::read(OTHER_NS), true)
-        .await
-        .unwrap_err();
-    assert!(matches!(error, crate::session::SessionError::SingleNamespace(ns) if ns == NS));
+    // Allowed: the fake API serves no Pods there, but no policy stopped it.
+    assert!(
+        !outcome.text.starts_with("denied by policy"),
+        "{}",
+        outcome.text
+    );
+    assert!(confirmer.requests().is_empty());
+    assert_eq!(session.namespaces(), [NS, OTHER_NS]);
 }
 
 #[tokio::test]
@@ -2277,7 +2276,21 @@ async fn escape_attempts_in_an_open_session_never_reach_the_api() {
     let session = open_session(&api.url, &permissive(), Vec::new());
     session.set_grants(Grants::all(&[NS]));
     let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
-    for (tool, arguments) in escape_attempts() {
+    // Another valid namespace is no escape in an open session (#15).
+    let legit = |arguments: &Value| {
+        let text = arguments.to_string();
+        [
+            format!("\"{OTHER_NS}\""),
+            "\"kube-system\"".to_owned(),
+            "\"all\"".to_owned(),
+        ]
+        .iter()
+        .any(|ns| text.contains(ns.as_str()))
+    };
+    for (tool, arguments) in escape_attempts()
+        .into_iter()
+        .filter(|(_, arguments)| !legit(arguments))
+    {
         let outcome = server
             .call("test-agent", tool, args(arguments.clone()))
             .await;
@@ -2312,6 +2325,7 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
         "helm_show_values",
         "helm_list_releases",
         "helm_release_history",
+        "helm_get_values",
     ] {
         assert!(
             !description(read).contains("Requires your approval"),
@@ -2330,6 +2344,8 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
         );
     }
     assert!(f.server.instructions().contains("helm_install"));
+    assert!(f.server.instructions().contains("helm_get_values"));
+    assert!(description("helm_upgrade").contains("valuesPatch"));
     // A path or an unknown repository is refused before anything runs.
     let outcome = f
         .server
@@ -2346,4 +2362,281 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
     );
     assert!(f.confirmer.requests().is_empty());
     assert!(f.api.requests().is_empty());
+}
+
+#[tokio::test]
+async fn helm_get_values_masks_secrets_and_never_falls_back() {
+    let f = fixture(Profile::ReadOnly, permissive(), true).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv::default());
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_get_values",
+            args(json!({"release": "web", "revision": 2, "namespace": NS})),
+        )
+        .await;
+    assert!(!outcome.is_error, "the read failed");
+    for secret in [
+        "hunter2-in-values",
+        "first-key-in-values",
+        "eyJhbGciOiJIUzI1NiJ9",
+    ] {
+        assert!(!outcome.text.contains(secret), "a value is not masked");
+    }
+    let answer: Value = serde_json::from_str(&outcome.text).unwrap();
+    assert_eq!(answer["revision"], 2);
+    assert_eq!(answer["chart"], "podinfo-6.15.0");
+    let values = answer["values"].as_str().unwrap();
+    assert!(values.contains("replicaCount: 2"), "{values}");
+    assert!(values.contains("user: app"), "{values}");
+    assert_eq!(
+        answer["maskedKeys"],
+        json!(["apiKeys[0]", "auth.password", "extra.webhook"])
+    );
+    // Reading needs nothing but read(ns), and asks nothing.
+    assert!(f.confirmer.requests().is_empty());
+
+    // The namespace's identity may not read the storage: a clear refusal,
+    // and no other credentials are tried.
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_get_values",
+            args(json!({"release": "web", "revision": 9, "namespace": NS})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .text
+            .contains("does not read them with other credentials"),
+        "{}",
+        outcome.text
+    );
+    let reads: Vec<String> = f
+        .api
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains("sh.helm.release"))
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            format!("GET /api/v1/namespaces/{NS}/secrets/sh.helm.release.v1.web.v2"),
+            format!("GET /api/v1/namespaces/{NS}/secrets/sh.helm.release.v1.web.v9"),
+        ]
+    );
+}
+
+// ------------------------------------------------- don't ask again (#30)
+
+/// An impersonated session whose user ticks "don't ask again" wherever it
+/// is offered.
+async fn remembering_fixture() -> Fixture {
+    fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        true,
+    )
+    .await
+}
+
+fn remembered(action: crate::RememberedAction) -> crate::Remembered {
+    crate::Remembered {
+        action,
+        namespace: NS.into(),
+    }
+}
+
+fn web_deployment(host_path: bool) -> String {
+    let volumes = if host_path {
+        "      volumes:\n      - name: host\n        hostPath:\n          path: /\n"
+    } else {
+        ""
+    };
+    format!(
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    \
+         spec:\n      containers:\n      - name: app\n        image: nginx\n{volumes}"
+    )
+}
+
+#[tokio::test]
+async fn dont_ask_again_holds_for_that_change_in_that_namespace() {
+    use crate::RememberedAction;
+    let f = remembering_fixture().await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    let first = f.server.call("agent", "scale", args(scale.clone())).await;
+    assert!(!first.is_error, "{}", first.text);
+    assert!(
+        first.text.contains("chose not to be asked again"),
+        "{}",
+        first.text
+    );
+    assert_eq!(call_requests(&f), 1);
+    assert!(f.confirmer.requests()[0].allow_remember);
+    assert_eq!(
+        f.server.session().remembered(),
+        vec![remembered(RememberedAction::Scale)]
+    );
+
+    // The next scale runs without a window, and everyone is told.
+    let patches = |f: &Fixture| {
+        f.api
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PATCH "))
+            .count()
+    };
+    let before = patches(&f);
+    let second = f.server.call("agent", "scale", args(scale)).await;
+    assert!(!second.is_error, "{}", second.text);
+    assert!(
+        second
+            .text
+            .starts_with("Approved by the user's earlier choice"),
+        "{}",
+        second.text
+    );
+    assert_eq!(call_requests(&f), 1);
+    assert_eq!(patches(&f), before + 1);
+    let audit = audit_lines(&f.audit_path);
+    let scales: Vec<&Value> = audit
+        .iter()
+        .filter(|line| line["tool"] == "scale")
+        .collect();
+    assert_eq!(scales[0]["decided_by"], "user");
+    assert_eq!(scales[0]["remembered"], "saved");
+    assert_eq!(scales[1]["decided_by"], "remembered");
+    assert_eq!(scales[1]["remembered"], "used");
+    assert!(
+        audit
+            .iter()
+            .filter(|line| line["tool"] != "scale")
+            .all(|line| line.get("remembered").is_none())
+    );
+
+    // Another kind of change is asked on its own.
+    let restart = json!({"kind": "Deployment", "name": "web"});
+    f.server
+        .call("agent", "rollout_restart", args(restart.clone()))
+        .await;
+    assert_eq!(call_requests(&f), 2);
+    f.server
+        .call("agent", "rollout_restart", args(restart))
+        .await;
+    assert_eq!(call_requests(&f), 2);
+
+    // Deleting is asked every time and never offers it.
+    let delete = json!({"kind": "Widget", "apiVersion": "example.com/v1", "name": "w"});
+    for _ in 0..2 {
+        f.server
+            .call("agent", "delete_resource", args(delete.clone()))
+            .await;
+    }
+    assert_eq!(call_requests(&f), 4);
+    assert!(!f.confirmer.requests()[3].allow_remember);
+
+    // session_info lists it.
+    let info = f
+        .server
+        .call("agent", "session_info", Map::new())
+        .await
+        .text;
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["notAskedAgain"][0]["action"], "scale");
+    assert_eq!(info["notAskedAgain"][0]["namespace"], NS);
+}
+
+#[tokio::test]
+async fn dont_ask_again_never_covers_dangerous_fields() {
+    let f = remembering_fixture().await;
+    let apply = |host_path: bool| {
+        args(json!({"yaml": web_deployment(host_path), "namespace": NS, "dryRun": false}))
+    };
+    let outcome = f.server.call("agent", "apply_manifest", apply(false)).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(call_requests(&f), 1);
+    f.server.call("agent", "apply_manifest", apply(false)).await;
+    assert_eq!(call_requests(&f), 1, "remembered");
+    // A hostPath needs "I understand" every time (#194).
+    for _ in 0..2 {
+        f.server.call("agent", "apply_manifest", apply(true)).await;
+    }
+    let requests = f.confirmer.requests();
+    assert_eq!(call_requests(&f), 3);
+    assert!(!requests[1].dangerous.is_empty());
+    assert!(!requests[1].allow_remember && !requests[2].allow_remember);
+}
+
+#[tokio::test]
+async fn secrets_are_asked_past_dont_ask_again() {
+    let f = remembering_fixture().await;
+    for _ in 0..2 {
+        f.server
+            .call(
+                "agent",
+                "delete_secret",
+                args(json!({"name": "db", "explanation": "rotate"})),
+            )
+            .await;
+    }
+    let forms: Vec<_> = f
+        .confirmer
+        .requests()
+        .into_iter()
+        .filter(|request| matches!(request.kind, RequestKind::Secret { .. }))
+        .collect();
+    assert_eq!(forms.len(), 2, "every deletion is asked");
+    assert!(forms.iter().all(|request| !request.allow_remember));
+    assert!(f.server.session().remembered().is_empty());
+}
+
+#[tokio::test]
+async fn dont_ask_again_ends_with_the_right_or_the_session() {
+    use crate::RememberedAction;
+    let f = remembering_fixture().await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    let session = f.server.session();
+    assert!(session.is_remembered(&remembered(RememberedAction::Scale)));
+
+    // Taking `modify(ns)` back forgets it.
+    session.revoke(&Grant::modify(NS)).await.unwrap();
+    assert!(session.remembered().is_empty());
+
+    // "Ask again" in Settings forgets it too.
+    session.decide(Grant::modify(NS), true).await.unwrap();
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    assert_eq!(call_requests(&f), 2);
+    assert_eq!(session.remembered().len(), 1);
+    session.forget_remembered();
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    assert_eq!(call_requests(&f), 3, "asked again");
+
+    // A new session starts with nothing remembered; this one forgets it
+    // when it ends.
+    assert_eq!(session.remembered().len(), 1);
+    session.close().await.unwrap();
+    assert!(session.remembered().is_empty());
+    assert!(!session.is_remembered(&remembered(RememberedAction::Scale)));
+}
+
+#[tokio::test]
+async fn client_only_never_offers_dont_ask_again() {
+    let f = fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        false,
+    )
+    .await;
+    let scale = json!({"kind": "Deployment", "name": "web", "replicas": 3});
+    f.server.call("agent", "scale", args(scale.clone())).await;
+    f.server.call("agent", "scale", args(scale)).await;
+    assert_eq!(call_requests(&f), 2);
+    assert!(f.confirmer.requests().iter().all(|r| !r.allow_remember));
+    assert!(f.server.session().remembered().is_empty());
 }

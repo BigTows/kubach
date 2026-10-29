@@ -58,26 +58,26 @@ Serves the Model Context Protocol over stdin/stdout for one session.
                          context: the startup context from Kubach settings,
                          else current-context
   -n, --namespace NS     limit the session to this namespace; repeat for
-                         several if the context allows it (default: no limit:
-                         the agent names namespaces and Kubach asks you the
-                         first time it reads each one)
-  -p, --profile PROFILE  read-only, debug or deploy: the most the session may
-                         ask for (default: the context's maximum profile)
-      --ttl DURATION     session length: 30m, 2h, 1h30m or minutes (default:
-                         30 minutes, at most the context's session length)
-      --grant-read       allow reading the session's namespaces from the start,
-                         without asking in the Kubach window (reads then work
-                         without the app). Without --namespace: the context's
-                         default namespace only. Secrets and changes are still
-                         asked for, and the context's settings still apply
+                         several (default: no limit: the agent names
+                         namespaces, as many as it needs)
+  -p, --profile PROFILE  read-only, debug or deploy: the most this session may
+                         ever get, by default or on request; it only narrows
+                         the context's minimal access (default: no limit)
+      --ttl DURATION     session length: 30m, 2h, 1h30m or minutes (default and
+                         at most 8 hours; the session also ends with the
+                         process)
+      --grant-read       set up reading the session's namespaces at the start.
+                         Kept for older setups: reading is the minimum anyway.
+                         Without --namespace it pins the context's default
+                         namespace
   -h, --help             this help
 
 The context must allow AI agent access: Kubach → Settings → Security.
-The session starts without namespaces and rights: the agent lists the
-namespaces it can ask for (list_namespaces), and the first time it needs a
-right (reading a namespace, revealing a Secret, changing a namespace) Kubach
-asks in its window; the answer holds until the session ends. Changes (apply,
-delete, exec) are confirmed one by one there as well. That needs Kubach
+The agent gets the context's minimal access without asking (by default:
+reading built-in resources in any namespace, no Secrets). For more (logs and
+exec, changes and Helm, Secrets, custom resources) Kubach asks in its window,
+for this session or by default on the cluster. Changes (apply, delete, Helm,
+exec) are confirmed one by one there as well. That needs Kubach
 running with Settings → AI agent → HTTP server on.
 
 A context imported into the Kubach vault works only through the running app
@@ -425,8 +425,8 @@ pub(super) fn resolve(
             context: name,
             server_url: server,
             namespaces,
-            // A ceiling: every right within it is asked for (#227).
-            profile: options.profile.unwrap_or(policy.max_profile),
+            // A cap of this process only; it never grants anything (#15).
+            profile: options.profile.unwrap_or(Profile::Deploy),
             ttl: options.ttl,
             hints,
         },
@@ -541,16 +541,15 @@ async fn serve(options: Options) -> Result<(), String> {
 
     let scope = session.scope();
     eprintln!(
-        "kubach mcp: session {} on {} ({}), until {}; {}",
+        "kubach mcp: session {} on {} (without asking: {}), until {}; {}",
         session.id(),
         scope.context,
-        scope.profile,
+        session.access(),
         scope.expires_at,
         if scope.pinned() {
             format!("namespaces: {}", scope.namespaces.join(", "))
         } else {
-            "namespaces are asked for in the Kubach window when the agent first reads them"
-                .to_owned()
+            "any namespace the agent names".to_owned()
         },
     );
     for boundary in session.boundaries() {
@@ -680,9 +679,10 @@ impl StdioChooser {
         );
         server.set_helm(super::helm_env(&self.settings, true));
         eprintln!(
-            "kubach mcp: session {} on {name} ({}), chosen by the agent and approved in Kubach",
+            "kubach mcp: session {} on {name} (without asking: {}), chosen by the agent and \
+             approved in Kubach",
             session.id(),
-            session.scope().profile,
+            session.access(),
         );
         let key = bridge::random_token();
         let heartbeat = tokio::spawn(heartbeat(session.clone(), key.clone(), self.dir.clone()));
@@ -853,6 +853,9 @@ async fn heartbeat(session: Arc<Session>, key: String, dir: Option<PathBuf>) {
                 eprintln!("kubach mcp: {grant} taken back, but the Role was not updated: {error}");
             }
         }
+        if reply.forget_remembered {
+            session.forget_remembered();
+        }
         if reply.revoked {
             eprintln!("kubach mcp: the session was revoked in Kubach");
             let _ = session.close().await;
@@ -987,6 +990,16 @@ users:
     fn resolves_from_settings_and_refuses_when_disabled() {
         let contexts = Contexts::from_yaml(KUBECONFIG).unwrap();
         let mut settings = Settings::default();
+        let key = ContextKey::new("dev", "https://127.0.0.1:6443");
+        // On by default (#9): the strict default resolves.
+        assert!(resolve(Options::default(), &settings, &contexts, None).is_ok());
+        settings.security.set_policy(
+            &key,
+            ContextPolicy {
+                mcp_enabled: false,
+                ..ContextPolicy::default()
+            },
+        );
         let error = resolve(Options::default(), &settings, &contexts, None).unwrap_err();
         assert!(error.contains("AI agent access is off"), "{error}");
         // The flag does not widen the settings.
@@ -997,10 +1010,8 @@ users:
         let error = resolve(flagged.clone(), &settings, &contexts, None).unwrap_err();
         assert!(error.contains("AI agent access is off"), "{error}");
 
-        let key = ContextKey::new("dev", "https://127.0.0.1:6443");
-        settings
-            .security
-            .set_policy(&key, ContextPolicy::development());
+        settings.security.set_policy(&key, ContextPolicy::default());
+
         let plan = resolve(Options::default(), &settings, &contexts, None).unwrap();
         assert!(!plan.grant_read);
         assert_eq!(plan.spec.context, "dev");
@@ -1015,7 +1026,7 @@ users:
         let granted = resolve(flagged, &settings, &contexts, None).unwrap();
         assert!(granted.grant_read);
         assert_eq!(granted.spec.namespaces, ["team"]);
-        // The ceiling is the context's maximum; rights are asked for.
+        // Not narrowed: the minimum comes from the settings, more is asked.
         assert_eq!(plan.spec.profile, Profile::Deploy);
         let narrow = Options {
             profile: Some(Profile::ReadOnly),

@@ -33,7 +33,8 @@ pub use logs::{
     sources_for_selector, stream_logs,
 };
 pub use port_forward::{
-    ForwardId, ForwardInfo, ForwardState, LocalPort, PortForwardManager, local_port_candidates,
+    ForwardAgent, ForwardId, ForwardInfo, ForwardState, LocalPort, PortForwardManager,
+    local_port_candidates,
 };
 
 /// Errors from streaming operations.

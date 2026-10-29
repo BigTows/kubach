@@ -984,7 +984,9 @@ mod exports {
             return;
         }
         let expected = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("no snapshot {name}; run with UPDATE_SNAPSHOTS=1"));
+            .unwrap_or_else(|_| panic!("no snapshot {name}; run with UPDATE_SNAPSHOTS=1"))
+            // A Windows checkout may turn the snapshot's line ends into CRLF.
+            .replace("\r\n", "\n");
         assert_eq!(actual, expected, "snapshot {name} differs");
     }
 

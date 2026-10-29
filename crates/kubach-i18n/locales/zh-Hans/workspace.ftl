@@ -54,6 +54,9 @@ workspace-connect = 连接
 workspace-connecting = 正在连接 { $context }…
 workspace-connect-failed = 无法连接到 { $context }
 workspace-retry = 重试
+workspace-gke-plugin-missing = 未安装 gke-gcloud-auth-plugin。GKE 上下文需要它来登录；Kubach 可以通过 gcloud 安装它。
+workspace-gke-gcloud-missing = 未安装 gke-gcloud-auth-plugin 和 Google Cloud CLI。请在 设置 → Tools 中下载 Google Cloud CLI，插件会随之安装。
+workspace-gke-open-tools = 打开 设置 → Tools
 
 ## 快捷栏磁贴提示
 
@@ -64,7 +67,6 @@ hotbar-row-namespace = Namespace
 hotbar-row-status = 状态
 hotbar-row-shortcut = 快捷键
 hotbar-row-source = 来源
-hotbar-row-security = 安全
 hotbar-row-vault = 保险库
 hotbar-row-problem = 问题
 hotbar-row-file = 文件
@@ -75,17 +77,6 @@ hotbar-state-disconnected = 未连接
 hotbar-state-connecting = 正在连接…
 hotbar-state-connected = 已连接，{ $version }
 hotbar-state-error = 错误：{ $error }
-hotbar-security-looser = 比严格设置宽松：{ $list }
-hotbar-loosened-mcp = AI 代理访问
-hotbar-loosened-profile = 配置档
-hotbar-loosened-temporary-objects = 集群中的独立身份
-hotbar-loosened-deploy = 应用更改
-hotbar-loosened-exec = exec
-hotbar-loosened-session-ttl = 会话时长
-hotbar-loosened-namespaces = 多个 namespace
-hotbar-loosened-secret-values = 显示 Secret 值
-hotbar-loosened-agent-secret-values = 应请求向代理显示 Secret 值
-hotbar-loosened-agent-other-kinds = 代理可用自定义资源
 
 ## 快捷栏菜单
 

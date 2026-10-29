@@ -2,9 +2,9 @@
 //! agent, the session for HTTP agents, active sessions with the rights
 //! their agents were granted (#227) and the audit log.
 //!
-//! The HTTP session is one button (#401): it starts without namespaces,
-//! and its ceiling (profile) and length come from the context's security
-//! settings, so there is nothing else to pick here.
+//! Sessions start without namespaces (#401), with the context's minimal
+//! access from its security settings (#15), so there is nothing to pick
+//! here.
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,7 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_core::settings::{DEFAULT_MCP_PORT, Settings};
 use kubach_i18n::t;
-use kubach_mcp::{BoundaryInfo, Grant, GrantState, Profile, SessionMode};
+use kubach_mcp::{BoundaryInfo, Grant, GrantState, SessionMode};
 use kubach_ui::{NumberRow, SettingRow, ToggleRow};
 
 use super::{Entry, Group, SettingsScreen, searchable, setter};
@@ -102,15 +102,6 @@ fn grant_label(grant: &Grant) -> String {
             name = name.as_str()
         ),
         Grant::Modify { namespace } => t!("settings-grant-modify", namespace = namespace.as_str()),
-    }
-}
-
-/// A session's ceiling, named like the choices of the security settings.
-fn profile_label(profile: Profile) -> String {
-    match profile {
-        Profile::ReadOnly => t!("settings-profile-read-only"),
-        Profile::Debug => t!("settings-profile-debug"),
-        Profile::Deploy => t!("settings-profile-deploy"),
     }
 }
 
@@ -479,7 +470,7 @@ impl SettingsScreen {
                 row.context,
                 row.namespaces.join(" "),
                 row.profile,
-                profile_label(row.profile),
+                agent::level_label(row.profile),
                 row.clients.join(" ")
             );
             group = group.entry(Entry::new(text, session_row(ix, row, state, cx)));
@@ -746,7 +737,7 @@ fn session_row(
     let title = t!(
         "settings-session-title",
         context = row.context.as_str(),
-        profile = profile_label(row.profile)
+        profile = agent::level_label(row.profile)
     );
     let clients = if row.clients.is_empty() {
         t!("settings-session-no-calls")
@@ -839,6 +830,47 @@ fn session_row(
                 })
         }));
     let no_grants = row.grants.is_empty();
+    // "Don't ask again" of this session, with "Ask again" (#30).
+    let remembered = (!row.remembered.is_empty()).then(|| {
+        let list = row
+            .remembered
+            .iter()
+            .map(|r| {
+                t!(
+                    "settings-session-remembered-item",
+                    action = agent::remembered_action_label(r.action),
+                    namespace = r.namespace.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let forget = state.downgrade();
+        let session = row.id.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_color(theme.warning)
+                    .child(t!("settings-session-remembered", list = list)),
+            )
+            .child(
+                Button::new(("agent-ask-again", ix))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("settings-ask-again"))
+                    .on_click(move |_, _, cx| {
+                        forget
+                            .update(cx, |agent, cx| agent.forget_remembered(&session, cx))
+                            .ok();
+                    }),
+            )
+    });
     div()
         .flex()
         .items_center()
@@ -887,7 +919,10 @@ fn session_row(
                             .text_xs()
                             .whitespace_normal()
                             .text_color(theme.warning)
-                            .child(t!("settings-session-raised", raised = raised.to_string())),
+                            .child(t!(
+                                "settings-session-raised",
+                                raised = agent::raise_label(raised)
+                            )),
                     )
                 })
                 .when(no_grants, |this| {
@@ -898,7 +933,8 @@ fn session_row(
                             .child(t!("settings-session-no-grants")),
                     )
                 })
-                .when(!no_grants, |this| this.child(grants)),
+                .when(!no_grants, |this| this.child(grants))
+                .children(remembered),
         )
         .child(
             Button::new(("agent-revoke", ix))

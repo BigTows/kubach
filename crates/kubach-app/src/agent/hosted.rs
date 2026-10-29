@@ -85,8 +85,8 @@ pub(super) fn consent_request(
     let spec = &plan.spec;
     let ttl = spec
         .ttl
-        .unwrap_or(plan.policy.default_ttl)
-        .min(plan.policy.max_ttl);
+        .unwrap_or(kubach_mcp::DEFAULT_SESSION_TTL)
+        .min(kubach_mcp::MAX_SESSION_TTL);
     let minutes = ttl.as_secs().div_ceil(60);
     // Shown to the user only, in the language of the interface.
     let time = match (minutes / 60, minutes % 60) {
@@ -117,7 +117,10 @@ pub(super) fn consent_request(
         summary: t!("agent-consent-summary", context = spec.context.as_str()),
         details: [
             t!("agent-consent-namespaces", namespaces = namespaces),
-            t!("agent-consent-profile", profile = spec.profile.to_string()),
+            t!(
+                "agent-consent-access",
+                access = super::access_label(plan.policy.minimum.capped(spec.profile))
+            ),
             t!("agent-consent-time", time = time),
             t!("agent-consent-reading", reading = reading),
             t!("agent-consent-process", process = process.as_str()),
@@ -142,7 +145,9 @@ pub(super) async fn after_consent<T>(
     start: impl Future<Output = Result<T, String>>,
 ) -> Result<T, HostRefusal> {
     match kubach_mcp::confirm::ask(confirmer, consent).await {
-        ConfirmationDecision::Approved | ConfirmationDecision::ApprovedAlways => start
+        ConfirmationDecision::Approved
+        | ConfirmationDecision::ApprovedAlways
+        | ConfirmationDecision::ApprovedForSession => start
             .await
             .map_err(|error| HostRefusal::denied(format!("cannot start the session: {error}"))),
         ConfirmationDecision::Rejected { .. } => Err(HostRefusal::rejected(context)),
@@ -192,6 +197,7 @@ fn ps(_pid: u32) -> Option<(u32, String)> {
 }
 
 /// `"  4100 /usr/local/bin/claude"` → `(4100, "claude")`.
+#[cfg(any(unix, test))]
 fn parse_ps(line: &str) -> Option<(u32, String)> {
     let line = line.lines().next()?.trim();
     let (ppid, command) = line.split_once(char::is_whitespace)?;
@@ -221,10 +227,7 @@ mod tests {
     use kubach_mcp::ScriptedConfirmer;
     use kubach_mcp::confirm::DenyAll;
 
-    use super::{
-        after_consent, consent_request, describe_process, lock_ends, parse_ps, plan,
-        unlocked_contexts,
-    };
+    use super::{after_consent, consent_request, lock_ends, parse_ps, plan, unlocked_contexts};
 
     const LOCAL: &str = r#"
 apiVersion: v1
@@ -293,9 +296,7 @@ users:
     fn allowed() -> Settings {
         let mut settings = Settings::default();
         let key = ContextKey::new("prod-imported", SERVER);
-        settings
-            .security
-            .set_policy(&key, ContextPolicy::development());
+        settings.security.set_policy(&key, ContextPolicy::default());
         settings
     }
 
@@ -331,10 +332,18 @@ users:
         let open = Contexts::load_all(vec![local_file(&dir)], imported(true)).unwrap();
         let unlocked = unlocked_contexts(&imported(true));
 
-        // Unlocked but AI agent access off for the context (#39).
+        // Unlocked but AI agent access turned off for the context (#39, #9).
+        let mut off = Settings::default();
+        off.security.set_policy(
+            &ContextKey::new("prod-imported", SERVER),
+            ContextPolicy {
+                mcp_enabled: false,
+                ..ContextPolicy::default()
+            },
+        );
         let refusal = plan(
             &request("prod-imported"),
-            &Settings::default(),
+            &off,
             Some(&open),
             &names,
             &unlocked,
@@ -404,7 +413,7 @@ users:
         .unwrap()
     }
 
-    /// The user is asked about the context, namespace, profile and process.
+    /// The user is asked about the context, namespace, access and process.
     #[test]
     fn the_user_sees_what_starts() {
         let plan = approved_plan();
@@ -420,7 +429,12 @@ users:
             "{}",
             consent.details
         );
-        assert!(consent.details.contains("deploy"), "{}", consent.details);
+        // The minimal access, never a ceiling (#15).
+        assert!(
+            consent.details.contains("Without asking:") && consent.details.contains("Read"),
+            "{}",
+            consent.details
+        );
         assert!(consent.client.contains("started by claude"));
         assert!(!consent.allow_remember);
         assert!(!consent.mode.server_enforced());
@@ -471,7 +485,7 @@ users:
         assert_eq!(parse_ps(""), None);
         #[cfg(unix)]
         {
-            let me = describe_process(std::process::id()).unwrap();
+            let me = super::describe_process(std::process::id()).unwrap();
             assert!(me.contains(&format!("pid {}", std::process::id())), "{me}");
         }
     }

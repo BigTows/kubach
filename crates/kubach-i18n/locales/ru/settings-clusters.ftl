@@ -174,70 +174,36 @@ settings-hide-message = Плитка уйдёт из хотбара; kubeconfig 
 
 ## Безопасность контекста
 
-settings-profile-read-only = Только чтение
-settings-profile-debug = Отладка
-settings-profile-deploy = Изменения
-settings-deploy-dry-run = Только пробный запуск
-settings-deploy-apply = Применять после подтверждения
-settings-exec-never = Никогда
-settings-exec-single = Отдельные команды
-settings-exec-shell = Отдельные команды и shell
-settings-namespaces-one = Один
-settings-namespaces-several = Несколько
-settings-agent-secrets-none = Ничего
-settings-agent-secrets-metadata = Метаданные и проверки
-settings-agent-secrets-reveal = Метаданные, проверки и раскрытие по запросу
-settings-security-preset = Набор
-settings-security-preset-strict = Строгий: значения по умолчанию.
-settings-security-preset-development = Разработка: всё разрешено, каждое изменение подтверждается, значения Secret показываются и раскрываются агенту по запросу.
-settings-security-preset-custom = Свои значения.
-settings-preset-strict = Строгий
-settings-preset-development = Разработка
 settings-group-security = Безопасность
-settings-security-description-no-server = Что может ИИ-агент, подключённый по MCP. Новые контексты строгие. В kubeconfig нет API-сервера.
-settings-security-description = Что может ИИ-агент, подключённый по MCP. Новые контексты строгие. Настройки привязаны к этому имени и серверу { $server }.
-settings-security-loosened = Мягче значений по умолчанию для { $name }: { $list }.
-settings-security-relaxed = Ослабленная безопасность
-settings-security-suggest-development = Похоже на локальный кластер. Предлагается набор «Разработка»; сам он не применяется.
-settings-group-secrets = Secret
+settings-security-description-no-server = Видите ли вы здесь значения Secret и что ИИ-агент, подключённый по MCP, получает без вопросов. В kubeconfig нет API-сервера.
+settings-security-description = Видите ли вы здесь значения Secret и что ИИ-агент, подключённый по MCP, получает без вопросов. Настройки привязаны к этому имени и серверу { $server }.
 settings-hide-secret-values = Скрывать значения Secret
 settings-hide-secret-values-description = Для Secret этого контекста нет «Показать», «Копировать» и «Загрузить значение», а в Helm и Kustomize нет раскрытия. Значения по-прежнему можно заменить, не загружая их.
 settings-group-agent-mcp = ИИ-агент (MCP)
-settings-agent-mcp-description = Агент начинает без прав. Он называет namespace, и Kubach спрашивает вас, когда агент впервые читает его, раскрывает Secret или что-то меняет. Эти настройки — максимум, который он может здесь получить.
+settings-agent-mcp-description = Без вопросов агент получает минимальный доступ ниже. Больше он запрашивает у вас в Kubach: на одну сессию или по умолчанию на этом кластере. Изменения, удаления, Helm и каждая команда в контейнере всё равно подтверждаются по одной, а предел — ваши собственные права в Kubernetes.
 settings-mcp-enabled = Доступ ИИ-агента
 settings-mcp-enabled-description = Выключено: на этом кластере не начинается ни одна сессия агента.
-settings-ceiling-raised = Повышен по запросу агента { $time } сессией { $session }: { $changes }.
-settings-ceiling-raised-client = Повышен по запросу агента { $time } сессией { $session } ({ $client }): { $changes }.
-settings-ceiling-raised-earlier =
+settings-minimum-access = Минимальный доступ
+settings-minimum-access-description = Что агент получает без вопросов. Чтение: встроенные ресурсы (Pod, Deployment, Service, ConfigMap, Job, Ingress, события…) во всех namespace, без Secret. Отладка: ещё логи и команды в контейнерах. Изменения: ещё apply, delete, scale и Helm.
+settings-minimum-read = Чтение
+settings-minimum-debug = Отладка
+settings-minimum-changes = Изменения
+settings-minimum-secrets = Secret по умолчанию
+settings-minimum-secrets-description = Имена, ключи, размеры Secret и проверки внутри Kubach без вопросов, но не значения. Выключено: агент сначала спрашивает. Раскрытие значений спрашивается для каждого Secret и возможно, только пока «Скрывать значения Secret» выключено.
+settings-minimum-crds = Пользовательские ресурсы по умолчанию
+settings-minimum-crds-description = Kind сверх встроенных (CRD, например объекты Flux или Argo CD) без вопросов. В них бывают учётные данные, и они заставляют контроллер действовать со своими правами. Выключено: агент сначала спрашивает. ServiceAccount, RBAC и Secret через них агент не меняет никогда.
+settings-minimum-reset = Сбросить до чтения
+settings-minimum-reset-description = Вернуть чтение встроенных ресурсов; всё остальное снова спрашивается. Уже идущие сессии сохраняют своё до конца.
+# $time: например 10:00:00; $changes: что повышено, как записано в файле настроек.
+settings-access-raised = Разрешено по умолчанию по запросу агента { $time } сессией { $session }: { $changes }.
+settings-access-raised-client = Разрешено по умолчанию по запросу агента { $time } сессией { $session } ({ $client }): { $changes }.
+settings-access-raised-earlier =
     { $count ->
         [one] (ещё { $count } повышение в файле настроек)
         [few] (ещё { $count } повышения в файле настроек)
        *[other] (ещё { $count } повышений в файле настроек)
     }
-settings-ceiling-raised-title = Потолок повышен из сессии
-settings-protected = Защищённый кластер
-settings-protected-description = Агент не может попросить из сессии поднять ограничения ниже: такие вызовы отклоняются с объяснением, а вас не спрашивают. Выключить это можно только здесь. Для production.
-settings-max-profile = Максимум, который может попросить агент
-settings-max-profile-description = Только чтение: просмотр ресурсов. Отладка: ещё логи и exec. Изменения: ещё изменения. Выше этого агент может попросить вас в Kubach поднять уровень — на одну сессию или навсегда, если кластер не защищён.
-settings-deploy-mode = Изменения
-settings-deploy-mode-description = С уровнем «Изменения». Пробный запуск: агент видит diff, ничего не меняется. Применение: каждое изменение выполняется после вашего подтверждения, включая Secret со значениями, которые вы вводите в Kubach.
-settings-exec-mode = Команды в контейнерах
-settings-exec-mode-description = С уровнем «Отладка» или «Изменения». Каждую команду подтверждаете вы.
-settings-agent-secrets = Secret для агента
-settings-agent-secrets-hidden-description = Имена, ключи, размеры и проверки внутри Kubach, но не значения. Для раскрытия нужно выключить «Скрывать значения Secret»: агент не получит значение, которое не можете видеть вы.
-settings-agent-secrets-description = Раскрытие спрашивает вас о каждом Secret и предупреждает, что значения уйдут провайдеру модели. Остальные инструменты всегда скрывают значения.
-settings-agent-other-kinds = Пользовательские ресурсы (CRD)
-settings-agent-other-kinds-description = Выключено: только встроенные kind, такие как Pod, Deployment, Service, ConfigMap, Job и Ingress. Включено: ещё и пользовательские ресурсы, в которых могут быть учётные данные или которые заставят контроллер (Flux, Argo CD) действовать со своими правами. Secret, ServiceAccount и RBAC остаются недоступны.
-settings-namespaces = Namespace на сессию
-settings-namespaces-description = Один: первый разрешённый вами namespace — единственный, который получит сессия. Несколько: о каждом новом namespace спрашивается отдельно.
-settings-session-ttl = Длительность сессии
-settings-session-ttl-description = Сессия и все права в ней заканчиваются через это время (не больше 8 ч) или при выходе из Kubach. Сессии `kubach mcp` длятся 30 минут, если не запущены с бо́льшим --ttl.
-settings-group-enforcement = Проверка на стороне кластера
-settings-enforcement-description = Kubach сам проверяет каждый вызов агента. Эти настройки добавляют вторую проверку API-сервером, чтобы ошибка в Kubach не дала агенту больше, чем вы разрешили.
-settings-temporary-objects = Отдельная идентичность для агента
-settings-temporary-objects-description = В каждом namespace, который вы разрешили агенту читать, Kubach создаёт ServiceAccount, чья Role содержит ровно разрешённое, и удаляет его в конце сессии. Нужны права администратора в namespace.
-settings-require-server-enforced = Требовать её
-settings-require-server-enforced-description = Отказывать в namespace, где кластер не может обеспечить ограничения. Выключено: такой namespace помечается «ограничения только в Kubach», и каждое изменение в нём подтверждается по одному.
+settings-access-raised-title = Повышено из сессии
 
 ## Заготовки
 

@@ -43,6 +43,7 @@ use super::panel_width;
 use super::plugin_text;
 use super::prometheus_link::{PrometheusRegistry, PrometheusStatus};
 use super::rows;
+use super::table_sort;
 use super::usage::{self, MetricsState, UsageFeed, UsageKind};
 use crate::cluster::{CatalogState, Cluster};
 
@@ -824,7 +825,8 @@ impl ResourceBrowser {
         });
         let api = &view.entry.kind.api;
         let kind = kind_key(&api.group, &api.kind);
-        column_order::remember(&table, kind, all_columns, cx);
+        column_order::remember(&table, kind.clone(), all_columns, cx);
+        table_sort::remember(&table, kind, cx);
         view._table_events = Some(cx.subscribe(
             &table,
             |this, _, event: &ResourceTableEvent, cx| {

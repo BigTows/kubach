@@ -1,0 +1,16 @@
+{
+    "cluster": {
+        "name": "internal",
+        "arn": "arn:aws:eks:eu-west-1:123456789012:cluster/internal",
+        "version": "1.30",
+        "endpoint": "https://FEDCBA9876543210FEDCBA9876543210.gr7.eu-west-1.eks.amazonaws.com",
+        "resourcesVpcConfig": {
+            "endpointPublicAccess": false,
+            "endpointPrivateAccess": true
+        },
+        "status": "ACTIVE",
+        "certificateAuthority": {
+            "data": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lK"
+        }
+    }
+}
