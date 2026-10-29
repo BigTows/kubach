@@ -15,6 +15,7 @@ cloud-gke-plugin-missing = gke-gcloud-auth-plugin is not installed; GKE contexts
 cloud-gke-plugin-install = Install the plugin
 cloud-gke-plugin-installing = Installing the plugin…
 cloud-gke-plugin-failed = gke-gcloud-auth-plugin was not installed: { $error }
+cloud-gke-plugin-required = Install gke-gcloud-auth-plugin first (Google GKE tab): GKE contexts can't sign in without it.
 cloud-gke-python-hint = On macOS gcloud needs Python 3.10 or newer: install it (python.org or brew install python) or point CLOUDSDK_PYTHON at it, then try again.
 # $tool is the command: gcloud, yc or aws.
 cloud-not-logged-in = { $tool } is not signed in. Sign in in a terminal, then press Try again:

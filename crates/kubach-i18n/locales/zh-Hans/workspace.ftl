@@ -54,6 +54,9 @@ workspace-connect = 连接
 workspace-connecting = 正在连接 { $context }…
 workspace-connect-failed = 无法连接到 { $context }
 workspace-retry = 重试
+workspace-gke-plugin-missing = 未安装 gke-gcloud-auth-plugin。GKE 上下文需要它来登录；Kubach 可以通过 gcloud 安装它。
+workspace-gke-gcloud-missing = 未安装 gke-gcloud-auth-plugin 和 Google Cloud CLI。请在 设置 → Tools 中下载 Google Cloud CLI，插件会随之安装。
+workspace-gke-open-tools = 打开 设置 → Tools
 
 ## 快捷栏磁贴提示
 

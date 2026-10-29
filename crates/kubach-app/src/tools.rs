@@ -443,8 +443,14 @@ impl ToolDownloads {
     }
 
     /// Runs `gcloud components install gke-gcloud-auth-plugin` with the
-    /// gcloud at `gcloud` (on the user's request).
-    pub fn install_gke_plugin(&mut self, gcloud: PathBuf, cx: &mut Context<Self>) {
+    /// gcloud at `gcloud` (on the user's request); `then` runs once it is
+    /// installed.
+    pub fn install_gke_plugin(
+        &mut self,
+        gcloud: PathBuf,
+        then: impl FnOnce(&mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.plugin_task.is_some() {
             return;
         }
@@ -452,6 +458,7 @@ impl ToolDownloads {
         self.plugin_error = None;
         self.plugin_task = Some(cx.spawn(async move |this, cx| {
             let outcome = handle.await;
+            let installed = matches!(outcome, Ok(Ok(())));
             this.update(cx, |this, cx| {
                 this.plugin_task = None;
                 this.plugin_error = match outcome {
@@ -462,6 +469,9 @@ impl ToolDownloads {
                 cx.notify();
             })
             .ok();
+            if installed {
+                cx.update(then);
+            }
         }));
         cx.notify();
     }

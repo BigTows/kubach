@@ -12,6 +12,7 @@ cloud-gke-plugin-missing = gke-gcloud-auth-plugin не установлен, б�
 cloud-gke-plugin-install = Установить плагин
 cloud-gke-plugin-installing = Устанавливаем плагин…
 cloud-gke-plugin-failed = gke-gcloud-auth-plugin не установлен: { $error }
+cloud-gke-plugin-required = Сначала установите gke-gcloud-auth-plugin (вкладка Google GKE): без него контексты GKE не смогут войти.
 cloud-gke-python-hint = На macOS gcloud нужен Python 3.10 или новее: установите его (python.org или brew install python) или укажите его в CLOUDSDK_PYTHON и повторите.
 cloud-not-logged-in = Вход в { $tool } не выполнен. Войдите в терминале и нажмите «Повторить»:
 cloud-error = Ошибка { $tool }: { $error }
