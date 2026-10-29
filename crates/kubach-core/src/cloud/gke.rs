@@ -17,12 +17,7 @@ pub fn accounts_call() -> CliCall {
 
 /// `gcloud projects list --format=json`.
 pub fn projects_call() -> CliCall {
-    CliCall::new([
-        "projects",
-        "list",
-        "--format=json",
-        "--sort-by=projectId",
-    ])
+    CliCall::new(["projects", "list", "--format=json", "--sort-by=projectId"])
 }
 
 /// `gcloud container clusters list --project <id> --format=json`.
@@ -54,9 +49,7 @@ pub fn parse_projects(json: &str) -> Result<Vec<Scope>, CloudError> {
     let projects = value.as_array().cloned().unwrap_or_default();
     Ok(projects
         .iter()
-        .filter(|p| {
-            text(p, "/lifecycleState").is_none_or(|state| state == "ACTIVE")
-        })
+        .filter(|p| text(p, "/lifecycleState").is_none_or(|state| state == "ACTIVE"))
         .filter_map(|p| {
             let id = text(p, "/projectId")?;
             let label = match text(p, "/name") {
@@ -90,18 +83,24 @@ fn cluster(c: &Value, project: &Scope) -> Option<CloudCluster> {
         .and_then(Value::as_bool)
         == Some(false);
     let mut endpoints = Vec::new();
-    let public = text(c, "/controlPlaneEndpointsConfig/ipEndpointsConfig/publicEndpoint")
-        .or_else(|| text(c, "/privateClusterConfig/publicEndpoint"))
-        .or_else(|| text(c, "/endpoint"));
+    let public = text(
+        c,
+        "/controlPlaneEndpointsConfig/ipEndpointsConfig/publicEndpoint",
+    )
+    .or_else(|| text(c, "/privateClusterConfig/publicEndpoint"))
+    .or_else(|| text(c, "/endpoint"));
     if let Some(public) = public.filter(|_| !private_only && !public_disabled) {
         endpoints.push(Endpoint {
             kind: EndpointKind::External,
             server: https(&public),
         });
     }
-    if let Some(private) = text(c, "/privateClusterConfig/privateEndpoint")
-        .or_else(|| text(c, "/controlPlaneEndpointsConfig/ipEndpointsConfig/privateEndpoint"))
-    {
+    if let Some(private) = text(c, "/privateClusterConfig/privateEndpoint").or_else(|| {
+        text(
+            c,
+            "/controlPlaneEndpointsConfig/ipEndpointsConfig/privateEndpoint",
+        )
+    }) {
         endpoints.push(Endpoint {
             kind: EndpointKind::Internal,
             server: https(&private),
@@ -179,7 +178,10 @@ mod tests {
                 "--format=json"
             ]
         );
-        assert_eq!(projects_call().args[..3], ["projects", "list", "--format=json"]);
+        assert_eq!(
+            projects_call().args[..3],
+            ["projects", "list", "--format=json"]
+        );
     }
 
     #[test]
@@ -225,7 +227,10 @@ mod tests {
         assert_eq!(public.location, "europe-west1");
         assert_eq!(public.status, "RUNNING");
         assert_eq!(public.version.as_deref(), Some("1.31.1-gke.1678000"));
-        assert_eq!(public.ca_data.as_deref(), Some("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSQ=="));
+        assert_eq!(
+            public.ca_data.as_deref(),
+            Some("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSQ==")
+        );
         assert_eq!(
             public.endpoints,
             [
@@ -248,7 +253,10 @@ mod tests {
         let kinds: Vec<EndpointKind> = private_nodes.endpoints.iter().map(|e| e.kind).collect();
         assert_eq!(kinds, [EndpointKind::External, EndpointKind::Internal]);
         assert_eq!(
-            private_nodes.endpoint(EndpointKind::Internal).unwrap().server,
+            private_nodes
+                .endpoint(EndpointKind::Internal)
+                .unwrap()
+                .server,
             "https://172.16.0.2"
         );
 

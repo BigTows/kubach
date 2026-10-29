@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use kube::config::{
-    AuthInfo, Cluster as KubeCluster, Context, ExecConfig, Kubeconfig, NamedAuthInfo,
-    NamedCluster, NamedContext,
+    AuthInfo, Cluster as KubeCluster, Context, ExecConfig, Kubeconfig, NamedAuthInfo, NamedCluster,
+    NamedContext,
 };
 
 use crate::tools::cli::{self, CliTool};
@@ -249,6 +249,38 @@ impl Default for ExecCommands {
     }
 }
 
+impl ExecCommands {
+    /// The commands for the CLIs found: an absolute path for a copy Kubach
+    /// downloaded (it is not in `PATH`), the bare name for one in `PATH`.
+    /// The GKE plugin goes with `gcloud`: its bare name when it is in
+    /// `PATH` too, else its absolute path next to gcloud.
+    pub fn for_binaries(
+        gcloud: Option<&cli::CliBinary>,
+        gke_plugin: Option<&Path>,
+        plugin_in_path: bool,
+        yc: Option<&cli::CliBinary>,
+        aws: Option<&cli::CliBinary>,
+    ) -> Self {
+        let defaults = Self::default();
+        let command = |binary: Option<&cli::CliBinary>, fallback: String| match binary {
+            Some(binary) if binary.source == cli::CliSource::Downloaded => {
+                binary.path.display().to_string()
+            }
+            _ => fallback,
+        };
+        let downloaded_gcloud = gcloud.is_some_and(|g| g.source == cli::CliSource::Downloaded);
+        let gke_plugin = match gke_plugin {
+            Some(path) if downloaded_gcloud || !plugin_in_path => path.display().to_string(),
+            _ => defaults.gke_plugin,
+        };
+        Self {
+            gke_plugin,
+            yc: command(yc, defaults.yc),
+            aws: command(aws, defaults.aws),
+        }
+    }
+}
+
 /// gcloud's install hint for the GKE plugin.
 const GKE_INSTALL_HINT: &str = "Install gke-gcloud-auth-plugin for use with kubectl by following \
      https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin";
@@ -387,11 +419,7 @@ pub enum CloudError {
 
 /// Runs `call` with the CLI at `program` (the login shell's environment is
 /// added by [`crate::process`]) and returns its standard output.
-pub async fn run(
-    provider: Provider,
-    program: &Path,
-    call: &CliCall,
-) -> Result<String, CloudError> {
+pub async fn run(provider: Provider, program: &Path, call: &CliCall) -> Result<String, CloudError> {
     let mut command = tokio::process::Command::new(program);
     command.args(&call.args);
     for (name, value) in cli::quiet_env(provider.tool()) {
@@ -627,8 +655,8 @@ mod tests {
                 endpoint: EndpointKind::External,
             }],
             &ExecCommands {
-                gke_plugin: "/data/tools/gcloud/591.0.0/google-cloud-sdk/bin/gke-gcloud-auth-plugin"
-                    .into(),
+                gke_plugin:
+                    "/data/tools/gcloud/591.0.0/google-cloud-sdk/bin/gke-gcloud-auth-plugin".into(),
                 ..ExecCommands::default()
             },
         );
@@ -655,7 +683,12 @@ mod tests {
             exec.api_version.as_deref(),
             Some("client.authentication.k8s.io/v1beta1")
         );
-        assert!(exec.install_hint.as_deref().unwrap().contains("gke-gcloud-auth-plugin"));
+        assert!(
+            exec.install_hint
+                .as_deref()
+                .unwrap()
+                .contains("gke-gcloud-auth-plugin")
+        );
         // It loads as a kubeconfig again.
         let text = yaml(&config);
         let back = Kubeconfig::from_yaml(&text).unwrap();
@@ -714,12 +747,10 @@ mod tests {
     #[test]
     fn eks_context_like_update_kubeconfig() {
         let config = build_kubeconfig(
-            &[
-                Selection {
-                    cluster: eks_cluster(Some("work")),
-                    endpoint: EndpointKind::External,
-                },
-            ],
+            &[Selection {
+                cluster: eks_cluster(Some("work")),
+                endpoint: EndpointKind::External,
+            }],
             &ExecCommands::default(),
         );
         let arn = "arn:aws:eks:eu-west-1:123456789012:cluster/main";
@@ -796,13 +827,58 @@ mod tests {
         let names: Vec<&str> = config.contexts.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["yc-k8s", "yc-k8s-ru-central1-b", "gke_acme-prod_europe-west1_prod"]
+            [
+                "yc-k8s",
+                "yc-k8s-ru-central1-b",
+                "gke_acme-prod_europe-west1_prod"
+            ]
         );
         assert_eq!(config.current_context.as_deref(), Some("yc-k8s"));
         // The vault import accepts it.
         let plan = crate::vault::ImportPlan::from_kubeconfig(config, &HashSet::new());
         assert_eq!(plan.contexts.len(), 3);
         assert!(plan.review.files.is_empty());
+    }
+
+    #[test]
+    fn exec_commands_for_found_clis() {
+        use std::path::PathBuf;
+        let binary = |tool, path: &str, source| cli::CliBinary {
+            tool,
+            path: PathBuf::from(path),
+            source,
+        };
+        let yc = binary(
+            CliTool::Yc,
+            "/data/tools/yc/1.42.0/yc",
+            cli::CliSource::Downloaded,
+        );
+        let aws = binary(CliTool::Aws, "/usr/local/bin/aws", cli::CliSource::Path);
+        let gcloud = binary(
+            CliTool::Gcloud,
+            "/data/tools/gcloud/591.0.0/google-cloud-sdk/bin/gcloud",
+            cli::CliSource::Downloaded,
+        );
+        let plugin =
+            Path::new("/data/tools/gcloud/591.0.0/google-cloud-sdk/bin/gke-gcloud-auth-plugin");
+        let commands =
+            ExecCommands::for_binaries(Some(&gcloud), Some(plugin), false, Some(&yc), Some(&aws));
+        assert_eq!(commands.yc, "/data/tools/yc/1.42.0/yc");
+        assert_eq!(commands.aws, "aws");
+        assert_eq!(commands.gke_plugin, plugin.display().to_string());
+
+        // gcloud from PATH: the plugin by name when PATH has it too.
+        let brew = binary(
+            CliTool::Gcloud,
+            "/opt/homebrew/bin/gcloud",
+            cli::CliSource::Path,
+        );
+        let sdk_plugin = Path::new("/opt/sdk/bin/gke-gcloud-auth-plugin");
+        let in_path = ExecCommands::for_binaries(Some(&brew), Some(sdk_plugin), true, None, None);
+        assert_eq!(in_path.gke_plugin, "gke-gcloud-auth-plugin");
+        assert_eq!(in_path.yc, "yc");
+        let beside = ExecCommands::for_binaries(Some(&brew), Some(sdk_plugin), false, None, None);
+        assert_eq!(beside.gke_plugin, "/opt/sdk/bin/gke-gcloud-auth-plugin");
     }
 
     #[test]
@@ -845,7 +921,10 @@ mod tests {
         assert_eq!(Provider::Yandex.login_commands(Some("x")), ["yc init"]);
         assert_eq!(
             Provider::Eks.login_commands(Some("work")),
-            ["aws configure --profile work", "aws sso login --profile work"]
+            [
+                "aws configure --profile work",
+                "aws sso login --profile work"
+            ]
         );
         assert_eq!(
             Provider::Eks.login_commands(Some("default")),
@@ -856,8 +935,8 @@ mod tests {
     #[test]
     fn pem_and_addresses() {
         assert_eq!(pem_to_data("not pem"), None);
-        let data = pem_to_data("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        let data =
+            pem_to_data("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n").unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(data)
             .unwrap();

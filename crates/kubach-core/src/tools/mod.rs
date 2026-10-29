@@ -19,9 +19,9 @@ pub mod cli;
 pub mod download;
 pub mod gcloud;
 pub mod helm;
-pub mod yc;
 pub mod proxy;
 pub mod signature;
+pub mod yc;
 
 use std::path::PathBuf;
 

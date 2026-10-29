@@ -175,14 +175,16 @@ pub(super) async fn discover(
     program: &Path,
     profile: Option<&str>,
 ) -> Result<Discovery, CloudError> {
-    let (profiles, active) = parse_profiles(&run(Provider::Yandex, program, &profiles_call()).await?);
+    let (profiles, active) =
+        parse_profiles(&run(Provider::Yandex, program, &profiles_call()).await?);
     if profiles.is_empty() {
         return Err(CloudError::NotLoggedIn {
             message: "yc has no profiles".into(),
         });
     }
     let profile = profile.map(str::to_owned).or(active);
-    let clouds = parse_clouds(&run(Provider::Yandex, program, &clouds_call(profile.as_deref())).await?)?;
+    let clouds =
+        parse_clouds(&run(Provider::Yandex, program, &clouds_call(profile.as_deref())).await?)?;
     let mut scopes = Vec::new();
     for (id, name) in clouds {
         let output = run(
@@ -206,7 +208,12 @@ pub(super) async fn clusters(
     profile: Option<&str>,
     folder: &Scope,
 ) -> Result<Vec<CloudCluster>, CloudError> {
-    let output = run(Provider::Yandex, program, &clusters_call(&folder.id, profile)).await?;
+    let output = run(
+        Provider::Yandex,
+        program,
+        &clusters_call(&folder.id, profile),
+    )
+    .await?;
     parse_clusters(&output, folder, profile)
 }
 

@@ -369,7 +369,15 @@ async fn install(
     )
     .await?;
     let actual = sink.finish()?;
-    let verification = match check(&release.integrity, &archive_path, &file_name, &actual, signature).await {
+    let verification = match check(
+        &release.integrity,
+        &archive_path,
+        &file_name,
+        &actual,
+        signature,
+    )
+    .await
+    {
         Ok(verification) => verification,
         Err(error) => {
             fs::remove_file(&archive_path).ok();
@@ -380,7 +388,15 @@ async fn install(
     let staged = temp.path().join("staged");
     fs::create_dir(&staged)?;
     let entry_rel = tool.entry(platform);
-    unpack(&release.layout, &archive_path, &file_name, temp.path(), &staged, &entry_rel).await?;
+    unpack(
+        &release.layout,
+        &archive_path,
+        &file_name,
+        temp.path(),
+        &staged,
+        &entry_rel,
+    )
+    .await?;
     fs::remove_file(&archive_path).ok();
     let entry = staged.join(&entry_rel);
     if !entry.is_file() {
@@ -391,9 +407,9 @@ async fn install(
 
     let version = match &release.version {
         Some(version) => version.clone(),
-        None => binary_version(tool, &entry)
-            .await
-            .ok_or_else(|| io::Error::other(format!("{} does not answer --version", tool.command())))?,
+        None => binary_version(tool, &entry).await.ok_or_else(|| {
+            io::Error::other(format!("{} does not answer --version", tool.command()))
+        })?,
     };
     if !is_directory_name(&version) {
         return Err(DownloadError::InvalidUrl(version));
@@ -602,7 +618,11 @@ pub async fn install_gke_plugin(gcloud: &Path) -> Result<(), String> {
 
 /// The last few non-empty lines of a program's error output.
 pub fn last_lines(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     lines[lines.len().saturating_sub(4)..].join("\n")
 }
 
@@ -720,13 +740,19 @@ mod tests {
             Err(SignatureError::UnknownKey { .. })
         ));
         assert!(matches!(
-            package_signer("Package \"x.pkg\":\n   Status: no signature\n", "94KV3E626L"),
+            package_signer(
+                "Package \"x.pkg\":\n   Status: no signature\n",
+                "94KV3E626L"
+            ),
             Err(SignatureError::Malformed(_))
         ));
     }
 
     fn fake(root: &Path, tool: CliTool, version: &str, platform: Platform) {
-        let path = root.join(tool.name()).join(version).join(tool.entry(platform));
+        let path = root
+            .join(tool.name())
+            .join(version)
+            .join(tool.entry(platform));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"bin").unwrap();
     }

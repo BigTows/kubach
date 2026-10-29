@@ -91,21 +91,34 @@ fn safe_relative(name: &str) -> Result<Option<std::path::PathBuf>, ArchiveError>
     let unix = name.replace('\\', "/");
     let escapes = unix.starts_with('/')
         || unix.split('/').any(|part| part == "..")
-        || unix.split('/').next().is_some_and(|first| first.contains(':'));
+        || unix
+            .split('/')
+            .next()
+            .is_some_and(|first| first.contains(':'));
     if escapes {
-        return Err(ArchiveError::Corrupt(format!("{name}: path leaves the archive")));
+        return Err(ArchiveError::Corrupt(format!(
+            "{name}: path leaves the archive"
+        )));
     }
     let normalized = normalize(&unix);
     Ok((!normalized.is_empty()).then(|| normalized.split('/').collect()))
 }
 
-fn extract_all_tar_gz(archive: &Path, dest: &Path, budget: &mut Budget) -> Result<(), ArchiveError> {
+fn extract_all_tar_gz(
+    archive: &Path,
+    dest: &Path,
+    budget: &mut Budget,
+) -> Result<(), ArchiveError> {
     let decoder = flate2::read::GzDecoder::new(File::open(archive)?);
     let mut tar = tar::Archive::new(decoder);
     let corrupt = |e: io::Error| ArchiveError::Corrupt(e.to_string());
     for entry in tar.entries().map_err(corrupt)? {
         let entry = entry.map_err(corrupt)?;
-        let name = entry.path().map_err(corrupt)?.to_string_lossy().into_owned();
+        let name = entry
+            .path()
+            .map_err(corrupt)?
+            .to_string_lossy()
+            .into_owned();
         let Some(relative) = safe_relative(&name)? else {
             continue;
         };

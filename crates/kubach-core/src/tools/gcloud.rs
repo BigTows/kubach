@@ -109,9 +109,9 @@ fn page_version(html: &str) -> Option<String> {
         let version = &rest[..rest.find(SUFFIX)?];
         let parts: Vec<&str> = version.split('.').collect();
         let plain = parts.len() == 3
-            && parts.iter().all(|p| {
-                !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit())
-            });
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()));
         plain.then(|| version.to_owned())
     })
 }
@@ -154,8 +154,7 @@ mod tests {
         assert_eq!(
             mac.integrity,
             Integrity::Sha256 {
-                expected: "3b7bbaaf2dd0287fab5320359fb61c678cbd6e8d6d58b884470def1bf96589a1"
-                    .into(),
+                expected: "3b7bbaaf2dd0287fab5320359fb61c678cbd6e8d6d58b884470def1bf96589a1".into(),
                 source: PAGE_URL.into(),
             }
         );

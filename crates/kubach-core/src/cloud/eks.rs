@@ -73,7 +73,14 @@ pub fn region_call(profile: Option<&str>) -> CliCall {
 /// `aws eks list-clusters --region r --output json [--profile p]`.
 pub fn list_call(region: &str, profile: Option<&str>) -> CliCall {
     with_profile(
-        strings(&["eks", "list-clusters", "--region", region, "--output", "json"]),
+        strings(&[
+            "eks",
+            "list-clusters",
+            "--region",
+            region,
+            "--output",
+            "json",
+        ]),
         profile,
     )
 }
@@ -299,7 +306,10 @@ mod tests {
         assert_eq!(main.name, "main");
         assert_eq!(main.status, "ACTIVE");
         assert_eq!(main.version.as_deref(), Some("1.31"));
-        assert_eq!(main.ca_data.as_deref(), Some("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJ"));
+        assert_eq!(
+            main.ca_data.as_deref(),
+            Some("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJ")
+        );
         assert_eq!(
             main.endpoints,
             [Endpoint {

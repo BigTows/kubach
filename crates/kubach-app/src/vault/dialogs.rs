@@ -135,6 +135,13 @@ pub fn add_cluster(window: &mut Window, cx: &mut App) {
                     cx,
                 ))
                 .child(add_option(
+                    "add-cloud",
+                    t!("vault-add-cloud"),
+                    t!("vault-add-cloud-text"),
+                    super::cloud::open,
+                    cx,
+                ))
+                .child(add_option(
                     "add-manual",
                     t!("vault-add-manual"),
                     t!("vault-add-manual-text"),
