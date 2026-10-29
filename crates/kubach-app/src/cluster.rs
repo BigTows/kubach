@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::time::Duration;
@@ -11,7 +11,9 @@ use kubach_core::kubeconfig::{FileProblem, FileState, FilesWatcher, Source};
 use kubach_core::metrics::MetricsApi;
 use kubach_core::metrics::shared::{MetricsHub, MetricsServer};
 use kubach_core::runtime::{self, BackgroundTask};
-use kubach_core::settings::{ContextKey, ContextPolicy, SecretAction, SecuritySettings};
+use kubach_core::settings::{
+    ContextKey, ContextPolicy, HotbarPrefs, SecretAction, SecuritySettings,
+};
 use kubach_core::vault::Imported;
 use kubach_core::{ApiCatalog, Connection, ConnectionState, ContextInfo, Contexts, discovery};
 
@@ -144,6 +146,9 @@ pub struct Cluster {
     /// Contexts kept connected, the active one included, so switching back
     /// is instant; the least recently used beyond this disconnect.
     keep_connected: usize,
+    /// Contexts hidden from the hotbar; hiding the open one switches to
+    /// another tile (#41).
+    hidden: BTreeSet<String>,
     /// Per-context security settings; observers are notified when they
     /// change, so screens re-check what they may show.
     security: SecuritySettings,
@@ -160,7 +165,7 @@ impl Cluster {
     /// else the kubeconfig default.
     pub fn new(cx: &mut Context<Self>) -> Self {
         let settings = AppSettings::try_global(cx);
-        let (kubeconfig_paths, startup, keep_connected, security) = settings
+        let (kubeconfig_paths, startup, keep_connected, hidden, security) = settings
             .as_ref()
             .map(|settings| {
                 let settings = settings.read(cx).get();
@@ -169,6 +174,7 @@ impl Cluster {
                     clusters.resolved_kubeconfig_paths(),
                     clusters.startup_context.clone(),
                     clusters.keep_connected(),
+                    clusters.hotbar.hidden.clone(),
                     settings.security.clone(),
                 )
             })
@@ -177,6 +183,7 @@ impl Cluster {
                     Vec::new(),
                     None,
                     KEEP_CONNECTED,
+                    BTreeSet::new(),
                     SecuritySettings::default(),
                 )
             });
@@ -192,6 +199,7 @@ impl Cluster {
             sessions: HashMap::new(),
             recent: RecentContexts::default(),
             keep_connected,
+            hidden,
             security,
             _settings: settings.map(|settings| cx.observe(&settings, Self::settings_changed)),
             vault_revision: crate::vault::global(cx).map_or(0, |vault| vault.read(cx).revision()),
@@ -335,6 +343,12 @@ impl Cluster {
             clusters.resolved_kubeconfig_paths(),
             clusters.keep_connected(),
         );
+        if clusters.hotbar.hidden != self.hidden {
+            let hotbar = clusters.hotbar.clone();
+            let newly: Vec<String> = hotbar.hidden.difference(&self.hidden).cloned().collect();
+            self.hidden = hotbar.hidden.clone();
+            self.hid(&newly, &hotbar, cx);
+        }
         if keep_connected != self.keep_connected {
             self.keep_connected = keep_connected;
             if let Some(active) = self.active.clone() {
@@ -348,6 +362,24 @@ impl Cluster {
         self.kubeconfig_paths = paths;
         self.watch_files(cx);
         self.reload(cx);
+    }
+
+    /// Contexts just hidden from the hotbar: their connections close, and
+    /// the open one gives way to the neighbouring tile, or to no context.
+    fn hid(&mut self, names: &[String], hotbar: &HotbarPrefs, cx: &mut Context<Self>) {
+        let all: Vec<String> = self
+            .contexts()
+            .map(|contexts| contexts.list().iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        for name in names {
+            self.disconnect(name, cx);
+            if self.active.as_deref() == Some(name.as_str()) {
+                match hotbar.neighbor(&all, name) {
+                    Some(next) => self.connect(next, cx),
+                    None => self.active = None,
+                }
+            }
+        }
     }
 
     /// Reads the kubeconfig files and the vault again in the background; a
