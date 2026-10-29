@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 # Versioning: YEAR.MONTH.INC (month without leading zero, INC resets every month)
-version = "2026.10.1"
+version = "2026.10.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/BigTows/kubach"

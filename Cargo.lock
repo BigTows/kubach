@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "kubach-app"
-version = "2026.10.1"
+version = "2026.10.2"
 dependencies = [
  "arboard",
  "dirs 7.0.0",
@@ -4586,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "kubach-core"
-version = "2026.10.1"
+version = "2026.10.2"
 dependencies = [
  "argon2 0.6.0",
  "base64 0.23.1",
@@ -4636,7 +4636,7 @@ dependencies = [
 
 [[package]]
 name = "kubach-i18n"
-version = "2026.10.1"
+version = "2026.10.2"
 dependencies = [
  "fluent-bundle",
  "fluent-syntax",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "kubach-mcp"
-version = "2026.10.1"
+version = "2026.10.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -4667,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "kubach-ui"
-version = "2026.10.1"
+version = "2026.10.2"
 dependencies = [
  "alacritty_terminal",
  "gpui-kit",
