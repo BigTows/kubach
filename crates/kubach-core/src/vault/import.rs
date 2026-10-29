@@ -108,6 +108,13 @@ impl ImportPlan {
         Ok(Self::new(config, review, taken))
     }
 
+    /// Plans importing a config Kubach built itself (clusters imported
+    /// from a cloud, #38); it refers to no local files.
+    pub fn from_kubeconfig(config: Kubeconfig, taken: &HashSet<String>) -> Self {
+        let review = ConfigReview::of(&config, None);
+        Self::new(config, review, taken)
+    }
+
     fn new(mut config: Kubeconfig, review: ConfigReview, taken: &HashSet<String>) -> Self {
         let current = config.current_context.as_deref().and_then(|current| {
             config

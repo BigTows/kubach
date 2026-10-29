@@ -1,0 +1,23 @@
+[
+  {
+    "id": "b1gfolder000000000a",
+    "cloud_id": "b1gcloud0000000000",
+    "created_at": "2023-02-14T08:30:13Z",
+    "name": "default",
+    "status": "ACTIVE"
+  },
+  {
+    "id": "b1gfolder000000000b",
+    "cloud_id": "b1gcloud0000000000",
+    "created_at": "2024-05-01T12:00:00Z",
+    "name": "prod",
+    "status": "ACTIVE"
+  },
+  {
+    "id": "b1gfolder000000000c",
+    "cloud_id": "b1gcloud0000000000",
+    "created_at": "2022-01-01T00:00:00Z",
+    "name": "old",
+    "status": "PENDING_DELETION"
+  }
+]

@@ -5,12 +5,21 @@
 //! binary inside. [`download`] fetches, verifies and unpacks it into
 //! `<data dir>/tools/<name>/<version>/`; nothing is installed system-wide.
 //! A release other than the pinned one must carry a detached OpenPGP
-//! signature by a key Kubach ships ([`signature`], #403). Only Helm
-//! ([`helm::HELM4`], [`helm::HELM3`]) is described so far.
+//! signature by a key Kubach ships ([`signature`], #403). Helm
+//! ([`helm::HELM4`], [`helm::HELM3`]) is described this way.
+//!
+//! The cloud CLIs of "Import from cloud" (#38) — `gcloud`, `yc`, `aws` —
+//! release too often to pin; [`cli`] downloads their current release,
+//! trusted by what each vendor publishes ([`gcloud`], [`yc`], [`aws`]),
+//! with the same fetching, unpacking and layout.
 
 pub mod archive;
+pub mod aws;
+pub mod cli;
 pub mod download;
+pub mod gcloud;
 pub mod helm;
+pub mod yc;
 pub mod proxy;
 pub mod signature;
 

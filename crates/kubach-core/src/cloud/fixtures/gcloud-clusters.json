@@ -1,0 +1,64 @@
+[
+  {
+    "name": "web",
+    "location": "europe-west1",
+    "zone": "europe-west1",
+    "locations": ["europe-west1-b", "europe-west1-c", "europe-west1-d"],
+    "endpoint": "34.76.10.20",
+    "status": "RUNNING",
+    "currentMasterVersion": "1.31.1-gke.1678000",
+    "currentNodeVersion": "1.31.1-gke.1678000",
+    "currentNodeCount": 3,
+    "masterAuth": {
+      "clusterCaCertificate": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSQ=="
+    },
+    "controlPlaneEndpointsConfig": {
+      "dnsEndpointConfig": {
+        "allowExternalTraffic": true,
+        "endpoint": "gke-0123456789abcdef-123456789012.europe-west1.gke.goog"
+      },
+      "ipEndpointsConfig": {
+        "enabled": true,
+        "enablePublicEndpoint": true,
+        "globalAccess": false,
+        "publicEndpoint": "34.76.10.20"
+      }
+    },
+    "network": "default",
+    "selfLink": "https://container.googleapis.com/v1/projects/acme-prod/locations/europe-west1/clusters/web"
+  },
+  {
+    "name": "batch",
+    "location": "europe-west1-b",
+    "zone": "europe-west1-b",
+    "endpoint": "35.195.1.2",
+    "status": "RUNNING",
+    "currentMasterVersion": "1.30.5-gke.1014001",
+    "masterAuth": {
+      "clusterCaCertificate": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUI="
+    },
+    "privateClusterConfig": {
+      "enablePrivateNodes": true,
+      "masterIpv4CidrBlock": "172.16.0.0/28",
+      "privateEndpoint": "172.16.0.2",
+      "publicEndpoint": "35.195.1.2"
+    },
+    "selfLink": "https://container.googleapis.com/v1/projects/acme-prod/zones/europe-west1-b/clusters/batch"
+  },
+  {
+    "name": "internal",
+    "location": "us-central1",
+    "zone": "us-central1",
+    "endpoint": "10.10.0.2",
+    "status": "PROVISIONING",
+    "currentMasterVersion": "1.31.1-gke.1678000",
+    "masterAuth": {
+      "clusterCaCertificate": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM="
+    },
+    "privateClusterConfig": {
+      "enablePrivateEndpoint": true,
+      "enablePrivateNodes": true,
+      "privateEndpoint": "10.10.0.2"
+    }
+  }
+]

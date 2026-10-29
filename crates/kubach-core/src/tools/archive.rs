@@ -1,7 +1,9 @@
-//! Taking one file out of a release archive (`.tar.gz` or `.zip`).
+//! Taking one file out of a release archive (`.tar.gz` or `.zip`), or
+//! unpacking all of it (cloud CLIs, #38).
 //!
 //! Only the named member is written, to a path the caller picks, so
 //! entries with `..` or absolute paths in the archive can't escape.
+//! [`extract_all`] refuses such entries and skips links and special files.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -56,6 +58,117 @@ pub fn extract_member(
         ArchiveKind::TarGz => extract_tar_gz(archive, &wanted, dest, limit),
         ArchiveKind::Zip => extract_zip(archive, &wanted, dest, limit),
     }
+}
+
+/// Unpacks every regular file and directory of the archive into the
+/// existing directory `dest`: at most `limit` bytes in all. Entries with
+/// `..`, absolute paths or drive letters fail the whole unpack; symbolic
+/// and hard links and special files are skipped (the cloud CLIs have
+/// links only in documentation and tests). Files keep whether they are
+/// executable (Unix).
+pub fn extract_all(
+    archive: &Path,
+    kind: ArchiveKind,
+    dest: &Path,
+    limit: u64,
+) -> Result<(), ArchiveError> {
+    let mut budget = Budget { left: limit, limit };
+    match kind {
+        ArchiveKind::TarGz => extract_all_tar_gz(archive, dest, &mut budget),
+        ArchiveKind::Zip => extract_all_zip(archive, dest, &mut budget),
+    }
+}
+
+/// Bytes still allowed by [`extract_all`].
+struct Budget {
+    left: u64,
+    limit: u64,
+}
+
+/// `name` as a relative path under the unpack directory, or an error for
+/// a name that would leave it.
+fn safe_relative(name: &str) -> Result<Option<std::path::PathBuf>, ArchiveError> {
+    let unix = name.replace('\\', "/");
+    let escapes = unix.starts_with('/')
+        || unix.split('/').any(|part| part == "..")
+        || unix.split('/').next().is_some_and(|first| first.contains(':'));
+    if escapes {
+        return Err(ArchiveError::Corrupt(format!("{name}: path leaves the archive")));
+    }
+    let normalized = normalize(&unix);
+    Ok((!normalized.is_empty()).then(|| normalized.split('/').collect()))
+}
+
+fn extract_all_tar_gz(archive: &Path, dest: &Path, budget: &mut Budget) -> Result<(), ArchiveError> {
+    let decoder = flate2::read::GzDecoder::new(File::open(archive)?);
+    let mut tar = tar::Archive::new(decoder);
+    let corrupt = |e: io::Error| ArchiveError::Corrupt(e.to_string());
+    for entry in tar.entries().map_err(corrupt)? {
+        let entry = entry.map_err(corrupt)?;
+        let name = entry.path().map_err(corrupt)?.to_string_lossy().into_owned();
+        let Some(relative) = safe_relative(&name)? else {
+            continue;
+        };
+        let kind = entry.header().entry_type();
+        let target = dest.join(&relative);
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if kind.is_file() {
+            let mode = entry.header().mode().unwrap_or(0o644);
+            write_entry(entry, &target, &name, mode, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_all_zip(archive: &Path, dest: &Path, budget: &mut Budget) -> Result<(), ArchiveError> {
+    let corrupt = |e: zip::result::ZipError| ArchiveError::Corrupt(e.to_string());
+    let mut zip = zip::ZipArchive::new(File::open(archive)?).map_err(corrupt)?;
+    for index in 0..zip.len() {
+        let file = zip.by_index(index).map_err(corrupt)?;
+        let name = file.name().map_err(corrupt)?.into_owned();
+        let Some(relative) = safe_relative(&name)? else {
+            continue;
+        };
+        let target = dest.join(&relative);
+        if file.is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if file.is_file() {
+            let mode = file.unix_mode().unwrap_or(0o644);
+            write_entry(file, &target, &name, mode, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_entry(
+    reader: impl Read,
+    target: &Path,
+    name: &str,
+    mode: u32,
+    budget: &mut Budget,
+) -> Result<(), ArchiveError> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = File::create_new(target)?;
+    let copied = io::copy(&mut reader.take(budget.left + 1), &mut out)?;
+    if copied > budget.left {
+        return Err(ArchiveError::TooLarge {
+            member: name.to_owned(),
+            limit: budget.limit,
+        });
+    }
+    budget.left -= copied;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
 }
 
 fn normalize(path: &str) -> String {
@@ -243,6 +356,62 @@ mod tests {
             Err(ArchiveError::TooLarge { .. })
         ));
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn extracts_a_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        fixtures::tar_gz(
+            &archive,
+            &[
+                ("google-cloud-sdk/bin/gcloud", b"#!/bin/sh\n"),
+                ("./google-cloud-sdk/lib/x.py", b"print()"),
+            ],
+        );
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        extract_all(&archive, ArchiveKind::TarGz, &dest, 1024).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("google-cloud-sdk/bin/gcloud")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert!(dest.join("google-cloud-sdk/lib/x.py").is_file());
+
+        let zip = dir.path().join("a.zip");
+        fixtures::zip(&zip, &[("aws/dist/aws", b"elf"), ("aws/install", b"sh")]);
+        let dest = dir.path().join("zip");
+        std::fs::create_dir(&dest).unwrap();
+        extract_all(&zip, ArchiveKind::Zip, &dest, 1024).unwrap();
+        assert_eq!(std::fs::read(dest.join("aws/dist/aws")).unwrap(), b"elf");
+    }
+
+    #[test]
+    fn whole_tree_refuses_escapes_and_size() {
+        assert!(safe_relative("../etc/passwd").is_err());
+        assert!(safe_relative("a/../../b").is_err());
+        assert!(safe_relative("/abs").is_err());
+        assert!(safe_relative("C:/windows").is_err());
+        assert!(safe_relative("a\\..\\b").is_err());
+        assert_eq!(safe_relative("./").unwrap(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("evil.zip");
+        fixtures::zip(&zip, &[("ok", b"1"), ("../evil", b"2")]);
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(matches!(
+            extract_all(&zip, ArchiveKind::Zip, &dest, 1024),
+            Err(ArchiveError::Corrupt(_))
+        ));
+        assert!(!dir.path().join("evil").exists());
+        let big = dir.path().join("big.tar.gz");
+        fixtures::tar_gz(&big, &[("a", b"12345"), ("b", b"12345")]);
+        let dest = dir.path().join("big");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(matches!(
+            extract_all(&big, ArchiveKind::TarGz, &dest, 8),
+            Err(ArchiveError::TooLarge { .. })
+        ));
     }
 
     #[test]

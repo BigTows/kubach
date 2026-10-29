@@ -170,6 +170,8 @@ pub enum ExecTemplate {
     Gke,
     /// Azure AKS: `kubelogin get-token` with the Azure CLI login.
     Aks,
+    /// Yandex Cloud Managed Kubernetes: `yc k8s create-token` (#38).
+    Yandex,
 }
 
 /// Server id (application id) of the AKS AAD server, the same for every
@@ -183,20 +185,22 @@ pub struct TemplateParams {
     pub cluster_name: String,
     /// EKS region; empty for the profile's default.
     pub region: String,
-    /// AWS profile; empty for the default one.
+    /// AWS profile (EKS) or yc profile (Yandex); empty for the default
+    /// one.
     pub profile: String,
     /// AKS server id.
     pub server_id: String,
 }
 
 impl ExecTemplate {
-    pub const ALL: [Self; 3] = [Self::Eks, Self::Gke, Self::Aks];
+    pub const ALL: [Self; 4] = [Self::Eks, Self::Gke, Self::Aks, Self::Yandex];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Eks => "Amazon EKS",
             Self::Gke => "Google GKE",
             Self::Aks => "Azure AKS",
+            Self::Yandex => "Yandex Cloud",
         }
     }
 
@@ -206,6 +210,7 @@ impl ExecTemplate {
             Self::Eks => "aws",
             Self::Gke => "gke-gcloud-auth-plugin",
             Self::Aks => "kubelogin",
+            Self::Yandex => "yc",
         }
     }
 
@@ -215,6 +220,7 @@ impl ExecTemplate {
             Self::Eks => msg!("manual-install-eks"),
             Self::Gke => msg!("manual-install-gke"),
             Self::Aks => msg!("manual-install-aks"),
+            Self::Yandex => msg!("manual-install-yc"),
         }
     }
 
@@ -269,6 +275,15 @@ impl ExecTemplate {
                     .to_vec();
                 (args, Vec::new())
             }
+            // As `yc managed-kubernetes cluster get-credentials` writes it.
+            Self::Yandex => {
+                let mut args = vec!["k8s".to_owned(), "create-token".to_owned()];
+                let profile = params.profile.trim();
+                if !profile.is_empty() {
+                    args.push(format!("--profile={profile}"));
+                }
+                (args, Vec::new())
+            }
         };
         Ok(ExecSpec {
             command: self.command().into(),
@@ -299,6 +314,12 @@ impl ExecTemplate {
                 .iter()
                 .find(|(name, _)| name == "AWS_PROFILE")
                 .map(|(_, value)| value.clone())
+                .or_else(|| {
+                    exec.args
+                        .iter()
+                        .find_map(|arg| arg.strip_prefix("--profile="))
+                        .map(str::to_owned)
+                })
                 .unwrap_or_default(),
             server_id: value_of("--server-id"),
         };
@@ -666,7 +687,7 @@ impl ManualCluster {
     }
 }
 
-fn exec_config(exec: &ExecSpec) -> Result<ExecConfig, FormProblem> {
+pub(crate) fn exec_config(exec: &ExecSpec) -> Result<ExecConfig, FormProblem> {
     let command = exec.command.trim();
     if command.is_empty() {
         return Err(FormProblem::EmptyCommand);
@@ -1529,5 +1550,24 @@ contexts:
             ManualCluster::from_yaml("contexts: [oops: {"),
             Err(NotSimple::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn yandex_template_like_yc_get_credentials() {
+        let params = TemplateParams {
+            profile: "prod".into(),
+            ..ExecTemplate::Yandex.default_params()
+        };
+        let yc = ExecTemplate::Yandex.exec(&params).unwrap();
+        assert_eq!(yc.command, "yc");
+        assert_eq!(yc.args, ["k8s", "create-token", "--profile=prod"]);
+        assert!(yc.env.is_empty());
+        let (template, detected) = ExecTemplate::detect(&yc).unwrap();
+        assert_eq!(template, ExecTemplate::Yandex);
+        assert_eq!(detected.profile, "prod");
+        let plain = ExecTemplate::Yandex
+            .exec(&ExecTemplate::Yandex.default_params())
+            .unwrap();
+        assert_eq!(plain.args, ["k8s", "create-token"]);
     }
 }
