@@ -197,6 +197,7 @@ fn ps(_pid: u32) -> Option<(u32, String)> {
 }
 
 /// `"  4100 /usr/local/bin/claude"` → `(4100, "claude")`.
+#[cfg(any(unix, test))]
 fn parse_ps(line: &str) -> Option<(u32, String)> {
     let line = line.lines().next()?.trim();
     let (ppid, command) = line.split_once(char::is_whitespace)?;
@@ -226,10 +227,7 @@ mod tests {
     use kubach_mcp::ScriptedConfirmer;
     use kubach_mcp::confirm::DenyAll;
 
-    use super::{
-        after_consent, consent_request, describe_process, lock_ends, parse_ps, plan,
-        unlocked_contexts,
-    };
+    use super::{after_consent, consent_request, lock_ends, parse_ps, plan, unlocked_contexts};
 
     const LOCAL: &str = r#"
 apiVersion: v1
@@ -487,7 +485,7 @@ users:
         assert_eq!(parse_ps(""), None);
         #[cfg(unix)]
         {
-            let me = describe_process(std::process::id()).unwrap();
+            let me = super::describe_process(std::process::id()).unwrap();
             assert!(me.contains(&format!("pid {}", std::process::id())), "{me}");
         }
     }
