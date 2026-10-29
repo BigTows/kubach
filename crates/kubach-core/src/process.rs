@@ -346,7 +346,8 @@ mod tests {
     #[cfg(unix)]
     const ECHO_STDIN: &str = "cat";
     #[cfg(windows)]
-    const ECHO_STDIN: &str = "findstr \"^\"";
+    // No quotes: Rust escapes them as \" in the argument, which cmd keeps.
+    const ECHO_STDIN: &str = "more";
 
     #[cfg(unix)]
     const SLEEP: &str = "sleep 5";
