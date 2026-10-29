@@ -12,6 +12,7 @@ cloud-gke-plugin-missing = 未安装 gke-gcloud-auth-plugin，GKE 上下文需�
 cloud-gke-plugin-install = 安装插件
 cloud-gke-plugin-installing = 正在安装插件…
 cloud-gke-plugin-failed = 未能安装 gke-gcloud-auth-plugin：{ $error }
+cloud-gke-plugin-required = 请先安装 gke-gcloud-auth-plugin（Google GKE 标签页）：没有它 GKE 上下文无法登录。
 cloud-gke-python-hint = 在 macOS 上 gcloud 需要 Python 3.10 或更高版本：请安装（python.org 或 brew install python）或通过 CLOUDSDK_PYTHON 指定，然后重试。
 cloud-not-logged-in = { $tool } 尚未登录。请在终端中登录，然后点击“重试”：
 cloud-error = { $tool } 出错：{ $error }

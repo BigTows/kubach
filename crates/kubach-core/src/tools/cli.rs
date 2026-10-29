@@ -587,6 +587,13 @@ pub fn gke_plugin_name() -> String {
 /// The GKE exec plugin that goes with `gcloud`: next to it (the SDK's
 /// `bin`, also behind a symlink such as Homebrew's), else in `PATH`.
 pub fn gke_plugin(gcloud: &Path) -> Option<PathBuf> {
+    gke_plugin_beside(gcloud)
+        .or_else(|| crate::which::which(gcloud::GKE_PLUGIN, &crate::env::path()))
+}
+
+/// The GKE exec plugin in the folder of `gcloud` or of the file its
+/// symlink points to (the SDK's `bin`).
+fn gke_plugin_beside(gcloud: &Path) -> Option<PathBuf> {
     let name = gke_plugin_name();
     let mut dirs: Vec<PathBuf> = gcloud.parent().map(Path::to_owned).into_iter().collect();
     if let Ok(real) = fs::canonicalize(gcloud)
@@ -597,7 +604,30 @@ pub fn gke_plugin(gcloud: &Path) -> Option<PathBuf> {
     dirs.into_iter()
         .map(|dir| dir.join(&name))
         .find(|path| crate::which::is_executable(path))
-        .or_else(|| crate::which::which(gcloud::GKE_PLUGIN, &crate::env::path()))
+}
+
+/// The SDK folder holding `gke-gcloud-auth-plugin` beside the gcloud in
+/// `PATH` or the one Kubach downloaded. Homebrew links only `gcloud` into
+/// its `bin`, so the plugin `gcloud components install` adds is not in
+/// `PATH`; contexts naming it bare still start it from here
+/// ([`crate::env::apply_to_exec`]).
+pub fn gke_plugin_dir() -> Option<PathBuf> {
+    let platform = Platform::current()?;
+    let in_path = find_in_path(CliTool::Gcloud, platform, &crate::env::path());
+    let downloaded = downloaded(CliTool::Gcloud).map(|installed| installed.path);
+    in_path
+        .into_iter()
+        .chain(downloaded)
+        .find_map(|gcloud| gke_plugin_beside(&gcloud))
+        .and_then(|plugin| plugin.parent().map(Path::to_owned))
+}
+
+/// Whether the exec plugin `command` is `gke-gcloud-auth-plugin`, by name
+/// or by path.
+pub fn is_gke_plugin(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .is_some_and(|stem| stem == gcloud::GKE_PLUGIN)
 }
 
 /// Runs `gcloud components install gke-gcloud-auth-plugin --quiet` with
@@ -802,6 +832,15 @@ mod tests {
         download::make_executable(&plugin).unwrap();
         #[cfg(unix)]
         assert_eq!(gke_plugin(&gcloud), Some(plugin));
+    }
+
+    #[test]
+    fn gke_plugin_by_name_or_path() {
+        assert!(is_gke_plugin("gke-gcloud-auth-plugin"));
+        assert!(is_gke_plugin("gke-gcloud-auth-plugin.exe"));
+        assert!(is_gke_plugin("/opt/sdk/bin/gke-gcloud-auth-plugin"));
+        assert!(!is_gke_plugin("aws"));
+        assert!(!is_gke_plugin("gcloud"));
     }
 
     #[tokio::test]

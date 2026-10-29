@@ -54,6 +54,9 @@ workspace-connect = Подключить
 workspace-connecting = Подключение к { $context }…
 workspace-connect-failed = Не удаётся подключиться к { $context }
 workspace-retry = Повторить
+workspace-gke-plugin-missing = gke-gcloud-auth-plugin не установлен. Он нужен контекстам GKE для входа; Kubach может установить его через gcloud.
+workspace-gke-gcloud-missing = Не установлены ни gke-gcloud-auth-plugin, ни Google Cloud CLI. Скачайте Google Cloud CLI в Настройки → Tools, плагин установится вместе с ним.
+workspace-gke-open-tools = Открыть Настройки → Tools
 
 ## Подсказки плиток хотбара
 

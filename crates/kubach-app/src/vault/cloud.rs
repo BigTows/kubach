@@ -286,6 +286,21 @@ impl CloudImport {
         selections
     }
 
+    /// GKE clusters are checked but `gke-gcloud-auth-plugin` is missing:
+    /// their contexts could not sign in, so the import waits for it.
+    fn gke_plugin_missing(&self) -> bool {
+        let gke = self
+            .selections()
+            .iter()
+            .any(|selection| selection.cluster.provider() == Provider::Gke);
+        gke && self
+            .tabs
+            .get(&Provider::Gke)
+            .and_then(|tab| tab.binary.clone())
+            .or_else(|| cli::locate(Provider::Gke.tool()))
+            .is_none_or(|gcloud| cli::gke_plugin(&gcloud.path).is_none())
+    }
+
     fn exec_commands(&self) -> ExecCommands {
         let binary = |provider: Provider| {
             self.tabs
@@ -311,6 +326,11 @@ impl CloudImport {
         let selections = self.selections();
         if selections.is_empty() {
             self.error = Some(t!("cloud-none-selected").into());
+            cx.notify();
+            return;
+        }
+        if self.gke_plugin_missing() {
+            self.error = Some(t!("cloud-gke-plugin-required").into());
             cx.notify();
             return;
         }
@@ -442,7 +462,8 @@ impl CloudImport {
                             .on_click(move |_, _, cx| {
                                 if let Some(downloads) = &downloads {
                                     let path = path.clone();
-                                    downloads.update(cx, |d, cx| d.install_gke_plugin(path, cx));
+                                    downloads
+                                        .update(cx, |d, cx| d.install_gke_plugin(path, |_| {}, cx));
                                 }
                             }),
                     ),
@@ -779,7 +800,9 @@ impl Render for CloudImport {
         let clusters = self.render_clusters(&tab, cx);
         self.tabs.insert(provider, tab);
         let selected = self.selections().len();
+        let gke_plugin_missing = self.gke_plugin_missing();
         let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
         div()
             .w_full()
             .min_w_0()
@@ -807,8 +830,14 @@ impl Render for CloudImport {
                         div()
                             .flex_1()
                             .text_xs()
-                            .text_color(muted)
-                            .child(t!("cloud-selected", count = selected)),
+                            .when(!gke_plugin_missing, |this| {
+                                this.text_color(muted)
+                                    .child(t!("cloud-selected", count = selected))
+                            })
+                            .when(gke_plugin_missing, |this| {
+                                this.text_color(danger)
+                                    .child(t!("cloud-gke-plugin-required"))
+                            }),
                     )
                     .child(
                         Button::new("cloud-cancel")
@@ -822,7 +851,7 @@ impl Render for CloudImport {
                             .primary()
                             .small()
                             .label(t!("cloud-next"))
-                            .disabled(selected == 0)
+                            .disabled(selected == 0 || gke_plugin_missing)
                             .on_click(cx.listener(|this, _, window, cx| this.next(window, cx))),
                     ),
             )

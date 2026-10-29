@@ -13,6 +13,8 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::Shared;
 use gpui_kit::{App, Global, SharedString};
+use kubach_core::tools::cli::{self, CliTool};
+use kubach_i18n::t;
 
 /// Outcome of loading the shell environment; set once at startup.
 #[derive(Clone, Debug, Default)]
@@ -124,6 +126,15 @@ pub fn banner_message(error: &str) -> String {
 /// Connection error text with a `PATH` hint for an exec plugin that was not
 /// found.
 pub fn exec_not_found_message(error: &str, command: Option<&str>, cx: &App) -> String {
+    // The status view offers to install it (#38); PATH is beside the point.
+    if command.is_some_and(cli::is_gke_plugin) && self::error(cx).is_none() {
+        let hint = if cli::locate(CliTool::Gcloud).is_some() {
+            t!("workspace-gke-plugin-missing")
+        } else {
+            t!("workspace-gke-gcloud-missing")
+        };
+        return format!("{error}\n\n{hint}");
+    }
     let plugin = command.map_or_else(|| "The exec auth plugin".to_owned(), |c| format!("`{c}`"));
     let hint = match self::error(cx) {
         Some(shell_error) => format!(

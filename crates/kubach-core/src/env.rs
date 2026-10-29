@@ -77,12 +77,12 @@ pub fn apply_to_kubeconfig(kubeconfig: &mut Kubeconfig) {
 }
 
 pub(crate) fn kubeconfig_vars(kubeconfig: &mut Kubeconfig, vars: &[(OsString, OsString)]) {
-    if vars.is_empty() {
-        return;
-    }
     for named in &mut kubeconfig.auth_infos {
         if let Some(exec) = named.auth_info.as_mut().and_then(|auth| auth.exec.as_mut()) {
-            exec_vars(exec, vars);
+            if !vars.is_empty() {
+                exec_vars(exec, vars);
+            }
+            gke_plugin_path(exec, vars, crate::tools::cli::gke_plugin_dir);
         }
     }
 }
@@ -91,9 +91,60 @@ pub(crate) fn kubeconfig_vars(kubeconfig: &mut Kubeconfig, vars: &[(OsString, Os
 /// `gke-gcloud-auth-plugin`, `kubelogin`): kube-rs starts it with this
 /// process's environment plus that list, and looks the command up in the
 /// resulting `PATH`. Variables the kubeconfig sets or drops are kept as
-/// they are.
+/// they are. A bare `gke-gcloud-auth-plugin` missing from that `PATH` is
+/// looked up in the gcloud SDK's `bin` as well (#38).
 pub fn apply_to_exec(exec: &mut ExecConfig) {
     exec_vars(exec, captured());
+    gke_plugin_path(exec, captured(), crate::tools::cli::gke_plugin_dir);
+}
+
+/// For an exec plugin naming `gke-gcloud-auth-plugin` bare when it is not
+/// in the `PATH` the plugin gets: appends `plugin_dir` (the SDK's `bin`,
+/// which also holds the `gcloud` the plugin calls) to that `PATH`.
+fn gke_plugin_path(
+    exec: &mut ExecConfig,
+    vars: &[(OsString, OsString)],
+    plugin_dir: impl FnOnce() -> Option<PathBuf>,
+) {
+    let Some(command) = exec.command.as_deref() else {
+        return;
+    };
+    if !crate::tools::cli::is_gke_plugin(command) || command.contains(['/', '\\']) {
+        return;
+    }
+    let own = exec
+        .env
+        .iter()
+        .flatten()
+        .rev()
+        .find(|entry| entry.get("name").is_some_and(|name| name == "PATH"))
+        .and_then(|entry| entry.get("value"))
+        .map(OsString::from);
+    let path = own
+        .or_else(|| lookup(vars, "PATH"))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    if crate::which::which(command, &path).is_some() {
+        return;
+    }
+    let Some(dir) = plugin_dir() else {
+        return;
+    };
+    let dirs = std::env::split_paths(&path).chain([dir]);
+    let Some(joined) = std::env::join_paths(dirs)
+        .ok()
+        .and_then(|joined| joined.into_string().ok())
+    else {
+        return;
+    };
+    let env = exec.env.get_or_insert_with(Vec::new);
+    env.retain(|entry| entry.get("name").is_none_or(|name| name != "PATH"));
+    env.push(
+        [("name", "PATH"), ("value", joined.as_str())]
+            .into_iter()
+            .map(|(field, text)| (field.to_owned(), text.to_owned()))
+            .collect(),
+    );
 }
 
 fn lookup(vars: &[(OsString, OsString)], name: &str) -> Option<OsString> {
@@ -246,5 +297,64 @@ mod tests {
         apply_vars(&mut cmd, &vars(&[("PATH", dir.path().to_str().unwrap())]));
         let output = cmd.output().unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
+    }
+
+    #[cfg(unix)]
+    fn gke_exec(command: &str, path: Option<&str>) -> ExecConfig {
+        ExecConfig {
+            command: Some(command.into()),
+            env: path.map(|path| vec![entry("PATH", path)]),
+            ..ExecConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn exec_path(exec: &ExecConfig) -> Vec<&str> {
+        exec.env
+            .iter()
+            .flatten()
+            .filter(|entry| entry["name"] == "PATH")
+            .map(|entry| entry["value"].as_str())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_gke_plugin_is_started_from_the_sdk() {
+        use std::os::unix::fs::PermissionsExt;
+        let sdk = tempfile::tempdir().unwrap();
+        let plugin = sdk.path().join("gke-gcloud-auth-plugin");
+        std::fs::write(&plugin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sdk_dir = || Some(sdk.path().to_owned());
+        let expected = format!("/kubach-test-38/bin:{}", sdk.path().display());
+
+        // Not in the plugin's PATH: the SDK's bin is appended once.
+        let mut exec = gke_exec("gke-gcloud-auth-plugin", Some("/kubach-test-38/bin"));
+        gke_plugin_path(&mut exec, &[], sdk_dir);
+        assert_eq!(exec_path(&exec), [expected.as_str()]);
+
+        // No PATH of its own: the shell's PATH is the base.
+        let mut exec = gke_exec("gke-gcloud-auth-plugin", None);
+        gke_plugin_path(
+            &mut exec,
+            &vars(&[("PATH", "/kubach-test-38/bin")]),
+            sdk_dir,
+        );
+        assert_eq!(exec_path(&exec), [expected.as_str()]);
+
+        // Already in PATH, a path, another plugin or no SDK: unchanged.
+        let in_path = sdk.path().display().to_string();
+        let mut exec = gke_exec("gke-gcloud-auth-plugin", Some(&in_path));
+        gke_plugin_path(&mut exec, &[], || panic!("not looked up"));
+        assert_eq!(exec_path(&exec), [in_path.as_str()]);
+        for command in ["/opt/sdk/bin/gke-gcloud-auth-plugin", "aws"] {
+            let mut exec = gke_exec(command, Some("/kubach-test-38/bin"));
+            gke_plugin_path(&mut exec, &[], || panic!("not looked up"));
+            assert_eq!(exec_path(&exec), ["/kubach-test-38/bin"]);
+        }
+        let mut exec = gke_exec("gke-gcloud-auth-plugin", Some("/kubach-test-38/bin"));
+        gke_plugin_path(&mut exec, &[], || None);
+        assert_eq!(exec_path(&exec), ["/kubach-test-38/bin"]);
     }
 }
