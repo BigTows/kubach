@@ -1,5 +1,6 @@
 //! Window titlebar that also works as the window frame under client-side
-//! decorations (Linux without a server frame, e.g. GNOME on Wayland).
+//! decorations (Linux without a server frame, e.g. GNOME on Wayland) and on
+//! Windows, where the transparent titlebar hides the system caption.
 //!
 //! The resize border and shadow of such windows come from the gpui-kit window
 //! root (`gpui_kit::open_window`), which wraps every window in
@@ -12,16 +13,34 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// Whether the app draws this window's frame itself: GPUI gave it client-side
-/// decorations. Always `false` on macOS and Windows, which keep the system
-/// frame (traffic lights, caption buttons).
+/// decorations. Always `false` on macOS and Windows, where the system moves
+/// the window (on Windows through [`WindowControlArea`] hit testing).
 pub fn is_client_decorated(window: &Window) -> bool {
     cfg!(target_os = "linux") && matches!(window.window_decorations(), Decorations::Client { .. })
+}
+
+/// Whether the app draws the window buttons: under client-side decorations
+/// and on Windows, whose transparent titlebar hides the caption buttons.
+fn draws_window_controls(window: &Window) -> bool {
+    cfg!(target_os = "windows") || is_client_decorated(window)
+}
+
+/// The window buttons in the top right corner of the titlebar.
+fn controls_overlay() -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .h_full()
+        .child(WindowControls::new())
 }
 
 /// A window's titlebar. Styled and filled by the caller; under client-side
 /// decorations it drags the window, maximizes or restores it on double
 /// click, opens the window menu on right click and shows [`WindowControls`]
-/// on the right. Elsewhere it is a plain container.
+/// on the right. On Windows it is the caption for the system (moving, double
+/// click, window menu) and shows [`WindowControls`] too. Elsewhere it is a
+/// plain container.
 #[derive(IntoElement)]
 pub struct WindowTitlebar {
     id: SharedString,
@@ -68,6 +87,12 @@ impl RenderOnce for WindowTitlebar {
         let mut bar = div().id(self.id.clone()).relative();
         bar.style().refine(&self.style);
         let bar = bar.children(self.children);
+        if cfg!(target_os = "windows") {
+            // Presses that no child stops reach the system as caption clicks.
+            return bar
+                .window_control_area(WindowControlArea::Drag)
+                .child(controls_overlay());
+        }
         if !is_client_decorated(window) {
             return bar;
         }
@@ -103,20 +128,13 @@ impl RenderOnce for WindowTitlebar {
                 window.show_window_menu(event.position)
             })
         })
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .h_full()
-                .child(WindowControls::new()),
-        )
+        .child(controls_overlay())
     }
 }
 
 /// Minimize, maximize/restore and close buttons for client-side decorated
-/// windows, limited to what the window manager supports. Renders nothing
-/// otherwise unless [`WindowControls::always`] is set.
+/// windows and on Windows, limited to what the window manager supports.
+/// Renders nothing otherwise unless [`WindowControls::always`] is set.
 #[derive(IntoElement, Default)]
 pub struct WindowControls {
     always: bool,
@@ -134,20 +152,33 @@ impl WindowControls {
     }
 }
 
-fn control(id: &'static str, icon: IconName, action: fn(&mut Window)) -> Button {
-    Button::new(id)
+fn control(
+    id: &'static str,
+    icon: IconName,
+    area: WindowControlArea,
+    action: fn(&mut Window),
+) -> Div {
+    let button = Button::new(id)
         .ghost()
         .xsmall()
         .icon(icon)
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             action(window);
+        });
+    // On Windows the system hit tests the button as its caption button
+    // (snap layouts on maximize); occluding hides the titlebar's drag area
+    // underneath from that test.
+    div()
+        .when(cfg!(target_os = "windows"), |button| {
+            button.occlude().window_control_area(area)
         })
+        .child(button)
 }
 
 impl RenderOnce for WindowControls {
     fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
-        let visible = self.always || is_client_decorated(window);
+        let visible = self.always || draws_window_controls(window);
         let supported = window.window_controls();
         let (maximize_icon, maximize_id) = if window.is_maximized() {
             (IconName::WindowRestore, "window-restore")
@@ -166,17 +197,24 @@ impl RenderOnce for WindowControls {
                         row.child(control(
                             "window-minimize",
                             IconName::WindowMinimize,
+                            WindowControlArea::Min,
                             |window| window.minimize_window(),
                         ))
                     })
                     .when(supported.maximize, |row| {
-                        row.child(control(maximize_id, maximize_icon, |window| {
-                            window.zoom_window()
-                        }))
+                        row.child(control(
+                            maximize_id,
+                            maximize_icon,
+                            WindowControlArea::Max,
+                            |window| window.zoom_window(),
+                        ))
                     })
-                    .child(control("window-close", IconName::WindowClose, |window| {
-                        window.remove_window()
-                    }))
+                    .child(control(
+                        "window-close",
+                        IconName::WindowClose,
+                        WindowControlArea::Close,
+                        |window| window.remove_window(),
+                    ))
             })
     }
 }
