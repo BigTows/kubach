@@ -163,6 +163,7 @@ section-operation = Operation
 section-owner-references = Owner references
 section-parameters = Parameters
 section-ports = Ports
+section-probes = Probes
 section-recommendations = Recommendations
 section-resources = Resources
 section-resources-summary = Resources summary

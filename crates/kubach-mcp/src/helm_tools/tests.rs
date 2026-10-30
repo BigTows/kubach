@@ -181,6 +181,7 @@ fn get_values_masks_by_name_lists_and_secret_looking_strings() {
         "image": {"repository": "registry.example.com/app", "tag": "1.2.3"},
         "url": "postgres://app:hunter3@db:5432/shop",
         "secretPort": 5432,
+        "redisPassword": 123456,
     });
     let mut masked = mask_values_listed(&mut values);
     masked.sort();
@@ -190,7 +191,7 @@ fn get_values_masks_by_name_lists_and_secret_looking_strings() {
             "apiKeys[0]",
             "apiKeys[1]",
             "auth.password",
-            "secretPort",
+            "redisPassword",
             "webhook.caBundle"
         ]
     );
@@ -202,6 +203,49 @@ fn get_values_masks_by_name_lists_and_secret_looking_strings() {
     assert_eq!(values["auth"]["enabled"], true);
     assert_eq!(values["image"]["tag"], "1.2.3");
     assert_eq!(values["replicaCount"], 2);
+    // A port of a secret store is a number under a setting, not a credential.
+    assert_eq!(values["secretPort"], 5432);
+}
+
+/// Booleans, null and settings of credentials are not credentials (#59);
+/// strings under credential names still are.
+#[test]
+fn get_values_keeps_switches_and_settings_under_sensitive_names() {
+    let mut values = json!({
+        "automountServiceAccountToken": true,
+        "serviceAccount": {"automountServiceAccountToken": false, "name": "app"},
+        "auth": {"enabled": true, "existingSecret": null, "tokenTTL": 3600},
+        "passwordMinLength": 12,
+        "serviceAccountToken": "eyJhbGciOi.plain-but-named",
+        "apiToken": "abc",
+        "password": "hunter2",
+        "tokens": [1, "t1"],
+    });
+    let mut masked = mask_values_listed(&mut values);
+    masked.sort();
+    assert_eq!(
+        masked,
+        [
+            "apiToken",
+            "password",
+            "serviceAccountToken",
+            "tokens[0]",
+            "tokens[1]"
+        ]
+    );
+    assert_eq!(values["automountServiceAccountToken"], true);
+    assert_eq!(
+        values["serviceAccount"]["automountServiceAccountToken"],
+        false
+    );
+    assert_eq!(values["auth"]["enabled"], true);
+    assert_eq!(values["auth"]["existingSecret"], Value::Null);
+    assert_eq!(values["auth"]["tokenTTL"], 3600);
+    assert_eq!(values["passwordMinLength"], 12);
+    let text = values.to_string();
+    for secret in ["plain-but-named", "\"abc\"", "hunter2", "t1"] {
+        assert!(!text.contains(secret), "{secret} is not masked");
+    }
 }
 
 #[test]
