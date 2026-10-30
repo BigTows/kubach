@@ -167,13 +167,7 @@ mod tests {
     use crate::helm::repo::{Repository, parse_index};
 
     fn repo(name: &str, url: &str, index: &str) -> LoadedRepository {
-        LoadedRepository::ready(
-            Repository {
-                name: name.into(),
-                url: url.into(),
-            },
-            parse_index(index).unwrap(),
-        )
+        LoadedRepository::ready(Repository::new(name, url), parse_index(index).unwrap())
     }
 
     const WEB: &str = r#"

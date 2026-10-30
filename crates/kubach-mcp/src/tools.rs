@@ -312,7 +312,7 @@ struct CompareArgs {
     other_key: String,
 }
 
-fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
+pub(crate) fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
     KindRef { kind, api_version }
 }
 
@@ -560,7 +560,7 @@ pub(crate) async fn ask_access_now(
             ctx.client_name, scope.context
         ),
         details: format!(
-            "Without asking, the agent has {current} on {context}. Allowing adds this until the \
+            "The agent's access on {context} now: {current}. Allowing adds this until the \
              session ends; with \"Allow by default\" the context's minimal access is raised for \
              good. Either way every change, deletion and command is still confirmed one by one, \
              and nothing exceeds your own RBAC.",
@@ -791,6 +791,7 @@ pub(crate) async fn run(
             top_pods(ctx, &allowed).await
         }
         "get_topology" => topology_tools::get_topology(ctx, args).await,
+        "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
@@ -994,7 +995,7 @@ pub(crate) async fn run(
 
 // ------------------------------------------------------------- helpers
 
-fn kind_of(allowed: &Allowed) -> &ResourceKind {
+pub(crate) fn kind_of(allowed: &Allowed) -> &ResourceKind {
     allowed.kind.as_ref().expect("policy resolved the kind")
 }
 
@@ -1014,7 +1015,7 @@ fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolErro
     }
 }
 
-async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
+pub(crate) async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
     let api = discovery::api(client, kind_of(allowed), Some(&allowed.namespace));
     let obj = api.get(name_of(allowed)).await?;
     ensure_namespace(&obj, &allowed.namespace)?;
@@ -1028,7 +1029,7 @@ fn masked_value(obj: &DynamicObject) -> Value {
 }
 
 /// Final masking and size bound of any text shown to the agent.
-fn finish(text: &str) -> String {
+pub(crate) fn finish(text: &str) -> String {
     truncate(&mask_text(text), MAX_OUTPUT_BYTES).into_owned()
 }
 
@@ -1094,6 +1095,10 @@ fn session_info(session: &Session) -> String {
             "howToRaise": "Tools beyond the access are marked \"Requires your approval in \
                 Kubach\": call them and the user is asked to allow it, for this session or by \
                 default on this cluster. Changes are still confirmed one by one.",
+            "meaning": "Access says which tools may be called without asking for more access. \
+                It approves no change: every change, deletion, Helm action, command in a \
+                container and port-forward is confirmed by the user one by one, unless the user \
+                ticked \"don't ask again\" for it (see notAskedAgain).",
         },
         "secretValues": if scope.policy.reveal_allowed() {
             "revealed one Secret at a time after the user confirms it"
