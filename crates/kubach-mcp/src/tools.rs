@@ -15,10 +15,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::jiff::Timestamp;
 use kubach_core::apply::{self as core_apply, ApplyOptions, yaml_diff};
-use kubach_core::discovery::{self, ResourceKind};
+use kubach_core::discovery::{self, ApiCatalog, ResourceKind};
 use kubach_core::plugin::builtin::action;
 use kubach_core::plugin::{ActionId, ActionKind, ActionParams, Cell, PluginRegistry, format_age};
 use kubach_core::rbac::ResourceAccess;
+use kubach_core::secrets::mask::is_core_secret;
 use kubach_core::streams::exec_capture;
 use kubach_core::workload_pods::{Workload, pods_of};
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
@@ -33,8 +34,8 @@ use crate::grants::Grant;
 use crate::helm_tools;
 use crate::masking::{mask_object, mask_text, truncate};
 use crate::policy::{
-    Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Request, service_account_changes,
-    walk_fields,
+    Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
+    service_account_changes, walk_fields,
 };
 use crate::remember::{RememberNote, rememberable};
 use crate::scope::NamespaceSource;
@@ -1256,21 +1257,82 @@ async fn list_namespaces(session: &Session) -> String {
     serde_json::to_string_pretty(&out).unwrap_or_default()
 }
 
+/// How many custom resource kinds `list_kinds` shows at most.
+const MAX_CUSTOM_KINDS: usize = 60;
+
 fn list_kinds(session: &Session) -> String {
-    let policy = session.policy();
+    kinds_table(&session.policy(), session.catalog())
+}
+
+/// The kinds the agent may read: the built-in ones it reads now, then the
+/// namespaced custom resources the cluster serves, with whether reading
+/// them still needs the user's approval (#65). Never Secrets, identity
+/// objects or cluster-scoped kinds.
+fn kinds_table(policy: &Policy<'_>, catalog: &ApiCatalog) -> String {
+    let offered = |kind: &&ResourceKind| {
+        kind.namespaced
+            && !is_core_secret(&kind.api.group, &kind.api.kind)
+            && !is_identity(&kind.api.group, &kind.api.kind)
+    };
+    let reference = |kind: &ResourceKind| KindRef {
+        kind: kind.api.kind.clone(),
+        api_version: Some(kind.api.api_version.clone()),
+    };
+    let row = |out: &mut String, kind: &ResourceKind| {
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}",
+            kind.api.kind, kind.api.api_version, kind.api.plural
+        );
+    };
     let mut out = String::from("KIND\tAPIVERSION\tRESOURCE\n");
-    for kind in session.catalog().kinds() {
-        let reference = KindRef {
-            kind: kind.api.kind.clone(),
-            api_version: Some(kind.api.api_version.clone()),
-        };
-        if policy.read_kind(&reference).is_ok() {
-            let _ = writeln!(
-                out,
-                "{}\t{}\t{}",
-                kind.api.kind, kind.api.api_version, kind.api.plural
-            );
+    for kind in catalog
+        .kinds()
+        .iter()
+        .filter(|k| k.is_builtin())
+        .filter(offered)
+    {
+        if policy.read_kind(&reference(kind)).is_ok() {
+            row(&mut out, kind);
         }
+    }
+    let custom: Vec<&ResourceKind> = catalog.custom_kinds().filter(offered).collect();
+    if custom.is_empty() {
+        return out;
+    }
+    let crds = Access {
+        crds: true,
+        ..Access::NONE
+    };
+    let note = match policy.within_access(crds, "Custom resources") {
+        Ok(()) => "access to custom resources is granted in this session".to_owned(),
+        Err(denial) if denial.code == DenialCode::NeedsAccess => {
+            "they need the user's approval: access to custom resources is not granted in this \
+             session yet; the first list_resources or get_resource call on one asks the user in \
+             Kubach"
+                .to_owned()
+        }
+        Err(denial) if denial.code == DenialCode::AccessRefused => {
+            "the user refused access to custom resources in this session; they cannot be read"
+                .to_owned()
+        }
+        Err(denial) => format!("not available: {}", denial.message),
+    };
+    let _ = write!(
+        out,
+        "\nCUSTOM RESOURCES ({}; {note}):\nKIND\tAPIVERSION\tRESOURCE\n",
+        custom.len()
+    );
+    for kind in custom.iter().take(MAX_CUSTOM_KINDS) {
+        row(&mut out, kind);
+    }
+    if custom.len() > MAX_CUSTOM_KINDS {
+        let _ = writeln!(
+            out,
+            "... and {} more custom kinds not shown; pass kind and apiVersion to list_resources \
+             for one of them",
+            custom.len() - MAX_CUSTOM_KINDS
+        );
     }
     out
 }
@@ -2410,6 +2472,41 @@ mod tests {
             ..Default::default()
         };
         assert!(has_more(&cut));
+    }
+
+    #[test]
+    fn list_kinds_caps_custom_kinds() {
+        use crate::testutil::{NS, kind, permissive, scope_with};
+        let total = MAX_CUSTOM_KINDS + 7;
+        let catalog = ApiCatalog::from_resources(
+            std::iter::once(kind("apps", "v1", "Deployment", "deployments", true)).chain(
+                (0..total).map(|i| {
+                    kind(
+                        &format!("g{i:03}.example.com"),
+                        "v1",
+                        "Thing",
+                        "things",
+                        true,
+                    )
+                }),
+            ),
+        );
+        let scope = scope_with(crate::settings::Profile::Deploy, &permissive(), &[NS]);
+        let policy = Policy::new(
+            &scope,
+            &catalog,
+            false,
+            crate::grants::Grants::new(),
+            crate::scope::SessionMode::ClientOnly,
+        );
+        let out = kinds_table(&policy, &catalog);
+        let rows = out.lines().filter(|l| l.starts_with("Thing\t")).count();
+        assert_eq!(rows, MAX_CUSTOM_KINDS, "{out}");
+        assert!(
+            out.contains(&format!("CUSTOM RESOURCES ({total};")),
+            "{out}"
+        );
+        assert!(out.contains("... and 7 more custom kinds"), "{out}");
     }
 
     #[test]

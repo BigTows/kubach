@@ -251,6 +251,9 @@ struct InstallArgs {
     namespace: Option<String>,
     #[serde(default)]
     create_namespace: bool,
+    /// Only show the agent what the install would do (#68).
+    #[serde(default)]
+    preview: bool,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +266,9 @@ struct UpgradeArgs {
     /// Changes merged into the release's values by Kubach (#22).
     values_patch: Option<String>,
     namespace: Option<String>,
+    /// Only show the agent what the upgrade would do (#68).
+    #[serde(default)]
+    preview: bool,
 }
 
 #[derive(Deserialize)]
@@ -1722,6 +1728,48 @@ async fn ask_user_credentials(
 }
 
 /// What the next step does after a yes to the user's credentials.
+/// What a preview leads to (#68).
+const PREVIEW_NEXT: &str = "Server-side dry run: nothing was installed or changed and the user \
+     was not asked. Call again without preview to do it; the user then sees this and approves.";
+
+/// What `preview: true` shows the agent (#68).
+struct PreviewText<'a> {
+    objects: &'a [String],
+    cluster: &'a [String],
+    findings: &'a [Finding],
+    /// Masked unified diff of the manifests.
+    diff: &'a str,
+    /// Masked values diff of an upgrade.
+    values_diff: Option<&'a str>,
+}
+
+fn preview_text(preview: &PreviewText<'_>, note: &str) -> String {
+    let mut out = json!({
+        "preview": true,
+        "note": note,
+        "objects": preview.objects,
+        "clusterObjects": preview.cluster,
+        "needsTheUsersAttention": preview
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.path, f.message))
+            .collect::<Vec<_>>(),
+        "diff": if preview.diff.trim().is_empty() {
+            "no object changes"
+        } else {
+            preview.diff
+        },
+    });
+    if let Some(diff) = preview.values_diff {
+        out["valuesDiff"] = json!(if diff.trim().is_empty() {
+            "the values did not change"
+        } else {
+            diff
+        });
+    }
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
 const DRY_RUN_NEXT: &str = "If you allow it, Kubach runs the server-side dry run with your \
                             credentials and shows its objects and diff in the next window; \
                             nothing changes until you approve that one.";
@@ -1841,7 +1889,33 @@ pub(crate) async fn install(
     let rendered = rendered(ctx, &binary, &template).await;
     let scan = scan(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let (previous_manifest, previous_label) = ("", "nothing installed");
+    let preview_values_diff: Option<&str> = None;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
+    if as_user && a.preview {
+        // The dry run would need the user's credentials: what helm
+        // template renders, without asking anyone.
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
+        let diff = masked_diff(
+            previous_manifest,
+            rendered.as_deref().unwrap_or_default(),
+            previous_label,
+            "helm template",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &objects,
+                cluster: &[],
+                findings: &scan.findings,
+                diff: &diff,
+                values_diff: preview_values_diff,
+            },
+            "Rendered with helm template, without the cluster: this chart needs the user's own \
+             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
+             dry run runs only when you call without preview and the user allows it.",
+        )));
+    }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
@@ -1905,6 +1979,25 @@ pub(crate) async fn install(
         namespaces: others.clone(),
         ..base_change
     };
+    if a.preview {
+        let diff = masked_diff(
+            "",
+            preview_release.manifest.expose(),
+            "nothing installed",
+            "after the install",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &preview.objects,
+                cluster: &preview.cluster,
+                findings: &preview.findings,
+                diff: &diff,
+                values_diff: None,
+            },
+            PREVIEW_NEXT,
+        )));
+    }
     let details = format!(
         "Objects of the server-side dry run:\n{}",
         bullet_list("+", &preview.objects)
@@ -2134,6 +2227,10 @@ pub(crate) async fn upgrade(
     };
     let rendered = rendered(ctx, &binary, &template).await;
     let current_manifest = release_manifest(&current);
+    let previous_label = format!("revision {}", current.revision);
+    let (previous_manifest, previous_label) =
+        (current.manifest.expose().as_str(), previous_label.as_str());
+    let preview_values_diff = Some(values.diff.as_str());
     let scan = scan(
         ctx,
         &namespace,
@@ -2142,6 +2239,30 @@ pub(crate) async fn upgrade(
     .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
+    if as_user && a.preview {
+        // The dry run would need the user's credentials: what helm
+        // template renders, without asking anyone.
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
+        let diff = masked_diff(
+            previous_manifest,
+            rendered.as_deref().unwrap_or_default(),
+            previous_label,
+            "helm template",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &objects,
+                cluster: &[],
+                findings: &scan.findings,
+                diff: &diff,
+                values_diff: preview_values_diff,
+            },
+            "Rendered with helm template, without the cluster: this chart needs the user's own \
+             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
+             dry run runs only when you call without preview and the user allows it.",
+        )));
+    }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
@@ -2197,6 +2318,18 @@ pub(crate) async fn upgrade(
         namespaces: others.clone(),
         ..base_change
     };
+    if a.preview {
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &preview.objects,
+                cluster: &preview.cluster,
+                findings: &preview.findings,
+                diff: &diff,
+                values_diff: Some(values.diff.as_str()),
+            },
+            PREVIEW_NEXT,
+        )));
+    }
     let details = if diff.trim().is_empty() {
         "The dry run changes no object.".to_owned()
     } else {

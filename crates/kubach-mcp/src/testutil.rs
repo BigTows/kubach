@@ -11,7 +11,8 @@ use crate::settings::{Profile, SecurityPolicy};
 pub const NS: &str = "kubach-test-mcp";
 pub const OTHER_NS: &str = "kubach-test-mcp-other";
 
-fn kind(
+/// A discovered kind with every verb.
+pub fn kind(
     group: &str,
     version: &str,
     kind: &str,
@@ -119,6 +120,14 @@ pub fn catalog() -> ApiCatalog {
         ),
         kind("argoproj.io", "v1alpha1", "AppProject", "appprojects", true),
         kind("other.example.com", "v1", "Widget", "widgets", true),
+        kind("cert-manager.io", "v1", "Certificate", "certificates", true),
+        kind(
+            "cert-manager.io",
+            "v1",
+            "ClusterIssuer",
+            "clusterissuers",
+            false,
+        ),
         kind("networking.k8s.io", "v1", "Ingress", "ingresses", true),
         kind(
             "networking.k8s.io",

@@ -2945,6 +2945,102 @@ async fn client_only_never_offers_dont_ask_again() {
     assert!(f.server.session().remembered().is_empty());
 }
 
+// ------------------------------------------------ custom resource kinds (#65)
+
+fn without_crds() -> SecurityPolicy {
+    SecurityPolicy::with_minimum(Access {
+        crds: false,
+        ..Access::ALL
+    })
+}
+
+/// The two tables of `list_kinds`: built-in rows, then custom rows and the
+/// header line of the custom section.
+fn kinds_of(text: &str) -> (String, String) {
+    let (builtin, custom) = text.split_once("\nCUSTOM RESOURCES").unwrap_or((text, ""));
+    (builtin.to_owned(), custom.to_owned())
+}
+
+#[tokio::test]
+async fn list_kinds_offers_custom_resources_that_need_approval() {
+    let f = session_fixture(Profile::Deploy, without_crds(), false, false).await;
+    let outcome = f.server.call("test-agent", "list_kinds", Map::new()).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let (builtin, custom) = kinds_of(&outcome.text);
+    assert!(
+        builtin.contains("Deployment\tapps/v1\tdeployments"),
+        "{builtin}"
+    );
+    assert!(!builtin.contains("example.com"), "{builtin}");
+    assert!(
+        custom.contains("Widget\texample.com/v1\twidgets"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Widget\tother.example.com/v1\twidgets"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Certificate\tcert-manager.io/v1\tcertificates"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Application\targoproj.io/v1alpha1"),
+        "{custom}"
+    );
+    assert!(custom.contains("need the user's approval"), "{custom}");
+    assert!(
+        custom.contains("list_resources or get_resource"),
+        "{custom}"
+    );
+    // Never cluster-scoped kinds, Secrets or identity objects.
+    for hidden in [
+        "ClusterIssuer",
+        "Secret",
+        "ServiceAccount",
+        "Role",
+        "Namespace",
+        "Node",
+    ] {
+        assert!(
+            !outcome
+                .text
+                .lines()
+                .any(|l| l.starts_with(&format!("{hidden}\t"))),
+            "{hidden}: {}",
+            outcome.text
+        );
+    }
+    // Listing kinds asks nobody and reaches no API.
+    assert!(f.confirmer.requests().is_empty());
+    assert!(f.api.requests().is_empty());
+}
+
+#[tokio::test]
+async fn list_kinds_says_when_custom_resources_are_granted() {
+    let f = session_fixture(Profile::Deploy, permissive(), false, false).await;
+    let outcome = f.server.call("test-agent", "list_kinds", Map::new()).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let (builtin, custom) = kinds_of(&outcome.text);
+    assert!(custom.contains("is granted in this session"), "{custom}");
+    assert!(!custom.contains("approval"), "{custom}");
+    assert!(custom.contains("Widget\texample.com/v1"), "{custom}");
+    // Custom kinds are listed once, in their own section.
+    assert!(!builtin.contains("example.com"), "{builtin}");
+    // Access to custom resources reads built-in kinds beyond the
+    // allowlist too, but never identity objects.
+    for hidden in ["ServiceAccount", "Role", "RoleBinding", "Secret"] {
+        assert!(
+            !outcome
+                .text
+                .lines()
+                .any(|l| l.starts_with(&format!("{hidden}\t"))),
+            "{hidden}: {}",
+            outcome.text
+        );
+    }
+}
+
 /// The texts the agent reads agree with the policy (#57): a Deploy-profile
 /// session has access to changes, yet the policy confirms each one, so
 /// nothing may say changes run without asking.

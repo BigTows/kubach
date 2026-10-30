@@ -582,6 +582,11 @@ fn kind_props(extra: Value) -> Value {
     props
 }
 
+/// How helm_install and helm_upgrade describe `preview` (#68).
+const PREVIEW_HELP: &str = "Only show what would change: the server-side dry run's objects and \
+     masked manifest diff (and values diff), without asking the user or changing anything. Call \
+     again without preview to do it";
+
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
      one. Any namespace works; list_namespaces shows the ones Kubach knows of";
@@ -609,7 +614,11 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_kinds",
-            description: "Namespaced resource kinds available in this session.",
+            description: "Namespaced resource kinds available in this session: the built-in \
+                          ones you can read, then the custom resources (CRDs) the cluster \
+                          serves, with apiVersion, and whether reading them still needs the \
+                          user's approval (the first list_resources or get_resource call on one \
+                          asks for it). Secrets, RBAC and cluster-scoped kinds are not listed.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -1091,6 +1100,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string", "description": "Chart version; the latest stable by default"},
                         "values": {"type": "string", "description": "Values as one YAML mapping (no file paths)"},
                         "createNamespace": {"type": "boolean", "default": false},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()
@@ -1122,6 +1132,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string"},
                         "values": {"type": "string", "description": "Values as one YAML mapping; they replace all of the release's values. Not with valuesPatch"},
                         "valuesPatch": {"type": "string", "description": "Only the changes, as one YAML mapping merged into the release's values (null removes a key). Not with values"},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()
