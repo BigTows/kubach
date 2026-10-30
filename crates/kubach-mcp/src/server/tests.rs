@@ -2944,3 +2944,100 @@ async fn client_only_never_offers_dont_ask_again() {
     assert!(f.confirmer.requests().iter().all(|r| !r.allow_remember));
     assert!(f.server.session().remembered().is_empty());
 }
+
+/// The texts the agent reads agree with the policy (#57): a Deploy-profile
+/// session has access to changes, yet the policy confirms each one, so
+/// nothing may say changes run without asking.
+#[tokio::test]
+async fn texts_say_changes_are_confirmed_as_the_policy_does() {
+    use crate::policy::{Confirmation, ForwardPortRef, KindRef, Request};
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let session = f.server.session();
+    assert_eq!(session.access().profile, Profile::Deploy);
+    let ns = Some(NS.to_owned());
+    let changes = [
+        Request::Apply {
+            yaml: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n".into(),
+            namespace: ns.clone(),
+            dry_run: false,
+        },
+        Request::Scale {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+            replicas: 1,
+        },
+        Request::Restart {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+        },
+        Request::Delete {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+        },
+        Request::Exec {
+            pod: "web-0".into(),
+            container: None,
+            namespace: ns.clone(),
+            command: vec!["id".into()],
+        },
+        Request::PortForward {
+            namespace: ns.clone(),
+            target: "pod/web-0".into(),
+            port: ForwardPortRef::Number(8080),
+            local_port: None,
+        },
+        Request::HelmChange {
+            namespace: ns.clone(),
+            release: "web".into(),
+        },
+    ];
+    for request in &changes {
+        let allowed = session
+            .policy()
+            .check(request)
+            .unwrap_or_else(|denial| panic!("{request:?}: {denial:?}"));
+        assert_eq!(allowed.confirmation, Confirmation::Required, "{request:?}");
+    }
+
+    let instructions = f.server.instructions();
+    let info = f.server.call("agent", "session_info", Map::new()).await;
+    assert!(!info.is_error, "{}", info.text);
+    for text in [&instructions, &info.text] {
+        assert!(!text.contains("Without asking"), "{text}");
+        assert!(text.contains("approves no change"), "{text}");
+        assert!(text.contains("one by one"), "{text}");
+        assert!(text.contains("don't ask again"), "{text}");
+    }
+    assert!(instructions.contains("even within your access"));
+
+    // A tool beyond the access: allowing the access approves no call.
+    let read_only = fixture(Profile::ReadOnly, permissive(), false).await;
+    let tools = read_only.server.tools();
+    let description = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref().map(str::to_owned))
+            .unwrap_or_else(|| panic!("{name} is not offered"))
+    };
+    for change in [
+        "apply_manifest",
+        "scale",
+        "rollout_restart",
+        "delete_resource",
+        "exec",
+        "port_forward_start",
+    ] {
+        assert!(
+            description(change).contains("each one is still confirmed"),
+            "{change}: {}",
+            description(change)
+        );
+    }
+    let logs = description("get_logs");
+    assert!(logs.contains("Requires your approval in Kubach"), "{logs}");
+    assert!(!logs.contains("each one is still confirmed"), "{logs}");
+}

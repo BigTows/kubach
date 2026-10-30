@@ -541,7 +541,7 @@ async fn serve(options: Options) -> Result<(), String> {
 
     let scope = session.scope();
     eprintln!(
-        "kubach mcp: session {} on {} (without asking: {}), until {}; {}",
+        "kubach mcp: session {} on {} (access: {}), until {}; {}",
         session.id(),
         scope.context,
         session.access(),
@@ -679,7 +679,7 @@ impl StdioChooser {
         );
         server.set_helm(super::helm_env(&self.settings, true));
         eprintln!(
-            "kubach mcp: session {} on {name} (without asking: {}), chosen by the agent and \
+            "kubach mcp: session {} on {name} (access: {}), chosen by the agent and \
              approved in Kubach",
             session.id(),
             session.access(),
