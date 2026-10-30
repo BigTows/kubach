@@ -69,6 +69,9 @@ pub trait ContextChooser: Send + Sync {
 pub struct SharedServer {
     current: Arc<RwLock<Option<McpServer>>>,
     chooser: Arc<RwLock<Option<Arc<dyn ContextChooser>>>>,
+    /// Why the last session ended, told to the agent until a new one
+    /// starts: its tools vanish with it (#56).
+    ended: Arc<RwLock<Option<String>>>,
 }
 
 impl SharedServer {
@@ -78,14 +81,56 @@ impl SharedServer {
 
     /// Serves `server` from the next request on; `None` serves nothing.
     pub fn set(&self, server: Option<McpServer>) {
+        if server.is_some() {
+            *sync::write(&self.ended) = None;
+        }
         *sync::write(&self.current) = server;
+    }
+
+    /// Stops serving the session, and tells the agent on its next call
+    /// that it ended and `why` (the user revoked it, the vault locked…).
+    pub fn end(&self, why: &str) {
+        let previous = sync::write(&self.current).take();
+        if let Some(server) = previous {
+            self.record_end(&server, why);
+        }
+    }
+
+    fn record_end(&self, server: &McpServer, why: &str) {
+        let context = &server.session().scope().context;
+        *sync::write(&self.ended) = Some(format!(
+            "The Kubach session on context {context} ended: {why}. Its tools are gone; call \
+             use_context to start a new session (the user approves it in Kubach again)."
+        ));
     }
 
     /// The active session's server, if its session is still active.
     pub fn get(&self) -> Option<McpServer> {
-        sync::read(&self.current)
-            .clone()
-            .filter(|server| server.session().is_active())
+        let server = sync::read(&self.current).clone()?;
+        if server.session().is_active() {
+            return Some(server);
+        }
+        // It closed itself (TTL) or was closed under us: say why, once.
+        let why = if server.session().scope().expired() {
+            "its time limit ran out"
+        } else {
+            "it was closed"
+        };
+        let mut current = sync::write(&self.current);
+        if current
+            .as_ref()
+            .is_some_and(|c| c.session().id() == server.session().id())
+        {
+            *current = None;
+            drop(current);
+            self.record_end(&server, why);
+        }
+        None
+    }
+
+    /// Why the last session ended, while no new one runs.
+    pub fn ended(&self) -> Option<String> {
+        sync::read(&self.ended).clone()
     }
 
     /// Lets the agent pick the context with `list_contexts` and
@@ -168,6 +213,7 @@ impl SharedServer {
                     Ok(server) => {
                         let text =
                             format!("The user allowed context {name}. {}", server.instructions());
+                        *sync::write(&self.ended) = None;
                         let previous = sync::write(&self.current).replace(server);
                         if let Some(previous) = previous {
                             let session = previous.session().clone();
@@ -181,10 +227,13 @@ impl SharedServer {
                 }
             }
             "session_info" if self.get().is_none() => Some((
-                "No context chosen yet: call list_contexts, then use_context. The user approves \
-                 the context in the Kubach window; anything beyond the context's minimal \
-                 access is asked for later, when a call needs it."
-                    .into(),
+                match self.ended() {
+                    Some(ended) => ended,
+                    None => "No context chosen yet: call list_contexts, then use_context. The \
+                         user approves the context in the Kubach window; anything beyond the \
+                         context's minimal access is asked for later, when a call needs it."
+                        .into(),
+                },
                 false,
                 false,
             )),
@@ -289,10 +338,16 @@ impl ServerHandler for SharedServer {
             .into());
         }
         let Some(server) = self.get() else {
-            let text = if self.chooser().is_some() {
-                "No context chosen yet: call list_contexts, then use_context."
-            } else {
-                NO_SESSION
+            let text = match self.ended() {
+                // The client still lists the session's tools: refresh it.
+                Some(ended) => {
+                    let _ = context.peer.notify_tool_list_changed().await;
+                    ended
+                }
+                None if self.chooser().is_some() => {
+                    "No context chosen yet: call list_contexts, then use_context.".into()
+                }
+                None => NO_SESSION.into(),
             };
             return Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into());
         };
@@ -425,5 +480,40 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn an_ended_session_tells_the_agent_why() {
+        let shared = SharedServer::new();
+        shared.set_chooser(std::sync::Arc::new(Chooser::default()));
+        shared
+            .call_context_tool("agent", "use_context", &context("dev"))
+            .await
+            .unwrap();
+        assert!(shared.ended().is_none());
+        // The app ends it (revoked, vault locked, TTL): the reason stays.
+        shared.end("the user ended it in Kubach");
+        assert!(shared.get().is_none());
+        let ended = shared.ended().unwrap();
+        assert!(ended.contains("context dev ended"), "{ended}");
+        assert!(ended.contains("the user ended it in Kubach"), "{ended}");
+        assert!(ended.contains("use_context"), "{ended}");
+        let (text, error, _) = shared
+            .call_context_tool("agent", "session_info", &Map::new())
+            .await
+            .unwrap();
+        assert!(!error);
+        assert_eq!(text, ended);
+        // A new session forgets it.
+        shared
+            .call_context_tool("agent", "use_context", &context("dev"))
+            .await
+            .unwrap();
+        assert!(shared.ended().is_none());
+        // A session closed under the shared server is noticed on the way.
+        let session = shared.get().unwrap().session().clone();
+        session.close().await.unwrap();
+        assert!(shared.get().is_none());
+        assert!(shared.ended().unwrap().contains("it was closed"));
     }
 }
