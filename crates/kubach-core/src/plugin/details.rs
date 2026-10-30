@@ -261,12 +261,14 @@ pub struct ContainerInfo {
     pub role: ContainerRole,
     pub image: String,
     pub phase: ContainerPhase,
-    /// The previous run, e.g. `Terminated: Error (exit code 1)`.
+    /// The previous run, e.g. `Terminated: Error (exit code 1) · started …
+    /// · finished …`.
     pub last_state: Option<String>,
     pub ready: Option<bool>,
     pub restarts: i32,
     pub ports: Vec<String>,
-    /// `(Liveness, http-get :80/ every 10s)`.
+    /// `(Liveness, http-get :80/ · delay 0s · timeout 1s · every 10s ·
+    /// failure 3 · success 1)`, startup, liveness, readiness in that order.
     pub probes: Vec<(String, String)>,
     pub requests: String,
     pub limits: String,
@@ -416,6 +418,34 @@ impl ContainerInfo {
     /// `Running`, `Waiting: CrashLoopBackOff`, `Terminated: Completed (exit code 0)`.
     pub fn state_text(&self) -> String {
         self.phase.text()
+    }
+
+    /// The container for text output (MCP): a header line, then indented
+    /// state, readiness, restarts, the previous run and every probe.
+    /// Containers that may have probes but have none say so.
+    pub fn text_lines(&self) -> Vec<String> {
+        let mut state = self.state_text();
+        if let ContainerPhase::Running { since: Some(since) } = &self.phase {
+            state.push_str(&format!(" since {since}"));
+        }
+        let mut lines = vec![
+            format!("{} ({:?}): {}", self.name, self.role, self.image),
+            format!("  State: {state}"),
+        ];
+        if let Some(ready) = self.ready {
+            lines.push(format!("  Ready: {ready}"));
+        }
+        lines.push(format!("  Restarts: {}", self.restarts));
+        if let Some(last) = &self.last_state {
+            lines.push(format!("  Last state: {last}"));
+        }
+        for (name, probe) in &self.probes {
+            lines.push(format!("  {name} probe: {probe}"));
+        }
+        if self.probes.is_empty() && self.role != ContainerRole::Init {
+            lines.push("  Probes: none".into());
+        }
+        lines
     }
 }
 
@@ -752,16 +782,7 @@ impl DetailSection {
                 .collect(),
             SectionBody::Containers(containers) => containers
                 .iter()
-                .map(|c| {
-                    format!(
-                        "{} ({:?}): {} · {} · {} restarts",
-                        c.name,
-                        c.role,
-                        c.image,
-                        c.state_text(),
-                        c.restarts
-                    )
-                })
+                .flat_map(ContainerInfo::text_lines)
                 .collect(),
             SectionBody::Related(related) => vec![match &related.filter {
                 RelatedFilter::Names(names) => format!("{} {}", related.kind, names.join(", ")),
