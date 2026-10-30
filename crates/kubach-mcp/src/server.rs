@@ -401,7 +401,8 @@ impl McpServer {
             "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
              {access}. Access says which tools you may call without asking for more; it \
              approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
-             and calls across all namespaces are not available. {secrets}{writes} Call \
+             and calls across all namespaces are not available, except nodes: list_nodes, \
+             describe_node and top_nodes read them (they need access to nodes). {secrets}{writes} Call \
              `session_info` for details.",
             scope.context
         )
@@ -525,6 +526,7 @@ fn tool_access(name: &str) -> Option<Access> {
             profile,
             secrets,
             crds: false,
+            nodes: false,
         })
     };
     match name {
@@ -539,6 +541,10 @@ fn tool_access(name: &str) -> Option<Access> {
         | "helm_list_releases"
         | "helm_release_history"
         | "helm_get_values" => need(Profile::ReadOnly, true),
+        "list_nodes" | "describe_node" | "top_nodes" => Some(Access {
+            nodes: true,
+            ..Access::NONE
+        }),
         _ => None,
     }
 }
@@ -707,6 +713,34 @@ fn catalog() -> Vec<ToolSpec> {
             name: "top_pods",
             description: "CPU and memory usage of pods (needs metrics-server).",
             schema: object_schema(ns.clone(), &[]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "list_nodes",
+            description: "Nodes of the cluster: status, roles, age, version and the conditions \
+                          that are off (not Ready, memory/disk/PID pressure, cordoned). Read with \
+                          the user's credentials once they allowed nodes.",
+            schema: object_schema(json!({}), &[]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "describe_node",
+            description: "One node: conditions with reasons and messages, capacity and \
+                          allocatable, what its pods request and limit against it, taints, \
+                          system info, the node's events and pods evicted from it (memory, disk \
+                          or PID pressure). Pods of namespaces this session does not read are \
+                          only counted.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "top_nodes",
+            description: "CPU and memory used per node, and as % of allocatable, like kubectl \
+                          top nodes (needs metrics-server).",
+            schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
         },

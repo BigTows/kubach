@@ -147,6 +147,10 @@ impl SettingsScreen {
             t!("settings-minimum-crds"),
             t!("settings-minimum-crds-description"),
         );
+        let (nodes_title, nodes_description) = (
+            t!("settings-minimum-nodes"),
+            t!("settings-minimum-nodes-description"),
+        );
         let (reset_title, reset_description) = (
             t!("settings-minimum-reset"),
             t!("settings-minimum-reset-description"),
@@ -194,6 +198,19 @@ impl SettingsScreen {
                     .default_value(defaults.minimum_crds)
                     .on_change(policy_setter(&self.settings, &key, |p, on| {
                         p.minimum_crds = on
+                    })),
+            ))
+            .entry(Entry::new(
+                searchable(
+                    "minimal minimum nodes node conditions pressure eviction top usage default",
+                    &[&nodes_title, &nodes_description],
+                ),
+                ToggleRow::new("minimum-nodes", nodes_title)
+                    .description(nodes_description)
+                    .checked(policy.minimum_nodes)
+                    .default_value(defaults.minimum_nodes)
+                    .on_change(policy_setter(&self.settings, &key, |p, on| {
+                        p.minimum_nodes = on
                     })),
             ))
             .entry(Entry::new(

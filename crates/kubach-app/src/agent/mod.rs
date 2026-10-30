@@ -1570,6 +1570,7 @@ impl AgentState {
             level: raise.profile.into(),
             secrets: raise.secrets,
             crds: raise.crds,
+            nodes: raise.nodes,
         };
         let time = k8s_openapi::jiff::Timestamp::now().to_string();
         store.update(cx, |store, cx| {
@@ -1713,7 +1714,7 @@ pub fn level_label(profile: Profile) -> String {
 }
 
 /// What `access` covers, in the interface language: the level, plus
-/// Secrets and custom resources when it has them.
+/// Secrets, custom resources and nodes when it has them.
 pub fn access_label(access: kubach_mcp::Access) -> String {
     let mut parts = vec![level_label(access.profile)];
     if access.secrets {
@@ -1721,6 +1722,9 @@ pub fn access_label(access: kubach_mcp::Access) -> String {
     }
     if access.crds {
         parts.push(t!("agent-access-crds"));
+    }
+    if access.nodes {
+        parts.push(t!("agent-access-nodes"));
     }
     parts.join(" + ")
 }
@@ -1752,6 +1756,9 @@ pub fn raise_label(raise: kubach_mcp::Access) -> String {
     }
     if raise.crds {
         parts.push(t!("agent-access-crds"));
+    }
+    if raise.nodes {
+        parts.push(t!("agent-access-nodes"));
     }
     parts.join(" + ")
 }

@@ -33,6 +33,10 @@ pub struct Access {
     pub secrets: bool,
     /// Kinds beyond the built-in allowlist: custom resources (#192).
     pub crds: bool,
+    /// Nodes, their events and usage (#61). Cluster-scoped, so read with
+    /// the user's credentials, by Kubach's fixed read-only calls.
+    #[serde(default)]
+    pub nodes: bool,
 }
 
 impl Default for Access {
@@ -47,6 +51,7 @@ impl Access {
         profile: Profile::ReadOnly,
         secrets: false,
         crds: false,
+        nodes: false,
     };
 
     /// Only the profile.
@@ -55,6 +60,7 @@ impl Access {
             profile,
             secrets: false,
             crds: false,
+            nodes: false,
         }
     }
 
@@ -63,6 +69,7 @@ impl Access {
         profile: Profile::Deploy,
         secrets: true,
         crds: true,
+        nodes: true,
     };
 
     /// Both together.
@@ -71,6 +78,7 @@ impl Access {
             profile: self.profile.max(other.profile),
             secrets: self.secrets || other.secrets,
             crds: self.crds || other.crds,
+            nodes: self.nodes || other.nodes,
         }
     }
 
@@ -87,6 +95,7 @@ impl Access {
         self.profile >= other.profile
             && (self.secrets || !other.secrets)
             && (self.crds || !other.crds)
+            && (self.nodes || !other.nodes)
     }
 
     /// What `needed` asks for beyond `self`; `None` when covered. The
@@ -103,6 +112,7 @@ impl Access {
             },
             secrets: needed.secrets && !self.secrets,
             crds: needed.crds && !self.crds,
+            nodes: needed.nodes && !self.nodes,
         })
     }
 
@@ -121,6 +131,11 @@ impl Access {
         }
         if self.crds {
             parts.push("custom resources (CRDs)".into());
+        }
+        if self.nodes {
+            parts.push(
+                "nodes: conditions, events and usage (read with the user's credentials)".into(),
+            );
         }
         parts
     }
@@ -177,7 +192,8 @@ mod tests {
             Some(Access {
                 profile: Profile::ReadOnly,
                 secrets: true,
-                crds: false
+                crds: false,
+                nodes: false,
             })
         );
         assert_eq!(
@@ -201,7 +217,8 @@ mod tests {
             Access {
                 profile: Profile::Debug,
                 secrets: true,
-                crds: true
+                crds: true,
+                nodes: true,
             }
         );
         assert_eq!(Access::NONE.capped(Profile::Deploy), Access::NONE);
@@ -214,6 +231,7 @@ mod tests {
                 profile: Profile::Deploy,
                 secrets: true,
                 crds: false,
+                nodes: false,
             }],
             ..Raises::default()
         };

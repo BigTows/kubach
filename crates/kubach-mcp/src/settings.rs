@@ -161,6 +161,7 @@ impl From<&kubach_core::settings::ContextPolicy> for SecurityPolicy {
                 profile: Profile::from(minimum.level),
                 secrets: minimum.secrets,
                 crds: minimum.crds,
+                nodes: minimum.nodes,
             },
             hide_secret_values: stored.hide_secret_values,
             temporary_objects: true,
@@ -207,6 +208,7 @@ mod tests {
             minimum_access: AgentLevel::Changes,
             minimum_secrets: true,
             minimum_crds: true,
+            minimum_nodes: true,
             hide_secret_values: false,
             mcp_enabled: false,
         });
