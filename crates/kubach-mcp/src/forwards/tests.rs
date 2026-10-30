@@ -1,5 +1,5 @@
 //! The port-forward tools (#17) against a fake API server that serves pod
-//! `web-0` and Service `web`. Forwards listen for real, on 127.0.0.1;
+//! `web-0` (or the pods a test gives) and Service `web`. Forwards listen for real, on 127.0.0.1;
 //! connecting is not tested here (it needs a cluster, see
 //! `tests/port_forward_cluster.rs`).
 
@@ -45,6 +45,12 @@ fn service() -> Value {
 
 /// Serves `pod()` and `service()` and records `METHOD path` of each request.
 async fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
+    fake_api_with(vec![pod()]).await
+}
+
+/// Serves `pods` (listed for any selector) and `service()`.
+async fn fake_api_with(pods: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let pods = Arc::new(pods);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -52,6 +58,7 @@ async fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let log = log.clone();
+            let served = pods.clone();
             tokio::spawn(async move {
                 let (read, mut write) = stream.into_split();
                 let mut reader = BufReader::new(read);
@@ -82,11 +89,14 @@ async fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
                     let path = parts.next().unwrap_or("").to_owned();
                     log.lock().unwrap().push(format!("{method} {path}"));
                     let pods = format!("/api/v1/namespaces/{NS}/pods");
-                    let (status, body) = if path == format!("{pods}/web-0") {
-                        ("200 OK", pod().to_string())
+                    let named = path
+                        .strip_prefix(&format!("{pods}/"))
+                        .and_then(|name| served.iter().find(|p| p["metadata"]["name"] == name));
+                    let (status, body) = if let Some(pod) = named {
+                        ("200 OK", pod.to_string())
                     } else if path.starts_with(&format!("{pods}?")) {
                         let list = json!({"apiVersion": "v1", "kind": "PodList",
-                                          "metadata": {}, "items": [pod()]});
+                                          "metadata": {}, "items": *served});
                         ("200 OK", list.to_string())
                     } else if path == format!("/api/v1/namespaces/{NS}/services/web") {
                         ("200 OK", service().to_string())
@@ -123,7 +133,12 @@ struct Fixture {
 
 /// A debug-level session reading `NS`, with every RBAC right.
 async fn fixture(approve: bool) -> Fixture {
-    let (url, requests) = fake_api().await;
+    fixture_with(approve, vec![pod()]).await
+}
+
+/// [`fixture`] with the API serving `pods`.
+async fn fixture_with(approve: bool, pods: Vec<Value>) -> Fixture {
+    let (url, requests) = fake_api_with(pods).await;
     let client = Client::try_from(Config::new(url.parse().unwrap())).unwrap();
     let scope = scope_with(Profile::Debug, &permissive(), &[NS]);
     let capabilities: HashSet<Capability> = Capability::ALL.into_iter().collect();
@@ -270,7 +285,7 @@ async fn a_confirmed_forward_listens_on_loopback_and_ends_with_the_session() {
 }
 
 #[tokio::test]
-async fn a_rejected_forward_reads_and_opens_nothing() {
+async fn a_rejected_forward_opens_nothing() {
     let f = fixture(false).await;
     let outcome = f
         .server
@@ -282,8 +297,182 @@ async fn a_rejected_forward_reads_and_opens_nothing() {
         .await;
     assert!(outcome.is_error);
     assert!(f.server.session().forwards().manager().list().is_empty());
-    assert!(f.requests.lock().unwrap().is_empty());
+    // The target was read to check it (#60), nothing more.
+    let requests = f.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.starts_with("GET ") && !r.contains("portforward")),
+        "{requests:?}"
+    );
     assert!(!f.server.session().grants().is_forwarding(NS));
+}
+
+// ------------------------------------- targets that cannot work (#60)
+
+/// A pod `name` of the Service with `status`.
+fn pod_with(name: &str, status: Value) -> Value {
+    let mut pod = pod();
+    pod["metadata"]["name"] = json!(name);
+    pod["status"] = status;
+    pod
+}
+
+fn crash_looping(name: &str) -> Value {
+    pod_with(
+        name,
+        json!({
+            "phase": "Running",
+            "conditions": [
+                {"type": "Ready", "status": "False", "reason": "ContainersNotReady"},
+                {"type": "PodScheduled", "status": "True"},
+            ],
+            "containerStatuses": [{
+                "name": "app", "image": "nginx", "imageID": "", "ready": false,
+                "restartCount": 7,
+                "state": {"waiting": {"reason": "CrashLoopBackOff",
+                                      "message": "back-off 5m0s restarting failed container"}},
+            }],
+        }),
+    )
+}
+
+fn unschedulable(name: &str) -> Value {
+    pod_with(
+        name,
+        json!({
+            "phase": "Pending",
+            "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                            "message": "0/3 nodes are available: 3 Insufficient cpu."}],
+        }),
+    )
+}
+
+fn running_unready(name: &str) -> Value {
+    pod_with(
+        name,
+        json!({
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "False"}],
+            "containerStatuses": [{
+                "name": "app", "image": "nginx", "imageID": "", "ready": false,
+                "restartCount": 0, "started": true,
+                "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}},
+            }],
+        }),
+    )
+}
+
+/// Calls `port_forward_start` on `pods`; returns the error text, after
+/// checking the user was not asked and nothing was forwarded.
+async fn refused(pods: Vec<Value>, target: &str, port: Value) -> String {
+    let f = fixture_with(true, pods).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "port_forward_start",
+            args(json!({"target": target, "port": port})),
+        )
+        .await;
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert!(
+        !f.confirmer
+            .requests()
+            .iter()
+            .any(|r| matches!(r.kind, RequestKind::PortForward { .. })),
+        "the user was asked: {}",
+        outcome.text
+    );
+    assert!(f.server.session().forwards().manager().list().is_empty());
+    assert!(!f.server.session().grants().is_forwarding(NS));
+    let requests = f.requests.lock().unwrap().clone();
+    assert!(
+        requests.iter().all(|r| !r.contains("portforward")),
+        "{requests:?}"
+    );
+    outcome.text
+}
+
+#[tokio::test]
+async fn a_crash_looping_pod_is_refused_with_its_reason() {
+    let text = refused(vec![crash_looping("web-0")], "pod/web-0", json!(8080)).await;
+    for part in [
+        "pod web-0 is not ready",
+        "phase Running",
+        "CrashLoopBackOff",
+        "0/1 containers ready",
+        "container app: waiting",
+        "back-off 5m0s",
+        "7 restarts",
+        "user was not asked",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_pending_pod_is_refused_with_why_it_is_not_scheduled() {
+    let text = refused(vec![unschedulable("web-0")], "pod/web-0", json!(8080)).await;
+    assert!(text.contains("phase Pending"), "{text}");
+    assert!(text.contains("PodScheduled is False"), "{text}");
+    assert!(text.contains("Insufficient cpu"), "{text}");
+}
+
+#[tokio::test]
+async fn a_running_pod_that_is_not_ready_is_refused() {
+    let text = refused(vec![running_unready("web-0")], "pod/web-0", json!(8080)).await;
+    assert!(text.contains("phase Running"), "{text}");
+    assert!(
+        text.contains("container app: running, but not ready"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_service_without_ready_pods_is_refused_with_its_pods() {
+    let pods = vec![crash_looping("web-1"), unschedulable("web-2")];
+    let text = refused(pods, "service/web", json!("http")).await;
+    assert!(
+        text.contains("none of the 2 pods of svc/web is ready"),
+        "{text}"
+    );
+    assert!(text.contains("no ready endpoints"), "{text}");
+    assert!(
+        text.contains("pod web-1") && text.contains("CrashLoopBackOff"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pod web-2") && text.contains("Pending"),
+        "{text}"
+    );
+
+    let text = refused(Vec::new(), "service/web", json!(80)).await;
+    assert!(text.contains("no pods match svc/web"), "{text}");
+    assert!(text.contains("selector app=web"), "{text}");
+}
+
+#[tokio::test]
+async fn a_port_that_is_not_there_is_refused_with_the_ports_that_are() {
+    let text = refused(vec![pod()], "service/web", json!(8080)).await;
+    assert!(text.contains("service web has no port 8080"), "{text}");
+    assert!(text.contains("svc/web has TCP ports 80 (http)"), "{text}");
+
+    let text = refused(vec![pod()], "pod/web-0", json!("metrics")).await;
+    assert!(text.contains("no TCP port named metrics"), "{text}");
+    assert!(
+        text.contains("pod/web-0 has TCP ports 8080 (http)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_ready_pod_has_no_problem() {
+    let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_value(pod()).unwrap();
+    assert_eq!(super::check::pod_problem(&pod), None);
+    let pod: k8s_openapi::api::core::v1::Pod =
+        serde_json::from_value(crash_looping("web-0")).unwrap();
+    assert!(super::check::pod_problem(&pod).is_some());
 }
 
 #[tokio::test]
