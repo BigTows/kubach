@@ -322,34 +322,90 @@ fn int_or_string(v: &IntOrString) -> String {
     }
 }
 
-/// `http-get :80/healthz · every 10s · delay 5s`.
+/// `http-get :80/healthz · delay 0s · timeout 1s · every 10s · failure 3 ·
+/// success 1`: the defaults Kubernetes applies are spelled out, as a short
+/// timeout or a missing delay is what usually makes a probe kill a pod.
 fn probe_text(p: &Probe) -> String {
     let action = if let Some(h) = &p.http_get {
+        let scheme = h
+            .scheme
+            .as_deref()
+            .filter(|s| !s.eq_ignore_ascii_case("HTTP"))
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
         format!(
-            "http-get :{}{}",
+            "http-get {}:{}{}{scheme}",
+            h.host.as_deref().unwrap_or_default(),
             int_or_string(&h.port),
             h.path.as_deref().unwrap_or("/")
         )
     } else if let Some(t) = &p.tcp_socket {
-        format!("tcp :{}", int_or_string(&t.port))
+        format!(
+            "tcp {}:{}",
+            t.host.as_deref().unwrap_or_default(),
+            int_or_string(&t.port)
+        )
     } else if let Some(g) = &p.grpc {
-        format!("grpc :{}", g.port)
+        match g.service.as_deref().filter(|s| !s.is_empty()) {
+            Some(service) => format!("grpc :{} service {service}", g.port),
+            None => format!("grpc :{}", g.port),
+        }
     } else if let Some(e) = &p.exec {
         format!("exec {}", e.command.clone().unwrap_or_default().join(" "))
     } else {
         "unknown".into()
     };
-    let mut parts = vec![action, format!("every {}s", p.period_seconds.unwrap_or(10))];
-    if let Some(delay) = p.initial_delay_seconds.filter(|d| *d > 0) {
-        parts.push(format!("delay {delay}s"));
-    }
-    if let Some(timeout) = p.timeout_seconds.filter(|t| *t != 1) {
-        parts.push(format!("timeout {timeout}s"));
+    let mut parts = vec![
+        action,
+        format!("delay {}s", p.initial_delay_seconds.unwrap_or(0)),
+        format!("timeout {}s", p.timeout_seconds.unwrap_or(1)),
+        format!("every {}s", p.period_seconds.unwrap_or(10)),
+        format!("failure {}", p.failure_threshold.unwrap_or(3)),
+        format!("success {}", p.success_threshold.unwrap_or(1)),
+    ];
+    if let Some(grace) = p.termination_grace_period_seconds {
+        parts.push(format!("grace {grace}s"));
     }
     parts.join(" · ")
 }
 
-fn probes(c: &Container) -> Vec<(String, String)> {
+/// Longest termination message kept in [`last_state_text`].
+const MESSAGE_LIMIT: usize = 200;
+
+/// The previous run of a container: `Terminated: OOMKilled (exit code 137,
+/// signal 9) · started … · finished …`, with the first line of its
+/// termination message.
+fn last_state_text(state: &ContainerState) -> Option<String> {
+    let t = state.terminated.as_ref()?;
+    let mut code = format!("exit code {}", t.exit_code);
+    if let Some(signal) = t.signal.filter(|s| *s != 0) {
+        code.push_str(&format!(", signal {signal}"));
+    }
+    let mut parts = vec![format!(
+        "Terminated: {} ({code})",
+        t.reason.as_deref().unwrap_or("Terminated")
+    )];
+    if let Some(started) = &t.started_at {
+        parts.push(format!("started {}", started.0));
+    }
+    if let Some(finished) = &t.finished_at {
+        parts.push(format!("finished {}", finished.0));
+    }
+    if let Some(line) = t
+        .message
+        .as_deref()
+        .and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()))
+    {
+        let mut line: String = line.chars().take(MESSAGE_LIMIT).collect();
+        if line.len() < t.message.as_deref().unwrap_or_default().trim().len() {
+            line.push('…');
+        }
+        parts.push(format!("message: {line}"));
+    }
+    Some(parts.join(" · "))
+}
+
+pub(crate) fn probes(c: &Container) -> Vec<(String, String)> {
     [
         ("Startup", c.startup_probe.as_ref()),
         ("Liveness", c.liveness_probe.as_ref()),
@@ -428,13 +484,7 @@ fn container_info(
 ) -> ContainerInfo {
     let last_state = cs
         .and_then(|cs| cs.last_state.as_ref())
-        .filter(|s| s.terminated.is_some())
-        .map(|s| match phase(Some(s)) {
-            ContainerPhase::Terminated { reason, exit_code } => {
-                format!("Terminated: {reason} (exit code {exit_code})")
-            }
-            _ => String::new(),
-        });
+        .and_then(last_state_text);
     ContainerInfo {
         name: c.name.clone(),
         role,
@@ -1217,7 +1267,8 @@ mod tests {
             c[0].probes,
             [(
                 "Readiness".to_owned(),
-                "http-get :80/ready · every 5s".to_owned()
+                "http-get :80/ready · delay 0s · timeout 1s · every 5s · failure 3 · success 1"
+                    .to_owned()
             )]
         );
         assert!(
@@ -1245,6 +1296,157 @@ mod tests {
         );
         let labels = sections.iter().find(|s| s.title == "Labels").unwrap();
         assert_eq!(labels.placement, Placement::Metadata);
+    }
+
+    #[test]
+    fn probe_text_spells_out_defaults() {
+        let probe = |v: Value| probe_text(&serde_json::from_value(v).unwrap());
+        assert_eq!(
+            probe(json!({"httpGet": {"path": "/healthz", "port": 8080}})),
+            "http-get :8080/healthz · delay 0s · timeout 1s · every 10s · failure 3 · success 1"
+        );
+        assert_eq!(
+            probe(json!({
+                "httpGet": {"host": "10.0.0.1", "port": 8443, "scheme": "HTTPS"},
+                "initialDelaySeconds": 15, "timeoutSeconds": 5, "periodSeconds": 20,
+                "failureThreshold": 6, "successThreshold": 2,
+                "terminationGracePeriodSeconds": 30
+            })),
+            "http-get 10.0.0.1:8443/ (HTTPS) · delay 15s · timeout 5s · every 20s · failure 6 · \
+             success 2 · grace 30s"
+        );
+        assert_eq!(
+            probe(json!({"tcpSocket": {"port": "db"}})),
+            "tcp :db · delay 0s · timeout 1s · every 10s · failure 3 · success 1"
+        );
+        assert_eq!(
+            probe(json!({"grpc": {"port": 9090, "service": "health"}})),
+            "grpc :9090 service health · delay 0s · timeout 1s · every 10s · failure 3 · success 1"
+        );
+        assert_eq!(
+            probe(json!({"exec": {"command": ["sh", "-c", "pg_isready"]}})),
+            "exec sh -c pg_isready · delay 0s · timeout 1s · every 10s · failure 3 · success 1"
+        );
+    }
+
+    /// A pod whose liveness probe (1s timeout, no delay) keeps killing its
+    /// app container, behind a completed init container and a sidecar
+    /// that was OOM-killed.
+    fn probe_loop() -> DynamicObject {
+        obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "api-0", "namespace": "default"},
+            "spec": {
+                "initContainers": [
+                    {"name": "migrate", "image": "migrate:1"},
+                    {"name": "proxy", "image": "envoy:1", "restartPolicy": "Always",
+                     "readinessProbe": {"tcpSocket": {"port": 15000}}}
+                ],
+                "containers": [{
+                    "name": "api", "image": "api:2",
+                    "livenessProbe": {"httpGet": {"path": "/health", "port": 8080}, "timeoutSeconds": 1},
+                    "startupProbe": {"grpc": {"port": 9090}, "failureThreshold": 30, "periodSeconds": 2}
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "migrate", "image": "migrate:1", "imageID": "", "ready": true,
+                     "restartCount": 0,
+                     "state": {"terminated": {"exitCode": 0, "reason": "Completed",
+                               "startedAt": "2026-10-22T11:00:00Z", "finishedAt": "2026-10-22T11:00:05Z"}}},
+                    {"name": "proxy", "image": "envoy:1", "imageID": "", "ready": true,
+                     "restartCount": 1,
+                     "state": {"running": {"startedAt": "2026-10-22T11:30:00Z"}},
+                     "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled",
+                                   "startedAt": "2026-10-22T11:00:06Z", "finishedAt": "2026-10-22T11:29:59Z"}}}
+                ],
+                "containerStatuses": [{
+                    "name": "api", "image": "api:2", "imageID": "", "ready": false,
+                    "restartCount": 12,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m0s"}},
+                    "lastState": {"terminated": {
+                        "exitCode": 143, "signal": 15, "reason": "Error",
+                        "message": "shutting down\nbye",
+                        "startedAt": "2026-10-22T11:58:00Z", "finishedAt": "2026-10-22T11:58:31Z"
+                    }}
+                }]
+            }
+        }))
+    }
+
+    #[test]
+    fn containers_show_probes_and_last_state() {
+        let sections = PodPlugin.details_at(&probe_loop(), ts(NOW));
+        let SectionBody::Containers(inits) = section(&sections, "Init containers") else {
+            panic!()
+        };
+        assert_eq!(inits[0].last_state, None);
+        assert!(inits[0].probes.is_empty());
+        assert_eq!(
+            inits[1].last_state.as_deref(),
+            Some(
+                "Terminated: OOMKilled (exit code 137) · started 2026-10-22T11:00:06Z · \
+                 finished 2026-10-22T11:29:59Z"
+            )
+        );
+        let SectionBody::Containers(apps) = section(&sections, "Containers") else {
+            panic!()
+        };
+        assert_eq!(
+            apps[0].last_state.as_deref(),
+            Some(
+                "Terminated: Error (exit code 143, signal 15) · started 2026-10-22T11:58:00Z · \
+                 finished 2026-10-22T11:58:31Z · message: shutting down…"
+            )
+        );
+        let names: Vec<_> = apps[0].probes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Startup", "Liveness"]);
+    }
+
+    #[test]
+    fn container_text_lines_for_agents() {
+        let sections = PodPlugin.details_at(&probe_loop(), ts(NOW));
+        let inits = sections
+            .iter()
+            .find(|s| s.title == "Init containers")
+            .unwrap();
+        assert_eq!(
+            inits.text_lines(),
+            [
+                "migrate (Init): migrate:1",
+                "  State: Terminated: Completed (exit code 0)",
+                "  Restarts: 0",
+                "proxy (Sidecar): envoy:1",
+                "  State: Running since 2026-10-22T11:30:00Z",
+                "  Ready: true",
+                "  Restarts: 1",
+                "  Last state: Terminated: OOMKilled (exit code 137) · started 2026-10-22T11:00:06Z · \
+                 finished 2026-10-22T11:29:59Z",
+                "  Readiness probe: tcp :15000 · delay 0s · timeout 1s · every 10s · failure 3 · \
+                 success 1",
+            ]
+        );
+        let apps = sections.iter().find(|s| s.title == "Containers").unwrap();
+        assert_eq!(
+            apps.text_lines(),
+            [
+                "api (App): api:2",
+                "  State: Waiting: CrashLoopBackOff (back-off 5m0s)",
+                "  Ready: false",
+                "  Restarts: 12",
+                "  Last state: Terminated: Error (exit code 143, signal 15) · \
+                 started 2026-10-22T11:58:00Z · finished 2026-10-22T11:58:31Z · \
+                 message: shutting down…",
+                "  Startup probe: grpc :9090 · delay 0s · timeout 1s · every 2s · failure 30 · \
+                 success 1",
+                "  Liveness probe: http-get :8080/health · delay 0s · timeout 1s · every 10s · \
+                 failure 3 · success 1",
+            ]
+        );
+        let plain = PodPlugin.details_at(&pod(running()), ts(NOW));
+        let apps = plain.iter().find(|s| s.title == "Containers").unwrap();
+        assert!(apps.text_lines().contains(&"  Probes: none".to_owned()));
     }
 
     #[test]

@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::Profile;
 
-/// What the agent may do without asking, in the dimensions that are
-/// raised on request.
+/// What the agent may call without asking for more access, in the
+/// dimensions that are raised on request. It approves no change (see the
+/// module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Access {

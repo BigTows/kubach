@@ -164,6 +164,7 @@ section-operation = Операция
 section-owner-references = Владельцы
 section-parameters = Параметры
 section-ports = Порты
+section-probes = Проверки
 section-recommendations = Рекомендации
 section-resources = Ресурсы
 section-resources-summary = Сводка ресурсов
