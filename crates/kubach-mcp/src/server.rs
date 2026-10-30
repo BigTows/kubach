@@ -380,7 +380,8 @@ impl McpServer {
         let helm = if self.helm().is_some() {
             " Helm: helm_search_charts and helm_show_values for charts of the repositories added \
              in Kubach (or an oci:// chart the user allows), helm_list_releases, \
-             helm_release_history and helm_get_values (a release's values, secrets masked); \
+             helm_release_history and helm_get_values (a release's values, secrets masked) read \
+             Helm's storage Secrets, so they need access to Secrets like list_secrets; \
              helm_install, helm_upgrade, helm_rollback and helm_uninstall run a server-side dry \
              run that the user approves in Kubach. To change a few values of a release, pass \
              only them to helm_upgrade as valuesPatch: Kubach merges it into the release's \
@@ -509,9 +510,13 @@ fn tool_access(name: &str) -> Option<Access> {
         "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
         | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
-        "list_secrets" | "check_secret" | "compare_secret_values" | "get_secret_value" => {
-            need(Profile::ReadOnly, true)
-        }
+        "list_secrets"
+        | "check_secret"
+        | "compare_secret_values"
+        | "get_secret_value"
+        | "helm_list_releases"
+        | "helm_release_history"
+        | "helm_get_values" => need(Profile::ReadOnly, true),
         _ => None,
     }
 }

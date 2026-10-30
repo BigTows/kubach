@@ -1424,9 +1424,8 @@ pub(crate) async fn get_values(
                 code,
                 message: format!(
                     "{message}. The session's identity in {namespace} ({}) cannot read them, \
-                     and Kubach does not read them with other credentials. With access to \
-                     Secrets for the session (list_secrets asks the user for it) it can; \
-                     otherwise ask the user to look at the values in Kubach's Helm screen",
+                     and Kubach does not read them with other credentials. Ask the user to look \
+                     at the values in Kubach's Helm screen",
                     ctx.session.describe_identity(Some(&namespace))
                 ),
             },

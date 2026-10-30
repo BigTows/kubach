@@ -538,6 +538,24 @@ fn helm_changes_need_the_ceiling_the_namespace_and_a_confirmation() {
         Some(Grant::read(NS))
     );
     assert!(policy.check(&Request::HelmCharts).is_ok());
+    // Helm keeps releases in Secrets: without access to them the user is
+    // asked for it, as for list_secrets (#53).
+    let strict = SecurityPolicy {
+        mcp_enabled: true,
+        ..SecurityPolicy::default()
+    };
+    let scope = scope_with(Profile::ReadOnly, &strict, &[NS]);
+    let denial = Policy::new(
+        &scope,
+        &catalog,
+        false,
+        grants(&[Grant::read(NS)]),
+        SessionMode::TemporaryServiceAccount,
+    )
+    .check(&read)
+    .unwrap_err();
+    assert_eq!(denial.code, DenialCode::NeedsAccess);
+    assert!(denial.access.is_some_and(|access| access.secrets));
 }
 
 #[test]

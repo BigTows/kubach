@@ -219,7 +219,8 @@ pub enum Request {
     /// Helm charts of the repositories added in Kubach or of an `oci://`
     /// reference (#418): search and default values. No namespace.
     HelmCharts,
-    /// Helm releases of a namespace: list and history.
+    /// Helm releases of a namespace: list, history and values. Needs
+    /// access to Secrets, where Helm stores them (#53).
     HelmRead {
         namespace: Option<String>,
     },
@@ -498,10 +499,12 @@ impl<'a> Policy<'a> {
             Request::SecretWrite { .. }
             | Request::SecretCopy { .. }
             | Request::SecretDelete { .. } => need(Profile::Deploy, true),
+            // Helm keeps releases in Secrets of their namespace (#53).
             Request::SecretList { .. }
             | Request::SecretCheck { .. }
             | Request::SecretCompare { .. }
-            | Request::SecretReveal { .. } => need(Profile::ReadOnly, true),
+            | Request::SecretReveal { .. }
+            | Request::HelmRead { .. } => need(Profile::ReadOnly, true),
             _ => None,
         }
     }
@@ -1017,6 +1020,7 @@ impl<'a> Policy<'a> {
             | Request::SecretCheck { .. }
             | Request::SecretCompare { .. } => "Secret metadata",
             Request::SecretReveal { .. } => "revealing a Secret",
+            Request::HelmRead { .. } => "reading Helm releases (Helm keeps them in Secrets)",
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };
