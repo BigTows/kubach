@@ -55,6 +55,53 @@ fn owned_pod() -> Value {
     })
 }
 
+/// Pod `name` with label `app`, owned by StatefulSet `db` (uid 7) when
+/// `owned`; an init container `init` and the container `db`.
+fn labeled_pod(name: &str, app: &str, owned: bool) -> Value {
+    let owners = if owned {
+        json!([{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "uid": "7", "controller": true}])
+    } else {
+        json!([])
+    };
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": NS, "labels": {"app": app},
+                     "ownerReferences": owners},
+        "spec": {"initContainers": [{"name": "init", "image": "busybox"}],
+                 "containers": [{"name": "db", "image": "postgres"}]},
+    })
+}
+
+/// Pods selected by `app=db` (`db-0`, `db-1` of StatefulSet `db` and the
+/// stray `db-other`) or `app=many` (12 pods), for the log tests.
+fn selected_pods(path: &str) -> Option<Value> {
+    let items: Vec<Value> = if path.contains("app%3Ddb") || path.contains("app=db") {
+        vec![
+            labeled_pod("db-other", "db", false),
+            labeled_pod("db-1", "db", true),
+            labeled_pod("db-0", "db", true),
+        ]
+    } else if path.contains("app%3Dmany") || path.contains("app=many") {
+        (0..12)
+            .map(|i| labeled_pod(&format!("many-{i:02}"), "many", false))
+            .collect()
+    } else {
+        return None;
+    };
+    Some(json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": items}))
+}
+
+/// Logs of the pods of [`selected_pods`]: each line names its stream, one
+/// carries a password for masking.
+fn selected_pod_logs(path: &str) -> String {
+    let pod = path.split('/').nth_back(1).unwrap_or_default();
+    let container = path
+        .split(['?', '&'])
+        .find_map(|part| part.strip_prefix("container="))
+        .unwrap_or("default");
+    format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
+}
+
 fn replica_set() -> Value {
     json!({
         "apiVersion": "apps/v1", "kind": "ReplicaSet",
@@ -237,10 +284,35 @@ impl FakeApi {
                             ("200 OK", secret().to_string())
                         } else if method == "POST" && path.starts_with(&secrets) {
                             ("201 Created", String::from_utf8_lossy(&body).into_owned())
+                        } else if let Some(list) = (method == "GET"
+                            && path.starts_with(&format!("{pods}?")))
+                        .then(|| selected_pods(&path))
+                        .flatten()
+                        {
+                            ("200 OK", list.to_string())
                         } else if method == "GET"
                             && (path == pods || path.starts_with(&format!("{pods}?")))
                         {
                             ("200 OK", pod_list().to_string())
+                        } else if method == "GET"
+                            && (path.starts_with(&format!("{pods}/db-"))
+                                || path.starts_with(&format!("{pods}/many-")))
+                        {
+                            let rest = &path[pods.len() + 1..];
+                            if rest.contains("/log") {
+                                ("200 OK", selected_pod_logs(&path))
+                            } else {
+                                let owned = rest == "db-0" || rest == "db-1";
+                                let app = if owned { "db" } else { "many" };
+                                ("200 OK", labeled_pod(rest, app, owned).to_string())
+                            }
+                        } else if method == "GET"
+                            && path == format!("/apis/apps/v1/namespaces/{NS}/statefulsets/db")
+                        {
+                            let db = json!({"apiVersion": "apps/v1", "kind": "StatefulSet",
+                                "metadata": {"name": "db", "namespace": NS, "uid": "7"},
+                                "spec": {"selector": {"matchLabels": {"app": "db"}}}});
+                            ("200 OK", db.to_string())
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
@@ -418,6 +490,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
             ("describe_resource", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
             ("list_events", json!({"namespace": ns})),
             ("get_logs", json!({"pod": "web-0", "namespace": ns})),
+            ("get_logs", json!({"kind": "StatefulSet", "name": "db", "namespace": ns})),
+            ("get_logs", json!({"labelSelector": "app=db", "namespace": ns})),
             ("top_pods", json!({"namespace": ns})),
             ("exec", json!({"pod": "web-0", "namespace": ns, "command": ["id"]})),
             ("port_forward_start", json!({"target": "pod/web-0", "port": 8080, "namespace": ns})),
@@ -452,6 +526,16 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ("get_resource", json!({"kind": "Pod", "name": "../../kube-system/pods/x"})),
         ("get_resource", json!({"kind": "Pod", "name": "x", "namespace": NS, "extra": 1})),
         ("get_logs", json!({"pod": "web-0", "container": "../../x"})),
+        ("get_logs", json!({})),
+        ("get_logs", json!({"pod": "web-0", "labelSelector": "app=db"})),
+        ("get_logs", json!({"kind": "Secret", "name": "db"})),
+        ("get_logs", json!({"kind": "ConfigMap", "name": "app-config"})),
+        ("get_logs", json!({"kind": "StatefulSet"})),
+        ("get_logs", json!({"kind": "StatefulSet", "name": "../db"})),
+        ("get_logs", json!({"labelSelector": "app=db\n"})),
+        ("get_logs", json!({"pod": "web-0", "allContainers": true, "container": "app"})),
+        ("get_logs", json!({"pod": "web-0", "filter": "(", "regex": true})),
+        ("get_logs", json!({"pod": "web-0", "filter": ""})),
         ("list_events", json!({"kind": "Secret", "name": "db"})),
         ("scale", json!({"kind": "Deployment", "name": "web/../../x", "replicas": 1})),
         ("delete_resource", json!({"kind": "RoleBinding", "name": "x"})),
@@ -1238,6 +1322,196 @@ async fn logs_of_pods_the_agent_shaped_are_confirmed() {
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(f.confirmer.requests().is_empty());
+}
+
+fn pod_log_requests(f: &Fixture) -> Vec<String> {
+    f.api
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains("/log"))
+        .collect()
+}
+
+#[tokio::test]
+async fn logs_of_a_workload_read_its_pods_and_containers() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"kind": "StatefulSet", "name": "db", "allContainers": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    // Only the StatefulSet's own pods, sorted, init containers first.
+    let streams: Vec<&str> = outcome
+        .text
+        .lines()
+        .filter_map(|line| line.strip_suffix(" failed"))
+        .collect();
+    assert_eq!(
+        streams,
+        [
+            "[db-0/init] ERROR db-0",
+            "[db-0/db] ERROR db-0",
+            "[db-1/init] ERROR db-1",
+            "[db-1/db] ERROR db-1"
+        ],
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[db-0/init] hello from db-0/init"));
+    assert!(!outcome.text.contains("db-other"), "{}", outcome.text);
+    assert!(!outcome.text.contains("hunter2"), "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 4);
+    assert!(f.confirmer.requests().is_empty());
+
+    // All containers of one pod; tail and previous apply to each stream.
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"pod": "db-0", "allContainers": true, "tailLines": 5, "previous": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome.text.contains("[db-0/init] hello"),
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[db-0/db] hello"), "{}", outcome.text);
+    let logs = pod_log_requests(&f);
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    assert!(
+        logs.iter()
+            .all(|r| r.contains("tailLines=5") && r.contains("previous=true")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn logs_by_selector_are_filtered_per_line_after_masking() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let call = |arguments: Value| f.server.call("agent", "get_logs", args(arguments));
+    let outcome = call(json!({"labelSelector": "app=db", "filter": "ERROR"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    // The selector picks every labeled pod, its default container each.
+    assert_eq!(
+        lines,
+        [
+            "[db-0/db] ERROR db-0 failed",
+            "[db-1/db] ERROR db-1 failed",
+            "[db-other/db] ERROR db-other failed"
+        ]
+    );
+
+    let outcome =
+        call(json!({"labelSelector": "app=db", "filter": "^ERROR db-[01] ", "regex": true})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(outcome.text.lines().count(), 2, "{}", outcome.text);
+
+    // The filter cannot probe what masking hides.
+    let outcome = call(json!({"labelSelector": "app=db", "filter": "hunter2"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("no line matched"), "{}", outcome.text);
+
+    // One stream: no prefix, as before.
+    let outcome = call(json!({"pod": "web-0", "filter": "ready"})).await;
+    assert_eq!(outcome.text, "ready\n");
+
+    // A container the pods lack is said, not guessed.
+    let outcome = call(json!({"labelSelector": "app=db", "container": "sidecar"})).await;
+    assert!(
+        outcome.text.contains("db-0 has no container sidecar"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
+async fn logs_of_many_pods_are_capped_and_say_what_was_left_out() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=many"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 10);
+    assert!(
+        outcome.text.starts_with(
+            "(12 pods match; only the first 10 were read. Left out: many-10, many-11)"
+        ),
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[many-09/db] hello"));
+
+    // Streams are capped too: 10 pods × 2 containers is the limit.
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=many", "allContainers": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 20);
+}
+
+#[tokio::test]
+async fn logs_of_several_shaped_pods_are_asked_once() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    f.server.session().note_change(NS, "StatefulSet", "db");
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"kind": "StatefulSet", "name": "db", "allContainers": true})),
+        )
+        .await;
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("rejected"), "{}", outcome.text);
+    assert!(pod_log_requests(&f).is_empty());
+    let asked = f.confirmer.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].summary.contains("db-0, db-1"),
+        "{}",
+        asked[0].summary
+    );
+    assert!(
+        asked[0]
+            .details
+            .contains("Pod db-1: This agent created or changed StatefulSet db"),
+        "{}",
+        asked[0].details
+    );
+
+    let f = fixture(Profile::Deploy, permissive(), true).await;
+    f.server.session().note_change(NS, "StatefulSet", "db");
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(f.confirmer.requests().len(), 1);
+    assert_eq!(pod_log_requests(&f).len(), 3);
 }
 
 /// `kubach mcp --grant-read`: the session's server without any window.

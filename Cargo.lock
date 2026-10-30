@@ -4654,6 +4654,7 @@ dependencies = [
  "k8s-openapi",
  "kubach-core",
  "kube",
+ "regex",
  "rmcp",
  "secrecy",
  "serde",

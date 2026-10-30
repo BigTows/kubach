@@ -25,6 +25,7 @@ use std::fmt;
 use kubach_core::apply::{self, ResolvedManifest};
 use kubach_core::discovery::{ApiCatalog, ResourceKind};
 use kubach_core::secrets::mask::is_core_secret;
+use kubach_core::workload_pods::Workload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -114,8 +115,12 @@ pub enum Request {
         namespace: Option<String>,
         object: Option<(KindRef, String)>,
     },
+    /// `get_logs`: exactly one of a pod, a workload (kind + name) or a
+    /// label selector picks the pods.
     Logs {
-        pod: String,
+        pod: Option<String>,
+        workload: Option<(KindRef, String)>,
+        label_selector: Option<String>,
         container: Option<String>,
         namespace: Option<String>,
     },
@@ -715,11 +720,45 @@ impl<'a> Policy<'a> {
             }
             Request::Logs {
                 pod,
+                workload,
+                label_selector,
                 container,
                 namespace,
             } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
-                allowed.name = Some(object_name(pod)?);
+                match (pod, workload, label_selector) {
+                    (Some(pod), None, None) => allowed.name = Some(object_name(pod)?),
+                    (None, Some((kind, name)), None) => {
+                        let kind = self.read_kind(kind)?;
+                        if Workload::from_api(&kind.api.group, &kind.api.kind).is_none() {
+                            return Err(Denial::new(
+                                DenialCode::InvalidInput,
+                                format!(
+                                    "logs by kind take a Deployment, StatefulSet, DaemonSet, \
+                                     ReplicaSet, Job or CronJob, not {}",
+                                    kind.api.kind
+                                ),
+                            ));
+                        }
+                        allowed.kind = Some(kind);
+                        allowed.name = Some(object_name(name)?);
+                    }
+                    (None, None, Some(selector)) => {
+                        if selector.trim().is_empty() {
+                            return Err(Denial::new(
+                                DenialCode::InvalidInput,
+                                "labelSelector must not be empty",
+                            ));
+                        }
+                        check_selector(selector)?;
+                    }
+                    _ => {
+                        return Err(Denial::new(
+                            DenialCode::InvalidInput,
+                            "give exactly one of pod, kind + name, or labelSelector",
+                        ));
+                    }
+                }
                 if let Some(container) = container {
                     container_name(container)?;
                 }
