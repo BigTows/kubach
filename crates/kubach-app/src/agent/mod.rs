@@ -1207,8 +1207,9 @@ impl AgentState {
         .detach();
     }
 
-    fn end_app_session(&mut self) {
-        self.shared.set(None);
+    /// Ends the app's session; the agent's next call is told `why` (#56).
+    fn end_app_session(&mut self, why: &str) {
+        self.shared.end(why);
         self.session_in_vault = false;
         close_all(self.session.take().into_iter().collect());
     }
@@ -1349,7 +1350,9 @@ impl AgentState {
                 hosted::lock_ends(&session.scope().context, &unlocked).is_some()
             });
         if app_ends {
-            self.end_app_session();
+            self.end_app_session(
+                "its context is in the vault, which was locked; the user unlocks it",
+            );
             self.session_error = Some(LOCKED_SESSION.into());
         }
         let ended = self
@@ -1366,7 +1369,7 @@ impl AgentState {
     /// few seconds).
     pub fn revoke(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.session.as_ref().is_some_and(|s| s.id() == id) {
-            self.end_app_session();
+            self.end_app_session("the user ended it in Kubach");
         } else if let Some(session) = self.hosted.revoke(id) {
             close_all(vec![session]);
         } else {
@@ -1589,7 +1592,7 @@ impl AgentState {
         let mut changed = false;
         if self.session.as_ref().is_some_and(|s| !s.is_active()) {
             // TTL: the session closed itself.
-            self.end_app_session();
+            self.end_app_session("its time limit ran out");
             changed = true;
         }
         let swept = self.hosted.sweep(STALE);

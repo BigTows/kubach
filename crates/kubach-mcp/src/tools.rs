@@ -561,7 +561,7 @@ pub(crate) async fn ask_access_now(
             ctx.client_name, scope.context
         ),
         details: format!(
-            "Without asking, the agent has {current} on {context}. Allowing adds this until the \
+            "The agent's access on {context} now: {current}. Allowing adds this until the \
              session ends; with \"Allow by default\" the context's minimal access is raised for \
              good. Either way every change, deletion and command is still confirmed one by one, \
              and nothing exceeds your own RBAC.",
@@ -1095,6 +1095,10 @@ fn session_info(session: &Session) -> String {
             "howToRaise": "Tools beyond the access are marked \"Requires your approval in \
                 Kubach\": call them and the user is asked to allow it, for this session or by \
                 default on this cluster. Changes are still confirmed one by one.",
+            "meaning": "Access says which tools may be called without asking for more access. \
+                It approves no change: every change, deletion, Helm action, command in a \
+                container and port-forward is confirmed by the user one by one, unless the user \
+                ticked \"don't ask again\" for it (see notAskedAgain).",
         },
         "secretValues": if scope.policy.reveal_allowed() {
             "revealed one Secret at a time after the user confirms it"

@@ -122,10 +122,15 @@ impl McpServer {
                 let note = needed
                     .and_then(|needed| have.missing(needed))
                     .map(|missing| {
+                        let each = if confirms_each_call(spec.name) {
+                            " Allowing it approves no call: each one is still confirmed."
+                        } else {
+                            ""
+                        };
                         format!(
                             " Requires your approval in Kubach: this needs {missing}, beyond this \
                          session's access ({have}); the first call asks the user to allow it \
-                         (for this session or by default on this cluster)."
+                         (for this session or by default on this cluster).{each}"
                         )
                     });
                 Some(spec.into_tool(note))
@@ -393,13 +398,10 @@ impl McpServer {
             ""
         };
         format!(
-            "Kubach gives you access to Kubernetes namespaces of context {}. Without asking you \
-             have {access}.{more}{helm} {namespaces} Cluster-scoped resources and calls across \
-             all namespaces are not available. {secrets}{writes} Changes, deletions, \
-             commands in containers and port-forwards (port_forward_start, on 127.0.0.1 of the \
-             user's machine) are previewed and need the user's approval one by one; the user may \
-             tick \"don't ask again\" for one kind of change in one namespace for this session, \
-             and the result of such a call then says it was approved that way. Call \
+            "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
+             {access}. Access says which tools you may call without asking for more; it \
+             approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
+             and calls across all namespaces are not available. {secrets}{writes} Call \
              `session_info` for details.",
             scope.context
         )
@@ -493,6 +495,26 @@ struct ToolSpec {
     schema: Value,
     read_only: bool,
     destructive: bool,
+}
+
+/// What the agent is told about confirmations, whatever its access:
+/// [`Policy::check`](crate::policy::Policy::check) marks every change,
+/// deletion, Helm action, command and port-forward as
+/// [`Confirmation::Required`](crate::policy::Confirmation::Required), and
+/// only what [`rememberable`](crate::remember::rememberable) allows may
+/// skip the window after "don't ask again".
+const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets), \
+     command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
+     machine) is previewed and confirmed by the user one by one, even within your access. The \
+     user may tick \"don't ask again\" for one kind of change in one namespace for this session \
+     (not for deletions or Secrets); the result of such a call then says it was approved that \
+     way.";
+
+/// Whether every real call of tool `name` is confirmed by the user (a dry
+/// run of `apply_manifest` is not).
+fn confirms_each_call(name: &str) -> bool {
+    matches!(name, "exec" | "port_forward_start")
+        || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
 }
 
 /// What a tool needs of the access, where the user may raise it (#15).
