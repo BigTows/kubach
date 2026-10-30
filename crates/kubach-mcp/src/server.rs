@@ -609,7 +609,11 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_kinds",
-            description: "Namespaced resource kinds available in this session.",
+            description: "Namespaced resource kinds available in this session: the built-in \
+                          ones you can read, then the custom resources (CRDs) the cluster \
+                          serves, with apiVersion, and whether reading them still needs the \
+                          user's approval (the first list_resources or get_resource call on one \
+                          asks for it). Secrets, RBAC and cluster-scoped kinds are not listed.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
