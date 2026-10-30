@@ -129,6 +129,49 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     )
     .await;
 
+    // A preview: the dry run's objects and diff for the agent, no change
+    // confirmed and nothing installed (#68).
+    let preview = call(
+        &server,
+        "helm_install",
+        json!({
+            "release": "kubach-podinfo",
+            "chart": CHART,
+            "version": "6.15.0",
+            "namespace": namespace,
+            "values": "replicaCount: 1\nextra:\n  password: s3cret-value\n",
+            "preview": true,
+        }),
+    )
+    .await;
+    assert_eq!(preview["preview"], true, "{preview}");
+    assert!(
+        preview["objects"].to_string().contains("Deployment"),
+        "{preview}"
+    );
+    assert!(
+        preview["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("kind: Deployment"),
+        "{preview}"
+    );
+    assert!(!preview.to_string().contains("s3cret-value"), "{preview}");
+    assert!(
+        !confirmer
+            .requests()
+            .iter()
+            .any(|request| matches!(request.kind, RequestKind::Helm { .. })),
+        "a preview asked to confirm a change"
+    );
+    let none = call(
+        &server,
+        "helm_list_releases",
+        json!({"namespace": namespace}),
+    )
+    .await;
+    assert_eq!(none["releases"], json!([]), "{none}");
+
     // Install: the access (changes), the change itself; the namespace's
     // rights come with the access (#15).
     let installed = call(
@@ -158,8 +201,10 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, ["source", "access", "helm"]);
-    let RequestKind::Helm { helm } = &requests[2].kind else {
+    // The preview raised the access to changes; helm_list_releases asked
+    // for access to Secrets, where Helm keeps releases (#53).
+    assert_eq!(kinds, ["source", "access", "access", "helm"]);
+    let RequestKind::Helm { helm } = &requests[3].kind else {
         unreachable!()
     };
     assert_eq!(helm.action, HelmAction::Install);
