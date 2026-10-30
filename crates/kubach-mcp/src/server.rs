@@ -614,7 +614,11 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_kinds",
-            description: "Namespaced resource kinds available in this session.",
+            description: "Namespaced resource kinds available in this session: the built-in \
+                          ones you can read, then the custom resources (CRDs) the cluster \
+                          serves, with apiVersion, and whether reading them still needs the \
+                          user's approval (the first list_resources or get_resource call on one \
+                          asks for it). Secrets, RBAC and cluster-scoped kinds are not listed.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -667,13 +671,25 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_logs",
-            description: "Recent container logs (bounded, credentials masked best-effort).",
+            description: "Recent container logs (bounded, credentials masked best-effort). Pick \
+                          pods by exactly one of: pod, kind + name of a workload (Deployment, \
+                          StatefulSet, DaemonSet, ReplicaSet, Job, CronJob), or labelSelector; \
+                          at most 10 pods and 20 containers per call. With several streams \
+                          each line starts with [pod/container]; notes on top say what was \
+                          left out.",
             schema: object_schema(
                 {
                     let mut p = json!({
                         "pod": {"type": "string"},
-                        "container": {"type": "string"},
-                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000},
+                        "kind": {"type": "string", "description": "Workload kind, with name: logs of its pods"},
+                        "apiVersion": {"type": "string", "description": "Only to disambiguate kind"},
+                        "name": {"type": "string", "description": "Workload name, with kind"},
+                        "labelSelector": {"type": "string", "description": "Logs of the pods it selects, e.g. app=web"},
+                        "container": {"type": "string", "description": "Default: the pod's default container"},
+                        "allContainers": {"type": "boolean", "description": "Every container, init containers included"},
+                        "filter": {"type": "string", "description": "Only lines containing this text (applied after masking)"},
+                        "regex": {"type": "boolean", "description": "filter is a regular expression"},
+                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Per container"},
                         "sinceSeconds": {"type": "integer", "minimum": 1},
                         "previous": {"type": "boolean"},
                     });
@@ -682,7 +698,7 @@ fn catalog() -> Vec<ToolSpec> {
                         .extend(ns.as_object().unwrap().clone());
                     p
                 },
-                &["pod"],
+                &[],
             ),
             read_only: true,
             destructive: false,

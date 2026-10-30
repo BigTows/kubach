@@ -43,7 +43,7 @@ async fn evict(client: &Client, obj: &DynamicObject) -> Result<(), PluginError> 
 
 /// Summary computed like `kubectl get pods`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PodSummary {
+pub struct PodSummary {
     pub status: String,
     pub ready: usize,
     pub total: usize,
@@ -84,7 +84,7 @@ fn exit_reason(prefix: &str, signal: Option<i32>, code: i32) -> String {
 pub(crate) const WARNING_CONDITIONS: [&str; 1] = ["DisruptionTarget"];
 
 /// Port of kubectl's `printPod` status logic.
-pub(crate) fn summarize(pod: &Pod) -> PodSummary {
+pub fn summarize(pod: &Pod) -> PodSummary {
     let spec = pod.spec.as_ref();
     let status = pod.status.as_ref();
     let init_specs = spec
