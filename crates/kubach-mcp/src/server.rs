@@ -776,6 +776,24 @@ fn catalog() -> Vec<ToolSpec> {
             destructive: false,
         },
         ToolSpec {
+            name: "wait_for_rollout",
+            description: "Wait until a Deployment, StatefulSet or DaemonSet has rolled out, like \
+                          kubectl rollout status --timeout: after scale, rollout_restart, \
+                          apply_manifest or Helm. Returns when all pods are updated and ready, \
+                          or at the timeout (default 120s, at most 600s) or a failure (progress \
+                          deadline, paused), then with the pods not ready and why (Pending and \
+                          the scheduler's message, CrashLoopBackOff, last exit such as OOMKilled).",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "name"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
             name: "delete_resource",
             description: "Delete a resource (needs the user's approval).",
             schema: object_schema(
