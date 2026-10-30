@@ -408,6 +408,9 @@ mod tests {
             .unwrap();
         assert!(!error && changed, "{text}");
         assert!(text.contains("The user allowed context dev"));
+        // Access is not approval: changes are still confirmed (#57).
+        assert!(!text.contains("Without asking"), "{text}");
+        assert!(text.contains("approves no change"), "{text}");
         assert_eq!(shared.get().unwrap().session().scope().context, "dev");
         let tools = names(&shared);
         assert!(tools.contains(&"list_resources".to_owned()));
