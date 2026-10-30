@@ -841,33 +841,23 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     )
     .await;
 
-    // The temporary ServiceAccount cannot read Helm's storage Secrets
-    // without access to Secrets: a clear refusal, no other credentials.
-    let refused = server
-        .call(
-            "test",
-            "helm_get_values",
-            args(json!({"release": PATCH_RELEASE, "namespace": namespace})),
-        )
-        .await;
-    assert!(refused.is_error, "{}", refused.text);
-    assert!(
-        refused
-            .text
-            .contains("does not read them with other credentials"),
-        "{}",
-        refused.text
-    );
-    // With access to Secrets (asked for by list_secrets) it reads them.
-    call(&server, "list_secrets", json!({"namespace": namespace})).await;
-
-    // The release's values, masked.
+    // Helm's storage Secrets need access to Secrets: the first read asks
+    // the user for it, as list_secrets does (#53), and then reads them.
+    let asked = confirmer.requests().len();
     let read = call(
         &server,
         "helm_get_values",
         json!({"release": PATCH_RELEASE, "namespace": namespace}),
     )
     .await;
+    assert!(
+        confirmer.requests()[asked..].iter().any(
+            |request| matches!(&request.kind, RequestKind::Access { raise, .. } if raise.secrets)
+        ),
+        "access to Secrets was not asked for"
+    );
+
+    // The release's values, masked.
     assert!(!read.to_string().contains(secret), "the values leak");
     assert_eq!(read["maskedKeys"], json!(["extra.password"]));
     let values = read["values"].as_str().unwrap_or_default().to_owned();

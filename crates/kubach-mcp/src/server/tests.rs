@@ -2343,6 +2343,36 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
             "{change}"
         );
     }
+    // Without access to Secrets, reading releases (kept in Secrets) asks
+    // for it, as list_secrets does (#53).
+    let strict = fixture(
+        Profile::ReadOnly,
+        SecurityPolicy::with_minimum(Access {
+            secrets: false,
+            ..Access::ALL
+        }),
+        false,
+    )
+    .await;
+    strict
+        .server
+        .set_helm(crate::helm_tools::HelmEnv::default());
+    let strict_tools = strict.server.tools();
+    for read in [
+        "helm_list_releases",
+        "helm_release_history",
+        "helm_get_values",
+    ] {
+        let description = strict_tools
+            .iter()
+            .find(|t| t.name == read)
+            .and_then(|t| t.description.as_deref())
+            .unwrap_or_default();
+        assert!(
+            description.contains("Requires your approval in Kubach"),
+            "{read}: {description}"
+        );
+    }
     assert!(f.server.instructions().contains("helm_install"));
     assert!(f.server.instructions().contains("helm_get_values"));
     assert!(description("helm_upgrade").contains("valuesPatch"));
