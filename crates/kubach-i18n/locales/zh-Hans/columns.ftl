@@ -163,6 +163,7 @@ section-operation = 操作
 section-owner-references = 所有者引用
 section-parameters = 参数
 section-ports = 端口
+section-probes = 探针
 section-recommendations = 建议
 section-resources = 资源
 section-resources-summary = 资源摘要
