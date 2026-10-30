@@ -13,7 +13,10 @@ pub mod logs;
 pub mod node_shell;
 pub mod port_forward;
 
-pub use debug::{DebugContainer, DebugOptions, create_debug_container, wait_for_debug_container};
+pub use debug::{
+    DebugContainer, DebugOptions, add_debug_container, create_debug_container,
+    wait_for_debug_container,
+};
 pub use exec::{
     ExecCapture, ExecEvent, ExecHandle, ExecSession, ExitStatus, SHELL_CANDIDATES, SessionCommand,
     SessionOptions, ShellAttempt, StartedShell, check_exec_target, exec_blocker, exec_capture,

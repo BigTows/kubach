@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use k8s_openapi::api::core::v1::{EphemeralContainer, Pod};
+use k8s_openapi::api::core::v1::{EphemeralContainer, Pod, SecurityContext};
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
 
@@ -31,6 +31,8 @@ pub struct DebugOptions {
     pub command: Option<Vec<String>>,
     pub tty: bool,
     pub stdin: bool,
+    /// None: the pod's defaults. Never privileged (#64).
+    pub security_context: Option<SecurityContext>,
 }
 
 impl Default for DebugOptions {
@@ -42,6 +44,7 @@ impl Default for DebugOptions {
             command: None,
             tty: true,
             stdin: true,
+            security_context: None,
         }
     }
 }
@@ -57,6 +60,7 @@ impl DebugOptions {
             stdin: Some(self.stdin),
             tty: Some(self.tty),
             termination_message_policy: Some("File".to_owned()),
+            security_context: self.security_context.clone(),
             ..Default::default()
         }
     }
@@ -77,6 +81,20 @@ pub async fn create_debug_container(
     namespace: &str,
     pod: &str,
     options: &DebugOptions,
+) -> Result<DebugContainer, StreamError> {
+    add_debug_container(client, namespace, pod, options, false).await
+}
+
+/// [`create_debug_container`], or with `dry_run` only the API server's
+/// verdict (admission, Pod Security included) without changing the pod.
+/// A dry run with a generated name checks that name only: pass
+/// [`DebugOptions::name`] to check the one that will be used.
+pub async fn add_debug_container(
+    client: &Client,
+    namespace: &str,
+    pod: &str,
+    options: &DebugOptions,
+    dry_run: bool,
 ) -> Result<DebugContainer, StreamError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let current = api.get(pod).await?;
@@ -120,7 +138,11 @@ pub async fn create_debug_container(
     let patch = serde_json::json!({
         "spec": { "ephemeralContainers": [options.to_container(&name)] }
     });
-    api.patch_ephemeral_containers(pod, &PatchParams::default(), &Patch::Strategic(patch))
+    let params = PatchParams {
+        dry_run,
+        ..Default::default()
+    };
+    api.patch_ephemeral_containers(pod, &params, &Patch::Strategic(patch))
         .await?;
     Ok(DebugContainer {
         namespace: namespace.to_owned(),
@@ -174,7 +196,7 @@ pub async fn wait_for_debug_container(
 }
 
 /// `debugger-` plus five base-36 characters, like kubectl.
-fn generate_name() -> String {
+pub fn generate_name() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

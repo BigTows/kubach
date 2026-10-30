@@ -131,6 +131,9 @@ pub fn modify_rules(profile: Profile) -> Vec<PolicyRule> {
     if profile >= Profile::Debug {
         // Exec over WebSocket is authorized as `get` before 1.30, `create` after.
         rules.push(rule("", &["pods/exec"], &["get", "create"]));
+        // debug_container (#64): adding an ephemeral container is a patch
+        // of this subresource, nothing more.
+        rules.push(rule("", &["pods/ephemeralcontainers"], &["patch"]));
     }
     if profile >= Profile::Deploy {
         // Server-side dry-run needs the write verbs too: the API server
@@ -220,6 +223,7 @@ pub enum Capability {
     PodLogs,
     PodExec,
     PodPortForward,
+    PatchEphemeralContainers,
     PatchDeployments,
     ScaleDeployments,
     DeleteDeployments,
@@ -230,12 +234,13 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Capability; 12] = [
+    pub const ALL: [Capability; 13] = [
         Self::ListPods,
         Self::ListEvents,
         Self::PodLogs,
         Self::PodExec,
         Self::PodPortForward,
+        Self::PatchEphemeralContainers,
         Self::PatchDeployments,
         Self::ScaleDeployments,
         Self::DeleteDeployments,
@@ -253,6 +258,9 @@ impl Capability {
             Self::PodLogs => ResourceAccess::new("get", "", "pods/log"),
             Self::PodExec => ResourceAccess::new("create", "", "pods/exec"),
             Self::PodPortForward => ResourceAccess::new("create", "", "pods/portforward"),
+            Self::PatchEphemeralContainers => {
+                ResourceAccess::new("patch", "", "pods/ephemeralcontainers")
+            }
             Self::PatchDeployments => ResourceAccess::new("patch", "apps", "deployments"),
             Self::ScaleDeployments => ResourceAccess::new("patch", "apps", "deployments/scale"),
             Self::DeleteDeployments => ResourceAccess::new("delete", "apps", "deployments"),
@@ -375,6 +383,30 @@ mod tests {
             role_rules(Profile::Debug)
                 .iter()
                 .all(|r| !r.verbs.iter().any(|v| v == "delete"))
+        );
+    }
+
+    #[test]
+    fn debug_containers_need_only_a_patch_of_the_subresource() {
+        let rules = modify_rules(Profile::Debug);
+        let ephemeral: Vec<&PolicyRule> = rules
+            .iter()
+            .filter(|r| {
+                r.resources
+                    .iter()
+                    .flatten()
+                    .any(|r| r == "pods/ephemeralcontainers")
+            })
+            .collect();
+        assert_eq!(ephemeral.len(), 1);
+        assert_eq!(ephemeral[0].verbs, vec!["patch".to_string()]);
+        assert_eq!(
+            ephemeral[0].resources,
+            Some(vec!["pods/ephemeralcontainers".to_string()])
+        );
+        assert!(
+            !all_resources(&read_rules(Profile::Deploy))
+                .contains(&"pods/ephemeralcontainers".to_string())
         );
     }
 

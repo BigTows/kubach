@@ -53,8 +53,8 @@ const DEFAULT_LOG_LINES: i64 = 200;
 const MAX_LOG_LINES: i64 = 2000;
 const MAX_LOG_BYTES: i64 = 256 * 1024;
 const MAX_EXEC_OUTPUT: usize = 64 * 1024;
-const DEFAULT_EXEC_TIMEOUT: u64 = 30;
-const MAX_EXEC_TIMEOUT: u64 = 120;
+pub(crate) const DEFAULT_EXEC_TIMEOUT: u64 = 30;
+pub(crate) const MAX_EXEC_TIMEOUT: u64 = 120;
 
 /// Why a call failed, and who decided.
 #[derive(Debug)]
@@ -138,7 +138,7 @@ impl ToolOutput {
         }
     }
 
-    fn confirmed(text: String) -> Self {
+    pub(crate) fn confirmed(text: String) -> Self {
         Self {
             text,
             confirmed: true,
@@ -510,6 +510,7 @@ fn named_namespace(request: &Request) -> Option<&str> {
         | Request::Restart { namespace, .. }
         | Request::Delete { namespace, .. }
         | Request::Exec { namespace, .. }
+        | Request::Debug { namespace, .. }
         | Request::PortForward { namespace, .. }
         | Request::SecretList { namespace, .. }
         | Request::SecretCheck { namespace, .. }
@@ -937,6 +938,7 @@ pub(crate) async fn run(
                 .clamp(1, MAX_EXEC_TIMEOUT);
             exec(ctx, &allowed, a.container.as_deref(), &a.command, timeout).await
         }
+        "debug_container" => crate::debug_tools::debug_container(ctx, args).await,
         "port_forward_start" => crate::forwards::start(ctx, args).await,
         "port_forward_list" => crate::forwards::list(ctx, args).await,
         "port_forward_stop" => crate::forwards::stop(ctx, args).await,
@@ -2372,7 +2374,7 @@ async fn run_action(
 }
 
 /// `sh -c 'echo hi'` style rendering for the confirmation prompt.
-fn shell_words(command: &[String]) -> String {
+pub(crate) fn shell_words(command: &[String]) -> String {
     command
         .iter()
         .map(|arg| {
@@ -2415,10 +2417,25 @@ async fn exec(
         Vec::new(),
     )
     .await?;
-    let client = ctx.session.client_in(&allowed.namespace)?;
+    let out = run_command(ctx, &allowed.namespace, pod, container, command, timeout).await?;
+    Ok(ToolOutput::confirmed(out))
+}
+
+/// Runs `command` in `container` of `pod` without stdin or TTY, at most
+/// `timeout` seconds, and renders its exit status and bounded, masked
+/// output for the agent. Confirmed by the caller.
+pub(crate) async fn run_command(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    pod: &str,
+    container: Option<&str>,
+    command: &[String],
+    timeout: u64,
+) -> Result<String, ToolError> {
+    let client = ctx.session.client_in(namespace)?;
     let run = exec_capture(
         &client,
-        &allowed.namespace,
+        namespace,
         pod,
         container,
         command.to_vec(),
@@ -2455,7 +2472,7 @@ async fn exec(
             MAX_EXEC_OUTPUT / 1024
         );
     }
-    Ok(ToolOutput::confirmed(out))
+    Ok(out)
 }
 
 #[cfg(test)]
