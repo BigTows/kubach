@@ -1342,13 +1342,19 @@ impl<'a> Policy<'a> {
 
 /// Kinds the agent may never write: Secrets and anything that changes who
 /// can do what (ServiceAccounts, RBAC).
-fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
-    let identity = (group.is_empty() && kind == "ServiceAccount")
+/// ServiceAccounts, RBAC and the other kinds that decide who may do what:
+/// the agent never changes them, and `list_kinds` does not offer them.
+pub(crate) fn is_identity(group: &str, kind: &str) -> bool {
+    (group.is_empty() && kind == "ServiceAccount")
         || group == "rbac.authorization.k8s.io"
         || group == "authorization.k8s.io"
         || group == "authentication.k8s.io"
         || group == "certificates.k8s.io"
-        || group == "admissionregistration.k8s.io";
+        || group == "admissionregistration.k8s.io"
+}
+
+fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
+    let identity = is_identity(group, kind);
     if is_core_secret(group, kind) {
         Err(Denial::new(
             DenialCode::Secret,
