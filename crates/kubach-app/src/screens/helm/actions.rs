@@ -522,7 +522,14 @@ impl HelmScreen {
             updates::locate_chart(&self.repos, &latest.chart)
                 .candidates()
                 .into_iter()
-                .map(|found| (found.repository.to_owned(), found.versions.to_vec()))
+                .map(|found| {
+                    // `repo/chart` goes to Helm: its name for the repository (#58).
+                    let name = kubach_core::helm::repo::helm_repository_name(
+                        &self.repos,
+                        found.repository,
+                    );
+                    (name.to_owned(), found.versions.to_vec())
+                })
                 .collect();
         let panel =
             cx.new(|cx| HelmUpgrade::new(client, target, &latest, candidates, version, window, cx));
