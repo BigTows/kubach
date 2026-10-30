@@ -582,6 +582,11 @@ fn kind_props(extra: Value) -> Value {
     props
 }
 
+/// How helm_install and helm_upgrade describe `preview` (#68).
+const PREVIEW_HELP: &str = "Only show what would change: the server-side dry run's objects and \
+     masked manifest diff (and values diff), without asking the user or changing anything. Call \
+     again without preview to do it";
+
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
      one. Any namespace works; list_namespaces shows the ones Kubach knows of";
@@ -666,13 +671,25 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_logs",
-            description: "Recent container logs (bounded, credentials masked best-effort).",
+            description: "Recent container logs (bounded, credentials masked best-effort). Pick \
+                          pods by exactly one of: pod, kind + name of a workload (Deployment, \
+                          StatefulSet, DaemonSet, ReplicaSet, Job, CronJob), or labelSelector; \
+                          at most 10 pods and 20 containers per call. With several streams \
+                          each line starts with [pod/container]; notes on top say what was \
+                          left out.",
             schema: object_schema(
                 {
                     let mut p = json!({
                         "pod": {"type": "string"},
-                        "container": {"type": "string"},
-                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000},
+                        "kind": {"type": "string", "description": "Workload kind, with name: logs of its pods"},
+                        "apiVersion": {"type": "string", "description": "Only to disambiguate kind"},
+                        "name": {"type": "string", "description": "Workload name, with kind"},
+                        "labelSelector": {"type": "string", "description": "Logs of the pods it selects, e.g. app=web"},
+                        "container": {"type": "string", "description": "Default: the pod's default container"},
+                        "allContainers": {"type": "boolean", "description": "Every container, init containers included"},
+                        "filter": {"type": "string", "description": "Only lines containing this text (applied after masking)"},
+                        "regex": {"type": "boolean", "description": "filter is a regular expression"},
+                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Per container"},
                         "sinceSeconds": {"type": "integer", "minimum": 1},
                         "previous": {"type": "boolean"},
                     });
@@ -681,7 +698,7 @@ fn catalog() -> Vec<ToolSpec> {
                         .extend(ns.as_object().unwrap().clone());
                     p
                 },
-                &["pod"],
+                &[],
             ),
             read_only: true,
             destructive: false,
@@ -799,6 +816,24 @@ fn catalog() -> Vec<ToolSpec> {
                 &["kind", "name"],
             ),
             read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "wait_for_rollout",
+            description: "Wait until a Deployment, StatefulSet or DaemonSet has rolled out, like \
+                          kubectl rollout status --timeout: after scale, rollout_restart, \
+                          apply_manifest or Helm. Returns when all pods are updated and ready, \
+                          or at the timeout (default 120s, at most 600s) or a failure (progress \
+                          deadline, paused), then with the pods not ready and why (Pending and \
+                          the scheduler's message, CrashLoopBackOff, last exit such as OOMKilled).",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "name"],
+            ),
+            read_only: true,
             destructive: false,
         },
         ToolSpec {
@@ -1065,6 +1100,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string", "description": "Chart version; the latest stable by default"},
                         "values": {"type": "string", "description": "Values as one YAML mapping (no file paths)"},
                         "createNamespace": {"type": "boolean", "default": false},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()
@@ -1096,6 +1132,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string"},
                         "values": {"type": "string", "description": "Values as one YAML mapping; they replace all of the release's values. Not with valuesPatch"},
                         "valuesPatch": {"type": "string", "description": "Only the changes, as one YAML mapping merged into the release's values (null removes a key). Not with values"},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()

@@ -3,7 +3,9 @@
 //! (confirm) → API → mask`; nothing reaches the API without an [`Allowed`]
 //! plan.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::ReplicaSet;
@@ -19,7 +21,8 @@ use kubach_core::plugin::{ActionId, ActionKind, ActionParams, Cell, PluginRegist
 use kubach_core::rbac::ResourceAccess;
 use kubach_core::secrets::mask::is_core_secret;
 use kubach_core::streams::exec_capture;
-use kube::api::{Api, DynamicObject, ListParams, LogParams};
+use kubach_core::workload_pods::{Workload, pods_of};
+use kube::api::{Api, ApiResource, DynamicObject, ListParams, LogParams};
 use kube::{Client, ResourceExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -254,8 +257,19 @@ struct EventsArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LogsArgs {
-    pod: String,
+    pod: Option<String>,
+    /// A workload whose pods are read, with `name`.
+    kind: Option<String>,
+    api_version: Option<String>,
+    name: Option<String>,
+    label_selector: Option<String>,
     container: Option<String>,
+    #[serde(default)]
+    all_containers: bool,
+    /// Only lines with this substring (a regular expression with `regex`).
+    filter: Option<String>,
+    #[serde(default)]
+    regex: bool,
     namespace: Option<String>,
     tail_lines: Option<i64>,
     since_seconds: Option<i64>,
@@ -313,7 +327,7 @@ struct CompareArgs {
     other_key: String,
 }
 
-fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
+pub(crate) fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
     KindRef { kind, api_version }
 }
 
@@ -768,14 +782,46 @@ pub(crate) async fn run(
         }
         "get_logs" => {
             let a: LogsArgs = parse(args)?;
+            let workload = match (&a.kind, &a.name, &a.api_version) {
+                (Some(kind), Some(name), _) => {
+                    Some((kind_ref(kind.clone(), a.api_version.clone()), name.clone()))
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(Denial::new(
+                        DenialCode::InvalidInput,
+                        "kind and name go together (apiVersion only with them)",
+                    )
+                    .into());
+                }
+            };
+            if a.all_containers && a.container.is_some() {
+                return Err(Denial::new(
+                    DenialCode::InvalidInput,
+                    "give either container or allContainers, not both",
+                )
+                .into());
+            }
+            let filter = line_filter(a.filter.as_deref(), a.regex)?;
             let request = Request::Logs {
                 pod: a.pod.clone(),
+                workload,
+                label_selector: a.label_selector.clone(),
                 container: a.container.clone(),
                 namespace: a.namespace.clone(),
             };
             let allowed = authorize(ctx, &request).await?;
-            ensure_rbac(ctx, &allowed.namespace, &[("get", "", "pods/log")]).await?;
-            get_logs(ctx, &allowed, &a).await
+            let mut rights = vec![("get", "", "pods/log")];
+            if a.pod.is_none() {
+                rights.push(("list", "", "pods"));
+            } else if a.all_containers {
+                rights.push(("get", "", "pods"));
+            }
+            if let Some(kind) = &allowed.kind {
+                rights.push(("get", kind.api.group.as_str(), kind.api.plural.as_str()));
+            }
+            ensure_rbac(ctx, &allowed.namespace, &rights).await?;
+            get_logs(ctx, &allowed, &a, filter.as_ref()).await
         }
         "top_pods" => {
             let a: NamespaceArgs = parse(args)?;
@@ -792,6 +838,7 @@ pub(crate) async fn run(
             top_pods(ctx, &allowed).await
         }
         "get_topology" => topology_tools::get_topology(ctx, args).await,
+        "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
@@ -995,7 +1042,7 @@ pub(crate) async fn run(
 
 // ------------------------------------------------------------- helpers
 
-fn kind_of(allowed: &Allowed) -> &ResourceKind {
+pub(crate) fn kind_of(allowed: &Allowed) -> &ResourceKind {
     allowed.kind.as_ref().expect("policy resolved the kind")
 }
 
@@ -1015,7 +1062,7 @@ fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolErro
     }
 }
 
-async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
+pub(crate) async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
     let api = discovery::api(client, kind_of(allowed), Some(&allowed.namespace));
     let obj = api.get(name_of(allowed)).await?;
     ensure_namespace(&obj, &allowed.namespace)?;
@@ -1029,7 +1076,7 @@ fn masked_value(obj: &DynamicObject) -> Value {
 }
 
 /// Final masking and size bound of any text shown to the agent.
-fn finish(text: &str) -> String {
+pub(crate) fn finish(text: &str) -> String {
     truncate(&mask_text(text), MAX_OUTPUT_BYTES).into_owned()
 }
 
@@ -1459,17 +1506,356 @@ async fn list_events(ctx: &Ctx<'_>, allowed: &Allowed, limit: usize) -> Result<S
     Ok(finish(&out))
 }
 
+/// At most this many pods per `get_logs` call, and streams (pod and
+/// container) in all.
+const MAX_LOG_PODS: usize = 10;
+const MAX_LOG_STREAMS: usize = 20;
+const MAX_FILTER_LEN: usize = 1024;
+/// Names of the pods left out, listed in the note.
+const MAX_LEFT_OUT_NAMES: usize = 20;
+
+/// The `filter` of `get_logs`, matched against each line.
+enum LineFilter {
+    Substring(String),
+    Regex(regex::Regex),
+}
+
+impl LineFilter {
+    fn matches(&self, line: &str) -> bool {
+        match self {
+            Self::Substring(needle) => line.contains(needle.as_str()),
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+fn line_filter(filter: Option<&str>, regex: bool) -> Result<Option<LineFilter>, ToolError> {
+    let invalid = |message: String| ToolError::from(Denial::new(DenialCode::InvalidInput, message));
+    let Some(filter) = filter else {
+        return if regex {
+            Err(invalid("regex needs a filter".to_owned()))
+        } else {
+            Ok(None)
+        };
+    };
+    if filter.is_empty() || filter.len() > MAX_FILTER_LEN {
+        return Err(invalid(format!(
+            "filter must have 1 to {MAX_FILTER_LEN} bytes"
+        )));
+    }
+    if !regex {
+        return Ok(Some(LineFilter::Substring(filter.to_owned())));
+    }
+    regex::RegexBuilder::new(filter)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .map(|regex| Some(LineFilter::Regex(regex)))
+        .map_err(|error| invalid(format!("filter is not a valid regular expression: {error}")))
+}
+
+/// One log stream: a pod and its container (`None`: the pod's default).
+struct LogStream {
+    pod: String,
+    container: Option<String>,
+}
+
+impl LogStream {
+    fn label(&self) -> String {
+        match &self.container {
+            Some(container) => format!("{}/{container}", self.pod),
+            None => self.pod.clone(),
+        }
+    }
+}
+
+/// `names` for a note, at most [`MAX_LEFT_OUT_NAMES`] of them.
+fn name_list(names: &[String]) -> String {
+    let shown = names[..names.len().min(MAX_LEFT_OUT_NAMES)].join(", ");
+    match names.len().saturating_sub(MAX_LEFT_OUT_NAMES) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// The pods of a workload: listed by its labels, chosen by owners with
+/// [`pods_of`].
+async fn workload_pods(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    api: &Api<Pod>,
+    notes: &mut Vec<String>,
+) -> Result<Vec<Pod>, ToolError> {
+    let namespace = &allowed.namespace;
+    let kind = kind_of(allowed);
+    let client = ctx.session.client_in(namespace)?;
+    let object = fetch(&client, allowed).await?;
+    let workload = Workload::from_api(&kind.api.group, &kind.api.kind)
+        .ok_or_else(|| ToolError::Failed(format!("{} has no pods", kind.api.kind)))?;
+    // Narrow the list by the workload's labels; owners decide below.
+    let labels: Vec<String> = object
+        .data
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut params = ListParams::default().limit(MAX_LIST_ITEMS);
+    if !labels.is_empty() {
+        params = params.labels(&labels.join(","));
+    }
+    let listed = api.list(&params).await?;
+    if listed
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|c| !c.is_empty())
+    {
+        notes.push(format!(
+            "(only {MAX_LIST_ITEMS} pods were looked at; pods of {} {} may be missing)",
+            kind.api.kind,
+            name_of(allowed)
+        ));
+    }
+    let listed: Vec<Pod> = listed
+        .items
+        .into_iter()
+        .filter(|pod| pod.metadata.namespace.as_deref() == Some(namespace.as_str()))
+        .collect();
+    let dynamic: Vec<Arc<DynamicObject>> = listed
+        .iter()
+        .filter_map(|pod| {
+            serde_json::to_value(pod)
+                .ok()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .map(Arc::new)
+        })
+        .collect();
+    // ReplicaSets of a Deployment, Jobs of a CronJob; when they cannot be
+    // read, the selector chooses.
+    let intermediates = match workload.intermediate() {
+        Some((_, intermediate)) => {
+            let resource = if intermediate == "ReplicaSet" {
+                ApiResource::erase::<ReplicaSet>(&())
+            } else {
+                ApiResource::erase::<Job>(&())
+            };
+            let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &resource);
+            api.list(&ListParams::default().limit(MAX_LIST_ITEMS))
+                .await
+                .ok()
+                .map(|list| list.items.into_iter().map(Arc::new).collect::<Vec<_>>())
+        }
+        None => None,
+    };
+    Ok(
+        pods_of(workload, &object, intermediates.as_deref(), &dynamic)
+            .iter()
+            .filter_map(|pod| {
+                listed
+                    .iter()
+                    .find(|p| p.metadata.name == pod.metadata.name)
+                    .cloned()
+            })
+            .collect(),
+    )
+}
+
+/// The pods `get_logs` reads, sorted, at most [`MAX_LOG_PODS`]; notes say
+/// what was left out. `None` for a single pod read as before (by name,
+/// without reading the pod).
+async fn log_pods(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    args: &LogsArgs,
+    api: &Api<Pod>,
+    notes: &mut Vec<String>,
+) -> Result<Option<Vec<Pod>>, ToolError> {
+    let mut pods: Vec<Pod> = if let Some(selector) = &args.label_selector {
+        let params = ListParams::default().labels(selector).limit(MAX_LIST_ITEMS);
+        let mut pods: Vec<Pod> = api
+            .list(&params)
+            .await?
+            .items
+            .into_iter()
+            .filter(|pod| pod.metadata.namespace.as_deref() == Some(allowed.namespace.as_str()))
+            .collect();
+        pods.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        pods
+    } else if allowed.kind.is_some() {
+        workload_pods(ctx, allowed, api, notes).await?
+    } else if args.all_containers {
+        vec![api.get(name_of(allowed)).await?]
+    } else {
+        return Ok(None);
+    };
+    if pods.len() > MAX_LOG_PODS {
+        let left: Vec<String> = pods[MAX_LOG_PODS..]
+            .iter()
+            .map(|pod| pod.name_any())
+            .collect();
+        notes.push(format!(
+            "({} pods match; only the first {MAX_LOG_PODS} were read. Left out: {})",
+            pods.len(),
+            name_list(&left)
+        ));
+        pods.truncate(MAX_LOG_PODS);
+    }
+    Ok(Some(pods))
+}
+
+/// Container names of `pod`: init containers first, then the containers
+/// and ephemeral containers, as `kubectl logs --all-containers`.
+fn pod_containers(pod: &Pod) -> Vec<String> {
+    let Some(spec) = &pod.spec else {
+        return Vec::new();
+    };
+    let init = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .map(|c| c.name.clone());
+    let main = spec.containers.iter().map(|c| c.name.clone());
+    let ephemeral = spec
+        .ephemeral_containers
+        .iter()
+        .flatten()
+        .map(|c| c.name.clone());
+    init.chain(main).chain(ephemeral).collect()
+}
+
+/// The container `kubectl logs` reads by default: the
+/// `kubectl.kubernetes.io/default-container` annotation, else the first.
+fn default_container(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("kubectl.kubernetes.io/default-container"))
+        .filter(|name| spec.containers.iter().any(|c| &c.name == *name))
+        .cloned()
+        .or_else(|| spec.containers.first().map(|c| c.name.clone()))
+}
+
+/// The streams of `pods`, at most [`MAX_LOG_STREAMS`].
+fn log_streams(pods: &[Pod], args: &LogsArgs, notes: &mut Vec<String>) -> Vec<LogStream> {
+    let mut streams = Vec::new();
+    for pod in pods {
+        let name = pod.name_any();
+        let containers = pod_containers(pod);
+        let chosen: Vec<Option<String>> = if args.all_containers {
+            containers.into_iter().map(Some).collect()
+        } else if let Some(container) = &args.container {
+            if containers.contains(container) {
+                vec![Some(container.clone())]
+            } else {
+                notes.push(format!("(pod {name} has no container {container})"));
+                Vec::new()
+            }
+        } else {
+            vec![default_container(pod)]
+        };
+        streams.extend(chosen.into_iter().map(|container| LogStream {
+            pod: name.clone(),
+            container,
+        }));
+    }
+    if pods.is_empty() {
+        notes.push("(no pods match)".to_owned());
+    }
+    if streams.len() > MAX_LOG_STREAMS {
+        let left: Vec<String> = streams[MAX_LOG_STREAMS..]
+            .iter()
+            .map(LogStream::label)
+            .collect();
+        notes.push(format!(
+            "(only the first {MAX_LOG_STREAMS} of {} containers were read. Left out: {})",
+            streams.len(),
+            name_list(&left)
+        ));
+        streams.truncate(MAX_LOG_STREAMS);
+    }
+    streams
+}
+
 async fn get_logs(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
     args: &LogsArgs,
+    filter: Option<&LineFilter>,
 ) -> Result<ToolOutput, ToolError> {
     let api: Api<Pod> = Api::namespaced(
         ctx.session.client_in(&allowed.namespace)?,
         &allowed.namespace,
     );
-    let params = LogParams {
-        container: args.container.clone(),
+    let mut notes = Vec::new();
+    let streams = match log_pods(ctx, allowed, args, &api, &mut notes).await? {
+        None => vec![LogStream {
+            pod: name_of(allowed).to_owned(),
+            container: args.container.clone(),
+        }],
+        Some(pods) => log_streams(&pods, args, &mut notes),
+    };
+
+    // Logs of a pod the agent itself shaped are the shortest way out for
+    // what its manifest read (#190, ADR 0005): confirmed, for every pod.
+    let mut checked = HashSet::new();
+    let mut shaped: Vec<(&str, String)> = Vec::new();
+    for stream in &streams {
+        if !checked.insert(stream.pod.as_str()) {
+            continue;
+        }
+        if let Some(reason) = agent_shaped(ctx, &api, &allowed.namespace, &stream.pod).await {
+            shaped.push((stream.pod.as_str(), reason));
+        }
+    }
+    let confirmed = !shaped.is_empty();
+    if confirmed {
+        let mut confirm_plan = allowed.clone();
+        confirm_plan.confirmation = Confirmation::Required;
+        let (summary, reasons) = match shaped.as_slice() {
+            [(pod, reason)] => (
+                format!("Read the logs of pod {}/{pod}", allowed.namespace),
+                reason.clone(),
+            ),
+            _ => (
+                format!(
+                    "Read the logs of pods {}/{}",
+                    allowed.namespace,
+                    shaped
+                        .iter()
+                        .map(|(pod, _)| *pod)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                shaped
+                    .iter()
+                    .map(|(pod, reason)| format!("Pod {pod}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        confirm(
+            ctx,
+            &confirm_plan,
+            "get_logs",
+            summary,
+            format!(
+                "{reasons}\n\nThe logs carry whatever the agent's manifest prints: values \
+                 of the Secrets it reads and ServiceAccount tokens it mounts. Kubach masks \
+                 well-known secret formats in logs, best effort only."
+            ),
+            Vec::new(),
+        )
+        .await?;
+    }
+
+    let params = |container: Option<String>| LogParams {
+        container,
         follow: false,
         limit_bytes: Some(MAX_LOG_BYTES),
         pretty: false,
@@ -1483,32 +1869,59 @@ async fn get_logs(
         ),
         timestamps: false,
     };
-    let pod = name_of(allowed);
-    // Logs of a pod the agent itself shaped are the shortest way out for
-    // what its manifest read (#190, ADR 0005): confirmed one by one.
-    let confirmed = match agent_shaped(ctx, &api, &allowed.namespace, pod).await {
-        Some(reason) => {
-            let mut confirm_plan = allowed.clone();
-            confirm_plan.confirmation = Confirmation::Required;
-            confirm(
-                ctx,
-                &confirm_plan,
-                "get_logs",
-                format!("Read the logs of pod {}/{pod}", allowed.namespace),
-                format!(
-                    "{reason}\n\nThe logs carry whatever the agent's manifest prints: values \
-                     of the Secrets it reads and ServiceAccount tokens it mounts. Kubach masks \
-                     well-known secret formats in logs, best effort only."
-                ),
-                Vec::new(),
-            )
-            .await?;
-            true
+    let prefixed = streams.len() > 1;
+    let mut body = String::new();
+    let mut matched = 0usize;
+    for (index, stream) in streams.iter().enumerate() {
+        if body.len() > MAX_OUTPUT_BYTES {
+            let left: Vec<String> = streams[index..].iter().map(LogStream::label).collect();
+            notes.push(format!("(output is full; not read: {})", name_list(&left)));
+            break;
         }
-        None => false,
+        let logs = match api
+            .logs(&stream.pod, &params(stream.container.clone()))
+            .await
+        {
+            Ok(logs) => logs,
+            // A single stream fails the call, as before.
+            Err(error) if streams.len() == 1 && notes.is_empty() => return Err(error.into()),
+            Err(error) => {
+                notes.push(format!(
+                    "({}: {})",
+                    stream.label(),
+                    ToolError::from(error).message()
+                ));
+                continue;
+            }
+        };
+        // Masked before filtering: the filter must not probe what masking
+        // hides.
+        let masked = mask_text(&logs);
+        if !prefixed && filter.is_none() {
+            body.push_str(&masked);
+            continue;
+        }
+        for line in masked.lines() {
+            if filter.is_some_and(|f| !f.matches(line)) {
+                continue;
+            }
+            matched += 1;
+            if prefixed {
+                let _ = write!(body, "[{}] ", stream.label());
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if filter.is_some() && matched == 0 && !streams.is_empty() {
+        notes.push("(no line matched the filter)".to_owned());
+    }
+    let text = if notes.is_empty() {
+        finish(&body)
+    } else {
+        // Notes first: truncation cuts the end.
+        finish(&format!("{}\n\n{body}", notes.join("\n")))
     };
-    let logs = api.logs(pod, &params).await?;
-    let text = finish(&logs);
     Ok(if confirmed {
         ToolOutput::confirmed(text)
     } else {
