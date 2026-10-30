@@ -11,7 +11,7 @@ Kubach выступает MCP-сервером (#12): AI-агент подклю
 | Профиль | Что разрешено |
 |---------|---------------|
 | read-only | `get`/`list`/`watch` ресурсов namespace, events. Без Secrets |
-| debug | read-only, плюс `pods/log` и `pods/exec` |
+| debug | read-only, плюс `pods/log`, `pods/exec` и `patch pods/ephemeralcontainers` (#64) |
 | deploy | read-only, плюс apply (SSA), rollout, scale и delete в namespace |
 
 Ограничения:
@@ -1226,3 +1226,35 @@ Forward агента не должен переживать самого аге�
   `remembered: "used"`; вызов, в окне которого поставили галочку, — `remembered: "saved"`.
   Агент первой строкой ответа видит, что действие одобрено по запомненному выбору (или что
   пользователь только что попросил больше не спрашивать).
+
+## Отладочный контейнер через агента (#64)
+
+В distroless-образах (Grafana и т. п.) нет `sh` и `cat`, `exec` там бесполезен. Инструмент
+`debug_container` — аналог `kubectl debug <pod> --image=busybox --target=<container>`:
+добавляет поду эфемерный контейнер через подресурс `pods/ephemeralcontainers` (strategic merge
+patch `spec.ephemeralContainers`), ждёт, пока он запустится, и, если агент передал `command`,
+выполняет её в нём так же, как `exec` (без TTY, вывод ограничен и маскируется).
+
+- **Контейнер остаётся.** Он запускает команду образа по умолчанию (у busybox — `sh` на
+  открытом stdin) и работает до удаления пода. Следующие команды агент выполняет обычным
+  `exec` с `container: <имя>`, каждая подтверждается отдельно; так под не копит по контейнеру на
+  каждую команду. Без `command` контейнер просто запускается.
+- **Образ.** По умолчанию — busybox с явным реестром и digest (`streams::debug::DEFAULT_IMAGE`,
+  как у вкладки Debug); образ агента разрешён, но проверяется (только `[A-Za-z0-9._-/:@]`, до
+  512 байт) и отдельно показывается в окне как выбранный агентом.
+- **Права.** Как у `exec`: уровень «Отладка» (ниже — `NeedsAccess`), `modify(ns)` там, где
+  границу держит сервер, RBAC пользователя `patch pods/ephemeralcontainers` и, если есть
+  команда, `create pods/exec` (SSAR). Role временного SA вместе с `modify(ns)` уровня «Отладка»
+  получает ровно `patch` на `pods/ephemeralcontainers` — это всё, что нужно для добавления.
+- **Подтверждение — каждый раз и без галочки.** Окно показывает под, целевой контейнер, образ,
+  имя и команду (`RequestKind::Exec` с argv, без команды — `RequestKind::Call`); опасные находки:
+  контейнер нельзя удалить до удаления пода, общий process namespace с целевым контейнером
+  (видны его процессы и через `/proc` — файлы и окружение), образ агента. С находками
+  `rememberable` возвращает `None`.
+- **Без привилегий и Pod Security.** Kubach никогда не ставит `privileged`, host-namespace и
+  capabilities; агент securityContext не передаёт. Сначала server-side dry run под идентичностью
+  сессии; если уровень Pod Security namespace его отклоняет, пробуется restricted-контекст
+  (`allowPrivilegeEscalation: false`, `drop: [ALL]`, `runAsNonRoot`, `RuntimeDefault` seccomp,
+  пользователь целевого контейнера или пода, иначе 65534). Отклонён и он — отказ без вопроса
+  пользователю. Под не в `Running`, неизвестный целевой контейнер и занятое имя тоже
+  отклоняются до окна.

@@ -51,6 +51,8 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 /// Longest exec command, all arguments together, in bytes. Keeps the
 /// confirmation dialog readable in full (#194).
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
+/// Longest image reference of a debug container (#64).
+pub const MAX_IMAGE_REF_BYTES: usize = 512;
 /// Lowest local port an agent's port-forward may take (#17): well-known
 /// ports stay with the system and the user.
 pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
@@ -160,6 +162,18 @@ pub enum Request {
         namespace: Option<String>,
         command: Vec<String>,
     },
+    /// `debug_container` (#64): an ephemeral container added to `pod`, in
+    /// the process namespace of `target` when given, then `command` run in
+    /// it like exec (none: it is left running for exec). Confirmed every
+    /// time: the pod keeps the container until it is deleted.
+    Debug {
+        pod: String,
+        target: Option<String>,
+        name: Option<String>,
+        image: Option<String>,
+        namespace: Option<String>,
+        command: Vec<String>,
+    },
     /// `port_forward_start` (#17): a local port on `127.0.0.1` to a pod,
     /// or to a ready pod of a Service or Deployment. `target` is
     /// `pod/<name>`, `service/<name>` or `deployment/<name>`.
@@ -245,6 +259,7 @@ impl Request {
             | Self::Restart { .. }
             | Self::Delete { .. }
             | Self::Exec { .. }
+            | Self::Debug { .. }
             | Self::SecretWrite { .. }
             | Self::SecretCopy { .. }
             | Self::SecretDelete { .. }
@@ -493,9 +508,10 @@ impl<'a> Policy<'a> {
             })
         };
         match request {
-            Request::Logs { .. } | Request::Exec { .. } | Request::PortForward { .. } => {
-                need(Profile::Debug, false)
-            }
+            Request::Logs { .. }
+            | Request::Exec { .. }
+            | Request::Debug { .. }
+            | Request::PortForward { .. } => need(Profile::Debug, false),
             Request::Apply { .. }
             | Request::Scale { .. }
             | Request::Restart { .. }
@@ -624,6 +640,7 @@ impl<'a> Policy<'a> {
             | Request::Restart { .. }
             | Request::Delete { .. }
             | Request::Exec { .. }
+            | Request::Debug { .. }
             | Request::SecretWrite { .. }
             | Request::SecretDelete { .. }
             | Request::HelmChange { .. } => {
@@ -827,6 +844,28 @@ impl<'a> Policy<'a> {
                     container_name(container)?;
                 }
                 check_command(command)?;
+                allowed.confirmation = Confirmation::Required;
+                Ok(allowed)
+            }
+            Request::Debug {
+                pod,
+                target,
+                name,
+                image,
+                namespace,
+                command,
+            } => {
+                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                allowed.name = Some(object_name(pod)?);
+                for container in [target, name].into_iter().flatten() {
+                    container_name(container)?;
+                }
+                if let Some(image) = image {
+                    check_image(image)?;
+                }
+                if !command.is_empty() {
+                    check_command(command)?;
+                }
                 allowed.confirmation = Confirmation::Required;
                 Ok(allowed)
             }
@@ -1049,6 +1088,7 @@ impl<'a> Policy<'a> {
         let what = match request {
             Request::Logs { .. } => "reading logs",
             Request::Exec { .. } => "exec",
+            Request::Debug { .. } => "a debug container",
             Request::PortForward { .. } => "port-forward",
             Request::Apply { dry_run: true, .. } => "a dry-run apply",
             Request::Apply { .. } => "apply",
@@ -1505,6 +1545,27 @@ fn container_name(name: &str) -> Result<(), Denial> {
         Err(Denial::new(
             DenialCode::InvalidName,
             format!("{name:?} is not a valid container name"),
+        ))
+    }
+}
+
+/// An image reference as the user sees it in the confirmation: registry,
+/// path, tag and digest characters only, nothing hidden (#64).
+fn check_image(image: &str) -> Result<(), Denial> {
+    let valid = !image.is_empty()
+        && image.len() <= MAX_IMAGE_REF_BYTES
+        && !image.starts_with(['-', '.', '/', ':', '@'])
+        && image
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b));
+    if valid {
+        Ok(())
+    } else {
+        Err(Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "{image:?} is not an image reference: use letters, digits and . _ - / : @                  only, at most {MAX_IMAGE_REF_BYTES} bytes, e.g. docker.io/library/busybox:1.37"
+            ),
         ))
     }
 }

@@ -401,7 +401,8 @@ impl McpServer {
             "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
              {access}. Access says which tools you may call without asking for more; it \
              approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
-             and calls across all namespaces are not available. {secrets}{writes} Call \
+             and calls across all namespaces are not available. For images without a shell \
+             (distroless) use debug_container, then exec into it. {secrets}{writes} Call \
              `session_info` for details.",
             scope.context
         )
@@ -513,7 +514,7 @@ const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, 
 /// Whether every real call of tool `name` is confirmed by the user (a dry
 /// run of `apply_manifest` is not).
 fn confirms_each_call(name: &str) -> bool {
-    matches!(name, "exec" | "port_forward_start")
+    matches!(name, "exec" | "debug_container" | "port_forward_start")
         || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
 }
 
@@ -528,7 +529,9 @@ fn tool_access(name: &str) -> Option<Access> {
         })
     };
     match name {
-        "get_logs" | "exec" | "port_forward_start" => need(Profile::Debug, false),
+        "get_logs" | "exec" | "debug_container" | "port_forward_start" => {
+            need(Profile::Debug, false)
+        }
         "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
         | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
@@ -1249,6 +1252,36 @@ fn catalog() -> Vec<ToolSpec> {
                     p
                 },
                 &["pod", "command"],
+            ),
+            read_only: false,
+            destructive: true,
+        },
+        ToolSpec {
+            name: "debug_container",
+            description: "For pods whose images have no shell or tools (distroless): add an \
+                          ephemeral debug container (kubectl debug), by default busybox, \
+                          optionally sharing the processes of targetContainer, wait until it \
+                          runs, then run command in it like exec. Needs the user's approval \
+                          every time; the container stays in the pod until the pod is deleted, \
+                          so add one and run further commands in it with exec (container: its \
+                          name).",
+            schema: object_schema(
+                {
+                    let mut p = json!({
+                        "pod": {"type": "string"},
+                        "targetContainer": {"type": "string", "description": "Container whose process namespace the debug container shares (sees its processes and, through /proc/<pid>/root, its files)"},
+                        "name": {"type": "string", "description": "Name of the debug container; debugger-<random> when left out"},
+                        "image": {"type": "string", "description": "Image of the debug container; a pinned busybox when left out"},
+                        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                                    "description": "Command to run in the debug container once it runs; leave out to only start it"},
+                        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 120},
+                    });
+                    p.as_object_mut()
+                        .unwrap()
+                        .extend(ns.as_object().unwrap().clone());
+                    p
+                },
+                &["pod"],
             ),
             read_only: false,
             destructive: true,

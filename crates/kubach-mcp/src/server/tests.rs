@@ -102,6 +102,61 @@ fn selected_pod_logs(path: &str) -> String {
     format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
 }
 
+/// Pods for `debug_container` (#64): `distroless-0` takes any debug
+/// container, `restricted-0` only one with a restricted security context,
+/// `locked-0` none (Pod Security refuses), `pending-0` is not running. Once
+/// added, the container `dbg` runs.
+fn debug_pod(method: &str, path: &str, body: &[u8]) -> Option<(&'static str, String)> {
+    let rest = path.strip_prefix(&format!("/api/v1/namespaces/{NS}/pods/"))?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let (name, sub) = match rest.split_once('/') {
+        Some((name, sub)) => (name, Some(sub)),
+        None => (rest, None),
+    };
+    if !["distroless-0", "restricted-0", "locked-0", "pending-0"].contains(&name) {
+        return None;
+    }
+    let phase = if name == "pending-0" {
+        "Pending"
+    } else {
+        "Running"
+    };
+    let pod = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": NS},
+        "spec": {"containers": [{"name": "app", "image": "gcr.io/distroless/static-debian12",
+                                 "securityContext": {"runAsUser": 472}}]},
+        "status": {"phase": phase, "ephemeralContainerStatuses": [
+            {"name": "dbg", "image": "busybox", "imageID": "", "ready": false, "restartCount": 0,
+             "state": {"running": {}}}
+        ]},
+    });
+    let forbidden = || {
+        let message = format!(
+            "pods \"{name}\" is forbidden: violates PodSecurity \"restricted:latest\": \
+             runAsNonRoot != true"
+        );
+        Some((
+            "403 Forbidden",
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                   "message": message, "reason": "Forbidden", "code": 403})
+            .to_string(),
+        ))
+    };
+    match (method, sub) {
+        ("GET", None) => Some(("200 OK", pod.to_string())),
+        ("PATCH", Some("ephemeralcontainers")) => {
+            let body = String::from_utf8_lossy(body);
+            match name {
+                "locked-0" => forbidden(),
+                "restricted-0" if !body.contains("runAsNonRoot") => forbidden(),
+                _ => Some(("200 OK", pod.to_string())),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn replica_set() -> Value {
     json!({
         "apiVersion": "apps/v1", "kind": "ReplicaSet",
@@ -316,6 +371,8 @@ impl FakeApi {
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
+                        } else if let Some(reply) = debug_pod(&method, &path, &body) {
+                            reply
                         } else if method == "GET" && path == format!("{pods}/web-0") {
                             ("200 OK", owned_pod().to_string())
                         } else if method == "GET"
@@ -494,6 +551,7 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
             ("get_logs", json!({"labelSelector": "app=db", "namespace": ns})),
             ("top_pods", json!({"namespace": ns})),
             ("exec", json!({"pod": "web-0", "namespace": ns, "command": ["id"]})),
+            ("debug_container", json!({"pod": "distroless-0", "namespace": ns, "targetContainer": "app"})),
             ("port_forward_start", json!({"target": "pod/web-0", "port": 8080, "namespace": ns})),
             ("scale", json!({"kind": "Deployment", "name": "web", "namespace": ns, "replicas": 5})),
             ("rollout_restart", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
@@ -3136,4 +3194,327 @@ async fn texts_say_changes_are_confirmed_as_the_policy_does() {
     let logs = description("get_logs");
     assert!(logs.contains("Requires your approval in Kubach"), "{logs}");
     assert!(!logs.contains("each one is still confirmed"), "{logs}");
+}
+
+// ------------------------------------------------------------- debug_container (#64)
+
+fn ephemeral_patches(f: &Fixture) -> Vec<String> {
+    f.api
+        .writes()
+        .into_iter()
+        .filter(|w| w.starts_with("PATCH ") && w.contains("/ephemeralcontainers"))
+        .collect()
+}
+
+fn patch_body(write: &str) -> Value {
+    serde_json::from_str(write.split_once('\n').unwrap().1).unwrap()
+}
+
+/// A Debug session where the API server holds the boundary and the user
+/// would tick "don't ask again" wherever it is offered.
+async fn debug_fixture() -> Fixture {
+    let f = fixture_with(
+        Profile::Debug,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        true,
+    )
+    .await;
+    f.server
+        .session()
+        .set_grants(grants(&[Grant::read(NS), Grant::modify(NS)]));
+    f
+}
+
+#[tokio::test]
+async fn debug_container_is_dry_run_then_confirmed_every_time() {
+    let f = debug_fixture().await;
+    let call = json!({"pod": "distroless-0", "targetContainer": "app", "name": "dbg"});
+    let outcome = f
+        .server
+        .call("agent", "debug_container", args(call.clone()))
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("is running"), "{}", outcome.text);
+    assert!(outcome.text.contains("container dbg"), "{}", outcome.text);
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 2, "{patches:?}");
+    assert!(patches[0].contains("dryRun=All"), "{}", patches[0]);
+    assert!(!patches[1].contains("dryRun"), "{}", patches[1]);
+    let body = patch_body(&patches[1]);
+    let container = &body["spec"]["ephemeralContainers"][0];
+    assert_eq!(container["name"], "dbg");
+    assert_eq!(container["targetContainerName"], "app");
+    assert_eq!(
+        container["image"],
+        kubach_core::streams::debug::DEFAULT_IMAGE
+    );
+    assert_eq!(container["stdin"], true);
+    // Nothing privileged, no host settings, no capabilities.
+    assert!(container.get("securityContext").is_none(), "{container}");
+
+    let requests = f.confirmer.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.tool, "debug_container");
+    assert_eq!(request.kind, RequestKind::Call);
+    assert!(
+        request.summary.contains("distroless-0"),
+        "{}",
+        request.summary
+    );
+    assert!(request.summary.contains("dbg"), "{}", request.summary);
+    assert!(
+        request.details.contains("Target container: app"),
+        "{}",
+        request.details
+    );
+    assert!(
+        request.dangerous[0]
+            .message
+            .contains("until the pod is deleted"),
+        "{:?}",
+        request.dangerous
+    );
+    assert!(request.dangerous.iter().any(|finding| {
+        finding
+            .message
+            .contains("process namespace of container app")
+    }));
+    // Permanent: never "don't ask again", so the next call asks again.
+    assert!(!request.allow_remember);
+    f.server.call("agent", "debug_container", args(call)).await;
+    assert_eq!(f.confirmer.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn debug_container_shows_the_command_and_the_agents_image() {
+    let f = fixture(Profile::Debug, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(
+                json!({"pod": "distroless-0", "image": "nicolaka/netshoot:v0.13",
+                        "command": ["ss", "-tlnp"]}),
+            ),
+        )
+        .await;
+    assert!(outcome.is_error);
+    let request = f.confirmer.requests().pop().unwrap();
+    assert_eq!(
+        request.kind,
+        RequestKind::Exec {
+            command: vec!["ss".into(), "-tlnp".into()]
+        }
+    );
+    assert!(
+        request.summary.contains("nicolaka/netshoot:v0.13"),
+        "{}",
+        request.summary
+    );
+    assert!(
+        request.summary.contains("then run a command"),
+        "{}",
+        request.summary
+    );
+    assert!(
+        request
+            .dangerous
+            .iter()
+            .any(|finding| finding.message.contains("chosen by the agent"))
+    );
+    // Rejected: only the dry run reached the pod.
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert!(patches[0].contains("dryRun=All"));
+}
+
+#[tokio::test]
+async fn debug_container_follows_restricted_pod_security() {
+    let f = debug_fixture().await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "restricted-0", "targetContainer": "app", "name": "dbg"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome.text.contains("runs as user 472"),
+        "{}",
+        outcome.text
+    );
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 3, "{patches:?}");
+    let body = patch_body(&patches[2]);
+    let context = &body["spec"]["ephemeralContainers"][0]["securityContext"];
+    assert_eq!(context["runAsNonRoot"], true);
+    assert_eq!(context["runAsUser"], 472);
+    assert_eq!(context["allowPrivilegeEscalation"], false);
+    assert_eq!(context["capabilities"]["drop"], json!(["ALL"]));
+    assert!(context["capabilities"].get("add").is_none());
+    assert!(context.get("privileged").is_none());
+    assert!(
+        f.confirmer.requests()[0]
+            .dangerous
+            .iter()
+            .any(|finding| finding.path.ends_with("securityContext"))
+    );
+}
+
+#[tokio::test]
+async fn debug_containers_that_cannot_work_are_not_asked_about() {
+    let f = debug_fixture().await;
+    let outcome = f
+        .server
+        .call("agent", "debug_container", args(json!({"pod": "locked-0"})))
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("Pod Security level"),
+        "{}",
+        outcome.text
+    );
+    assert!(f.confirmer.requests().is_empty());
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 2);
+    assert!(patches.iter().all(|p| p.contains("dryRun=All")));
+
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "pending-0"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(outcome.text.contains("is Pending"), "{}", outcome.text);
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "targetContainer": "sidecar"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("no container \"sidecar\""),
+        "{}",
+        outcome.text
+    );
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "name": "app"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(outcome.text.contains("already has"), "{}", outcome.text);
+    assert!(f.confirmer.requests().is_empty());
+    assert_eq!(ephemeral_patches(&f).len(), 2);
+}
+
+#[tokio::test]
+async fn debug_container_needs_debug_access_rbac_and_valid_input() {
+    // Beyond read-only access: the user is asked for the debug level
+    // first, and without it no API request is made.
+    let read_only = fixture(Profile::ReadOnly, permissive(), false).await;
+    let outcome = read_only
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    let asked = read_only.confirmer.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        matches!(&asked[0].kind, RequestKind::Access { raise, .. } if raise.profile == Profile::Debug),
+        "{:?}",
+        asked[0].kind
+    );
+    assert!(read_only.api.requests().is_empty());
+
+    let f = fixture(Profile::Debug, permissive(), true).await;
+    for bad in [
+        json!({"pod": "distroless-0", "image": "busybox; rm -rf /"}),
+        json!({"pod": "distroless-0", "image": "-busybox"}),
+        json!({"pod": "distroless-0", "name": "Not_A_Name"}),
+        json!({"pod": "distroless-0", "targetContainer": "../app"}),
+        json!({"pod": "distroless-0", "command": ["sh", "-c", "id\nrm -rf /"]}),
+        json!({"pod": "distroless-0", "securityContext": {"privileged": true}}),
+    ] {
+        let outcome = f
+            .server
+            .call("agent", "debug_container", args(bad.clone()))
+            .await;
+        assert!(outcome.is_error, "{bad}");
+    }
+    assert!(f.api.requests().is_empty(), "{:?}", f.api.requests());
+
+    // The user's RBAC: patching ephemeral containers, exec for a command.
+    let api = FakeApi::start().await;
+    let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+    let scope = scope_with(Profile::Debug, &permissive(), &[NS]);
+    let without = |missing: Capability| {
+        Capability::ALL
+            .into_iter()
+            .filter(|c| *c != missing)
+            .collect::<HashSet<_>>()
+    };
+    let session = Session::from_parts(
+        scope.clone(),
+        Identity::ClientOnly {
+            client: client.clone(),
+        },
+        catalog(),
+        without(Capability::PatchEphemeralContainers),
+    );
+    session.set_grants(grants(&[Grant::read(NS)]));
+    let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
+    let outcome = server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0"})),
+        )
+        .await;
+    assert!(
+        outcome
+            .text
+            .contains("no right to patch pods/ephemeralcontainers"),
+        "{}",
+        outcome.text
+    );
+    let session = Session::from_parts(
+        scope,
+        Identity::ClientOnly { client },
+        catalog(),
+        without(Capability::PodExec),
+    );
+    session.set_grants(grants(&[Grant::read(NS)]));
+    let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
+    let outcome = server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "command": ["ps"]})),
+        )
+        .await;
+    assert!(
+        outcome.text.contains("no right to create pods/exec"),
+        "{}",
+        outcome.text
+    );
+    assert!(api.writes().is_empty(), "{:?}", api.writes());
 }

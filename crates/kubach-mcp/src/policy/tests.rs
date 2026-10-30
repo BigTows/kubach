@@ -2549,3 +2549,54 @@ fn port_forward_targets_ports_and_namespaces_are_checked() {
     };
     assert_eq!(denied(Profile::Debug, elsewhere), DenialCode::Namespace);
 }
+
+#[test]
+fn debug_containers_are_like_exec_and_check_their_input() {
+    let debug = |image: Option<&str>, command: Vec<String>| Request::Debug {
+        pod: "web-0".into(),
+        target: Some("app".into()),
+        name: None,
+        image: image.map(str::to_owned),
+        namespace: None,
+        command,
+    };
+    let allowed = check(Profile::Debug, debug(None, Vec::new())).unwrap();
+    assert_eq!(allowed.confirmation, Confirmation::Required);
+    assert_eq!(allowed.name.as_deref(), Some("web-0"));
+    assert!(debug(None, Vec::new()).is_mutating());
+    assert_eq!(
+        denied(Profile::ReadOnly, debug(None, Vec::new())),
+        DenialCode::NeedsAccess
+    );
+    // Changing the pod needs modify(ns) where the server holds the boundary.
+    let read = [Grant::read(NS)];
+    let denial = checked(
+        Profile::Debug,
+        &permissive(),
+        &read,
+        SERVER,
+        &debug(None, Vec::new()),
+    )
+    .unwrap_err();
+    assert_eq!(denial.grant, Some(Grant::modify(NS)));
+
+    let pinned = Some("ghcr.io/org/tools:1.2@sha256:ab12");
+    assert!(check(Profile::Debug, debug(pinned, vec!["ps".into()])).is_ok());
+    for image in [
+        "",
+        "busybox latest",
+        "-busybox",
+        "busy\u{202E}box",
+        "busybox\n",
+    ] {
+        assert_eq!(
+            denied(Profile::Debug, debug(Some(image), Vec::new())),
+            DenialCode::InvalidInput,
+            "{image:?}"
+        );
+    }
+    assert_eq!(
+        denied(Profile::Debug, debug(None, vec!["a\u{200B}b".into()])),
+        DenialCode::InvalidInput
+    );
+}
