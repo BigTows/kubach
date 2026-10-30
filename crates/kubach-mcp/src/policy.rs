@@ -238,6 +238,12 @@ pub enum Request {
     /// Helm charts of the repositories added in Kubach or of an `oci://`
     /// reference (#418): search and default values. No namespace.
     HelmCharts,
+    /// Nodes (#61): the list, one node with its events and evictions, or
+    /// their usage. Cluster-scoped: read with the user's credentials, by
+    /// Kubach's own read-only calls, once the user allowed nodes.
+    Nodes {
+        name: Option<String>,
+    },
     /// Helm releases of a namespace: list, history and values. Needs
     /// access to Secrets, where Helm stores them (#53).
     HelmRead {
@@ -505,6 +511,7 @@ impl<'a> Policy<'a> {
                 profile,
                 secrets,
                 crds: false,
+                nodes: false,
             })
         };
         match request {
@@ -526,6 +533,10 @@ impl<'a> Policy<'a> {
             | Request::SecretCompare { .. }
             | Request::SecretReveal { .. }
             | Request::HelmRead { .. } => need(Profile::ReadOnly, true),
+            Request::Nodes { .. } => Some(Access {
+                nodes: true,
+                ..Access::NONE
+            }),
             _ => None,
         }
     }
@@ -593,9 +604,11 @@ impl<'a> Policy<'a> {
     pub fn required_grants(&self, request: &Request, allowed: &Allowed) -> Vec<Grant> {
         let read = Grant::read(allowed.namespace.clone());
         let mut needed = match request {
-            Request::Info | Request::ListKinds | Request::ListNamespaces | Request::HelmCharts => {
-                Vec::new()
-            }
+            Request::Info
+            | Request::ListKinds
+            | Request::ListNamespaces
+            | Request::HelmCharts
+            | Request::Nodes { .. } => Vec::new(),
             Request::HelmRead { .. } => vec![read],
             Request::List { .. }
             | Request::Get { .. }
@@ -689,6 +702,13 @@ impl<'a> Policy<'a> {
             }
             Request::HelmRead { namespace } => {
                 Ok(self.allowed(self.namespace(namespace.as_deref())?))
+            }
+            Request::Nodes { name } => {
+                let mut allowed = self.allowed(self.namespace(None).unwrap_or_default());
+                if let Some(name) = name {
+                    allowed.name = Some(object_name(name)?);
+                }
+                Ok(allowed)
             }
             Request::HelmChange { namespace, release } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
@@ -1100,6 +1120,7 @@ impl<'a> Policy<'a> {
             | Request::SecretCompare { .. } => "Secret metadata",
             Request::SecretReveal { .. } => "revealing a Secret",
             Request::HelmRead { .. } => "reading Helm releases (Helm keeps them in Secrets)",
+            Request::Nodes { .. } => "reading nodes (cluster-scoped, with the user's credentials)",
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };

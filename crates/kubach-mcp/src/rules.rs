@@ -334,6 +334,7 @@ mod tests {
             profile: Profile::Debug,
             secrets: false,
             crds: false,
+            nodes: false,
         };
         let read_only = Access {
             profile: Profile::ReadOnly,

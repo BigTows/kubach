@@ -200,6 +200,8 @@ settings-minimum-secrets = Secrets by default
 settings-minimum-secrets-description = Secret names, keys, sizes and checks inside Kubach without asking, never values. Off: the agent asks first. Revealing values is asked for each Secret, and only while “Hide Secret values” is off.
 settings-minimum-crds = Custom resources by default
 settings-minimum-crds-description = Kinds beyond the built-in ones (CRDs such as Flux or Argo CD objects) without asking. They may hold credentials or make a controller act with its own rights. Off: the agent asks first. ServiceAccounts, RBAC and Secrets are never changed through them.
+settings-minimum-nodes = Nodes by default
+settings-minimum-nodes-description = Nodes without asking: conditions (memory, disk, PID pressure), capacity and allocatable, taints, node events, evictions and usage. Nodes are cluster-scoped, so Kubach reads them with your own credentials, only these read calls. Off: the agent asks first.
 settings-minimum-reset = Reset to read
 settings-minimum-reset-description = Back to reading built-in resources; everything else is asked for again. Sessions already running keep what they have until they end.
 # $time: e.g. 10:00:00; $changes: what was raised, as recorded in the settings file.

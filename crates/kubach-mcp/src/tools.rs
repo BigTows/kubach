@@ -48,7 +48,7 @@ use kubach_core::sync;
 /// Field manager for changes made by the agent, distinct from the UI's.
 pub const FIELD_MANAGER: &str = "kubach-mcp";
 pub(crate) const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_LIST_ITEMS: u32 = 500;
+pub(crate) const MAX_LIST_ITEMS: u32 = 500;
 const DEFAULT_LOG_LINES: i64 = 200;
 const MAX_LOG_LINES: i64 = 2000;
 const MAX_LOG_BYTES: i64 = 256 * 1024;
@@ -839,6 +839,9 @@ pub(crate) async fn run(
             top_pods(ctx, &allowed).await
         }
         "get_topology" => topology_tools::get_topology(ctx, args).await,
+        "list_nodes" => crate::node_tools::list_nodes(ctx, args).await,
+        "describe_node" => crate::node_tools::describe_node(ctx, args).await,
+        "top_nodes" => crate::node_tools::top_nodes(ctx, args).await,
         "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
@@ -1082,7 +1085,7 @@ pub(crate) fn finish(text: &str) -> String {
     truncate(&mask_text(text), MAX_OUTPUT_BYTES).into_owned()
 }
 
-fn render_cell(cell: &Cell, now: Timestamp) -> String {
+pub(crate) fn render_cell(cell: &Cell, now: Timestamp) -> String {
     let text = match cell {
         Cell::Text(s) => s.clone(),
         Cell::Number(n) => n.to_string(),
