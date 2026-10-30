@@ -312,7 +312,7 @@ struct CompareArgs {
     other_key: String,
 }
 
-fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
+pub(crate) fn kind_ref(kind: String, api_version: Option<String>) -> KindRef {
     KindRef { kind, api_version }
 }
 
@@ -791,6 +791,7 @@ pub(crate) async fn run(
             top_pods(ctx, &allowed).await
         }
         "get_topology" => topology_tools::get_topology(ctx, args).await,
+        "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
@@ -994,7 +995,7 @@ pub(crate) async fn run(
 
 // ------------------------------------------------------------- helpers
 
-fn kind_of(allowed: &Allowed) -> &ResourceKind {
+pub(crate) fn kind_of(allowed: &Allowed) -> &ResourceKind {
     allowed.kind.as_ref().expect("policy resolved the kind")
 }
 
@@ -1014,7 +1015,7 @@ fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolErro
     }
 }
 
-async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
+pub(crate) async fn fetch(client: &Client, allowed: &Allowed) -> Result<DynamicObject, ToolError> {
     let api = discovery::api(client, kind_of(allowed), Some(&allowed.namespace));
     let obj = api.get(name_of(allowed)).await?;
     ensure_namespace(&obj, &allowed.namespace)?;
@@ -1028,7 +1029,7 @@ fn masked_value(obj: &DynamicObject) -> Value {
 }
 
 /// Final masking and size bound of any text shown to the agent.
-fn finish(text: &str) -> String {
+pub(crate) fn finish(text: &str) -> String {
     truncate(&mask_text(text), MAX_OUTPUT_BYTES).into_owned()
 }
 
