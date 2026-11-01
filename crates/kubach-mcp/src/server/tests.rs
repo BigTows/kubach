@@ -55,6 +55,108 @@ fn owned_pod() -> Value {
     })
 }
 
+/// Pod `name` with label `app`, owned by StatefulSet `db` (uid 7) when
+/// `owned`; an init container `init` and the container `db`.
+fn labeled_pod(name: &str, app: &str, owned: bool) -> Value {
+    let owners = if owned {
+        json!([{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "uid": "7", "controller": true}])
+    } else {
+        json!([])
+    };
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": NS, "labels": {"app": app},
+                     "ownerReferences": owners},
+        "spec": {"initContainers": [{"name": "init", "image": "busybox"}],
+                 "containers": [{"name": "db", "image": "postgres"}]},
+    })
+}
+
+/// Pods selected by `app=db` (`db-0`, `db-1` of StatefulSet `db` and the
+/// stray `db-other`) or `app=many` (12 pods), for the log tests.
+fn selected_pods(path: &str) -> Option<Value> {
+    let items: Vec<Value> = if path.contains("app%3Ddb") || path.contains("app=db") {
+        vec![
+            labeled_pod("db-other", "db", false),
+            labeled_pod("db-1", "db", true),
+            labeled_pod("db-0", "db", true),
+        ]
+    } else if path.contains("app%3Dmany") || path.contains("app=many") {
+        (0..12)
+            .map(|i| labeled_pod(&format!("many-{i:02}"), "many", false))
+            .collect()
+    } else {
+        return None;
+    };
+    Some(json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": items}))
+}
+
+/// Logs of the pods of [`selected_pods`]: each line names its stream, one
+/// carries a password for masking.
+fn selected_pod_logs(path: &str) -> String {
+    let pod = path.split('/').nth_back(1).unwrap_or_default();
+    let container = path
+        .split(['?', '&'])
+        .find_map(|part| part.strip_prefix("container="))
+        .unwrap_or("default");
+    format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
+}
+
+/// Pods for `debug_container` (#64): `distroless-0` takes any debug
+/// container, `restricted-0` only one with a restricted security context,
+/// `locked-0` none (Pod Security refuses), `pending-0` is not running. Once
+/// added, the container `dbg` runs.
+fn debug_pod(method: &str, path: &str, body: &[u8]) -> Option<(&'static str, String)> {
+    let rest = path.strip_prefix(&format!("/api/v1/namespaces/{NS}/pods/"))?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let (name, sub) = match rest.split_once('/') {
+        Some((name, sub)) => (name, Some(sub)),
+        None => (rest, None),
+    };
+    if !["distroless-0", "restricted-0", "locked-0", "pending-0"].contains(&name) {
+        return None;
+    }
+    let phase = if name == "pending-0" {
+        "Pending"
+    } else {
+        "Running"
+    };
+    let pod = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": NS},
+        "spec": {"containers": [{"name": "app", "image": "gcr.io/distroless/static-debian12",
+                                 "securityContext": {"runAsUser": 472}}]},
+        "status": {"phase": phase, "ephemeralContainerStatuses": [
+            {"name": "dbg", "image": "busybox", "imageID": "", "ready": false, "restartCount": 0,
+             "state": {"running": {}}}
+        ]},
+    });
+    let forbidden = || {
+        let message = format!(
+            "pods \"{name}\" is forbidden: violates PodSecurity \"restricted:latest\": \
+             runAsNonRoot != true"
+        );
+        Some((
+            "403 Forbidden",
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                   "message": message, "reason": "Forbidden", "code": 403})
+            .to_string(),
+        ))
+    };
+    match (method, sub) {
+        ("GET", None) => Some(("200 OK", pod.to_string())),
+        ("PATCH", Some("ephemeralcontainers")) => {
+            let body = String::from_utf8_lossy(body);
+            match name {
+                "locked-0" => forbidden(),
+                "restricted-0" if !body.contains("runAsNonRoot") => forbidden(),
+                _ => Some(("200 OK", pod.to_string())),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn replica_set() -> Value {
     json!({
         "apiVersion": "apps/v1", "kind": "ReplicaSet",
@@ -237,13 +339,40 @@ impl FakeApi {
                             ("200 OK", secret().to_string())
                         } else if method == "POST" && path.starts_with(&secrets) {
                             ("201 Created", String::from_utf8_lossy(&body).into_owned())
+                        } else if let Some(list) = (method == "GET"
+                            && path.starts_with(&format!("{pods}?")))
+                        .then(|| selected_pods(&path))
+                        .flatten()
+                        {
+                            ("200 OK", list.to_string())
                         } else if method == "GET"
                             && (path == pods || path.starts_with(&format!("{pods}?")))
                         {
                             ("200 OK", pod_list().to_string())
+                        } else if method == "GET"
+                            && (path.starts_with(&format!("{pods}/db-"))
+                                || path.starts_with(&format!("{pods}/many-")))
+                        {
+                            let rest = &path[pods.len() + 1..];
+                            if rest.contains("/log") {
+                                ("200 OK", selected_pod_logs(&path))
+                            } else {
+                                let owned = rest == "db-0" || rest == "db-1";
+                                let app = if owned { "db" } else { "many" };
+                                ("200 OK", labeled_pod(rest, app, owned).to_string())
+                            }
+                        } else if method == "GET"
+                            && path == format!("/apis/apps/v1/namespaces/{NS}/statefulsets/db")
+                        {
+                            let db = json!({"apiVersion": "apps/v1", "kind": "StatefulSet",
+                                "metadata": {"name": "db", "namespace": NS, "uid": "7"},
+                                "spec": {"selector": {"matchLabels": {"app": "db"}}}});
+                            ("200 OK", db.to_string())
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
+                        } else if let Some(reply) = debug_pod(&method, &path, &body) {
+                            reply
                         } else if method == "GET" && path == format!("{pods}/web-0") {
                             ("200 OK", owned_pod().to_string())
                         } else if method == "GET"
@@ -418,8 +547,11 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
             ("describe_resource", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
             ("list_events", json!({"namespace": ns})),
             ("get_logs", json!({"pod": "web-0", "namespace": ns})),
+            ("get_logs", json!({"kind": "StatefulSet", "name": "db", "namespace": ns})),
+            ("get_logs", json!({"labelSelector": "app=db", "namespace": ns})),
             ("top_pods", json!({"namespace": ns})),
             ("exec", json!({"pod": "web-0", "namespace": ns, "command": ["id"]})),
+            ("debug_container", json!({"pod": "distroless-0", "namespace": ns, "targetContainer": "app"})),
             ("port_forward_start", json!({"target": "pod/web-0", "port": 8080, "namespace": ns})),
             ("scale", json!({"kind": "Deployment", "name": "web", "namespace": ns, "replicas": 5})),
             ("rollout_restart", json!({"kind": "Deployment", "name": "web", "namespace": ns})),
@@ -452,6 +584,16 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ("get_resource", json!({"kind": "Pod", "name": "../../kube-system/pods/x"})),
         ("get_resource", json!({"kind": "Pod", "name": "x", "namespace": NS, "extra": 1})),
         ("get_logs", json!({"pod": "web-0", "container": "../../x"})),
+        ("get_logs", json!({})),
+        ("get_logs", json!({"pod": "web-0", "labelSelector": "app=db"})),
+        ("get_logs", json!({"kind": "Secret", "name": "db"})),
+        ("get_logs", json!({"kind": "ConfigMap", "name": "app-config"})),
+        ("get_logs", json!({"kind": "StatefulSet"})),
+        ("get_logs", json!({"kind": "StatefulSet", "name": "../db"})),
+        ("get_logs", json!({"labelSelector": "app=db\n"})),
+        ("get_logs", json!({"pod": "web-0", "allContainers": true, "container": "app"})),
+        ("get_logs", json!({"pod": "web-0", "filter": "(", "regex": true})),
+        ("get_logs", json!({"pod": "web-0", "filter": ""})),
         ("list_events", json!({"kind": "Secret", "name": "db"})),
         ("scale", json!({"kind": "Deployment", "name": "web/../../x", "replicas": 1})),
         ("delete_resource", json!({"kind": "RoleBinding", "name": "x"})),
@@ -1238,6 +1380,196 @@ async fn logs_of_pods_the_agent_shaped_are_confirmed() {
         .await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(f.confirmer.requests().is_empty());
+}
+
+fn pod_log_requests(f: &Fixture) -> Vec<String> {
+    f.api
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains("/log"))
+        .collect()
+}
+
+#[tokio::test]
+async fn logs_of_a_workload_read_its_pods_and_containers() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"kind": "StatefulSet", "name": "db", "allContainers": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    // Only the StatefulSet's own pods, sorted, init containers first.
+    let streams: Vec<&str> = outcome
+        .text
+        .lines()
+        .filter_map(|line| line.strip_suffix(" failed"))
+        .collect();
+    assert_eq!(
+        streams,
+        [
+            "[db-0/init] ERROR db-0",
+            "[db-0/db] ERROR db-0",
+            "[db-1/init] ERROR db-1",
+            "[db-1/db] ERROR db-1"
+        ],
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[db-0/init] hello from db-0/init"));
+    assert!(!outcome.text.contains("db-other"), "{}", outcome.text);
+    assert!(!outcome.text.contains("hunter2"), "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 4);
+    assert!(f.confirmer.requests().is_empty());
+
+    // All containers of one pod; tail and previous apply to each stream.
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"pod": "db-0", "allContainers": true, "tailLines": 5, "previous": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome.text.contains("[db-0/init] hello"),
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[db-0/db] hello"), "{}", outcome.text);
+    let logs = pod_log_requests(&f);
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    assert!(
+        logs.iter()
+            .all(|r| r.contains("tailLines=5") && r.contains("previous=true")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn logs_by_selector_are_filtered_per_line_after_masking() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let call = |arguments: Value| f.server.call("agent", "get_logs", args(arguments));
+    let outcome = call(json!({"labelSelector": "app=db", "filter": "ERROR"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    // The selector picks every labeled pod, its default container each.
+    assert_eq!(
+        lines,
+        [
+            "[db-0/db] ERROR db-0 failed",
+            "[db-1/db] ERROR db-1 failed",
+            "[db-other/db] ERROR db-other failed"
+        ]
+    );
+
+    let outcome =
+        call(json!({"labelSelector": "app=db", "filter": "^ERROR db-[01] ", "regex": true})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(outcome.text.lines().count(), 2, "{}", outcome.text);
+
+    // The filter cannot probe what masking hides.
+    let outcome = call(json!({"labelSelector": "app=db", "filter": "hunter2"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("no line matched"), "{}", outcome.text);
+
+    // One stream: no prefix, as before.
+    let outcome = call(json!({"pod": "web-0", "filter": "ready"})).await;
+    assert_eq!(outcome.text, "ready\n");
+
+    // A container the pods lack is said, not guessed.
+    let outcome = call(json!({"labelSelector": "app=db", "container": "sidecar"})).await;
+    assert!(
+        outcome.text.contains("db-0 has no container sidecar"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
+async fn logs_of_many_pods_are_capped_and_say_what_was_left_out() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=many"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 10);
+    assert!(
+        outcome.text.starts_with(
+            "(12 pods match; only the first 10 were read. Left out: many-10, many-11)"
+        ),
+        "{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("[many-09/db] hello"));
+
+    // Streams are capped too: 10 pods × 2 containers is the limit.
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=many", "allContainers": true})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(pod_log_requests(&f).len(), 20);
+}
+
+#[tokio::test]
+async fn logs_of_several_shaped_pods_are_asked_once() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    f.server.session().note_change(NS, "StatefulSet", "db");
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"kind": "StatefulSet", "name": "db", "allContainers": true})),
+        )
+        .await;
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("rejected"), "{}", outcome.text);
+    assert!(pod_log_requests(&f).is_empty());
+    let asked = f.confirmer.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].summary.contains("db-0, db-1"),
+        "{}",
+        asked[0].summary
+    );
+    assert!(
+        asked[0]
+            .details
+            .contains("Pod db-1: This agent created or changed StatefulSet db"),
+        "{}",
+        asked[0].details
+    );
+
+    let f = fixture(Profile::Deploy, permissive(), true).await;
+    f.server.session().note_change(NS, "StatefulSet", "db");
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(f.confirmer.requests().len(), 1);
+    assert_eq!(pod_log_requests(&f).len(), 3);
 }
 
 /// `kubach mcp --grant-read`: the session's server without any window.
@@ -2343,6 +2675,36 @@ async fn helm_tools_need_the_users_helm_and_follow_the_ceiling() {
             "{change}"
         );
     }
+    // Without access to Secrets, reading releases (kept in Secrets) asks
+    // for it, as list_secrets does (#53).
+    let strict = fixture(
+        Profile::ReadOnly,
+        SecurityPolicy::with_minimum(Access {
+            secrets: false,
+            ..Access::ALL
+        }),
+        false,
+    )
+    .await;
+    strict
+        .server
+        .set_helm(crate::helm_tools::HelmEnv::default());
+    let strict_tools = strict.server.tools();
+    for read in [
+        "helm_list_releases",
+        "helm_release_history",
+        "helm_get_values",
+    ] {
+        let description = strict_tools
+            .iter()
+            .find(|t| t.name == read)
+            .and_then(|t| t.description.as_deref())
+            .unwrap_or_default();
+        assert!(
+            description.contains("Requires your approval in Kubach"),
+            "{read}: {description}"
+        );
+    }
     assert!(f.server.instructions().contains("helm_install"));
     assert!(f.server.instructions().contains("helm_get_values"));
     assert!(description("helm_upgrade").contains("valuesPatch"));
@@ -2639,4 +3001,532 @@ async fn client_only_never_offers_dont_ask_again() {
     assert_eq!(call_requests(&f), 2);
     assert!(f.confirmer.requests().iter().all(|r| !r.allow_remember));
     assert!(f.server.session().remembered().is_empty());
+}
+
+// ------------------------------------------------ custom resource kinds (#65)
+
+fn without_crds() -> SecurityPolicy {
+    SecurityPolicy::with_minimum(Access {
+        crds: false,
+        ..Access::ALL
+    })
+}
+
+/// The two tables of `list_kinds`: built-in rows, then custom rows and the
+/// header line of the custom section.
+fn kinds_of(text: &str) -> (String, String) {
+    let (builtin, custom) = text.split_once("\nCUSTOM RESOURCES").unwrap_or((text, ""));
+    (builtin.to_owned(), custom.to_owned())
+}
+
+#[tokio::test]
+async fn list_kinds_offers_custom_resources_that_need_approval() {
+    let f = session_fixture(Profile::Deploy, without_crds(), false, false).await;
+    let outcome = f.server.call("test-agent", "list_kinds", Map::new()).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let (builtin, custom) = kinds_of(&outcome.text);
+    assert!(
+        builtin.contains("Deployment\tapps/v1\tdeployments"),
+        "{builtin}"
+    );
+    assert!(!builtin.contains("example.com"), "{builtin}");
+    assert!(
+        custom.contains("Widget\texample.com/v1\twidgets"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Widget\tother.example.com/v1\twidgets"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Certificate\tcert-manager.io/v1\tcertificates"),
+        "{custom}"
+    );
+    assert!(
+        custom.contains("Application\targoproj.io/v1alpha1"),
+        "{custom}"
+    );
+    assert!(custom.contains("need the user's approval"), "{custom}");
+    assert!(
+        custom.contains("list_resources or get_resource"),
+        "{custom}"
+    );
+    // Never cluster-scoped kinds, Secrets or identity objects.
+    for hidden in [
+        "ClusterIssuer",
+        "Secret",
+        "ServiceAccount",
+        "Role",
+        "Namespace",
+        "Node",
+    ] {
+        assert!(
+            !outcome
+                .text
+                .lines()
+                .any(|l| l.starts_with(&format!("{hidden}\t"))),
+            "{hidden}: {}",
+            outcome.text
+        );
+    }
+    // Listing kinds asks nobody and reaches no API.
+    assert!(f.confirmer.requests().is_empty());
+    assert!(f.api.requests().is_empty());
+}
+
+#[tokio::test]
+async fn list_kinds_says_when_custom_resources_are_granted() {
+    let f = session_fixture(Profile::Deploy, permissive(), false, false).await;
+    let outcome = f.server.call("test-agent", "list_kinds", Map::new()).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let (builtin, custom) = kinds_of(&outcome.text);
+    assert!(custom.contains("is granted in this session"), "{custom}");
+    assert!(!custom.contains("approval"), "{custom}");
+    assert!(custom.contains("Widget\texample.com/v1"), "{custom}");
+    // Custom kinds are listed once, in their own section.
+    assert!(!builtin.contains("example.com"), "{builtin}");
+    // Access to custom resources reads built-in kinds beyond the
+    // allowlist too, but never identity objects.
+    for hidden in ["ServiceAccount", "Role", "RoleBinding", "Secret"] {
+        assert!(
+            !outcome
+                .text
+                .lines()
+                .any(|l| l.starts_with(&format!("{hidden}\t"))),
+            "{hidden}: {}",
+            outcome.text
+        );
+    }
+}
+
+/// The texts the agent reads agree with the policy (#57): a Deploy-profile
+/// session has access to changes, yet the policy confirms each one, so
+/// nothing may say changes run without asking.
+#[tokio::test]
+async fn texts_say_changes_are_confirmed_as_the_policy_does() {
+    use crate::policy::{Confirmation, ForwardPortRef, KindRef, Request};
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let session = f.server.session();
+    assert_eq!(session.access().profile, Profile::Deploy);
+    let ns = Some(NS.to_owned());
+    let changes = [
+        Request::Apply {
+            yaml: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n".into(),
+            namespace: ns.clone(),
+            dry_run: false,
+        },
+        Request::Scale {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+            replicas: 1,
+        },
+        Request::Restart {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+        },
+        Request::Delete {
+            kind: KindRef::new("Deployment"),
+            name: "web".into(),
+            namespace: ns.clone(),
+        },
+        Request::Exec {
+            pod: "web-0".into(),
+            container: None,
+            namespace: ns.clone(),
+            command: vec!["id".into()],
+        },
+        Request::PortForward {
+            namespace: ns.clone(),
+            target: "pod/web-0".into(),
+            port: ForwardPortRef::Number(8080),
+            local_port: None,
+        },
+        Request::HelmChange {
+            namespace: ns.clone(),
+            release: "web".into(),
+        },
+    ];
+    for request in &changes {
+        let allowed = session
+            .policy()
+            .check(request)
+            .unwrap_or_else(|denial| panic!("{request:?}: {denial:?}"));
+        assert_eq!(allowed.confirmation, Confirmation::Required, "{request:?}");
+    }
+
+    let instructions = f.server.instructions();
+    let info = f.server.call("agent", "session_info", Map::new()).await;
+    assert!(!info.is_error, "{}", info.text);
+    for (what, text) in [
+        ("instructions", &instructions),
+        ("session_info", &info.text),
+    ] {
+        assert!(
+            !text.contains("Without asking"),
+            "{what} says \"Without asking\""
+        );
+        assert!(
+            text.contains("approves no change"),
+            "{what}: no \"approves no change\""
+        );
+        assert!(text.contains("one by one"), "{what}: no \"one by one\"");
+        assert!(
+            text.contains("don't ask again"),
+            "{what}: no \"don't ask again\""
+        );
+    }
+    assert!(instructions.contains("even within your access"));
+
+    // A tool beyond the access: allowing the access approves no call.
+    let read_only = fixture(Profile::ReadOnly, permissive(), false).await;
+    let tools = read_only.server.tools();
+    let description = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref().map(str::to_owned))
+            .unwrap_or_else(|| panic!("{name} is not offered"))
+    };
+    for change in [
+        "apply_manifest",
+        "scale",
+        "rollout_restart",
+        "delete_resource",
+        "exec",
+        "port_forward_start",
+    ] {
+        assert!(
+            description(change).contains("each one is still confirmed"),
+            "{change}: {}",
+            description(change)
+        );
+    }
+    let logs = description("get_logs");
+    assert!(logs.contains("Requires your approval in Kubach"), "{logs}");
+    assert!(!logs.contains("each one is still confirmed"), "{logs}");
+}
+
+// ------------------------------------------------------------- debug_container (#64)
+
+fn ephemeral_patches(f: &Fixture) -> Vec<String> {
+    f.api
+        .writes()
+        .into_iter()
+        .filter(|w| w.starts_with("PATCH ") && w.contains("/ephemeralcontainers"))
+        .collect()
+}
+
+fn patch_body(write: &str) -> Value {
+    serde_json::from_str(write.split_once('\n').unwrap().1).unwrap()
+}
+
+/// A Debug session where the API server holds the boundary and the user
+/// would tick "don't ask again" wherever it is offered.
+async fn debug_fixture() -> Fixture {
+    let f = fixture_with(
+        Profile::Debug,
+        permissive(),
+        ScriptedConfirmer::approving_for_session(),
+        true,
+    )
+    .await;
+    f.server
+        .session()
+        .set_grants(grants(&[Grant::read(NS), Grant::modify(NS)]));
+    f
+}
+
+#[tokio::test]
+async fn debug_container_is_dry_run_then_confirmed_every_time() {
+    let f = debug_fixture().await;
+    let call = json!({"pod": "distroless-0", "targetContainer": "app", "name": "dbg"});
+    let outcome = f
+        .server
+        .call("agent", "debug_container", args(call.clone()))
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("is running"), "{}", outcome.text);
+    assert!(outcome.text.contains("container dbg"), "{}", outcome.text);
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 2, "{patches:?}");
+    assert!(patches[0].contains("dryRun=All"), "{}", patches[0]);
+    assert!(!patches[1].contains("dryRun"), "{}", patches[1]);
+    let body = patch_body(&patches[1]);
+    let container = &body["spec"]["ephemeralContainers"][0];
+    assert_eq!(container["name"], "dbg");
+    assert_eq!(container["targetContainerName"], "app");
+    assert_eq!(
+        container["image"],
+        kubach_core::streams::debug::DEFAULT_IMAGE
+    );
+    assert_eq!(container["stdin"], true);
+    // Nothing privileged, no host settings, no capabilities.
+    assert!(container.get("securityContext").is_none(), "{container}");
+
+    let requests = f.confirmer.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.tool, "debug_container");
+    assert_eq!(request.kind, RequestKind::Call);
+    assert!(
+        request.summary.contains("distroless-0"),
+        "{}",
+        request.summary
+    );
+    assert!(request.summary.contains("dbg"), "{}", request.summary);
+    assert!(
+        request.details.contains("Target container: app"),
+        "{}",
+        request.details
+    );
+    assert!(
+        request.dangerous[0]
+            .message
+            .contains("until the pod is deleted"),
+        "{:?}",
+        request.dangerous
+    );
+    assert!(request.dangerous.iter().any(|finding| {
+        finding
+            .message
+            .contains("process namespace of container app")
+    }));
+    // Permanent: never "don't ask again", so the next call asks again.
+    assert!(!request.allow_remember);
+    f.server.call("agent", "debug_container", args(call)).await;
+    assert_eq!(f.confirmer.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn debug_container_shows_the_command_and_the_agents_image() {
+    let f = fixture(Profile::Debug, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(
+                json!({"pod": "distroless-0", "image": "nicolaka/netshoot:v0.13",
+                        "command": ["ss", "-tlnp"]}),
+            ),
+        )
+        .await;
+    assert!(outcome.is_error);
+    let request = f.confirmer.requests().pop().unwrap();
+    assert_eq!(
+        request.kind,
+        RequestKind::Exec {
+            command: vec!["ss".into(), "-tlnp".into()]
+        }
+    );
+    assert!(
+        request.summary.contains("nicolaka/netshoot:v0.13"),
+        "{}",
+        request.summary
+    );
+    assert!(
+        request.summary.contains("then run a command"),
+        "{}",
+        request.summary
+    );
+    assert!(
+        request
+            .dangerous
+            .iter()
+            .any(|finding| finding.message.contains("chosen by the agent"))
+    );
+    // Rejected: only the dry run reached the pod.
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert!(patches[0].contains("dryRun=All"));
+}
+
+#[tokio::test]
+async fn debug_container_follows_restricted_pod_security() {
+    let f = debug_fixture().await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "restricted-0", "targetContainer": "app", "name": "dbg"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome.text.contains("runs as user 472"),
+        "{}",
+        outcome.text
+    );
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 3, "{patches:?}");
+    let body = patch_body(&patches[2]);
+    let context = &body["spec"]["ephemeralContainers"][0]["securityContext"];
+    assert_eq!(context["runAsNonRoot"], true);
+    assert_eq!(context["runAsUser"], 472);
+    assert_eq!(context["allowPrivilegeEscalation"], false);
+    assert_eq!(context["capabilities"]["drop"], json!(["ALL"]));
+    assert!(context["capabilities"].get("add").is_none());
+    assert!(context.get("privileged").is_none());
+    assert!(
+        f.confirmer.requests()[0]
+            .dangerous
+            .iter()
+            .any(|finding| finding.path.ends_with("securityContext"))
+    );
+}
+
+#[tokio::test]
+async fn debug_containers_that_cannot_work_are_not_asked_about() {
+    let f = debug_fixture().await;
+    let outcome = f
+        .server
+        .call("agent", "debug_container", args(json!({"pod": "locked-0"})))
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("Pod Security level"),
+        "{}",
+        outcome.text
+    );
+    assert!(f.confirmer.requests().is_empty());
+    let patches = ephemeral_patches(&f);
+    assert_eq!(patches.len(), 2);
+    assert!(patches.iter().all(|p| p.contains("dryRun=All")));
+
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "pending-0"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(outcome.text.contains("is Pending"), "{}", outcome.text);
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "targetContainer": "sidecar"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome.text.contains("no container \"sidecar\""),
+        "{}",
+        outcome.text
+    );
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "name": "app"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    assert!(outcome.text.contains("already has"), "{}", outcome.text);
+    assert!(f.confirmer.requests().is_empty());
+    assert_eq!(ephemeral_patches(&f).len(), 2);
+}
+
+#[tokio::test]
+async fn debug_container_needs_debug_access_rbac_and_valid_input() {
+    // Beyond read-only access: the user is asked for the debug level
+    // first, and without it no API request is made.
+    let read_only = fixture(Profile::ReadOnly, permissive(), false).await;
+    let outcome = read_only
+        .server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0"})),
+        )
+        .await;
+    assert!(outcome.is_error);
+    let asked = read_only.confirmer.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        matches!(&asked[0].kind, RequestKind::Access { raise, .. } if raise.profile == Profile::Debug),
+        "{:?}",
+        asked[0].kind
+    );
+    assert!(read_only.api.requests().is_empty());
+
+    let f = fixture(Profile::Debug, permissive(), true).await;
+    for bad in [
+        json!({"pod": "distroless-0", "image": "busybox; rm -rf /"}),
+        json!({"pod": "distroless-0", "image": "-busybox"}),
+        json!({"pod": "distroless-0", "name": "Not_A_Name"}),
+        json!({"pod": "distroless-0", "targetContainer": "../app"}),
+        json!({"pod": "distroless-0", "command": ["sh", "-c", "id\nrm -rf /"]}),
+        json!({"pod": "distroless-0", "securityContext": {"privileged": true}}),
+    ] {
+        let outcome = f
+            .server
+            .call("agent", "debug_container", args(bad.clone()))
+            .await;
+        assert!(outcome.is_error, "{bad}");
+    }
+    assert!(f.api.requests().is_empty(), "{:?}", f.api.requests());
+
+    // The user's RBAC: patching ephemeral containers, exec for a command.
+    let api = FakeApi::start().await;
+    let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+    let scope = scope_with(Profile::Debug, &permissive(), &[NS]);
+    let without = |missing: Capability| {
+        Capability::ALL
+            .into_iter()
+            .filter(|c| *c != missing)
+            .collect::<HashSet<_>>()
+    };
+    let session = Session::from_parts(
+        scope.clone(),
+        Identity::ClientOnly {
+            client: client.clone(),
+        },
+        catalog(),
+        without(Capability::PatchEphemeralContainers),
+    );
+    session.set_grants(grants(&[Grant::read(NS)]));
+    let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
+    let outcome = server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0"})),
+        )
+        .await;
+    assert!(
+        outcome
+            .text
+            .contains("no right to patch pods/ephemeralcontainers"),
+        "{}",
+        outcome.text
+    );
+    let session = Session::from_parts(
+        scope,
+        Identity::ClientOnly { client },
+        catalog(),
+        without(Capability::PodExec),
+    );
+    session.set_grants(grants(&[Grant::read(NS)]));
+    let server = McpServer::new(session, Arc::new(ScriptedConfirmer::approving()), None);
+    let outcome = server
+        .call(
+            "agent",
+            "debug_container",
+            args(json!({"pod": "distroless-0", "command": ["ps"]})),
+        )
+        .await;
+    assert!(
+        outcome.text.contains("no right to create pods/exec"),
+        "{}",
+        outcome.text
+    );
+    assert!(api.writes().is_empty(), "{:?}", api.writes());
 }

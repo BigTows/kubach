@@ -122,7 +122,9 @@ fn every_debug_and_deploy_path_rejects_foreign_namespaces() {
         let ns = ns.to_string();
         let requests = [
             Request::Logs {
-                pod: "web-0".into(),
+                pod: Some("web-0".into()),
+                workload: None,
+                label_selector: None,
                 container: None,
                 namespace: Some(ns.clone()),
             },
@@ -226,7 +228,9 @@ fn names_cannot_traverse_paths() {
             "{name:?}"
         );
         let logs = Request::Logs {
-            pod: name.into(),
+            pod: Some(name.into()),
+            workload: None,
+            label_selector: None,
             container: None,
             namespace: None,
         };
@@ -245,12 +249,58 @@ fn names_cannot_traverse_paths() {
 fn container_names_are_validated() {
     for container in ["../x", "a/b", "C", ""] {
         let request = Request::Logs {
-            pod: "web-0".into(),
+            pod: Some("web-0".into()),
+            workload: None,
+            label_selector: None,
             container: Some(container.into()),
             namespace: None,
         };
         assert_eq!(denied(Profile::Debug, request), DenialCode::InvalidName);
     }
+}
+
+/// `get_logs` picks pods by exactly one of a pod, a workload or a selector.
+#[test]
+fn logs_take_one_source_of_pods() {
+    let logs =
+        |pod: Option<&str>, workload: Option<(&str, &str)>, selector: Option<&str>| Request::Logs {
+            pod: pod.map(Into::into),
+            workload: workload.map(|(kind, name)| (KindRef::new(kind), name.to_owned())),
+            label_selector: selector.map(Into::into),
+            container: None,
+            namespace: None,
+        };
+    let allowed = check(
+        Profile::Debug,
+        logs(None, Some(("deployments", "web")), None),
+    )
+    .unwrap();
+    assert_eq!(allowed.kind.unwrap().api.kind, "Deployment");
+    assert_eq!(allowed.name.as_deref(), Some("web"));
+    let allowed = check(Profile::Debug, logs(None, None, Some("app=web"))).unwrap();
+    assert!(allowed.kind.is_none() && allowed.name.is_none());
+    for request in [
+        logs(None, None, None),
+        logs(Some("web-0"), None, Some("app=web")),
+        logs(Some("web-0"), Some(("Deployment", "web")), None),
+        logs(None, Some(("Deployment", "web")), Some("app=web")),
+        logs(None, None, Some(" ")),
+        logs(None, None, Some("app=web\n")),
+        logs(None, Some(("ConfigMap", "app-config")), None),
+    ] {
+        assert_eq!(denied(Profile::Debug, request), DenialCode::InvalidInput);
+    }
+    assert_eq!(
+        denied(
+            Profile::Debug,
+            logs(None, Some(("Deployment", "../web")), None)
+        ),
+        DenialCode::InvalidName
+    );
+    assert_eq!(
+        denied(Profile::Debug, logs(None, Some(("Secret", "db")), None)),
+        DenialCode::Secret
+    );
 }
 
 #[test]
@@ -385,7 +435,9 @@ fn label_selector_cannot_carry_control_characters() {
 #[test]
 fn read_only_asks_to_raise_the_ceiling_for_debug_or_deploy() {
     let logs = Request::Logs {
-        pod: "web-0".into(),
+        pod: Some("web-0".into()),
+        workload: None,
+        label_selector: None,
         container: None,
         namespace: None,
     };
@@ -949,7 +1001,9 @@ fn beyond_the_ceiling_a_raise_is_asked_not_a_right() {
     for request in [
         scale(),
         Request::Logs {
-            pod: "web-0".into(),
+            pod: Some("web-0".into()),
+            workload: None,
+            label_selector: None,
             container: None,
             namespace: None,
         },
@@ -2003,7 +2057,9 @@ fn naming(ns: &str) -> Vec<Request> {
             object: None,
         },
         Request::Logs {
-            pod: "web-0".into(),
+            pod: Some("web-0".into()),
+            workload: None,
+            label_selector: None,
             container: None,
             namespace: ns.clone(),
         },
@@ -2492,4 +2548,55 @@ fn port_forward_targets_ports_and_namespaces_are_checked() {
         local_port: None,
     };
     assert_eq!(denied(Profile::Debug, elsewhere), DenialCode::Namespace);
+}
+
+#[test]
+fn debug_containers_are_like_exec_and_check_their_input() {
+    let debug = |image: Option<&str>, command: Vec<String>| Request::Debug {
+        pod: "web-0".into(),
+        target: Some("app".into()),
+        name: None,
+        image: image.map(str::to_owned),
+        namespace: None,
+        command,
+    };
+    let allowed = check(Profile::Debug, debug(None, Vec::new())).unwrap();
+    assert_eq!(allowed.confirmation, Confirmation::Required);
+    assert_eq!(allowed.name.as_deref(), Some("web-0"));
+    assert!(debug(None, Vec::new()).is_mutating());
+    assert_eq!(
+        denied(Profile::ReadOnly, debug(None, Vec::new())),
+        DenialCode::NeedsAccess
+    );
+    // Changing the pod needs modify(ns) where the server holds the boundary.
+    let read = [Grant::read(NS)];
+    let denial = checked(
+        Profile::Debug,
+        &permissive(),
+        &read,
+        SERVER,
+        &debug(None, Vec::new()),
+    )
+    .unwrap_err();
+    assert_eq!(denial.grant, Some(Grant::modify(NS)));
+
+    let pinned = Some("ghcr.io/org/tools:1.2@sha256:ab12");
+    assert!(check(Profile::Debug, debug(pinned, vec!["ps".into()])).is_ok());
+    for image in [
+        "",
+        "busybox latest",
+        "-busybox",
+        "busy\u{202E}box",
+        "busybox\n",
+    ] {
+        assert_eq!(
+            denied(Profile::Debug, debug(Some(image), Vec::new())),
+            DenialCode::InvalidInput,
+            "{image:?}"
+        );
+    }
+    assert_eq!(
+        denied(Profile::Debug, debug(None, vec!["a\u{200B}b".into()])),
+        DenialCode::InvalidInput
+    );
 }

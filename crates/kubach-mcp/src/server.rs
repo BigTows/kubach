@@ -122,10 +122,15 @@ impl McpServer {
                 let note = needed
                     .and_then(|needed| have.missing(needed))
                     .map(|missing| {
+                        let each = if confirms_each_call(spec.name) {
+                            " Allowing it approves no call: each one is still confirmed."
+                        } else {
+                            ""
+                        };
                         format!(
                             " Requires your approval in Kubach: this needs {missing}, beyond this \
                          session's access ({have}); the first call asks the user to allow it \
-                         (for this session or by default on this cluster)."
+                         (for this session or by default on this cluster).{each}"
                         )
                     });
                 Some(spec.into_tool(note))
@@ -380,7 +385,8 @@ impl McpServer {
         let helm = if self.helm().is_some() {
             " Helm: helm_search_charts and helm_show_values for charts of the repositories added \
              in Kubach (or an oci:// chart the user allows), helm_list_releases, \
-             helm_release_history and helm_get_values (a release's values, secrets masked); \
+             helm_release_history and helm_get_values (a release's values, secrets masked) read \
+             Helm's storage Secrets, so they need access to Secrets like list_secrets; \
              helm_install, helm_upgrade, helm_rollback and helm_uninstall run a server-side dry \
              run that the user approves in Kubach. To change a few values of a release, pass \
              only them to helm_upgrade as valuesPatch: Kubach merges it into the release's \
@@ -392,13 +398,13 @@ impl McpServer {
             ""
         };
         format!(
-            "Kubach gives you access to Kubernetes namespaces of context {}. Without asking you \
-             have {access}.{more}{helm} {namespaces} Cluster-scoped resources and calls across \
-             all namespaces are not available. {secrets}{writes} Changes, deletions, \
-             commands in containers and port-forwards (port_forward_start, on 127.0.0.1 of the \
-             user's machine) are previewed and need the user's approval one by one; the user may \
-             tick \"don't ask again\" for one kind of change in one namespace for this session, \
-             and the result of such a call then says it was approved that way. Call \
+            "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
+             {access}. Access says which tools you may call without asking for more; it \
+             approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
+             and calls across all namespaces are not available, except nodes: list_nodes, \
+             describe_node and top_nodes read them (they need access to nodes). For images \
+             without a shell (distroless) use debug_container, then exec into it. \
+             {secrets}{writes} Call \
              `session_info` for details.",
             scope.context
         )
@@ -494,6 +500,26 @@ struct ToolSpec {
     destructive: bool,
 }
 
+/// What the agent is told about confirmations, whatever its access:
+/// [`Policy::check`](crate::policy::Policy::check) marks every change,
+/// deletion, Helm action, command and port-forward as
+/// [`Confirmation::Required`](crate::policy::Confirmation::Required), and
+/// only what [`rememberable`](crate::remember::rememberable) allows may
+/// skip the window after "don't ask again".
+const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets), \
+     command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
+     machine) is previewed and confirmed by the user one by one, even within your access. The \
+     user may tick \"don't ask again\" for one kind of change in one namespace for this session \
+     (not for deletions or Secrets); the result of such a call then says it was approved that \
+     way.";
+
+/// Whether every real call of tool `name` is confirmed by the user (a dry
+/// run of `apply_manifest` is not).
+fn confirms_each_call(name: &str) -> bool {
+    matches!(name, "exec" | "debug_container" | "port_forward_start")
+        || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
+}
+
 /// What a tool needs of the access, where the user may raise it (#15).
 /// Custom resources are found by kind, at the call.
 fn tool_access(name: &str) -> Option<Access> {
@@ -502,16 +528,27 @@ fn tool_access(name: &str) -> Option<Access> {
             profile,
             secrets,
             crds: false,
+            nodes: false,
         })
     };
     match name {
-        "get_logs" | "exec" | "port_forward_start" => need(Profile::Debug, false),
+        "get_logs" | "exec" | "debug_container" | "port_forward_start" => {
+            need(Profile::Debug, false)
+        }
         "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
         | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
-        "list_secrets" | "check_secret" | "compare_secret_values" | "get_secret_value" => {
-            need(Profile::ReadOnly, true)
-        }
+        "list_secrets"
+        | "check_secret"
+        | "compare_secret_values"
+        | "get_secret_value"
+        | "helm_list_releases"
+        | "helm_release_history"
+        | "helm_get_values" => need(Profile::ReadOnly, true),
+        "list_nodes" | "describe_node" | "top_nodes" => Some(Access {
+            nodes: true,
+            ..Access::NONE
+        }),
         _ => None,
     }
 }
@@ -555,6 +592,11 @@ fn kind_props(extra: Value) -> Value {
     props
 }
 
+/// How helm_install and helm_upgrade describe `preview` (#68).
+const PREVIEW_HELP: &str = "Only show what would change: the server-side dry run's objects and \
+     masked manifest diff (and values diff), without asking the user or changing anything. Call \
+     again without preview to do it";
+
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
      one. Any namespace works; list_namespaces shows the ones Kubach knows of";
@@ -582,7 +624,11 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_kinds",
-            description: "Namespaced resource kinds available in this session.",
+            description: "Namespaced resource kinds available in this session: the built-in \
+                          ones you can read, then the custom resources (CRDs) the cluster \
+                          serves, with apiVersion, and whether reading them still needs the \
+                          user's approval (the first list_resources or get_resource call on one \
+                          asks for it). Secrets, RBAC and cluster-scoped kinds are not listed.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -635,13 +681,25 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_logs",
-            description: "Recent container logs (bounded, credentials masked best-effort).",
+            description: "Recent container logs (bounded, credentials masked best-effort). Pick \
+                          pods by exactly one of: pod, kind + name of a workload (Deployment, \
+                          StatefulSet, DaemonSet, ReplicaSet, Job, CronJob), or labelSelector; \
+                          at most 10 pods and 20 containers per call. With several streams \
+                          each line starts with [pod/container]; notes on top say what was \
+                          left out.",
             schema: object_schema(
                 {
                     let mut p = json!({
                         "pod": {"type": "string"},
-                        "container": {"type": "string"},
-                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000},
+                        "kind": {"type": "string", "description": "Workload kind, with name: logs of its pods"},
+                        "apiVersion": {"type": "string", "description": "Only to disambiguate kind"},
+                        "name": {"type": "string", "description": "Workload name, with kind"},
+                        "labelSelector": {"type": "string", "description": "Logs of the pods it selects, e.g. app=web"},
+                        "container": {"type": "string", "description": "Default: the pod's default container"},
+                        "allContainers": {"type": "boolean", "description": "Every container, init containers included"},
+                        "filter": {"type": "string", "description": "Only lines containing this text (applied after masking)"},
+                        "regex": {"type": "boolean", "description": "filter is a regular expression"},
+                        "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Per container"},
                         "sinceSeconds": {"type": "integer", "minimum": 1},
                         "previous": {"type": "boolean"},
                     });
@@ -650,7 +708,7 @@ fn catalog() -> Vec<ToolSpec> {
                         .extend(ns.as_object().unwrap().clone());
                     p
                 },
-                &["pod"],
+                &[],
             ),
             read_only: true,
             destructive: false,
@@ -659,6 +717,34 @@ fn catalog() -> Vec<ToolSpec> {
             name: "top_pods",
             description: "CPU and memory usage of pods (needs metrics-server).",
             schema: object_schema(ns.clone(), &[]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "list_nodes",
+            description: "Nodes of the cluster: status, roles, age, version and the conditions \
+                          that are off (not Ready, memory/disk/PID pressure, cordoned). Read with \
+                          the user's credentials once they allowed nodes.",
+            schema: object_schema(json!({}), &[]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "describe_node",
+            description: "One node: conditions with reasons and messages, capacity and \
+                          allocatable, what its pods request and limit against it, taints, \
+                          system info, the node's events and pods evicted from it (memory, disk \
+                          or PID pressure). Pods of namespaces this session does not read are \
+                          only counted.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "top_nodes",
+            description: "CPU and memory used per node, and as % of allocatable, like kubectl \
+                          top nodes (needs metrics-server).",
+            schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
         },
@@ -768,6 +854,24 @@ fn catalog() -> Vec<ToolSpec> {
                 &["kind", "name"],
             ),
             read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "wait_for_rollout",
+            description: "Wait until a Deployment, StatefulSet or DaemonSet has rolled out, like \
+                          kubectl rollout status --timeout: after scale, rollout_restart, \
+                          apply_manifest or Helm. Returns when all pods are updated and ready, \
+                          or at the timeout (default 120s, at most 600s) or a failure (progress \
+                          deadline, paused), then with the pods not ready and why (Pending and \
+                          the scheduler's message, CrashLoopBackOff, last exit such as OOMKilled).",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "name"],
+            ),
+            read_only: true,
             destructive: false,
         },
         ToolSpec {
@@ -1034,6 +1138,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string", "description": "Chart version; the latest stable by default"},
                         "values": {"type": "string", "description": "Values as one YAML mapping (no file paths)"},
                         "createNamespace": {"type": "boolean", "default": false},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()
@@ -1065,6 +1170,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "version": {"type": "string"},
                         "values": {"type": "string", "description": "Values as one YAML mapping; they replace all of the release's values. Not with valuesPatch"},
                         "valuesPatch": {"type": "string", "description": "Only the changes, as one YAML mapping merged into the release's values (null removes a key). Not with values"},
+                        "preview": {"type": "boolean", "default": false, "description": PREVIEW_HELP},
                     });
                     p.as_object_mut()
                         .unwrap()
@@ -1181,6 +1287,36 @@ fn catalog() -> Vec<ToolSpec> {
                     p
                 },
                 &["pod", "command"],
+            ),
+            read_only: false,
+            destructive: true,
+        },
+        ToolSpec {
+            name: "debug_container",
+            description: "For pods whose images have no shell or tools (distroless): add an \
+                          ephemeral debug container (kubectl debug), by default busybox, \
+                          optionally sharing the processes of targetContainer, wait until it \
+                          runs, then run command in it like exec. Needs the user's approval \
+                          every time; the container stays in the pod until the pod is deleted, \
+                          so add one and run further commands in it with exec (container: its \
+                          name).",
+            schema: object_schema(
+                {
+                    let mut p = json!({
+                        "pod": {"type": "string"},
+                        "targetContainer": {"type": "string", "description": "Container whose process namespace the debug container shares (sees its processes and, through /proc/<pid>/root, its files)"},
+                        "name": {"type": "string", "description": "Name of the debug container; debugger-<random> when left out"},
+                        "image": {"type": "string", "description": "Image of the debug container; a pinned busybox when left out"},
+                        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                                    "description": "Command to run in the debug container once it runs; leave out to only start it"},
+                        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 120},
+                    });
+                    p.as_object_mut()
+                        .unwrap()
+                        .extend(ns.as_object().unwrap().clone());
+                    p
+                },
+                &["pod"],
             ),
             read_only: false,
             destructive: true,

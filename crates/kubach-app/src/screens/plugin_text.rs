@@ -406,6 +406,7 @@ fn section_message(title: &str) -> Option<String> {
         "Owner references" => t!("section-owner-references"),
         "Parameters" => t!("section-parameters"),
         "Ports" => t!("section-ports"),
+        "Probes" => t!("section-probes"),
         "Recommendations" => t!("section-recommendations"),
         "Resources" => t!("section-resources"),
         "Resources summary" => t!("section-resources-summary"),

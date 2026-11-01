@@ -27,6 +27,7 @@ use kubach_core::streams::{
     PortForwardManager, StreamError, fetch_source,
 };
 use kubach_core::sync;
+use kube::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -324,7 +325,11 @@ fn port_number(source: &ForwardSource, port: &ForwardPortRef) -> Result<u16, Too
             .ok_or_else(|| {
                 Denial::new(
                     DenialCode::InvalidInput,
-                    format!("{} has no TCP port named {name}", source.label()),
+                    format!(
+                        "{} has no TCP port named {name}; {}",
+                        source.label(),
+                        check::ports_text(source)
+                    ),
                 )
                 .into()
             }),
@@ -374,6 +379,13 @@ pub(crate) async fn start(
         .clone();
     let name = allowed.name.clone().expect("policy validated the name");
     let target = format!("{}/{name}", kind.to_ascii_lowercase());
+    // A forward that cannot work is not put to the user (#60).
+    let client = ctx.session.client_in(&namespace)?;
+    let source = fetch_source(&client, &kind, &namespace, &name)
+        .await
+        .map_err(stream_error)?;
+    let port = port_number(&source, &a.port)?;
+    check::check_target(&client, &source, port).await?;
     let local = a
         .local_port
         .map_or_else(|| "any free port".to_owned(), |port| port.to_string());
@@ -405,7 +417,7 @@ pub(crate) async fn start(
     )
     .await?;
     ctx.session.begin_forward(&namespace).await?;
-    let started = open(ctx, &kind, &name, &namespace, &a).await;
+    let started = open(ctx, &client, &source, port, a.local_port).await;
     let info = match started {
         Ok(info) => info,
         Err(error) => {
@@ -463,20 +475,15 @@ pub(crate) async fn start(
     })
 }
 
-/// Reads the target under the session's identity and starts the forward.
+/// Starts the forward to `source` under the session's identity (`client`).
 async fn open(
     ctx: &Ctx<'_>,
-    kind: &str,
-    name: &str,
-    namespace: &str,
-    a: &StartArgs,
+    client: &Client,
+    source: &ForwardSource,
+    port: u16,
+    local_port: Option<u16>,
 ) -> Result<ForwardInfo, ToolError> {
-    let client = ctx.session.client_in(namespace)?;
-    let source = fetch_source(&client, kind, namespace, name)
-        .await
-        .map_err(stream_error)?;
-    let port = port_number(&source, &a.port)?;
-    let local = LocalPort::Exact(a.local_port.unwrap_or(0));
+    let local = LocalPort::Exact(local_port.unwrap_or(0));
     let agent = ForwardAgent {
         context: ctx.session.scope().context.clone(),
         client: ctx.client_name.to_owned(),
@@ -485,7 +492,7 @@ async fn open(
     ctx.session
         .forwards()
         .manager()
-        .start_for_agent(&client, &source, port, local, agent)
+        .start_for_agent(client, source, port, local, agent)
         .await
         .map_err(|error| match error {
             StreamError::PortInUse(port) => ToolError::Failed(format!(
@@ -568,6 +575,8 @@ pub(crate) async fn stop(
         audit: Some(json!({"forward": a.id, "target": forward.target})),
     })
 }
+
+mod check;
 
 #[cfg(test)]
 mod tests;

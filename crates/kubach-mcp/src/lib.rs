@@ -41,6 +41,9 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod debug_tools;
+mod node_tools;
+mod rollout_tools;
 mod secret_tools;
 pub mod secret_write;
 mod tools;

@@ -378,7 +378,10 @@ impl HelmCharts {
         if card.text(tab, &version).is_some() {
             return;
         }
-        let chart = repo::chart_reference(&card.repository, &card.chart);
+        let chart = repo::chart_reference(
+            repo::helm_repository_name(&self.repos, &card.repository),
+            &card.chart,
+        );
         let call = show(cx, tab.kind(), chart, Some(version.clone()));
         let task_version = version.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -463,7 +466,8 @@ impl HelmCharts {
             .map(|versions| versions.iter().map(|v| v.version.clone()).collect())
             .unwrap_or_default();
         let source = InstallSource::Repository {
-            repository: card.repository.clone(),
+            // `repo/chart` goes to Helm: its name for the repository (#58).
+            repository: repo::helm_repository_name(&self.repos, &card.repository).to_owned(),
             chart: card.chart.clone(),
             versions,
         };
@@ -672,8 +676,9 @@ impl HelmCharts {
                     theme.danger,
                 ),
             };
-            let update_name = name.clone();
-            let remove_name = name.clone();
+            // Helm commands take the name exactly as Helm keeps it (#58).
+            let update_name = loaded.repository.helm_name.clone();
+            let remove_name = loaded.repository.helm_name.clone();
             let filter_name = name.clone();
             let picked = self.repository.as_deref() == Some(name.as_str());
             div()

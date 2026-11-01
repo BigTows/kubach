@@ -178,6 +178,8 @@ settings-minimum-secrets = 默认允许 Secret
 settings-minimum-secrets-description = 无需询问即可获得 Secret 的名称、键、大小以及 Kubach 内部的检查结果，但不含值。关闭时：代理需先请求。揭示值需针对每个 Secret 询问，且仅在“隐藏 Secret 值”关闭时可用。
 settings-minimum-crds = 默认允许自定义资源
 settings-minimum-crds-description = 无需询问即可使用内置类型之外的 kind（CRD，例如 Flux 或 Argo CD 对象）。它们可能包含凭据，或让控制器以自己的权限执行操作。关闭时：代理需先请求。代理永远不会通过它们更改 ServiceAccount、RBAC 和 Secret。
+settings-minimum-nodes = 默认允许节点
+settings-minimum-nodes-description = 无需询问即可读取节点：状况（内存、磁盘、PID 压力）、容量与可分配资源、污点、节点事件、Pod 驱逐和资源用量。节点是集群级资源，因此 Kubach 使用你自己的凭据读取，且仅限这些只读请求。关闭时：代理需先请求。
 settings-minimum-reset = 重置为读取
 settings-minimum-reset-description = 恢复为读取内置资源；其他一切都需再次请求。已在运行的会话会保留现有权限直到结束。
 # $time: 例如 10:00:00；$changes: 设置文件中记录的提升内容。

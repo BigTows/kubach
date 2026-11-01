@@ -129,8 +129,26 @@ pub enum RepoError {
 /// the file: Kubach neither reads nor shows them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repository {
+    /// The name without surrounding whitespace: shown, searched and
+    /// compared (`repo/chart`).
     pub name: String,
+    /// The name exactly as in `repositories.yaml`, for Helm: `helm repo
+    /// add "x "` keeps the space, and Helm finds the repository, its
+    /// `<cache>/x -index.yaml` and `x /chart` only by that exact name (#58).
+    pub helm_name: String,
     pub url: String,
+}
+
+impl Repository {
+    /// A repository named `name` in `repositories.yaml`.
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        let helm_name = name.into();
+        Self {
+            name: helm_name.trim().to_owned(),
+            helm_name,
+            url: url.into(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,7 +165,8 @@ struct RepositoryEntry {
     url: String,
 }
 
-/// Parses `repositories.yaml`; entries without a name are skipped.
+/// Parses `repositories.yaml`; entries without a name are skipped. Names are
+/// trimmed (see [`Repository::helm_name`]).
 pub fn parse_repositories(text: &str) -> Result<Vec<Repository>, ValidationError> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
@@ -157,11 +176,8 @@ pub fn parse_repositories(text: &str) -> Result<Vec<Repository>, ValidationError
     Ok(file
         .repositories
         .into_iter()
-        .filter(|entry| !entry.name.is_empty())
-        .map(|entry| Repository {
-            name: entry.name,
-            url: entry.url,
-        })
+        .filter(|entry| !entry.name.trim().is_empty())
+        .map(|entry| Repository::new(entry.name, entry.url.trim()))
         .collect())
 }
 
@@ -317,7 +333,7 @@ pub fn load(
     Ok(repositories
         .into_iter()
         .map(|repository| {
-            let path = paths.index_file(&repository.name);
+            let path = paths.index_file(&repository.helm_name);
             let stamp = std::fs::metadata(&path)
                 .ok()
                 .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
@@ -364,6 +380,28 @@ impl ChartHit<'_> {
 /// `repo/chart`.
 pub fn chart_reference(repository: &str, chart: &str) -> String {
     format!("{repository}/{chart}")
+}
+
+/// The name Helm knows the repository `name` by ([`Repository::helm_name`]);
+/// `name` itself when no repository has it.
+pub fn helm_repository_name<'a>(repositories: &'a [LoadedRepository], name: &'a str) -> &'a str {
+    repositories
+        .iter()
+        .find(|loaded| loaded.repository.name == name)
+        .map_or(name, |loaded| loaded.repository.helm_name.as_str())
+}
+
+/// `reference` for a Helm command: `repo/chart` with the repository's name
+/// as Helm knows it ([`helm_repository_name`]); other references (`oci://`,
+/// paths, unknown repositories) as they are, trimmed.
+pub fn helm_chart_reference(repositories: &[LoadedRepository], reference: &str) -> String {
+    let reference = reference.trim();
+    match reference.split_once('/') {
+        Some((name, chart)) if !reference.contains("://") => {
+            chart_reference(helm_repository_name(repositories, name), chart)
+        }
+        _ => reference.to_owned(),
+    }
 }
 
 /// Search options, as the flags of `helm search repo`.
@@ -903,20 +941,55 @@ repositories:
         assert_eq!(
             repos,
             [
-                Repository {
-                    name: "bitnami".into(),
-                    url: "https://charts.bitnami.com/bitnami".into()
-                },
-                Repository {
-                    name: "external-dns".into(),
-                    url: "https://kubernetes-sigs.github.io/external-dns/".into()
-                },
+                Repository::new("bitnami", "https://charts.bitnami.com/bitnami"),
+                Repository::new(
+                    "external-dns",
+                    "https://kubernetes-sigs.github.io/external-dns/"
+                ),
             ]
         );
         assert!(!format!("{repos:?}").contains("secret"));
         assert_eq!(parse_repositories("").unwrap(), []);
         assert_eq!(parse_repositories("repositories: null\n").unwrap(), []);
         assert!(parse_repositories("repositories: [").is_err());
+    }
+
+    /// `helm repo add "spark-operator " ...` keeps the space in the file and
+    /// in the cache file names (#58).
+    #[test]
+    fn repository_names_are_trimmed_but_helm_keeps_its_own() {
+        let text = "repositories:\n- name: 'spark-operator '\n  url: https://spark.example\n\
+                    - name: ' '\n  url: https://blank.example\n";
+        let repos = parse_repositories(text).unwrap();
+        assert_eq!(repos.len(), 1, "a blank name is no name");
+        assert_eq!(repos[0].name, "spark-operator");
+        assert_eq!(repos[0].helm_name, "spark-operator ");
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HelmPaths {
+            repository_config: dir.path().join("repositories.yaml"),
+            repository_cache: dir.path().join("cache"),
+        };
+        std::fs::create_dir_all(&paths.repository_cache).unwrap();
+        std::fs::write(&paths.repository_config, text).unwrap();
+        std::fs::write(paths.index_file("spark-operator "), INDEX).unwrap();
+        let loaded = load(&paths, &[]).unwrap();
+        assert!(loaded[0].charts().is_some(), "index found by Helm's name");
+        let hit = &search(&loaded, "", SearchOptions::default())[0];
+        assert!(hit.reference().starts_with("spark-operator/"));
+        assert_eq!(
+            helm_chart_reference(&loaded, " spark-operator/web "),
+            "spark-operator /web"
+        );
+        assert_eq!(helm_chart_reference(&loaded, "other/web"), "other/web");
+        assert_eq!(
+            helm_chart_reference(&loaded, "oci://r.example/web"),
+            "oci://r.example/web"
+        );
+        assert_eq!(
+            helm_repository_name(&loaded, "spark-operator"),
+            "spark-operator "
+        );
     }
 
     #[test]
@@ -1016,10 +1089,7 @@ generated: "2025-01-02T03:04:05Z"
     fn loaded() -> Vec<LoadedRepository> {
         let index = Arc::new(parse_index(INDEX).unwrap());
         let repo = |name: &str, index: IndexState| LoadedRepository {
-            repository: Repository {
-                name: name.into(),
-                url: format!("https://{name}.example"),
-            },
+            repository: Repository::new(name, format!("https://{name}.example")),
             index,
             stamp: None,
         };

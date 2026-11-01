@@ -82,6 +82,7 @@ agent-field-access-now = Есть сейчас
 agent-access-details = «Разрешить» добавляет это до конца сессии. С «Разрешать по умолчанию» минимальный доступ { $context } повышается в Настройки → Security насовсем. В обоих случаях каждое изменение, удаление, действие Helm и команда по-прежнему подтверждаются по одной, и ничего не выходит за ваши права в Kubernetes.
 agent-access-secrets = Secret (метаданные и проверки)
 agent-access-crds = пользовательские ресурсы
+agent-access-nodes = ноды (чтение с вашими учётными данными)
 agent-tool-session = { $tool } · сессия { $session }
 agent-helm-values = Values (чувствительные ключи скрыты)
 agent-helm-values-show = Показать все values

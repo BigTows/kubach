@@ -92,6 +92,18 @@ pub fn is_sensitive_name(name: &str) -> bool {
     })
 }
 
+/// Whether the last word of a sensitive name ([`is_sensitive_name`]) is the
+/// sensitive one: `dbPassword`, `apiToken`, `tls.key`, but not `tokenTTL`
+/// or `passwordMinLength`, which name a setting of a credential.
+pub fn ends_with_sensitive_word(name: &str) -> bool {
+    let parts = name_parts(name);
+    parts.last().is_some_and(|last| is_sensitive_name(last))
+        || parts.len() >= 2 && {
+            let (a, b) = (&parts[parts.len() - 2], &parts[parts.len() - 1]);
+            SENSITIVE_PAIRS.iter().any(|(x, y)| a == x && b == y)
+        }
+}
+
 /// Masks values stored under a sensitive name ([`is_sensitive_name`]) in an
 /// object or a `List` of objects, whatever its kind; `replace` gives the
 /// placeholder for a value:
@@ -172,7 +184,7 @@ fn walk(key: &str, value: &mut Value, replace: &mut impl FnMut(&Value) -> Value)
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{is_sensitive_name, mask_named_values};
+    use super::{ends_with_sensitive_word, is_sensitive_name, mask_named_values};
 
     #[test]
     fn sensitive_names() {
@@ -212,6 +224,29 @@ mod tests {
             "",
         ] {
             assert!(!is_sensitive_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn names_ending_in_a_sensitive_word() {
+        for name in [
+            "password",
+            "dbPassword",
+            "apiToken",
+            "tls.key",
+            "CONN_STR",
+            "SECRET",
+        ] {
+            assert!(ends_with_sensitive_word(name), "{name}");
+        }
+        for name in [
+            "tokenTTL",
+            "passwordMinLength",
+            "secretName2x",
+            "replicas",
+            "",
+        ] {
+            assert!(!ends_with_sensitive_word(name), "{name}");
         }
     }
 

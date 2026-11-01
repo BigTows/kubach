@@ -73,6 +73,7 @@ agent-field-access-now = 当前拥有
 agent-access-details = 允许后，此权限在会话结束前有效。勾选“默认允许”后，{ $context } 的最低权限会在 设置 → Security 中永久提升。无论哪种情况，每项更改、删除、Helm 操作和命令仍需逐一批准，且不会超出你自己的 Kubernetes 权限。
 agent-access-secrets = Secret（元数据和检查）
 agent-access-crds = 自定义资源
+agent-access-nodes = 节点（使用你的凭据读取）
 agent-tool-session = { $tool } · 会话 { $session }
 agent-helm-values = Values（敏感键已遮蔽）
 agent-helm-values-show = 显示全部 values

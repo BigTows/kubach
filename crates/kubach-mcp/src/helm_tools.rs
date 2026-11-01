@@ -58,7 +58,7 @@ use kubach_core::helm::{
     Driver, HelmError, ManifestResource, Release, Releases, Sensitive, manifest_resources, oci,
     unified_diff,
 };
-use kubach_core::secrets::mask::is_sensitive_name;
+use kubach_core::secrets::mask::{ends_with_sensitive_word, is_sensitive_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -251,6 +251,9 @@ struct InstallArgs {
     namespace: Option<String>,
     #[serde(default)]
     create_namespace: bool,
+    /// Only show the agent what the install would do (#68).
+    #[serde(default)]
+    preview: bool,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +266,9 @@ struct UpgradeArgs {
     /// Changes merged into the release's values by Kubach (#22).
     values_patch: Option<String>,
     namespace: Option<String>,
+    /// Only show the agent what the upgrade would do (#68).
+    #[serde(default)]
+    preview: bool,
 }
 
 #[derive(Deserialize)]
@@ -436,23 +442,49 @@ fn values_placeholder(value: &Value) -> Value {
     Value::String(format!("*** ({size} bytes)"))
 }
 
-/// Values masked at any depth: every scalar under a sensitive key
-/// (`password`, `token`, `auth`…; in a list under one too) and every string
-/// that [`looks_like_secret`] becomes `*** (N bytes)`; other strings go
-/// through text masking.
+/// Values masked at any depth: every string under a sensitive key
+/// (`password`, `token`, `auth`…, a whole word of the key; in a list under
+/// one too) and every string that [`looks_like_secret`] becomes
+/// `*** (N bytes)`; other strings go through text masking. Booleans and null
+/// are never masked (`automountServiceAccountToken: true`), numbers only
+/// under a key whose last word is a credential one (`password: 123456`, not
+/// `tokenTTL: 3600`) (#59).
 pub(crate) fn mask_values(value: &mut Value) {
-    mask_values_at(value, "", false, &mut Vec::new());
+    mask_values_at(value, "", Key::Plain, &mut Vec::new());
 }
 
 /// [`mask_values`], returning the paths it masked (`auth.password`,
 /// `tokens[0]`), for `helm_get_values`.
 pub(crate) fn mask_values_listed(value: &mut Value) -> Vec<String> {
     let mut masked = Vec::new();
-    mask_values_at(value, "", false, &mut masked);
+    mask_values_at(value, "", Key::Plain, &mut masked);
     masked
 }
 
-fn mask_values_at(value: &mut Value, path: &str, sensitive: bool, masked: &mut Vec<String>) {
+/// What the key a value is stored under says about it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Plain,
+    /// A sensitive word, but not as its last word (`tokenTTL`).
+    Sensitive,
+    /// Ends in a sensitive word (`apiToken`, `password`).
+    Credential,
+}
+
+impl Key {
+    fn of(name: &str) -> Self {
+        if !is_sensitive_name(name) {
+            Key::Plain
+        } else if ends_with_sensitive_word(name) {
+            Key::Credential
+        } else {
+            Key::Sensitive
+        }
+    }
+}
+
+fn mask_values_at(value: &mut Value, path: &str, key: Key, masked: &mut Vec<String>) {
+    let sensitive = key != Key::Plain;
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
@@ -461,12 +493,12 @@ fn mask_values_at(value: &mut Value, path: &str, sensitive: bool, masked: &mut V
                 } else {
                     format!("{path}.{key}")
                 };
-                mask_values_at(child, &child_path, is_sensitive_name(key), masked);
+                mask_values_at(child, &child_path, Key::of(key), masked);
             }
         }
         Value::Array(items) => {
             for (index, item) in items.iter_mut().enumerate() {
-                mask_values_at(item, &format!("{path}[{index}]"), sensitive, masked);
+                mask_values_at(item, &format!("{path}[{index}]"), key, masked);
             }
         }
         Value::String(text) if !sensitive && !looks_like_secret(text) => {
@@ -478,10 +510,14 @@ fn mask_values_at(value: &mut Value, path: &str, sensitive: bool, masked: &mut V
             *value = values_placeholder(value);
             masked.push(path.to_owned());
         }
-        _ if sensitive => {
+        // A number is a credential only under a key that ends in a
+        // credential word (`password: 123456`), not a size or a duration
+        // (`tokenTTL: 3600`) (#59).
+        Value::Number(_) if key == Key::Credential => {
             *value = values_placeholder(value);
             masked.push(path.to_owned());
         }
+        // Booleans and null are switches, never credentials (#59).
         _ => {}
     }
 }
@@ -1304,11 +1340,13 @@ pub(crate) async fn show_values(
 ) -> Result<ToolOutput, ToolError> {
     let a: ShowValuesArgs = parse(args)?;
     let env = env(ctx)?;
-    let source = chart_source(&a.chart, &repository_names(&repositories(&env).await))?;
+    let loaded = repositories(&env).await;
+    let source = chart_source(&a.chart, &repository_names(&loaded))?;
     authorize(ctx, &Request::HelmCharts).await?;
     ensure_source(ctx, &source).await?;
     let binary = require_binary(&env)?;
-    let command = HelmCommand::show(ShowKind::Values, &a.chart, a.version.as_deref());
+    let chart = repo::helm_chart_reference(&loaded, &a.chart);
+    let command = HelmCommand::show(ShowKind::Values, &chart, a.version.as_deref());
     let text = helm_cli::run(Some(&binary), &command, SHOW_TIMEOUT)
         .await
         .map_err(helm_error)?;
@@ -1424,9 +1462,8 @@ pub(crate) async fn get_values(
                 code,
                 message: format!(
                     "{message}. The session's identity in {namespace} ({}) cannot read them, \
-                     and Kubach does not read them with other credentials. With access to \
-                     Secrets for the session (list_secrets asks the user for it) it can; \
-                     otherwise ask the user to look at the values in Kubach's Helm screen",
+                     and Kubach does not read them with other credentials. Ask the user to look \
+                     at the values in Kubach's Helm screen",
                     ctx.session.describe_identity(Some(&namespace))
                 ),
             },
@@ -1691,6 +1728,48 @@ async fn ask_user_credentials(
 }
 
 /// What the next step does after a yes to the user's credentials.
+/// What a preview leads to (#68).
+const PREVIEW_NEXT: &str = "Server-side dry run: nothing was installed or changed and the user \
+     was not asked. Call again without preview to do it; the user then sees this and approves.";
+
+/// What `preview: true` shows the agent (#68).
+struct PreviewText<'a> {
+    objects: &'a [String],
+    cluster: &'a [String],
+    findings: &'a [Finding],
+    /// Masked unified diff of the manifests.
+    diff: &'a str,
+    /// Masked values diff of an upgrade.
+    values_diff: Option<&'a str>,
+}
+
+fn preview_text(preview: &PreviewText<'_>, note: &str) -> String {
+    let mut out = json!({
+        "preview": true,
+        "note": note,
+        "objects": preview.objects,
+        "clusterObjects": preview.cluster,
+        "needsTheUsersAttention": preview
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.path, f.message))
+            .collect::<Vec<_>>(),
+        "diff": if preview.diff.trim().is_empty() {
+            "no object changes"
+        } else {
+            preview.diff
+        },
+    });
+    if let Some(diff) = preview.values_diff {
+        out["valuesDiff"] = json!(if diff.trim().is_empty() {
+            "the values did not change"
+        } else {
+            diff
+        });
+    }
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
 const DRY_RUN_NEXT: &str = "If you allow it, Kubach runs the server-side dry run with your \
                             credentials and shows its objects and diff in the next window; \
                             nothing changes until you approve that one.";
@@ -1745,7 +1824,9 @@ pub(crate) async fn install(
     release_name(&a.release)?;
     // Inputs first: a bad chart or values never bothers the user.
     let env = env(ctx)?;
-    let source = chart_source(&a.chart, &repository_names(&repositories(&env).await))?;
+    let loaded = repositories(&env).await;
+    let source = chart_source(&a.chart, &repository_names(&loaded))?;
+    let helm_chart = repo::helm_chart_reference(&loaded, &a.chart);
     let values = a.values.unwrap_or_default();
     parse_values(&values)?;
     let allowed = authorize(
@@ -1772,7 +1853,7 @@ pub(crate) async fn install(
     let binary = require_binary(&env)?;
     let request = InstallRequest {
         release: a.release.clone(),
-        chart: a.chart.trim().to_owned(),
+        chart: helm_chart,
         version: a.version.clone(),
         values: Sensitive::new(values.clone()),
         create_namespace: a.create_namespace,
@@ -1808,7 +1889,33 @@ pub(crate) async fn install(
     let rendered = rendered(ctx, &binary, &template).await;
     let scan = scan(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
+    let (previous_manifest, previous_label) = ("", "nothing installed");
+    let preview_values_diff: Option<&str> = None;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
+    if as_user && a.preview {
+        // The dry run would need the user's credentials: what helm
+        // template renders, without asking anyone.
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
+        let diff = masked_diff(
+            previous_manifest,
+            rendered.as_deref().unwrap_or_default(),
+            previous_label,
+            "helm template",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &objects,
+                cluster: &[],
+                findings: &scan.findings,
+                diff: &diff,
+                values_diff: preview_values_diff,
+            },
+            "Rendered with helm template, without the cluster: this chart needs the user's own \
+             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
+             dry run runs only when you call without preview and the user allows it.",
+        )));
+    }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
@@ -1872,6 +1979,25 @@ pub(crate) async fn install(
         namespaces: others.clone(),
         ..base_change
     };
+    if a.preview {
+        let diff = masked_diff(
+            "",
+            preview_release.manifest.expose(),
+            "nothing installed",
+            "after the install",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &preview.objects,
+                cluster: &preview.cluster,
+                findings: &preview.findings,
+                diff: &diff,
+                values_diff: None,
+            },
+            PREVIEW_NEXT,
+        )));
+    }
     let details = format!(
         "Objects of the server-side dry run:\n{}",
         bullet_list("+", &preview.objects)
@@ -2014,12 +2140,15 @@ pub(crate) async fn upgrade(
     release_name(&a.release)?;
     // Inputs first: a bad chart or values never bothers the user.
     let env = env(ctx)?;
-    let source = match &a.chart {
-        Some(chart) => Some(chart_source(
-            chart,
-            &repository_names(&repositories(&env).await),
-        )?),
-        None => None,
+    let (source, helm_chart) = match &a.chart {
+        Some(chart) => {
+            let loaded = repositories(&env).await;
+            (
+                Some(chart_source(chart, &repository_names(&loaded))?),
+                Some(repo::helm_chart_reference(&loaded, chart)),
+            )
+        }
+        None => (None, None),
     };
     let edit = values_edit(a.values.as_deref(), a.values_patch.as_deref())?;
     let allowed = authorize(
@@ -2042,9 +2171,9 @@ pub(crate) async fn upgrade(
             .get(&namespace, &a.release, None)
             .await
             .map_err(store_error)?;
-        let chart = match &a.chart {
+        let chart = match helm_chart {
             Some(chart) => UpgradeChart::Reference {
-                chart: chart.trim().to_owned(),
+                chart,
                 version: a.version.clone(),
             },
             None => UpgradeChart::Stored(
@@ -2098,6 +2227,10 @@ pub(crate) async fn upgrade(
     };
     let rendered = rendered(ctx, &binary, &template).await;
     let current_manifest = release_manifest(&current);
+    let previous_label = format!("revision {}", current.revision);
+    let (previous_manifest, previous_label) =
+        (current.manifest.expose().as_str(), previous_label.as_str());
+    let preview_values_diff = Some(values.diff.as_str());
     let scan = scan(
         ctx,
         &namespace,
@@ -2106,6 +2239,30 @@ pub(crate) async fn upgrade(
     .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
+    if as_user && a.preview {
+        // The dry run would need the user's credentials: what helm
+        // template renders, without asking anyone.
+        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
+        let diff = masked_diff(
+            previous_manifest,
+            rendered.as_deref().unwrap_or_default(),
+            previous_label,
+            "helm template",
+        )
+        .await;
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &objects,
+                cluster: &[],
+                findings: &scan.findings,
+                diff: &diff,
+                values_diff: preview_values_diff,
+            },
+            "Rendered with helm template, without the cluster: this chart needs the user's own \
+             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
+             dry run runs only when you call without preview and the user allows it.",
+        )));
+    }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
         let details = format!(
@@ -2161,6 +2318,18 @@ pub(crate) async fn upgrade(
         namespaces: others.clone(),
         ..base_change
     };
+    if a.preview {
+        return Ok(ToolOutput::read(preview_text(
+            &PreviewText {
+                objects: &preview.objects,
+                cluster: &preview.cluster,
+                findings: &preview.findings,
+                diff: &diff,
+                values_diff: Some(values.diff.as_str()),
+            },
+            PREVIEW_NEXT,
+        )));
+    }
     let details = if diff.trim().is_empty() {
         "The dry run changes no object.".to_owned()
     } else {

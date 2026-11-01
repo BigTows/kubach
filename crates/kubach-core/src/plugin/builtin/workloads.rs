@@ -1,7 +1,7 @@
 //! Deployment, StatefulSet, DaemonSet and ReplicaSet plugins.
 
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
-use k8s_openapi::api::core::v1::PodTemplateSpec;
+use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kubach_i18n::msg;
@@ -9,7 +9,7 @@ use kube::api::{DynamicObject, GroupVersionKind, Patch};
 use kube::{Client, Resource};
 use serde_json::{Value, json};
 
-use super::pod::{scheduling, security_notes};
+use super::pod::{probes, scheduling, security_notes};
 use super::{
     DELETE_ACTION, OVERVIEW, PORT_FORWARD_ACTION, action, api_for, col, creation, decode, delete,
     fallback_cells, kv, map_pairs, name_ns_cells, name_ns_columns, name_of, now_rfc3339, or_none,
@@ -234,6 +234,11 @@ fn workload_details(
         })
         .unwrap_or_default(),
     );
+    push_kv(
+        &mut sections,
+        "Probes",
+        spec.map(template_probes).unwrap_or_default(),
+    );
     push_notes(
         &mut sections,
         "Security",
@@ -250,6 +255,28 @@ fn workload_details(
     sections.extend(related);
     sections.extend(GenericPlugin.details(obj));
     sections
+}
+
+/// Probes of every container of a pod template, `(app liveness, http-get
+/// :80/ · delay 0s · …)`; containers without probes say `none`, init
+/// containers (they cannot have probes) are left out.
+fn template_probes(spec: &PodSpec) -> Vec<(String, String)> {
+    spec.init_containers
+        .iter()
+        .flatten()
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+        .chain(&spec.containers)
+        .flat_map(|c| {
+            let probes = probes(c);
+            if probes.is_empty() {
+                return vec![(c.name.clone(), "none".to_owned())];
+            }
+            probes
+                .into_iter()
+                .map(|(name, probe)| (format!("{} {}", c.name, name.to_lowercase()), probe))
+                .collect()
+        })
+        .collect()
 }
 
 /// `RollingUpdate · max surge 25% · max unavailable 25%`.
@@ -1264,6 +1291,41 @@ mod tests {
     }
 
     #[test]
+    fn deployment_details_show_template_probes() {
+        let mut o = deployment(3, healthy_status());
+        o.data["spec"]["template"]["spec"] = json!({
+            "initContainers": [
+                {"name": "migrate", "image": "x"},
+                {"name": "proxy", "image": "x", "restartPolicy": "Always",
+                 "startupProbe": {"tcpSocket": {"port": 15000}, "failureThreshold": 30}}
+            ],
+            "containers": [{
+                "name": "app", "image": "x",
+                "livenessProbe": {"httpGet": {"path": "/healthz", "port": "http"}, "timeoutSeconds": 1},
+                "readinessProbe": {"exec": {"command": ["cat", "/tmp/ready"]}, "periodSeconds": 5}
+            }]
+        });
+        let sections = DeploymentPlugin.details(&o);
+        assert_eq!(
+            pairs(&sections, "Probes"),
+            [
+                pair(
+                    "proxy startup",
+                    "tcp :15000 · delay 0s · timeout 1s · every 10s · failure 30 · success 1"
+                ),
+                pair(
+                    "app liveness",
+                    "http-get :http/healthz · delay 0s · timeout 1s · every 10s · failure 3 · success 1"
+                ),
+                pair(
+                    "app readiness",
+                    "exec cat /tmp/ready · delay 0s · timeout 1s · every 5s · failure 3 · success 1"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn deployment_details_and_selectors() {
         let mut o = deployment(3, healthy_status());
         o.metadata.uid = Some("d-uid".into());
@@ -1306,6 +1368,7 @@ mod tests {
             pairs(&sections, "Containers"),
             [pair("app", "nginx:latest")]
         );
+        assert_eq!(pairs(&sections, "Probes"), [pair("app", "none")]);
         // `:latest` and missing limits are reported.
         assert!(
             matches!(section_body(&sections, "Security"), SectionBody::Notes(n) if !n.is_empty())

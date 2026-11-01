@@ -50,6 +50,9 @@ pub struct AgentAccess {
     pub secrets: bool,
     /// Kinds beyond the built-in allowlist: custom resources (#192).
     pub crds: bool,
+    /// Nodes, their events and usage, read with the user's credentials
+    /// (#61).
+    pub nodes: bool,
 }
 
 /// Security settings of one context. `Default` is what a new context gets.
@@ -69,6 +72,8 @@ pub struct ContextPolicy {
     pub minimum_secrets: bool,
     /// Custom resources without asking.
     pub minimum_crds: bool,
+    /// Nodes without asking (#61).
+    pub minimum_nodes: bool,
 }
 
 impl Default for ContextPolicy {
@@ -81,6 +86,7 @@ impl Default for ContextPolicy {
             minimum_access: AgentLevel::Read,
             minimum_secrets: false,
             minimum_crds: false,
+            minimum_nodes: false,
         }
     }
 }
@@ -131,6 +137,7 @@ impl ContextPolicy {
             level: self.minimum_access,
             secrets: self.minimum_secrets,
             crds: self.minimum_crds,
+            nodes: self.minimum_nodes,
         }
     }
 
@@ -138,6 +145,7 @@ impl ContextPolicy {
         self.minimum_access = access.level;
         self.minimum_secrets = access.secrets;
         self.minimum_crds = access.crds;
+        self.minimum_nodes = access.nodes;
     }
 
     /// Whether the minimum is above reading built-in kinds.
@@ -173,6 +181,10 @@ impl ContextPolicy {
         if access.crds && !self.minimum_crds {
             changes.push("custom resources: asked → by default".to_owned());
             self.minimum_crds = true;
+        }
+        if access.nodes && !self.minimum_nodes {
+            changes.push("nodes: asked → by default".to_owned());
+            self.minimum_nodes = true;
         }
         changes
     }
@@ -560,6 +572,7 @@ mod tests {
             level: AgentLevel::Read,
             secrets: true,
             crds: true,
+            nodes: false,
         };
         assert_eq!(settings.raise_minimum(&key, both, "s3", "", "t").len(), 2);
         assert_eq!(
@@ -567,7 +580,8 @@ mod tests {
             AgentAccess {
                 level: AgentLevel::Changes,
                 secrets: true,
-                crds: true
+                crds: true,
+                nodes: false,
             }
         );
         // Round trip through the file format.

@@ -25,6 +25,7 @@ use std::fmt;
 use kubach_core::apply::{self, ResolvedManifest};
 use kubach_core::discovery::{ApiCatalog, ResourceKind};
 use kubach_core::secrets::mask::is_core_secret;
+use kubach_core::workload_pods::Workload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -50,6 +51,8 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 /// Longest exec command, all arguments together, in bytes. Keeps the
 /// confirmation dialog readable in full (#194).
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
+/// Longest image reference of a debug container (#64).
+pub const MAX_IMAGE_REF_BYTES: usize = 512;
 /// Lowest local port an agent's port-forward may take (#17): well-known
 /// ports stay with the system and the user.
 pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
@@ -114,8 +117,12 @@ pub enum Request {
         namespace: Option<String>,
         object: Option<(KindRef, String)>,
     },
+    /// `get_logs`: exactly one of a pod, a workload (kind + name) or a
+    /// label selector picks the pods.
     Logs {
-        pod: String,
+        pod: Option<String>,
+        workload: Option<(KindRef, String)>,
+        label_selector: Option<String>,
         container: Option<String>,
         namespace: Option<String>,
     },
@@ -152,6 +159,18 @@ pub enum Request {
     Exec {
         pod: String,
         container: Option<String>,
+        namespace: Option<String>,
+        command: Vec<String>,
+    },
+    /// `debug_container` (#64): an ephemeral container added to `pod`, in
+    /// the process namespace of `target` when given, then `command` run in
+    /// it like exec (none: it is left running for exec). Confirmed every
+    /// time: the pod keeps the container until it is deleted.
+    Debug {
+        pod: String,
+        target: Option<String>,
+        name: Option<String>,
+        image: Option<String>,
         namespace: Option<String>,
         command: Vec<String>,
     },
@@ -219,7 +238,14 @@ pub enum Request {
     /// Helm charts of the repositories added in Kubach or of an `oci://`
     /// reference (#418): search and default values. No namespace.
     HelmCharts,
-    /// Helm releases of a namespace: list and history.
+    /// Nodes (#61): the list, one node with its events and evictions, or
+    /// their usage. Cluster-scoped: read with the user's credentials, by
+    /// Kubach's own read-only calls, once the user allowed nodes.
+    Nodes {
+        name: Option<String>,
+    },
+    /// Helm releases of a namespace: list, history and values. Needs
+    /// access to Secrets, where Helm stores them (#53).
     HelmRead {
         namespace: Option<String>,
     },
@@ -239,6 +265,7 @@ impl Request {
             | Self::Restart { .. }
             | Self::Delete { .. }
             | Self::Exec { .. }
+            | Self::Debug { .. }
             | Self::SecretWrite { .. }
             | Self::SecretCopy { .. }
             | Self::SecretDelete { .. }
@@ -484,12 +511,14 @@ impl<'a> Policy<'a> {
                 profile,
                 secrets,
                 crds: false,
+                nodes: false,
             })
         };
         match request {
-            Request::Logs { .. } | Request::Exec { .. } | Request::PortForward { .. } => {
-                need(Profile::Debug, false)
-            }
+            Request::Logs { .. }
+            | Request::Exec { .. }
+            | Request::Debug { .. }
+            | Request::PortForward { .. } => need(Profile::Debug, false),
             Request::Apply { .. }
             | Request::Scale { .. }
             | Request::Restart { .. }
@@ -498,10 +527,16 @@ impl<'a> Policy<'a> {
             Request::SecretWrite { .. }
             | Request::SecretCopy { .. }
             | Request::SecretDelete { .. } => need(Profile::Deploy, true),
+            // Helm keeps releases in Secrets of their namespace (#53).
             Request::SecretList { .. }
             | Request::SecretCheck { .. }
             | Request::SecretCompare { .. }
-            | Request::SecretReveal { .. } => need(Profile::ReadOnly, true),
+            | Request::SecretReveal { .. }
+            | Request::HelmRead { .. } => need(Profile::ReadOnly, true),
+            Request::Nodes { .. } => Some(Access {
+                nodes: true,
+                ..Access::NONE
+            }),
             _ => None,
         }
     }
@@ -569,9 +604,11 @@ impl<'a> Policy<'a> {
     pub fn required_grants(&self, request: &Request, allowed: &Allowed) -> Vec<Grant> {
         let read = Grant::read(allowed.namespace.clone());
         let mut needed = match request {
-            Request::Info | Request::ListKinds | Request::ListNamespaces | Request::HelmCharts => {
-                Vec::new()
-            }
+            Request::Info
+            | Request::ListKinds
+            | Request::ListNamespaces
+            | Request::HelmCharts
+            | Request::Nodes { .. } => Vec::new(),
             Request::HelmRead { .. } => vec![read],
             Request::List { .. }
             | Request::Get { .. }
@@ -616,6 +653,7 @@ impl<'a> Policy<'a> {
             | Request::Restart { .. }
             | Request::Delete { .. }
             | Request::Exec { .. }
+            | Request::Debug { .. }
             | Request::SecretWrite { .. }
             | Request::SecretDelete { .. }
             | Request::HelmChange { .. } => {
@@ -665,6 +703,13 @@ impl<'a> Policy<'a> {
             Request::HelmRead { namespace } => {
                 Ok(self.allowed(self.namespace(namespace.as_deref())?))
             }
+            Request::Nodes { name } => {
+                let mut allowed = self.allowed(self.namespace(None).unwrap_or_default());
+                if let Some(name) = name {
+                    allowed.name = Some(object_name(name)?);
+                }
+                Ok(allowed)
+            }
             Request::HelmChange { namespace, release } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
                 kubach_core::helm::cli::check_release_name(release)
@@ -712,11 +757,45 @@ impl<'a> Policy<'a> {
             }
             Request::Logs {
                 pod,
+                workload,
+                label_selector,
                 container,
                 namespace,
             } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
-                allowed.name = Some(object_name(pod)?);
+                match (pod, workload, label_selector) {
+                    (Some(pod), None, None) => allowed.name = Some(object_name(pod)?),
+                    (None, Some((kind, name)), None) => {
+                        let kind = self.read_kind(kind)?;
+                        if Workload::from_api(&kind.api.group, &kind.api.kind).is_none() {
+                            return Err(Denial::new(
+                                DenialCode::InvalidInput,
+                                format!(
+                                    "logs by kind take a Deployment, StatefulSet, DaemonSet, \
+                                     ReplicaSet, Job or CronJob, not {}",
+                                    kind.api.kind
+                                ),
+                            ));
+                        }
+                        allowed.kind = Some(kind);
+                        allowed.name = Some(object_name(name)?);
+                    }
+                    (None, None, Some(selector)) => {
+                        if selector.trim().is_empty() {
+                            return Err(Denial::new(
+                                DenialCode::InvalidInput,
+                                "labelSelector must not be empty",
+                            ));
+                        }
+                        check_selector(selector)?;
+                    }
+                    _ => {
+                        return Err(Denial::new(
+                            DenialCode::InvalidInput,
+                            "give exactly one of pod, kind + name, or labelSelector",
+                        ));
+                    }
+                }
                 if let Some(container) = container {
                     container_name(container)?;
                 }
@@ -785,6 +864,28 @@ impl<'a> Policy<'a> {
                     container_name(container)?;
                 }
                 check_command(command)?;
+                allowed.confirmation = Confirmation::Required;
+                Ok(allowed)
+            }
+            Request::Debug {
+                pod,
+                target,
+                name,
+                image,
+                namespace,
+                command,
+            } => {
+                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                allowed.name = Some(object_name(pod)?);
+                for container in [target, name].into_iter().flatten() {
+                    container_name(container)?;
+                }
+                if let Some(image) = image {
+                    check_image(image)?;
+                }
+                if !command.is_empty() {
+                    check_command(command)?;
+                }
                 allowed.confirmation = Confirmation::Required;
                 Ok(allowed)
             }
@@ -1007,6 +1108,7 @@ impl<'a> Policy<'a> {
         let what = match request {
             Request::Logs { .. } => "reading logs",
             Request::Exec { .. } => "exec",
+            Request::Debug { .. } => "a debug container",
             Request::PortForward { .. } => "port-forward",
             Request::Apply { dry_run: true, .. } => "a dry-run apply",
             Request::Apply { .. } => "apply",
@@ -1017,6 +1119,8 @@ impl<'a> Policy<'a> {
             | Request::SecretCheck { .. }
             | Request::SecretCompare { .. } => "Secret metadata",
             Request::SecretReveal { .. } => "revealing a Secret",
+            Request::HelmRead { .. } => "reading Helm releases (Helm keeps them in Secrets)",
+            Request::Nodes { .. } => "reading nodes (cluster-scoped, with the user's credentials)",
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };
@@ -1338,13 +1442,19 @@ impl<'a> Policy<'a> {
 
 /// Kinds the agent may never write: Secrets and anything that changes who
 /// can do what (ServiceAccounts, RBAC).
-fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
-    let identity = (group.is_empty() && kind == "ServiceAccount")
+/// ServiceAccounts, RBAC and the other kinds that decide who may do what:
+/// the agent never changes them, and `list_kinds` does not offer them.
+pub(crate) fn is_identity(group: &str, kind: &str) -> bool {
+    (group.is_empty() && kind == "ServiceAccount")
         || group == "rbac.authorization.k8s.io"
         || group == "authorization.k8s.io"
         || group == "authentication.k8s.io"
         || group == "certificates.k8s.io"
-        || group == "admissionregistration.k8s.io";
+        || group == "admissionregistration.k8s.io"
+}
+
+fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
+    let identity = is_identity(group, kind);
     if is_core_secret(group, kind) {
         Err(Denial::new(
             DenialCode::Secret,
@@ -1456,6 +1566,27 @@ fn container_name(name: &str) -> Result<(), Denial> {
         Err(Denial::new(
             DenialCode::InvalidName,
             format!("{name:?} is not a valid container name"),
+        ))
+    }
+}
+
+/// An image reference as the user sees it in the confirmation: registry,
+/// path, tag and digest characters only, nothing hidden (#64).
+fn check_image(image: &str) -> Result<(), Denial> {
+    let valid = !image.is_empty()
+        && image.len() <= MAX_IMAGE_REF_BYTES
+        && !image.starts_with(['-', '.', '/', ':', '@'])
+        && image
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b));
+    if valid {
+        Ok(())
+    } else {
+        Err(Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "{image:?} is not an image reference: use letters, digits and . _ - / : @                  only, at most {MAX_IMAGE_REF_BYTES} bytes, e.g. docker.io/library/busybox:1.37"
+            ),
         ))
     }
 }

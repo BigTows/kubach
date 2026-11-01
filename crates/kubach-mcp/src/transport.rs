@@ -36,6 +36,19 @@ use crate::presence::{DISCONNECT_GRACE, Presence, SESSION_HEADER};
 use crate::server::McpServer;
 use crate::shared::SharedServer;
 
+/// How long an MCP client's HTTP session lives without a message: as long
+/// as a Kubach session may (#56). rmcp's default of 5 minutes dropped
+/// agents that thought for a while, or waited that long for the user to
+/// answer in Kubach (a call in flight is no message), and they lost every
+/// tool. Clients that vanish are noticed by [`crate::presence`] instead.
+pub const CLIENT_IDLE_TIMEOUT: Duration = crate::settings::MAX_SESSION_TTL;
+
+fn session_manager() -> Arc<LocalSessionManager> {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(CLIENT_IDLE_TIMEOUT);
+    Arc::new(manager)
+}
+
 /// Path of the MCP endpoint.
 pub const MCP_PATH: &str = "/mcp";
 /// Largest accepted request body (manifests included).
@@ -271,7 +284,7 @@ where
         .with_max_request_body_bytes(MAX_BODY_BYTES)
         .with_cancellation_token(cancel.child_token());
     let service: StreamableHttpService<S, LocalSessionManager> =
-        StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config);
+        StreamableHttpService::new(move || Ok(server.clone()), session_manager(), config);
     if bridge.as_ref().is_some_and(|bridge| bridge.token == token) {
         return Err(TransportError::Init(
             "the bridge needs a token of its own".into(),
@@ -435,6 +448,15 @@ mod token_tests {
         let n = stream.read(&mut response).await.unwrap();
         let text = String::from_utf8_lossy(&response[..n]).into_owned();
         text.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_client_outlives_rmcps_five_idle_minutes() {
+        // As long as a Kubach session may last, not rmcp's 5 minutes (#56).
+        assert_eq!(
+            super::session_manager().session_config.keep_alive,
+            Some(crate::settings::MAX_SESSION_TTL)
+        );
     }
 
     #[tokio::test]

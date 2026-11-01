@@ -18,7 +18,7 @@
 
 mod named;
 
-pub use named::{is_sensitive_name, mask_named_values};
+pub use named::{ends_with_sensitive_word, is_sensitive_name, mask_named_values};
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::LazyLock;
