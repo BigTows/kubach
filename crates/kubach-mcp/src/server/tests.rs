@@ -3159,11 +3159,23 @@ async fn texts_say_changes_are_confirmed_as_the_policy_does() {
     let instructions = f.server.instructions();
     let info = f.server.call("agent", "session_info", Map::new()).await;
     assert!(!info.is_error, "{}", info.text);
-    for text in [&instructions, &info.text] {
-        assert!(!text.contains("Without asking"), "{text}");
-        assert!(text.contains("approves no change"), "{text}");
-        assert!(text.contains("one by one"), "{text}");
-        assert!(text.contains("don't ask again"), "{text}");
+    for (what, text) in [
+        ("instructions", &instructions),
+        ("session_info", &info.text),
+    ] {
+        assert!(
+            !text.contains("Without asking"),
+            "{what} says \"Without asking\""
+        );
+        assert!(
+            text.contains("approves no change"),
+            "{what}: no \"approves no change\""
+        );
+        assert!(text.contains("one by one"), "{what}: no \"one by one\"");
+        assert!(
+            text.contains("don't ask again"),
+            "{what}: no \"don't ask again\""
+        );
     }
     assert!(instructions.contains("even within your access"));
 

@@ -243,8 +243,11 @@ fn get_values_keeps_switches_and_settings_under_sensitive_names() {
     assert_eq!(values["auth"]["tokenTTL"], 3600);
     assert_eq!(values["passwordMinLength"], 12);
     let text = values.to_string();
-    for secret in ["plain-but-named", "\"abc\"", "hunter2", "t1"] {
-        assert!(!text.contains(secret), "{secret} is not masked");
+    for (i, hidden) in ["plain-but-named", "\"abc\"", "hunter2", "t1"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!text.contains(hidden), "value #{i} is not masked");
     }
 }
 
