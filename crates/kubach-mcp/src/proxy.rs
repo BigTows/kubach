@@ -84,8 +84,15 @@ impl ProxyServer {
         }
     }
 
-    fn context(&self) -> &str {
+    /// The vault context the session is asked for.
+    pub fn context(&self) -> &str {
         &self.inner.request.context
+    }
+
+    /// What the agent is told about the session: the app's text once one
+    /// runs.
+    pub fn instructions(&self) -> String {
+        sync::lock(&self.inner.instructions).clone()
     }
 
     fn no_app(&self) -> String {
@@ -310,7 +317,7 @@ fn placeholder_tool() -> Tool {
 
 impl ServerHandler for ProxyServer {
     fn get_info(&self) -> ServerConfig {
-        let instructions = sync::lock(&self.inner.instructions).clone();
+        let instructions = self.instructions();
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -374,7 +381,7 @@ mod tests {
     use crate::server::McpServer;
     use crate::session::Session;
     use crate::settings::Profile;
-    use crate::shared::SharedServer;
+    use crate::shared::{ChosenSession, ContextChooser, ContextEntry, SharedServer};
     use crate::testutil::{catalog, permissive, scope_with};
     use crate::transport::{BridgeOptions, HttpEndpoint, HttpOptions, serve_shared_http};
 
@@ -604,6 +611,102 @@ mod tests {
             outcome.text
         );
         assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(hosted.is_empty());
+        endpoint.shutdown().await;
+    }
+
+    /// Picks [`CONTEXT`] as `kubach mcp` does for a vault context (#88):
+    /// asks the app to host the session and relays to it.
+    struct VaultChooser {
+        port: u16,
+    }
+
+    impl ContextChooser for VaultChooser {
+        fn list(&self) -> BoxFuture<'_, Vec<ContextEntry>> {
+            Box::pin(async { Vec::new() })
+        }
+
+        fn choose<'a>(
+            &'a self,
+            context: &'a str,
+            _client: &'a str,
+        ) -> BoxFuture<'a, Result<ChosenSession, String>> {
+            Box::pin(async move {
+                let proxy = proxy(self.port, context);
+                proxy.connect().await.map_err(|not| not.message)?;
+                Ok(ChosenSession::Hosted(proxy))
+            })
+        }
+    }
+
+    /// `use_context` on a vault context: the app runs the session, the
+    /// shared server relays to it and keeps the context tools (#88).
+    #[tokio::test]
+    async fn use_context_on_a_vault_context_relays_to_the_app() {
+        let app = Arc::new(FakeApp::new(true));
+        let (asked, hosted) = (app.asked.clone(), app.hosted.clone());
+        let (endpoint, port) = serve(app).await;
+        let shared = SharedServer::new();
+        shared.set_chooser(Arc::new(VaultChooser { port }));
+        let mut args = Map::new();
+        args.insert("context".into(), CONTEXT.into());
+
+        let (text, error, changed) = shared
+            .call_context_tool("agent", "use_context", &args)
+            .await
+            .unwrap();
+        assert!(!error && changed, "{text}");
+        assert!(
+            text.contains("The user allowed context prod-imported"),
+            "{text}"
+        );
+        assert!(shared.get().is_none(), "nothing runs in this process");
+        let proxy = shared.hosted().unwrap();
+        assert_eq!(hosted.list().len(), 1);
+
+        let names: Vec<String> = shared
+            .all_tools()
+            .await
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.contains(&"use_context".to_owned()), "{names:?}");
+        assert!(names.contains(&"list_resources".to_owned()), "{names:?}");
+        let infos = names.iter().filter(|name| *name == "session_info").count();
+        assert_eq!(infos, 1, "{names:?}");
+        // session_info goes to the hosted session, not the chooser.
+        assert!(
+            shared
+                .call_context_tool("agent", "session_info", &Map::new())
+                .await
+                .is_none()
+        );
+
+        let (text, _, _) = shared
+            .call_context_tool("agent", "list_contexts", &Map::new())
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(listed["current"], CONTEXT);
+
+        // The same context again is not asked again.
+        let (text, error, _) = shared
+            .call_context_tool("agent", "use_context", &args)
+            .await
+            .unwrap();
+        assert!(!error && text.contains("Already working"), "{text}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // A refused switch keeps the running session.
+        args.insert("context".into(), "other".into());
+        let (_, error, _) = shared
+            .call_context_tool("agent", "use_context", &args)
+            .await
+            .unwrap();
+        assert!(error);
+        assert_eq!(shared.hosted().unwrap().context(), CONTEXT);
+
+        proxy.end().await;
         assert!(hosted.is_empty());
         endpoint.shutdown().await;
     }

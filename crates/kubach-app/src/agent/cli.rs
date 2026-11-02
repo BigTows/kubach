@@ -11,7 +11,8 @@
 //! here: the process reads only the vault's public header to recognise its
 //! name, and the app runs the session while its vault is unlocked
 //! ([`kubach_mcp::proxy`]). Without the app or with the vault locked such a
-//! context gives the agent an explanation instead of tools.
+//! context gives the agent an explanation instead of tools. The same goes
+//! for a vault context the agent picks with `use_context` (#88).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,9 +26,9 @@ use kubach_core::state::{AppState, NamespaceChoice};
 use kubach_mcp::bridge::{self, BridgeClient, BridgeConfirmer, ExternalSession, HostRequest};
 use kubach_mcp::proxy::ProxyServer;
 use kubach_mcp::{
-    AuditLog, ConfirmationDecision, ConfirmationRequest, ContextChooser, ContextEntry, McpServer,
-    NamespaceHint, NamespaceSource, Profile, RequestKind, SecurityPolicy, Session, SessionMode,
-    SessionSpec, SharedServer,
+    AuditLog, ChosenSession, ConfirmationDecision, ConfirmationRequest, ContextChooser,
+    ContextEntry, McpServer, NamespaceHint, NamespaceSource, Profile, RequestKind, SecurityPolicy,
+    Session, SessionMode, SessionSpec, SharedServer,
 };
 
 use super::AUDIT_FILE;
@@ -576,14 +577,30 @@ struct Chosen {
     heartbeat: tokio::task::JoinHandle<()>,
 }
 
+/// A session the app runs on a vault context for this process, with the
+/// task keeping it alive.
+struct Hosted {
+    proxy: ProxyServer,
+    pinger: tokio::task::JoinHandle<()>,
+}
+
+impl Hosted {
+    async fn finish(self) {
+        self.pinger.abort();
+        self.proxy.end().await;
+    }
+}
+
 /// Picks the context for `kubach mcp` started without one (#421): the
-/// agent names a kubeconfig context, the user approves it in the running
-/// app (over the bridge), and only then the session starts here.
+/// agent names a context, the user approves it in the running app (over
+/// the bridge), and only then the session starts: here for a kubeconfig
+/// context, in the app for a vault one (#88).
 struct StdioChooser {
     settings: Settings,
     dir: Option<PathBuf>,
     audit: Option<Arc<AuditLog>>,
     chosen: std::sync::Mutex<Option<Chosen>>,
+    hosted: std::sync::Mutex<Option<Hosted>>,
 }
 
 impl StdioChooser {
@@ -603,15 +620,23 @@ impl StdioChooser {
         BridgeConfirmer::new(Box::new(move || dir.as_deref().and_then(locate_app)))
     }
 
-    async fn start(&self, name: &str, client: &str) -> Result<McpServer, String> {
-        let contexts = self.contexts()?;
+    async fn start(&self, name: &str, client: &str) -> Result<ChosenSession, String> {
+        let contexts = self.contexts();
         let vault = Self::vault_names();
-        if contexts.get(name).is_none() && vault.iter().any(|known| known == name) {
-            return Err(format!(
-                "context `{name}` is in the Kubach vault: its session runs in the app. Ask the \
-                 user to configure `kubach mcp --context {name}`, or to connect over HTTP"
-            ));
+        if vault_context(
+            &Options {
+                context: Some(name.to_owned()),
+                ..Options::default()
+            },
+            &self.settings,
+            contexts.as_ref().ok(),
+            &vault,
+        )
+        .is_some()
+        {
+            return self.start_hosted(name).await;
         }
+        let contexts = contexts?;
         let (server_url, _) = super::check_context_choice(
             &self.settings,
             Some(&contexts),
@@ -694,7 +719,47 @@ impl StdioChooser {
         if let Some(previous) = previous {
             self.finish(previous).await;
         }
-        Ok(server)
+        let hosted = kubach_core::sync::lock(&self.hosted).take();
+        if let Some(hosted) = hosted {
+            hosted.finish().await;
+        }
+        Ok(ChosenSession::Local(server))
+    }
+
+    /// Asks the app to run a session on vault context `name` (#88): the app
+    /// checks the vault and the context's settings and asks the user in its
+    /// window, as for `kubach mcp --context <name>`. The credentials stay
+    /// in the app; this process only relays the agent's calls.
+    async fn start_hosted(&self, name: &str) -> Result<ChosenSession, String> {
+        let request = HostRequest {
+            pid: std::process::id(),
+            context: name.to_owned(),
+            namespaces: Vec::new(),
+            profile: None,
+            ttl_secs: None,
+            grant_read: false,
+        };
+        let dir = self.dir.clone();
+        let proxy = ProxyServer::new(
+            Box::new(move || dir.as_deref().and_then(locate_app)),
+            request,
+        );
+        connect(proxy.clone())
+            .await
+            .map_err(|not| format!("no session on context `{name}`: {}", not.message))?;
+        let pinger = tokio::spawn(ping(proxy.clone()));
+        let previous = kubach_core::sync::lock(&self.hosted).replace(Hosted {
+            proxy: proxy.clone(),
+            pinger,
+        });
+        if let Some(previous) = previous {
+            previous.finish().await;
+        }
+        let local = kubach_core::sync::lock(&self.chosen).take();
+        if let Some(local) = local {
+            self.finish(local).await;
+        }
+        Ok(ChosenSession::Hosted(proxy))
     }
 
     /// Ends a session this process ran and tells the app.
@@ -718,12 +783,11 @@ impl ContextChooser for StdioChooser {
                 &std::collections::HashSet::new(),
                 &vault,
             );
+            // This process cannot tell whether the vault is unlocked: the
+            // app does, when use_context asks it for the session (#88).
             for entry in &mut entries {
                 if entry.source == "vault" {
-                    entry.unavailable = Some(format!(
-                        "a vault context: the user configures `kubach mcp --context {}` for it",
-                        entry.name
-                    ));
+                    entry.unavailable = None;
                 }
             }
             entries
@@ -734,7 +798,7 @@ impl ContextChooser for StdioChooser {
         &'a self,
         context: &'a str,
         client: &'a str,
-    ) -> BoxFuture<'a, Result<McpServer, String>> {
+    ) -> BoxFuture<'a, Result<ChosenSession, String>> {
         Box::pin(self.start(context, client))
     }
 }
@@ -752,6 +816,7 @@ async fn serve_choosing(settings: Settings, dir: Option<PathBuf>) -> Result<(), 
         dir,
         audit,
         chosen: std::sync::Mutex::new(None),
+        hosted: std::sync::Mutex::new(None),
     });
     let shared = SharedServer::new();
     shared.set_chooser(chooser.clone());
@@ -763,6 +828,10 @@ async fn serve_choosing(settings: Settings, dir: Option<PathBuf>) -> Result<(), 
     let chosen = kubach_core::sync::lock(&chooser.chosen).take();
     if let Some(chosen) = chosen {
         chooser.finish(chosen).await;
+    }
+    let hosted = kubach_core::sync::lock(&chooser.hosted).take();
+    if let Some(hosted) = hosted {
+        hosted.finish().await;
     }
     served.map_err(|error| error.to_string())
 }
@@ -800,8 +869,9 @@ async fn serve_hosted(
 }
 
 /// Starts the hosted session and reports how it went.
-async fn connect(proxy: ProxyServer) {
-    match proxy.connect().await {
+async fn connect(proxy: ProxyServer) -> Result<(), kubach_mcp::proxy::NotConnected> {
+    let result = proxy.connect().await;
+    match &result {
         Ok(Some(reply)) => {
             let session = &reply.session;
             eprintln!(
@@ -822,6 +892,7 @@ async fn connect(proxy: ProxyServer) {
         }
         Err(not) => eprintln!("kubach mcp: no session: {}", not.message),
     }
+    result.map(|_| ())
 }
 
 /// Keeps the hosted session alive in the app and reports when it ends.
