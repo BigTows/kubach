@@ -123,12 +123,35 @@ impl SettingsScreen {
                         .flex_col()
                         .gap_0p5()
                         .child(div().truncate().child(entry.name.clone()))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_color(theme.muted_foreground)
-                                .child(entry.contexts.join(", ")),
-                        ),
+                        .when(!unlocked, |column| {
+                            column.child(
+                                div()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(entry.contexts.join(", ")),
+                            )
+                        })
+                        // Unlocked: each context renames on click (#90).
+                        .when(unlocked, |column| {
+                            column.child(div().flex().flex_wrap().gap_1().children(
+                                entry.contexts.iter().enumerate().map(|(cx_ix, context)| {
+                                    let (id, context) = (id.clone(), context.clone());
+                                    Button::new(("vault-rename-context", ix * 1000 + cx_ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(context.clone())
+                                        .tooltip(t!("settings-vault-rename-context"))
+                                        .on_click(move |_, window, cx| {
+                                            vault::rename_context(
+                                                id.clone(),
+                                                context.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                }),
+                            ))
+                        }),
                 )
                 .child(actions)
         });
@@ -138,7 +161,7 @@ impl SettingsScreen {
         group = group.entry(Entry::new(
             searchable(
                 "vault imported encrypted kubeconfig import paste clipboard lock unlock update \
-                 export rename remove",
+                 export rename remove context name",
                 &[
                     &title,
                     &t!("settings-vault-import-file"),

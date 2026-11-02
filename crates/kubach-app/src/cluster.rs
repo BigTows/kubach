@@ -209,6 +209,12 @@ impl Cluster {
                     let revision = vault.read(cx).revision();
                     if revision != this.vault_revision {
                         this.vault_revision = revision;
+                        // The active context renamed (#90): stay on it.
+                        if let Some((old, new)) = vault.read(cx).renamed()
+                            && this.active.as_deref() == Some(old)
+                        {
+                            this.pending = Some(new.to_owned());
+                        }
                         this.reload(cx);
                     }
                 })
