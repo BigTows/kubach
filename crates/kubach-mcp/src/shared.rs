@@ -8,6 +8,10 @@
 //! namespaces and rights, as any session (#227, #401). With a session
 //! running both tools stay, so the agent can see or switch the context
 //! (switching asks again and ends the current session).
+//!
+//! `kubach mcp` cannot open a context of the encrypted vault: for one the
+//! chooser returns a [`ProxyServer`] instead, and the app runs the session
+//! (#88, ADR 0008).
 
 use std::sync::{Arc, RwLock};
 
@@ -22,6 +26,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::proxy::ProxyServer;
 use crate::server::{McpServer, client_name};
 use kubach_core::sync;
 
@@ -49,6 +54,21 @@ pub struct ContextEntry {
     pub current: bool,
 }
 
+/// The session a [`ContextChooser`] started.
+pub enum ChosenSession {
+    /// Runs in this process.
+    Local(McpServer),
+    /// Runs in the app on a vault context; calls are relayed over the
+    /// bridge, so the credentials never reach this process (#88).
+    Hosted(ProxyServer),
+}
+
+impl From<McpServer> for ChosenSession {
+    fn from(server: McpServer) -> Self {
+        Self::Local(server)
+    }
+}
+
 /// Lists contexts and starts a session on the one the agent names, after
 /// the user agreed in Kubach. Implemented by the app and by `kubach mcp`.
 pub trait ContextChooser: Send + Sync {
@@ -60,7 +80,7 @@ pub trait ContextChooser: Send + Sync {
         &'a self,
         context: &'a str,
         client: &'a str,
-    ) -> BoxFuture<'a, Result<McpServer, String>>;
+    ) -> BoxFuture<'a, Result<ChosenSession, String>>;
 }
 
 /// The current session's server, or none, and who picks the context.
@@ -68,6 +88,9 @@ pub trait ContextChooser: Send + Sync {
 #[derive(Clone, Default)]
 pub struct SharedServer {
     current: Arc<RwLock<Option<McpServer>>>,
+    /// A session the app runs for this process on a vault context (#88);
+    /// never set together with `current`.
+    hosted: Arc<RwLock<Option<ProxyServer>>>,
     chooser: Arc<RwLock<Option<Arc<dyn ContextChooser>>>>,
     /// Why the last session ended, told to the agent until a new one
     /// starts: its tools vanish with it (#56).
@@ -83,6 +106,7 @@ impl SharedServer {
     pub fn set(&self, server: Option<McpServer>) {
         if server.is_some() {
             *sync::write(&self.ended) = None;
+            self.drop_hosted();
         }
         *sync::write(&self.current) = server;
     }
@@ -128,6 +152,25 @@ impl SharedServer {
         None
     }
 
+    /// The session the app runs on a vault context for this process.
+    pub fn hosted(&self) -> Option<ProxyServer> {
+        sync::read(&self.hosted).clone()
+    }
+
+    /// Ends the hosted session, if any, in the app.
+    fn drop_hosted(&self) {
+        if let Some(proxy) = sync::write(&self.hosted).take() {
+            tokio::spawn(async move { proxy.end().await });
+        }
+    }
+
+    /// The context of the running session, local or hosted.
+    fn current_context(&self) -> Option<String> {
+        self.get()
+            .map(|server| server.session().scope().context.clone())
+            .or_else(|| self.hosted().map(|proxy| proxy.context().to_owned()))
+    }
+
     /// Why the last session ended, while no new one runs.
     pub fn ended(&self) -> Option<String> {
         sync::read(&self.ended).clone()
@@ -143,18 +186,28 @@ impl SharedServer {
         sync::read(&self.chooser).clone()
     }
 
-    /// Tools offered now: the session's, plus choosing a context.
+    /// Tools offered now: the session's, plus choosing a context. A
+    /// hosted session's tools come from the app: see [`Self::all_tools`].
     pub fn tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         let session = self.get();
         if self.chooser().is_some() {
             tools.extend(context_tools());
-            if session.is_none() {
+            if session.is_none() && self.hosted().is_none() {
                 tools.push(info_tool());
             }
         }
         if let Some(server) = session {
             tools.extend(server.tools());
+        }
+        tools
+    }
+
+    /// [`Self::tools`] plus a hosted session's, asked from the app.
+    pub async fn all_tools(&self) -> Vec<Tool> {
+        let mut tools = self.tools();
+        if let Some(proxy) = self.hosted() {
+            tools.extend(proxy.tools().await);
         }
         tools
     }
@@ -169,9 +222,7 @@ impl SharedServer {
         let chooser = self.chooser()?;
         match tool {
             "list_contexts" => {
-                let current = self
-                    .get()
-                    .map(|server| server.session().scope().context.clone());
+                let current = self.current_context();
                 let mut contexts = chooser.list().await;
                 for entry in &mut contexts {
                     entry.current = current.as_deref() == Some(entry.name.as_str());
@@ -209,8 +260,37 @@ impl SharedServer {
                         false,
                     ));
                 }
+                if let Some(proxy) = self.hosted()
+                    && proxy.context() == name
+                {
+                    return Some((
+                        format!(
+                            "Already working in context {name}. {}",
+                            proxy.instructions()
+                        ),
+                        false,
+                        false,
+                    ));
+                }
                 match chooser.choose(name, client).await {
-                    Ok(server) => {
+                    Ok(ChosenSession::Hosted(proxy)) => {
+                        let text =
+                            format!("The user allowed context {name}. {}", proxy.instructions());
+                        *sync::write(&self.ended) = None;
+                        let previous = sync::write(&self.current).take();
+                        if let Some(previous) = previous {
+                            let session = previous.session().clone();
+                            tokio::spawn(async move {
+                                let _ = session.close().await;
+                            });
+                        }
+                        let previous = sync::write(&self.hosted).replace(proxy);
+                        if let Some(previous) = previous {
+                            tokio::spawn(async move { previous.end().await });
+                        }
+                        Some((text, false, true))
+                    }
+                    Ok(ChosenSession::Local(server)) => {
                         let text =
                             format!("The user allowed context {name}. {}", server.instructions());
                         *sync::write(&self.ended) = None;
@@ -221,12 +301,13 @@ impl SharedServer {
                                 let _ = session.close().await;
                             });
                         }
+                        self.drop_hosted();
                         Some((text, false, true))
                     }
                     Err(error) => Some((error, true, false)),
                 }
             }
-            "session_info" if self.get().is_none() => Some((
+            "session_info" if self.get().is_none() && self.hosted().is_none() => Some((
                 match self.ended() {
                     Some(ended) => ended,
                     None => "No context chosen yet: call list_contexts, then use_context. The \
@@ -289,14 +370,18 @@ fn object(properties: Value, required: &[&str]) -> Map<String, Value> {
 
 impl ServerHandler for SharedServer {
     fn get_info(&self) -> ServerConfig {
-        let instructions = match (self.get(), self.chooser().is_some()) {
-            (Some(server), _) => server.instructions(),
-            (None, true) => "Kubach gives access to Kubernetes clusters the user allows. No \
-                 context is chosen yet: call list_contexts, then use_context; the user approves \
-                 it in the Kubach window. Anything beyond the context's minimal access is asked \
-                 for later, when a call needs it."
-                .to_owned(),
-            (None, false) => format!("Kubach gives access to Kubernetes clusters. {NO_SESSION}"),
+        let instructions = if let Some(server) = self.get() {
+            server.instructions()
+        } else if let Some(proxy) = self.hosted() {
+            proxy.instructions()
+        } else if self.chooser().is_some() {
+            "Kubach gives access to Kubernetes clusters the user allows. No context is chosen \
+             yet: call list_contexts, then use_context; the user approves it in the Kubach \
+             window. Anything beyond the context's minimal access is asked for later, when a \
+             call needs it."
+                .to_owned()
+        } else {
+            format!("Kubach gives access to Kubernetes clusters. {NO_SESSION}")
         };
         ServerConfig::new(
             ServerCapabilities::builder()
@@ -313,7 +398,7 @@ impl ServerHandler for SharedServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.tools()))
+        Ok(ListToolsResult::with_all_items(self.all_tools().await))
     }
 
     async fn call_tool(
@@ -331,6 +416,19 @@ impl ServerHandler for SharedServer {
             }
             let content = vec![ContentBlock::text(text)];
             return Ok(if is_error {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            }
+            .into());
+        }
+        if let Some(proxy) = self.hosted() {
+            let (outcome, list_changed) = proxy.call(&client, &request.name, args).await;
+            if list_changed {
+                let _ = context.peer.notify_tool_list_changed().await;
+            }
+            let content = vec![ContentBlock::text(outcome.text)];
+            return Ok(if outcome.is_error {
                 CallToolResult::error(content)
             } else {
                 CallToolResult::success(content)
@@ -363,7 +461,7 @@ mod tests {
 
     use serde_json::{Map, Value};
 
-    use super::{ContextChooser, ContextEntry, SharedServer};
+    use super::{ChosenSession, ContextChooser, ContextEntry, SharedServer};
     use crate::confirm::DenyAll;
     use crate::identity::Identity;
     use crate::server::McpServer;
@@ -398,7 +496,7 @@ mod tests {
             &'a self,
             context: &'a str,
             _client: &'a str,
-        ) -> BoxFuture<'a, Result<McpServer, String>> {
+        ) -> BoxFuture<'a, Result<ChosenSession, String>> {
             sync::lock(&self.asked).push(context.to_owned());
             Box::pin(async move {
                 if context != "dev" {
@@ -416,7 +514,7 @@ mod tests {
                     catalog(),
                     HashSet::new(),
                 );
-                Ok(McpServer::new(session, std::sync::Arc::new(DenyAll), None))
+                Ok(McpServer::new(session, std::sync::Arc::new(DenyAll), None).into())
             })
         }
     }

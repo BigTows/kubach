@@ -36,9 +36,10 @@ use kubach_mcp::bridge::{
 use kubach_mcp::confirm::CONFIRMATION_TIMEOUT;
 use kubach_mcp::hosted::HostedSessions;
 use kubach_mcp::{
-    AuditLog, BoundaryInfo, BridgeOptions, ConfirmationDecision, ConfirmationRequest, Confirmer,
-    ContextChooser, ContextEntry, Grant, GrantEntry, HttpEndpoint, HttpOptions, McpServer, Profile,
-    RequestKind, SecurityPolicy, Session, SessionMode, SessionSpec, SharedServer,
+    AuditLog, BoundaryInfo, BridgeOptions, ChosenSession, ConfirmationDecision,
+    ConfirmationRequest, Confirmer, ContextChooser, ContextEntry, Grant, GrantEntry, HttpEndpoint,
+    HttpOptions, McpServer, Profile, RequestKind, SecurityPolicy, Session, SessionMode,
+    SessionSpec, SharedServer,
 };
 use serde_json::Value;
 
@@ -120,7 +121,7 @@ impl ContextChooser for AppChooser {
         &'a self,
         context: &'a str,
         client: &'a str,
-    ) -> BoxFuture<'a, Result<McpServer, String>> {
+    ) -> BoxFuture<'a, Result<ChosenSession, String>> {
         let (reply, answer) = oneshot::channel();
         let sent = self
             .tx
@@ -135,7 +136,10 @@ impl ContextChooser for AppChooser {
             if !sent {
                 return Err(closed());
             }
-            answer.await.unwrap_or_else(|_| Err(closed()))
+            answer
+                .await
+                .unwrap_or_else(|_| Err(closed()))
+                .map(ChosenSession::from)
         })
     }
 }
