@@ -32,7 +32,7 @@ use zeroize::Zeroizing;
 
 pub use dialogs::{
     AfterUnlock, add_cluster, change_password, confirm_remove, confirm_reset, drop_zone, export,
-    import_clipboard, import_file, prompt_unlock, rename, update_from_file,
+    import_clipboard, import_file, prompt_unlock, rename, rename_context, update_from_file,
 };
 
 use crate::settings::AppSettings;
@@ -105,6 +105,9 @@ pub struct VaultState {
     /// unlock, edits); the keychain and Touch ID checks leave it alone, so
     /// observers can skip reloading contexts for them (#299).
     revision: u64,
+    /// The last context renamed (#90), at the revision it was renamed in,
+    /// so a connection to it follows the new name.
+    renamed: Option<(u64, String, String)>,
     _idle: Task<()>,
     _screen: Task<()>,
     _keychain_check: Task<()>,
@@ -236,6 +239,7 @@ impl VaultState {
             biometric: Support::Checking,
             busy: None,
             revision: 0,
+            renamed: None,
             _idle: idle,
             _screen: screen,
             _keychain_check: keychain_check,
@@ -265,6 +269,30 @@ impl VaultState {
     /// Changes whenever [`imported`](Self::imported) may have changed.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// The context renamed by the change that made the current
+    /// [`revision`](Self::revision), as `(old, new)`.
+    pub fn renamed(&self) -> Option<(&str, &str)> {
+        self.renamed
+            .as_ref()
+            .filter(|(revision, _, _)| *revision == self.revision)
+            .map(|(_, old, new)| (old.as_str(), new.as_str()))
+    }
+
+    /// Renames context `old` of entry `id` to `new` (#90); returns its API
+    /// server. See [`Vault::rename_context`].
+    pub fn rename_context(
+        &mut self,
+        cx: &mut Context<Self>,
+        id: &str,
+        old: &str,
+        new: &str,
+        taken: &std::collections::HashSet<String>,
+    ) -> Result<String, SharedString> {
+        let server = self.edit(cx, |vault| vault.rename_context(id, old, new, taken))?;
+        self.renamed = Some((self.revision, old.to_owned(), new.trim().to_owned()));
+        Ok(server)
     }
 
     pub fn status(&self) -> &VaultStatus {

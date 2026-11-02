@@ -192,6 +192,28 @@ impl Default for Clusters {
     }
 }
 
+impl Settings {
+    /// Carries what is stored for context `from` on API server `server` over
+    /// to its new name `to` (#90): security policy, startup context,
+    /// namespace, Helm driver, Prometheus and the hotbar tile.
+    pub fn rename_context(&mut self, from: &str, to: &str, server: &str) {
+        if from == to {
+            return;
+        }
+        self.security
+            .rename_context(&super::ContextKey::new(from.to_owned(), server), to);
+        let clusters = &mut self.clusters;
+        if clusters.startup_context.as_deref() == Some(from) {
+            clusters.startup_context = Some(to.to_owned());
+        }
+        super::hotbar::rename_key(&mut clusters.default_namespaces, from, to);
+        super::hotbar::rename_key(&mut clusters.helm_drivers, from, to);
+        super::hotbar::rename_key(&mut clusters.prometheus, from, to);
+        super::hotbar::rename_key(&mut clusters.prometheus_sources, from, to);
+        clusters.hotbar.rename(from, to);
+    }
+}
+
 impl Clusters {
     /// `kubeconfig_paths` with `~/` expanded.
     pub fn resolved_kubeconfig_paths(&self) -> Vec<PathBuf> {
@@ -429,6 +451,50 @@ impl Default for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{ContextKey, ContextPolicy};
+
+    /// Renaming a context keeps what the user set for it (#90); the same
+    /// name on another server is left alone.
+    #[test]
+    fn rename_context_carries_the_settings_over() {
+        const SERVER: &str = "https://c.example.com";
+        let mut settings = Settings::default();
+        let old = ContextKey::new("team-prod", SERVER);
+        let off = ContextPolicy {
+            mcp_enabled: false,
+            ..ContextPolicy::default()
+        };
+        settings.security.set_policy(&old, off.clone());
+        let elsewhere = ContextKey::new("team-prod", "https://other.example.com");
+        settings.security.set_policy(&elsewhere, off.clone());
+        let clusters = &mut settings.clusters;
+        clusters.startup_context = Some("team-prod".into());
+        clusters
+            .default_namespaces
+            .insert("team-prod".into(), "web".into());
+        clusters
+            .prometheus
+            .insert("team-prod".into(), "mon/prom".into());
+        clusters.hotbar.order = vec!["a".into(), "team-prod".into(), "prod".into()];
+        clusters.hotbar.set_alias("team-prod", "TP");
+        clusters.hotbar.hidden.insert("team-prod".into());
+
+        settings.rename_context("team-prod", "prod", SERVER);
+
+        let new = ContextKey::new("prod", SERVER);
+        assert_eq!(settings.security.policy(&new), off);
+        assert_eq!(settings.security.policy(&old), ContextPolicy::default());
+        assert_eq!(settings.security.policy(&elsewhere), off);
+        let clusters = &settings.clusters;
+        assert_eq!(clusters.startup_context.as_deref(), Some("prod"));
+        assert_eq!(clusters.default_namespaces["prod"], "web");
+        assert!(!clusters.default_namespaces.contains_key("team-prod"));
+        assert_eq!(clusters.prometheus["prod"], "mon/prom");
+        assert_eq!(clusters.hotbar.order, ["a", "prod"]);
+        assert_eq!(clusters.hotbar.alias("prod"), Some("TP"));
+        assert!(clusters.hotbar.hidden.contains("prod"));
+        assert!(!clusters.hotbar.hidden.contains("team-prod"));
+    }
 
     #[test]
     fn node_shell_defaults_and_overrides() {

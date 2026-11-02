@@ -950,6 +950,73 @@ impl Vault {
         })
     }
 
+    /// Renames context `old` of entry `id` to `new` (trimmed) in the stored
+    /// kubeconfig and in the readable header (#90). `taken`: context names
+    /// defined outside this entry. Returns the context's API server, which
+    /// keys its settings with the name.
+    pub fn rename_context(
+        &mut self,
+        id: &str,
+        old: &str,
+        new: &str,
+        taken: &HashSet<String>,
+    ) -> Result<String, VaultError> {
+        self.check(id)?;
+        let new = new.trim();
+        let contexts = self
+            .entry(id)
+            .map(|entry| entry.contexts.clone())
+            .unwrap_or_default();
+        if !contexts.iter().any(|name| name == old) {
+            return Err(VaultError::ContextNames);
+        }
+        let secret = self
+            .secret(id)
+            .ok_or_else(|| VaultError::UnknownEntry(id.to_owned()))?;
+        let mut config = Kubeconfig::from_yaml(&secret.kubeconfig)
+            .map_err(|error| VaultError::Serialize(error.to_string()))?;
+        let server = config
+            .contexts
+            .iter()
+            .find(|named| named.name == old)
+            .and_then(|named| named.context.as_ref())
+            .and_then(|context| {
+                config
+                    .clusters
+                    .iter()
+                    .find(|cluster| cluster.name == context.cluster)
+            })
+            .and_then(|cluster| cluster.cluster.as_ref()?.server.clone())
+            .unwrap_or_default();
+        if new == old {
+            return Ok(server);
+        }
+        if new.is_empty() || taken.contains(new) || contexts.iter().any(|name| name == new) {
+            return Err(VaultError::ContextNames);
+        }
+        for named in config.contexts.iter_mut().filter(|named| named.name == old) {
+            named.name = new.to_owned();
+        }
+        if config.current_context.as_deref() == Some(old) {
+            config.current_context = Some(new.to_owned());
+        }
+        let yaml = Zeroizing::new(
+            serde_saphyr::to_string(&config)
+                .map_err(|error| VaultError::Serialize(error.to_string()))?,
+        );
+        self.change(|envelope, secrets| {
+            if let Some(entry) = envelope.entries.iter_mut().find(|e| e.id == id) {
+                for name in entry.contexts.iter_mut().filter(|name| *name == old) {
+                    *name = new.to_owned();
+                }
+            }
+            if let Some(entry) = secrets.entries.iter_mut().find(|e| e.id == id) {
+                entry.kubeconfig = yaml.to_string();
+            }
+        })?;
+        Ok(server)
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<(), VaultError> {
         self.check(id)?;
         self.change(|envelope, secrets| {
@@ -1481,6 +1548,53 @@ contexts:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(VAULT_FILE);
         (dir, path)
+    }
+
+    #[test]
+    fn renames_a_context_in_the_config_and_the_header() {
+        let (_dir, path) = setup();
+        let mut vault = create(&path, "pw").unwrap();
+        let id = vault.add("team.yaml", &plan(), None).unwrap();
+        let taken: HashSet<String> = ["minikube".to_owned()].into();
+
+        // Taken, empty or unknown names change nothing.
+        for (old, new) in [
+            ("team-prod", "minikube"),
+            ("team-prod", "  "),
+            ("nope", "x"),
+        ] {
+            assert!(matches!(
+                vault.rename_context(&id, old, new, &taken),
+                Err(VaultError::ContextNames)
+            ));
+        }
+        assert_eq!(context_names(&path), ["team-prod"]);
+
+        let server = vault
+            .rename_context(&id, "team-prod", " prod ", &taken)
+            .unwrap();
+        assert_eq!(server, "https://c.example.com");
+        assert_eq!(context_names(&path), ["prod"]);
+        let yaml = vault.kubeconfig_yaml(&id).unwrap();
+        let config = Kubeconfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.contexts[0].name, "prod");
+        assert_eq!(
+            config.contexts[0].context.as_ref().unwrap().cluster,
+            "c",
+            "only the context is renamed"
+        );
+        assert!(yaml.contains("very-secret-token"));
+
+        // Survives a reopen.
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert_eq!(locked.entries()[0].contexts, ["prod"]);
+        let reopened = locked.unlock_with_password("pw").unwrap();
+        assert!(
+            reopened
+                .kubeconfig_yaml(&id)
+                .unwrap()
+                .contains("name: prod")
+        );
     }
 
     #[test]
