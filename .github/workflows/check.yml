@@ -3,7 +3,9 @@
 # release pull request (release-check.yml).
 #
 # Pushes to develop run it too: rust-cache only shares caches from the base
-# branch with pull requests, so this keeps their cache warm.
+# branch with pull requests, so this keeps their cache warm. Only those
+# pushes save the cache: a pull request's cache is seen by that pull request
+# alone and would crowd develop's out of the 10 GB limit (#95).
 name: Check
 
 on:
@@ -33,6 +35,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

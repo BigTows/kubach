@@ -86,6 +86,22 @@ impl HotbarPrefs {
         }
     }
 
+    /// Moves the place, alias, color and hiding of context `from` to `to`
+    /// (#90).
+    pub fn rename(&mut self, from: &str, to: &str) {
+        if self.order.iter().any(|name| name == from) {
+            self.order.retain(|name| name != to);
+        }
+        for name in self.order.iter_mut().filter(|name| *name == from) {
+            *name = to.to_owned();
+        }
+        rename_key(&mut self.aliases, from, to);
+        rename_key(&mut self.colors, from, to);
+        if self.hidden.remove(from) {
+            self.hidden.insert(to.to_owned());
+        }
+    }
+
     pub fn alias(&self, name: &str) -> Option<&str> {
         self.aliases.get(name).map(String::as_str)
     }
@@ -228,6 +244,14 @@ impl fmt::Display for TileColorChoice {
             Self::Preset(preset) => f.write_str(preset.name()),
             Self::Custom(rgb) => rgb.fmt(f),
         }
+    }
+}
+
+/// Moves the value of `from` to `to`, if there is one; a value of `to`
+/// stays only when `from` has none.
+pub(crate) fn rename_key<V>(map: &mut BTreeMap<String, V>, from: &str, to: &str) {
+    if let Some(value) = map.remove(from) {
+        map.insert(to.to_owned(), value);
     }
 }
 

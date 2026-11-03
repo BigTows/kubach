@@ -186,6 +186,32 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Carries what is remembered for context `from` over to its new name
+    /// `to` (#90); returns whether anything changed.
+    pub fn rename_context(&mut self, from: &str, to: &str) -> bool {
+        if from == to {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(memory) = self.namespaces.remove(from) {
+            self.namespaces.insert(to.to_owned(), memory);
+            changed = true;
+        }
+        if let Some(found) = self.prometheus.remove(from) {
+            self.prometheus.insert(to.to_owned(), found);
+            changed = true;
+        }
+        if let Some(ports) = self.forward_ports.remove(from) {
+            self.forward_ports.insert(to.to_owned(), ports);
+            changed = true;
+        }
+        for forward in self.forwards.iter_mut().filter(|f| f.context == from) {
+            forward.context = to.to_owned();
+            changed = true;
+        }
+        changed
+    }
+
     /// Remembered namespace selection of `context`.
     pub fn namespaces(&self, context: &str) -> Option<&NamespaceMemory> {
         self.namespaces.get(context)
@@ -606,6 +632,27 @@ mod tests {
 
     fn only(names: &[&str]) -> NamespaceChoice {
         NamespaceChoice::Only(names.iter().map(|&n| n.to_owned()).collect())
+    }
+
+    #[test]
+    fn rename_context_carries_the_memory_over() {
+        let mut state = AppState::default();
+        assert!(!state.rename_context("team-prod", "prod"));
+        state.remember_namespaces("team-prod", memory(only(&["web"]), &["web"]));
+        state.forwards.push(SavedForward {
+            context: "team-prod".into(),
+            namespace: "web".into(),
+            kind: "Service".into(),
+            name: "api".into(),
+            port: 80,
+            local_port: 8080,
+            port_name: None,
+            paused: false,
+        });
+        assert!(state.rename_context("team-prod", "prod"));
+        assert!(state.namespaces("team-prod").is_none());
+        assert_eq!(state.namespaces("prod").unwrap().recent, ["web"]);
+        assert_eq!(state.forwards[0].context, "prod");
     }
 
     fn memory(selection: NamespaceChoice, recent: &[&str]) -> NamespaceMemory {

@@ -1454,6 +1454,58 @@ pub fn rename(id: String, window: &mut Window, cx: &mut App) {
     input.update(cx, |input, cx| input.focus(window, cx));
 }
 
+/// Asks for a new name of context `context` in entry `id` (#90). The name
+/// changes in the stored kubeconfig, so agents and `--context` see it too;
+/// the context's settings and remembered state follow it.
+pub fn rename_context(id: String, context: String, window: &mut Window, cx: &mut App) {
+    let input = cx.new(|cx| InputState::new(window, cx).default_value(context.clone()));
+    let dialog_input = input.clone();
+    window.open_alert_dialog(cx, move |dialog, _, _| {
+        let (input, id, old) = (dialog_input.clone(), id.clone(), context.clone());
+        dialog
+            .confirm()
+            .title(t!("vault-rename-context-title", context = context.as_str()))
+            .description(t!("vault-rename-context-description"))
+            .child(Input::new(&input))
+            .on_ok(move |_, window, cx| {
+                let new = input.read(cx).value().trim().to_owned();
+                if new.is_empty() {
+                    return false;
+                }
+                if new == old {
+                    return true;
+                }
+                let taken = taken_names(Some(&id), cx);
+                let Some(vault) = global(cx) else {
+                    return true;
+                };
+                let renamed = vault.update(cx, |vault, cx| {
+                    vault.rename_context(cx, &id, &old, &new, &taken)
+                });
+                match renamed {
+                    Ok(server) => {
+                        if let Some(settings) = AppSettings::try_global(cx) {
+                            settings.update(cx, |settings, cx| {
+                                settings.edit(cx, |s| s.rename_context(&old, &new, &server))
+                            });
+                        }
+                        if let Some(state) = crate::state::StateStore::try_global(cx) {
+                            state.update(cx, |state, cx| {
+                                state.edit(cx, |state| state.rename_context(&old, &new))
+                            });
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        notify(window, cx, Notification::error(error));
+                        false
+                    }
+                }
+            })
+    });
+    input.update(cx, |input, cx| input.focus(window, cx));
+}
+
 /// Writes entry `id` as a plain kubeconfig file, after a warning.
 pub fn export(id: String, window: &mut Window, cx: &mut App) {
     let Some(name) = global(cx).and_then(|vault| {

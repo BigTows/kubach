@@ -334,6 +334,26 @@ impl SecuritySettings {
         self.contexts.iter().find(|entry| entry.key() == *key)
     }
 
+    /// Moves the policy and access raises of `from` to context `to` on the
+    /// same server (#90). A stale policy already stored for `to` is
+    /// replaced.
+    pub fn rename_context(&mut self, from: &ContextKey, to: &str) {
+        let target = ContextKey::new(to.to_owned(), &from.server);
+        if self.find(from).is_some() {
+            self.contexts.retain(|entry| entry.key() != target);
+        }
+        for entry in self
+            .contexts
+            .iter_mut()
+            .filter(|entry| entry.key() == *from)
+        {
+            entry.context = to.to_owned();
+        }
+        for raise in self.raises.iter_mut().filter(|raise| raise.key() == *from) {
+            raise.context = to.to_owned();
+        }
+    }
+
     /// Stores `policy` for `key`; the default policy removes the entry so
     /// the file only lists exceptions.
     pub fn set_policy(&mut self, key: &ContextKey, policy: ContextPolicy) {

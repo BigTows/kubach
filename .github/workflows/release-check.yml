@@ -73,7 +73,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Reads develop's cache (Linux, check.yml) and saves none: a pull
+      # request's cache serves only itself and crowds the 10 GB limit (#95).
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

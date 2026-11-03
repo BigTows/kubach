@@ -72,7 +72,7 @@ pub use settings::{
     DEFAULT_SESSION_TTL, ImpersonationTarget, MAX_SESSION_TTL, Profile, SecurityPolicy,
     SecurityPolicySource,
 };
-pub use shared::{ContextChooser, ContextEntry, SharedServer};
+pub use shared::{ChosenSession, ContextChooser, ContextEntry, SharedServer};
 pub use transport::{
     BridgeOptions, HttpEndpoint, HttpOptions, serve_http, serve_shared_http, serve_stdio,
 };
