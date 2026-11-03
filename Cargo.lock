@@ -4608,7 +4608,7 @@ dependencies = [
  "notify",
  "pgp",
  "portable-pty",
- "rand_chacha 0.3.1",
+ "rand_chacha 0.9.0",
  "regex",
  "roxmltree 0.21.2",
  "secrecy",
