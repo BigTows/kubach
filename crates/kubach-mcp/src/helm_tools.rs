@@ -2058,8 +2058,7 @@ async fn template_preview(
     preview: &TemplatePreview<'_>,
 ) -> Result<ToolOutput, ToolError> {
     let namespace = &preview.template.namespace;
-    let (live, lookup) =
-        lookup_render(ctx, env, binary, preview.template, preview.rendered).await;
+    let (live, lookup) = lookup_render(ctx, env, binary, preview.template, preview.rendered).await;
     let rendered = live.as_deref().or(preview.rendered);
     // What lookup found may change what the chart renders.
     let findings = match &live {
