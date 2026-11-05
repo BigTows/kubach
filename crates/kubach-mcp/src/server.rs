@@ -1173,10 +1173,13 @@ fn catalog() -> Vec<ToolSpec> {
             name: "helm_search_charts",
             description: "Search Helm charts of the repositories added in Kubach (like helm search \
                           repo), or list the versions of an oci:// chart (`oci`); the user is \
-                          asked once to allow a registry not added in Kubach.",
+                          asked once to allow a registry not added in Kubach. A query never \
+                          finds oci:// charts. An empty result says why (`reason`, `note`), \
+                          which repositories were searched (`searched`) and which have no \
+                          loaded index (`withoutIndex`).",
             schema: object_schema(
                 json!({
-                    "query": {"type": "string", "description": "Part of repo/chart, a description or a keyword; empty lists all"},
+                    "query": {"type": "string", "description": "One substring of repo/chart, a description or a keyword; empty lists all"},
                     "oci": {"type": "string", "description": "oci://registry/path of one chart, instead of query"},
                     "versions": {"type": "boolean", "default": false, "description": "Every version, not only the latest"},
                     "devel": {"type": "boolean", "default": false, "description": "Include pre-releases"},

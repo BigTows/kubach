@@ -4185,6 +4185,167 @@ async fn helm_with_no_kubeconfig_at_all_is_refused_before_asking() {
     assert!(f.calls().is_empty(), "{:?}", f.calls());
 }
 
+/// A search over `repositories.yaml` text and cached indexes (name, text)
+/// in a temporary Helm home, as the agent sees it.
+async fn search_charts(
+    list: Option<&str>,
+    indexes: &[(&str, &str)],
+    query: &str,
+) -> serde_json::Value {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = kubach_core::helm::repo::HelmPaths {
+        repository_config: dir.path().join("repositories.yaml"),
+        repository_cache: dir.path().to_owned(),
+    };
+    if let Some(list) = list {
+        std::fs::write(&paths.repository_config, list).unwrap();
+    }
+    for (name, text) in indexes {
+        std::fs::write(paths.index_file(name), text).unwrap();
+    }
+    let f = fixture(Profile::ReadOnly, permissive(), false).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv {
+        paths: Some(paths),
+        ..crate::helm_tools::HelmEnv::default()
+    });
+    let result = f
+        .server
+        .call("agent", "helm_search_charts", args(json!({"query": query})))
+        .await;
+    assert!(!result.is_error, "{}", result.text);
+    serde_json::from_str(&result.text).unwrap()
+}
+
+const TWO_REPOSITORIES: &str = "repositories:
+- name: podinfo
+  url: https://login:hunter2@example.com/podinfo
+- name: bitnami
+  url: https://example.com/bitnami
+";
+const PODINFO_INDEX: &str = "entries:
+  podinfo:
+  - name: podinfo
+    version: 6.7.0
+    description: A small web application
+";
+
+fn assert_oci_hint(found: &serde_json::Value) {
+    let oci = found["ociCharts"].as_str().unwrap();
+    assert!(oci.contains("oci://registry/path"), "{oci}");
+    assert!(oci.contains("helm_install"), "{oci}");
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_says_no_repositories_are_added() {
+    for list in [None, Some(""), Some("repositories: []\n")] {
+        let found = search_charts(list, &[], "redis").await;
+        assert_eq!(found["charts"], json!([]));
+        assert_eq!(found["reason"], "noRepositories");
+        assert_eq!(found["searched"], json!([]));
+        assert_eq!(found["withoutIndex"], json!([]));
+        let note = found["note"].as_str().unwrap();
+        assert!(note.contains("No repositories are added"), "{note}");
+        assert_oci_hint(&found);
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_repository_list_is_not_reported_as_no_repositories() {
+    let found = search_charts(Some("repositories: [password: hunter2"), &[], "redis").await;
+    assert_eq!(found["reason"], "repositoryListUnreadable");
+    let text = found.to_string();
+    assert!(!text.contains("No repositories are added"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert_oci_hint(&found);
+
+    // No Helm home at all: the same, not an empty list.
+    let f = fixture(Profile::ReadOnly, permissive(), false).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv::default());
+    let result = f
+        .server
+        .call("agent", "helm_search_charts", args(json!({})))
+        .await;
+    assert!(
+        result.text.contains("repositoryListUnreadable"),
+        "{}",
+        result.text
+    );
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_names_repositories_without_an_index() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("bitnami", "entries: [not: an index")],
+        "redis",
+    )
+    .await;
+    assert_eq!(found["reason"], "noLoadedIndex");
+    assert_eq!(found["searched"], json!([]));
+    assert_eq!(found["withoutIndex"], json!(["podinfo", "bitnami"]));
+    let note = found["note"].as_str().unwrap();
+    assert!(note.contains("podinfo, bitnami"), "{note}");
+    assert_oci_hint(&found);
+    assert!(!found.to_string().contains("hunter2"), "{found}");
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_names_what_was_searched_and_skipped() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("podinfo", PODINFO_INDEX)],
+        "redis",
+    )
+    .await;
+    assert_eq!(found["reason"], "noMatch");
+    assert_eq!(found["searched"], json!(["podinfo"]));
+    assert_eq!(found["withoutIndex"], json!(["bitnami"]));
+    let note = found["note"].as_str().unwrap();
+    assert!(note.contains("No chart matched in podinfo."), "{note}");
+    assert!(note.contains("no loaded index: bitnami."), "{note}");
+    assert_oci_hint(&found);
+
+    let every_index = search_charts(
+        Some("repositories:\n- name: podinfo\n  url: https://example.com\n"),
+        &[("podinfo", PODINFO_INDEX)],
+        "redis",
+    )
+    .await;
+    assert_eq!(every_index["reason"], "noMatch");
+    assert_eq!(every_index["withoutIndex"], json!([]));
+    let note = every_index["note"].as_str().unwrap();
+    assert!(!note.contains("no loaded index"), "{note}");
+}
+
+#[tokio::test]
+async fn a_chart_search_with_results_keeps_its_answer() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("podinfo", PODINFO_INDEX)],
+        "podinfo",
+    )
+    .await;
+    assert_eq!(
+        found,
+        json!({
+            "charts": [{
+                "chart": "podinfo/podinfo",
+                "version": "6.7.0",
+                "appVersion": null,
+                "description": "A small web application",
+                "deprecated": false,
+            }],
+            "more": false,
+            "repositories": [
+                {"name": "podinfo", "index": "ready"},
+                {"name": "bitnami", "index": "missing: update it in Kubach"},
+            ],
+            "note": "Charts of the repositories added in Kubach. An oci:// chart can be looked \
+                     at with oci; the user is asked to allow its registry.",
+        })
+    );
+}
+
 /// `# Source:` comments as `helm template` writes them.
 #[cfg(unix)]
 const LOOKUP_RENDER: &str = "---\n# Source: infra/templates/secret.yaml\napiVersion: v1\n\
