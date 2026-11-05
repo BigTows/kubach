@@ -27,13 +27,18 @@ use kube::{Client, ResourceExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
+use crate::all_namespaces;
+use crate::audit::DecidedBy;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
+use crate::event_tools::{EventFilter, list_events};
+use crate::fields::Fields;
 use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
 use crate::log_level::{Level, LevelCounts};
-use crate::masking::{mask_object, mask_text, truncate};
+use crate::masking::{Masked, mask_object, mask_text, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
     service_account_changes, walk_fields,
@@ -163,6 +168,9 @@ pub(crate) struct Ctx<'a> {
     pub helm: Option<std::sync::Arc<crate::helm_tools::HelmEnv>>,
     /// Live phases of a long call (helm), for MCP progress notifications.
     pub progress: Option<Progress>,
+    /// Fires when the agent cancels the call or goes away: waits stop then
+    /// (#109). Other tools do not look at it.
+    pub cancel: CancellationToken,
     /// The namespace the call acts in once the policy allowed it, for the
     /// identity in the audit log.
     pub namespace: std::sync::Mutex<Option<String>>,
@@ -172,6 +180,23 @@ pub(crate) struct Ctx<'a> {
     /// Whether the change ran on an earlier "don't ask again" or the user
     /// ticked it now (#30), for the audit log and the agent.
     pub remembered: std::sync::Mutex<Option<RememberNote>>,
+    /// Writes one object of a batch to the audit log at once (#108): the
+    /// call's own line comes last and says little about each of them.
+    pub audit_object: &'a (dyn Fn(ObjectAudit) + Send + Sync),
+}
+
+/// What happened to one object of a batch, for the audit log (#108).
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectAudit {
+    /// The object: kind, namespace, name, UID, replicas.
+    pub args: Value,
+    pub namespace: String,
+    pub decided_by: DecidedBy,
+    pub allowed: bool,
+    pub reason: Option<String>,
+    /// `ok`, `unchanged`, `left-out`, `rejected`, `not-touched`, `error` or
+    /// an HTTP status code.
+    pub result: String,
 }
 
 /// One answer for a right, as the audit log records it: never a value.
@@ -220,10 +245,11 @@ struct ListArgs {
     api_version: Option<String>,
     namespace: Option<String>,
     label_selector: Option<String>,
+    field_selector: Option<String>,
     limit: Option<u32>,
-    /// Accepted only to be refused explicitly.
     #[serde(default)]
     all_namespaces: bool,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +259,16 @@ struct ObjectArgs {
     api_version: Option<String>,
     name: String,
     namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetArgs {
+    kind: String,
+    api_version: Option<String>,
+    name: String,
+    namespace: Option<String>,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +289,12 @@ struct EventsArgs {
     api_version: Option<String>,
     name: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    all_namespaces: bool,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    reason: Option<String>,
+    since_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -421,7 +463,12 @@ pub(crate) async fn open_custom_rights(
 
 /// A 403 from reading under the session's identity, as a reason the agent
 /// can act on: whose rights are short and who can change that (#103).
-fn explain_forbidden(ctx: &Ctx<'_>, allowed: &Allowed, verb: &str, error: ToolError) -> ToolError {
+pub(crate) fn explain_forbidden(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    verb: &str,
+    error: ToolError,
+) -> ToolError {
     if !matches!(
         error,
         ToolError::Api {
@@ -823,18 +870,48 @@ pub(crate) async fn run(
         }
         "list_resources" => {
             let a: ListArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
             let request = Request::List {
                 kind: kind_ref(a.kind, a.api_version),
                 namespace: a.namespace,
                 all_namespaces: a.all_namespaces,
                 label_selector: a.label_selector.clone(),
+                field_selector: a.field_selector.clone(),
             };
             let allowed = authorize(ctx, &request).await?;
-            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit)
+            if a.all_namespaces {
+                return all_namespaces::list_resources(
+                    ctx,
+                    &allowed,
+                    &request,
+                    a.limit,
+                    fields.as_ref(),
+                )
+                .await;
+            }
+            let selectors = Selectors {
+                label: a.label_selector.as_deref(),
+                field: a.field_selector.as_deref(),
+            };
+            list_resources(ctx, &allowed, selectors, a.limit, fields.as_ref())
                 .await
+                .map_err(|error| explain_selector(error, selectors.field))
                 .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
         }
-        "get_resource" | "describe_resource" => {
+        "get_resource" => {
+            let a: GetArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
+            let request = Request::Get {
+                kind: kind_ref(a.kind, a.api_version),
+                name: a.name,
+                namespace: a.namespace,
+            };
+            let allowed = authorize(ctx, &request).await?;
+            get_resource(ctx, &allowed, fields.as_ref())
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+        }
+        "describe_resource" => {
             let a: ObjectArgs = parse(args)?;
             let request = Request::Get {
                 kind: kind_ref(a.kind, a.api_version),
@@ -842,15 +919,13 @@ pub(crate) async fn run(
                 namespace: a.namespace,
             };
             let allowed = authorize(ctx, &request).await?;
-            let result = if tool == "get_resource" {
-                get_resource(ctx, &allowed).await
-            } else {
-                describe_resource(ctx, &allowed).await
-            };
-            result.map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+            describe_resource(ctx, &allowed)
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
         }
         "list_events" => {
             let a: EventsArgs = parse(args)?;
+            let filter = EventFilter::new(a.event_type, a.reason, a.since_seconds)?;
             let object = match (a.kind, a.name) {
                 (Some(kind), Some(name)) => Some((kind_ref(kind, a.api_version), name)),
                 (None, None) => None,
@@ -865,10 +940,15 @@ pub(crate) async fn run(
             let request = Request::Events {
                 namespace: a.namespace,
                 object,
+                all_namespaces: a.all_namespaces,
             };
             let allowed = authorize(ctx, &request).await?;
+            let limit = a.limit.unwrap_or(50).min(200);
+            if a.all_namespaces {
+                return all_namespaces::list_events(ctx, &request, &filter, limit).await;
+            }
             ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
-            let events = list_events(ctx, &allowed, a.limit.unwrap_or(50).min(200)).await?;
+            let events = list_events(ctx, &allowed, &filter, limit).await?;
             Ok(ToolOutput::read(events))
         }
         "get_logs" => {
@@ -937,6 +1017,7 @@ pub(crate) async fn run(
         "uncordon_node" => crate::node_maintenance::cordon_node(ctx, args, false).await,
         "drain_node" => crate::node_maintenance::drain_node(ctx, args).await,
         "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
+        "wait_for_condition" => crate::wait_tools::wait_for_condition(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
@@ -946,6 +1027,7 @@ pub(crate) async fn run(
         "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
         "helm_rollback" => helm_tools::rollback(ctx, args).await,
         "helm_uninstall" => helm_tools::uninstall(ctx, args).await,
+        "helm_preview_diff" => crate::helm_preview::preview_diff(ctx, args).await,
         "can_reach" => topology_tools::can_reach(ctx, args).await,
         "apply_manifest" => {
             let a: ApplyArgs = parse(args)?;
@@ -958,6 +1040,8 @@ pub(crate) async fn run(
             let allowed = authorize(ctx, &request).await?;
             apply_manifest(ctx, &allowed, dry_run).await
         }
+        "scale_batch" => crate::batch_tools::scale(ctx, args).await,
+        "rollout_restart_batch" => crate::batch_tools::restart(ctx, args).await,
         "scale" => {
             let a: ScaleArgs = parse(args)?;
             let request = Request::Scale {
@@ -1151,7 +1235,7 @@ fn name_of(allowed: &Allowed) -> &str {
 
 /// Defense in depth: objects returned by a namespaced endpoint must be in
 /// that namespace.
-fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
+pub(crate) fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
     if obj.metadata.namespace.as_deref() == Some(namespace) {
         Ok(())
     } else {
@@ -1277,6 +1361,48 @@ fn session_info(session: &Session) -> String {
 /// context, each with its source. Either way with what the session may do
 /// in each.
 async fn list_namespaces(session: &Session) -> String {
+    let KnownNamespaces {
+        found,
+        complete,
+        note,
+    } = known_namespaces(session).await;
+    let grants = session.grants();
+    let policy = session.policy();
+    let namespaces: Vec<Value> = found
+        .into_iter()
+        .map(|(name, source)| {
+            let access = match grants.state(&Grant::read(name.clone())) {
+                Some(crate::grants::GrantState::Granted) => "allowed",
+                Some(crate::grants::GrantState::Denied) => "refused",
+                None if policy.namespace(Some(&name)).is_ok() => "available",
+                None => "not-in-this-session",
+            };
+            json!({"name": name, "source": source, "access": access})
+        })
+        .collect();
+    let out = json!({
+        "namespaces": namespaces,
+        "complete": complete,
+        "note": note,
+        "howToUse": "Pass `namespace` to a tool: reading built-in resources needs no question, \
+            in as many namespaces as you need. list_resources and list_events also take \
+            `allNamespaces: true`.",
+    });
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
+/// The namespaces Kubach knows for this session.
+pub(crate) struct KnownNamespaces {
+    /// With where each was found.
+    pub found: Vec<(String, NamespaceSource)>,
+    /// `false`: other namespaces may exist, and `note` says why.
+    pub complete: bool,
+    pub note: String,
+}
+
+/// The pinned namespaces, else the cluster's as the user may list them,
+/// else what Kubach knows of (#401). Names only.
+pub(crate) async fn known_namespaces(session: &Session) -> KnownNamespaces {
     use k8s_openapi::api::core::v1::Namespace;
     let scope = session.scope();
     let mut found: Vec<(String, NamespaceSource)> = Vec::new();
@@ -1335,28 +1461,11 @@ async fn list_namespaces(session: &Session) -> String {
             }
         }
     };
-    let grants = session.grants();
-    let policy = session.policy();
-    let namespaces: Vec<Value> = found
-        .into_iter()
-        .map(|(name, source)| {
-            let access = match grants.state(&Grant::read(name.clone())) {
-                Some(crate::grants::GrantState::Granted) => "allowed",
-                Some(crate::grants::GrantState::Denied) => "refused",
-                None if policy.namespace(Some(&name)).is_ok() => "available",
-                None => "not-in-this-session",
-            };
-            json!({"name": name, "source": source, "access": access})
-        })
-        .collect();
-    let out = json!({
-        "namespaces": namespaces,
-        "complete": complete,
-        "note": note,
-        "howToUse": "Pass `namespace` to a tool: reading built-in resources needs no question, \
-            in as many namespaces as you need.",
-    });
-    serde_json::to_string_pretty(&out).unwrap_or_default()
+    KnownNamespaces {
+        found,
+        complete,
+        note,
+    }
 }
 
 /// How many custom resource kinds `list_kinds` shows at most.
@@ -1439,64 +1548,147 @@ fn kinds_table(policy: &Policy<'_>, catalog: &ApiCatalog) -> String {
     out
 }
 
-async fn list_resources(
+/// The selectors of a `list_resources` call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Selectors<'a> {
+    pub label: Option<&'a str>,
+    pub field: Option<&'a str>,
+}
+
+/// The rows of one namespace, without the heading: table lines or, with
+/// `fields`, one YAML document each.
+pub(crate) struct Rows {
+    pub lines: Vec<String>,
+    /// The answer was cut by its `limit`: the server has more items.
+    pub more: bool,
+}
+
+/// The table heading of `kind`.
+pub(crate) fn table_heading(ctx: &Ctx<'_>, kind: &ResourceKind) -> String {
+    ctx.registry
+        .plugin_for_resource(&kind.api)
+        .columns()
+        .iter()
+        .map(|c| c.title.to_uppercase())
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Reads one namespace under its identity: the one way `list_resources`
+/// reaches the API, whether for one namespace or many.
+pub(crate) async fn read_rows(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
-    label_selector: Option<&str>,
+    selectors: Selectors<'_>,
     limit: Option<u32>,
-) -> Result<ToolOutput, ToolError> {
+    fields: Option<&Fields>,
+) -> Result<Rows, ToolError> {
     let kind = kind_of(allowed);
     let client = ctx.session.client_in(&allowed.namespace)?;
     let api = discovery::api(&client, kind, Some(&allowed.namespace));
     let mut params = ListParams::default().limit(limit.unwrap_or(100).clamp(1, MAX_LIST_ITEMS));
-    if let Some(selector) = label_selector {
+    if let Some(selector) = selectors.label {
         params = params.labels(selector);
+    }
+    if let Some(selector) = selectors.field {
+        params = params.fields(selector);
     }
     let list = api.list(&params).await?;
     let plugin = ctx.registry.plugin_for_resource(&kind.api);
-    let columns = plugin.columns();
     let now = Timestamp::now();
-    let mut out = columns
+    let lines = list
+        .items
         .iter()
-        .map(|c| c.title.to_uppercase())
-        .collect::<Vec<_>>()
-        .join("\t");
-    out.push('\n');
-    let mut shown = 0;
-    for obj in &list.items {
-        if ensure_namespace(obj, &allowed.namespace).is_err() {
-            continue;
-        }
-        let cells: Vec<String> = plugin
-            .cells(obj)
-            .iter()
-            .map(|c| render_cell(c, now))
-            .collect();
-        out.push_str(&cells.join("\t"));
+        .filter(|obj| ensure_namespace(obj, &allowed.namespace).is_ok())
+        .map(|obj| match fields {
+            Some(fields) => fields.row(&Masked::object(obj, &kind.api)),
+            None => plugin
+                .cells(obj)
+                .iter()
+                .map(|c| render_cell(c, now))
+                .collect::<Vec<_>>()
+                .join("\t"),
+        })
+        .collect();
+    Ok(Rows {
+        lines,
+        more: has_more(&list.metadata),
+    })
+}
+
+/// A selector the API server turned down, as bad input rather than an API
+/// failure: only a few fields of a kind can be selected on, and which is
+/// up to the server.
+pub(crate) fn explain_selector(error: ToolError, field_selector: Option<&str>) -> ToolError {
+    match (&error, field_selector) {
+        (
+            ToolError::Api {
+                code: Some(400),
+                message,
+            },
+            Some(selector),
+        ) => Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "the API server does not accept fieldSelector {selector:?} on this kind: \
+                 {message}. A kind selects on few fields: metadata.name on all of them, and \
+                 for Pods also spec.nodeName and status.phase, for example"
+            ),
+        )
+        .into(),
+        _ => error,
+    }
+}
+
+async fn list_resources(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    selectors: Selectors<'_>,
+    limit: Option<u32>,
+    fields: Option<&Fields>,
+) -> Result<ToolOutput, ToolError> {
+    let kind = kind_of(allowed);
+    let rows = read_rows(ctx, allowed, selectors, limit, fields).await?;
+    let mut out = String::new();
+    if fields.is_none() {
+        out = table_heading(ctx, kind);
         out.push('\n');
-        shown += 1;
+    }
+    for line in &rows.lines {
+        out.push_str(line);
+        out.push('\n');
     }
     let _ = write!(
         out,
-        "({shown} {} in {})",
-        kind.api.plural, allowed.namespace
+        "({} {} in {})",
+        rows.lines.len(),
+        kind.api.plural,
+        allowed.namespace
     );
-    if has_more(&list.metadata) {
-        out.push_str(" — more items exist; raise `limit` or narrow `labelSelector`");
+    if rows.more {
+        out.push_str(
+            " — more items exist; raise `limit` or narrow `labelSelector` or `fieldSelector`",
+        );
     }
     Ok(ToolOutput::read(finish(&out)))
 }
 
 /// A list answer cut by its `limit`: the server has more items.
-fn has_more(metadata: &ListMeta) -> bool {
+pub(crate) fn has_more(metadata: &ListMeta) -> bool {
     metadata.continue_.as_deref().is_some_and(|c| !c.is_empty())
 }
 
-async fn get_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
+async fn get_resource(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    fields: Option<&Fields>,
+) -> Result<ToolOutput, ToolError> {
     let obj = fetch(&ctx.session.client_in(&allowed.namespace)?, allowed).await?;
-    Ok(ToolOutput::read(finish(&core_apply::to_yaml(
-        &masked_value(&obj),
-    ))))
+    let text = match fields {
+        Some(fields) => fields.document(&Masked::object(&obj, &kind_of(allowed).api)),
+        None => core_apply::to_yaml(&masked_value(&obj)),
+    };
+    Ok(ToolOutput::read(finish(&text)))
 }
 
 async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
@@ -1541,71 +1733,43 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             relation.kind, relation.target_kind, relation.label_selector
         );
     }
-    let events = list_events(ctx, allowed, 20)
+    let events = list_events(ctx, allowed, &EventFilter::default(), 20)
         .await
         .unwrap_or_else(|e| e.message());
     let _ = write!(out, "\nEvents:\n{events}");
     Ok(ToolOutput::read(finish(&out)))
 }
 
-async fn list_events(ctx: &Ctx<'_>, allowed: &Allowed, limit: usize) -> Result<String, ToolError> {
-    let api: Api<Event> = Api::namespaced(
-        ctx.session.client_in(&allowed.namespace)?,
-        &allowed.namespace,
-    );
-    let mut params = ListParams::default().limit(MAX_LIST_ITEMS);
-    if let (Some(kind), Some(name)) = (&allowed.kind, &allowed.name) {
-        params = params.fields(&format!(
-            "involvedObject.kind={},involvedObject.name={name}",
-            kind.api.kind
-        ));
-    }
-    let list = api.list(&params).await?;
-    let more = has_more(&list.metadata);
-    let mut events = list.items;
-    let when = |e: &Event| {
-        e.last_timestamp
-            .as_ref()
-            .map(|t| t.0)
-            .or(e.event_time.as_ref().map(|t| t.0))
-            .or(e.metadata.creation_timestamp.as_ref().map(|t| t.0))
-    };
-    events.sort_by_key(when);
-    let now = Timestamp::now();
-    let skip = events.len().saturating_sub(limit);
-    let mut out = String::new();
-    for event in events.iter().skip(skip) {
-        if event.metadata.namespace.as_deref() != Some(allowed.namespace.as_str()) {
-            continue;
-        }
-        let age = when(event)
-            .map(|t| format_age(now.as_second() - t.as_second()))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "{age}\t{}\t{}\t{}/{}\t{}{}",
-            event.type_.as_deref().unwrap_or(""),
-            event.reason.as_deref().unwrap_or(""),
-            event.involved_object.kind.as_deref().unwrap_or(""),
-            event.involved_object.name.as_deref().unwrap_or(""),
-            event.message.as_deref().unwrap_or("").trim(),
-            event
-                .count
-                .filter(|c| *c > 1)
-                .map(|c| format!(" (x{c})"))
-                .unwrap_or_default(),
-        );
-    }
-    if out.is_empty() {
-        out.push_str("(no events)\n");
-    }
-    if more {
-        let _ = writeln!(
-            out,
-            "(only {MAX_LIST_ITEMS} events were read; more exist and newer ones may be missing)"
-        );
-    }
-    Ok(finish(&out))
+/// When an event last happened.
+pub(crate) fn event_time(event: &Event) -> Option<Timestamp> {
+    event
+        .series
+        .as_ref()
+        .and_then(|series| series.last_observed_time.as_ref())
+        .map(|t| t.0)
+        .or(event.last_timestamp.as_ref().map(|t| t.0))
+        .or(event.event_time.as_ref().map(|t| t.0))
+        .or(event.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// One event as a line of `list_events`, without its line break.
+pub(crate) fn event_line(event: &Event, now: Timestamp) -> String {
+    let age = event_time(event)
+        .map(|t| format_age(now.as_second() - t.as_second()))
+        .unwrap_or_default();
+    format!(
+        "{age}\t{}\t{}\t{}/{}\t{}{}",
+        event.type_.as_deref().unwrap_or(""),
+        event.reason.as_deref().unwrap_or(""),
+        event.involved_object.kind.as_deref().unwrap_or(""),
+        event.involved_object.name.as_deref().unwrap_or(""),
+        event.message.as_deref().unwrap_or("").trim(),
+        event
+            .count
+            .filter(|c| *c > 1)
+            .map(|c| format!(" (x{c})"))
+            .unwrap_or_default(),
+    )
 }
 
 /// At most this many pods per `get_logs` call, and streams (pod and
@@ -2661,15 +2825,6 @@ mod tests {
         let mut args = Map::new();
         args.insert("kind".into(), json!("Pod"));
         args.insert("allNamespace".into(), json!(true));
-        assert!(matches!(
-            parse::<ListArgs>(&args),
-            Err(ToolError::Denied(_))
-        ));
-        args.remove("allNamespace");
-        args.insert(
-            "fieldSelector".into(),
-            json!("metadata.namespace=kube-system"),
-        );
         assert!(matches!(
             parse::<ListArgs>(&args),
             Err(ToolError::Denied(_))

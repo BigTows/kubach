@@ -31,7 +31,14 @@
 //!   asks the user to run this one call with their own kubeconfig
 //!   credentials (#18): an unticked box, then, for install and upgrade, the
 //!   dry run under those credentials and the usual window with its diff.
-//!   Without the tick nothing runs and the agent is told which objects;
+//!   Without the tick nothing runs and the agent is told which objects.
+//!   A preview of such a chart asks nobody, so it shows `helm template`;
+//!   when the chart uses `lookup`, that render goes through the namespace's
+//!   ServiceAccount, read-only, or the objects it may misstate are marked
+//!   (#114);
+//! - a preview answers with a summary and keeps the masked diff in the
+//!   session for `helm_preview_diff` (#115, `helm_preview`); the
+//!   confirmation window keeps the whole diff;
 //! - charts only from repositories already added in Kubach, or an `oci://`
 //!   repository the user allows for the session; never a path or URL;
 //! - values only as YAML the agent passes (never a file path), masked by
@@ -53,6 +60,7 @@ use kubach_core::helm::cli::{
     self as helm_cli, HelmCliError, HelmCommand, HelmTarget, HelmWatch, InstallRequest, SecretEnv,
     ShowKind, TemplateRequest, UpgradeChart, UpgradeOutcome, UpgradeRequest,
 };
+use kubach_core::helm::lookup::{lookup_objects, lookup_use};
 use kubach_core::helm::repo::{self, HelmPaths, IndexState, SearchOptions};
 use kubach_core::helm::{
     Driver, HelmError, ManifestResource, Release, Releases, Sensitive, manifest_resources, oci,
@@ -65,6 +73,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, RequestKind, ask};
+use crate::helm_preview::{PreviewInput, changed_values, compare};
 use crate::masking::{mask_text, masked_manifest, truncate};
 use crate::policy::{Allowed, Denial, DenialCode, Finding, Request};
 use crate::scope::SessionMode;
@@ -601,7 +610,7 @@ pub(crate) fn merge_values(values: &mut Value, patch: &Value) {
 
 /// Marks a masked value of `new` that hides a changed value, which would
 /// otherwise look the same on both sides: `*** (N bytes, changed)`.
-fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_masked: &mut Value) {
+pub(crate) fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_masked: &mut Value) {
     match (old, new, old_masked, new_masked) {
         (Value::Object(old), Value::Object(new), Value::Object(old_m), Value::Object(new_m)) => {
             for (key, masked) in new_m.iter_mut() {
@@ -973,6 +982,16 @@ pub(crate) fn helm_rules(kinds: &[(String, String)]) -> Vec<PolicyRule> {
         .collect()
 }
 
+/// [`helm_rules`] without a verb that writes: all `lookup` needs (#114).
+pub(crate) fn helm_read_rules() -> Vec<PolicyRule> {
+    let mut rules = helm_rules(&[]);
+    for rule in &mut rules {
+        rule.verbs
+            .retain(|verb| matches!(verb.as_str(), "get" | "list" | "watch"));
+    }
+    rules
+}
+
 // ------------------------------------------------------------- helpers
 
 fn env(ctx: &Ctx<'_>) -> Result<Arc<HelmEnv>, ToolError> {
@@ -1006,10 +1025,14 @@ fn store_error(error: HelmError) -> ToolError {
 
 /// Names of the repositories added in Kubach (the user's helm).
 async fn repositories(env: &HelmEnv) -> Vec<repo::LoadedRepository> {
-    let Some(paths) = env.paths.clone() else {
-        return Vec::new();
-    };
-    kubach_core::runtime::blocking(move || repo::load(&paths, &[]).unwrap_or_default()).await
+    listed_repositories(env).await.unwrap_or_default()
+}
+
+/// The repositories added in Kubach; `None` when their list cannot be read,
+/// which is not the same as an empty list.
+async fn listed_repositories(env: &HelmEnv) -> Option<Vec<repo::LoadedRepository>> {
+    let paths = env.paths.clone()?;
+    kubach_core::runtime::blocking(move || repo::load(&paths, &[]).ok()).await
 }
 
 fn repository_names(loaded: &[repo::LoadedRepository]) -> Vec<String> {
@@ -1226,11 +1249,25 @@ async fn with_helm_role<T>(
     as_user: bool,
     work: impl Future<Output = Result<T, ToolError>>,
 ) -> Result<T, ToolError> {
-    if as_user || ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
+    if as_user {
+        return work.await;
+    }
+    with_role(ctx, namespace, helm_rules(kinds), work).await
+}
+
+/// Gives the namespace's temporary ServiceAccount `rules` while `work`
+/// runs; other identities have no Role to widen.
+async fn with_role<T>(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    rules: Vec<PolicyRule>,
+    work: impl Future<Output = Result<T, ToolError>>,
+) -> Result<T, ToolError> {
+    if ctx.session.mode_in(namespace) != SessionMode::TemporaryServiceAccount {
         return work.await;
     }
     ctx.session
-        .widen_role(namespace, helm_rules(kinds))
+        .widen_role(namespace, rules)
         .await
         .map_err(|error| {
             ToolError::Failed(format!(
@@ -1359,9 +1396,10 @@ pub(crate) async fn search(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
         ));
     }
-    let loaded = repositories(&env).await;
+    let listed = listed_repositories(&env).await;
+    let loaded = listed.as_deref().unwrap_or_default();
     let hits = repo::search(
-        &loaded,
+        loaded,
         &a.query,
         SearchOptions {
             all_versions: a.versions,
@@ -1395,22 +1433,86 @@ pub(crate) async fn search(
             })
         })
         .collect();
-    let out = json!({
+    let mut out = json!({
         "charts": rows,
         "more": hits.len() > MAX_SEARCH_ROWS,
         "repositories": repositories,
-        "note": if loaded.is_empty() {
-            "No repositories are added in Kubach. Only the user adds them (Kubach → Helm → \
-             Charts → Repositories); or pass oci to look at an oci:// chart, which the user is \
-             asked to allow."
-        } else {
-            "Charts of the repositories added in Kubach. An oci:// chart can be looked at with \
-             oci; the user is asked to allow its registry."
-        },
+        "note": "Charts of the repositories added in Kubach. An oci:// chart can be looked at \
+                 with oci; the user is asked to allow its registry.",
     });
+    if hits.is_empty() {
+        explain_empty_search(&mut out, listed.as_deref());
+    }
     Ok(ToolOutput::read(
         serde_json::to_string_pretty(&out).unwrap_or_default(),
     ))
+}
+
+/// Says in `out` why a chart search found nothing (#118); `listed` is what
+/// [`listed_repositories`] returned. Names only: a repository's URL may hold
+/// a login, and a parse error of the list or an index quotes the file.
+fn explain_empty_search(out: &mut Value, listed: Option<&[repo::LoadedRepository]>) {
+    const ONLY_THE_USER: &str = "Only the user adds repositories and updates their indexes, in \
+                                 Kubach (Helm → Charts → Repositories).";
+    let loaded = listed.unwrap_or_default();
+    let names = |ready: bool| -> Vec<&str> {
+        loaded
+            .iter()
+            .filter(|loaded| loaded.charts().is_some() == ready)
+            .map(|loaded| loaded.repository.name.as_str())
+            .collect()
+    };
+    let searched = names(true);
+    let without_index = names(false);
+    let (reason, note) = if listed.is_none() {
+        (
+            "repositoryListUnreadable",
+            "Kubach could not read Helm's repository list, so nothing was searched; repositories \
+             may still be added. Ask the user to check them in Kubach (Helm → Charts → \
+             Repositories)."
+                .to_owned(),
+        )
+    } else if loaded.is_empty() {
+        (
+            "noRepositories",
+            format!("No repositories are added in Kubach. {ONLY_THE_USER}"),
+        )
+    } else if searched.is_empty() {
+        (
+            "noLoadedIndex",
+            format!(
+                "Nothing was searched: no repository has a loaded index ({}). {ONLY_THE_USER}",
+                without_index.join(", ")
+            ),
+        )
+    } else {
+        let skipped = if without_index.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Not searched, no loaded index: {}. {ONLY_THE_USER}",
+                without_index.join(", ")
+            )
+        };
+        (
+            "noMatch",
+            format!(
+                "No chart matched in {}. The query is one substring of repo/chart, a description \
+                 or a keyword: a shorter one may match, and an empty one lists every chart.\
+                 {skipped}",
+                searched.join(", ")
+            ),
+        )
+    };
+    out["reason"] = json!(reason);
+    out["searched"] = json!(searched);
+    out["withoutIndex"] = json!(without_index);
+    out["note"] = json!(note);
+    out["ociCharts"] = json!(
+        "An oci:// chart is in no index, so a query never finds it. If its oci://registry/path \
+         is known, pass that as oci to list its versions, or as chart to helm_install; the user \
+         is asked to allow its registry."
+    );
 }
 
 pub(crate) async fn show_values(
@@ -1698,7 +1800,7 @@ async fn scan(ctx: &Ctx<'_>, namespace: &str, manifests: &[&str]) -> Result<Scan
 /// refuses it). Done before the user is asked about the call and before
 /// anything changes; a refusal names the objects. The call's namespace
 /// for the audit log stays the release's.
-async fn authorize_elsewhere(
+pub(crate) async fn authorize_elsewhere(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
     release: &str,
@@ -1733,20 +1835,25 @@ async fn authorize_elsewhere(
     Ok(())
 }
 
-/// `Kind name` of each object `helm template` rendered, with the
-/// namespace of one outside `namespace`, parsed on the blocking pool.
+/// `Kind name`, with the namespace of an object outside `namespace`.
+pub(crate) fn object_label(object: &ManifestResource, namespace: &str) -> String {
+    match object.namespace.as_deref() {
+        Some(other) if other != namespace => {
+            format!("{} {} (namespace {other})", object.kind, object.name)
+        }
+        _ => format!("{} {}", object.kind, object.name),
+    }
+}
+
+/// [`object_label`] of each object `helm template` rendered, parsed on the
+/// blocking pool.
 async fn rendered_objects(rendered: Option<&str>, namespace: &str) -> Vec<String> {
     let text = rendered.unwrap_or_default().to_owned();
     let namespace = namespace.to_owned();
     kubach_core::runtime::blocking(move || {
         manifest_resources(&text)
             .iter()
-            .map(|r| match r.namespace.as_deref() {
-                Some(other) if other != namespace => {
-                    format!("{} {} (namespace {other})", r.kind, r.name)
-                }
-                _ => format!("{} {}", r.kind, r.name),
-            })
+            .map(|object| object_label(object, &namespace))
             .collect()
     })
     .await
@@ -1814,42 +1921,286 @@ async fn ask_user_credentials(
 const PREVIEW_NEXT: &str = "Server-side dry run: nothing was installed or changed and the user \
      was not asked. Call again without preview to do it; the user then sees this and approves.";
 
-/// What `preview: true` shows the agent (#68).
+/// What `preview: true` shows the agent (#68): a summary, with the diff
+/// kept in the session (#115).
 struct PreviewText<'a> {
-    objects: &'a [String],
+    release: &'a str,
+    namespace: &'a str,
     cluster: &'a [String],
     findings: &'a [Finding],
-    /// Masked unified diff of the manifests.
-    diff: &'a str,
-    /// Masked values diff of an upgrade.
-    values_diff: Option<&'a str>,
+    /// Objects in other namespaces, needed again to read the diff.
+    elsewhere: &'a [Elsewhere],
+    /// The manifests compared, raw, each with what it is.
+    old: (&'a str, &'a str),
+    new: (&'a str, &'a str),
+    /// Masked values diff of an upgrade and its rows.
+    values: Option<(&'a str, &'a [Value])>,
+    /// A render by `helm template` of a chart that uses `lookup` (#114).
+    lookup: Option<&'a LookupNote>,
 }
 
-fn preview_text(preview: &PreviewText<'_>, note: &str) -> String {
+/// The answer to a preview. Compared on the blocking pool (#21).
+async fn preview_output(
+    ctx: &Ctx<'_>,
+    preview: &PreviewText<'_>,
+    note: &str,
+) -> Result<ToolOutput, ToolError> {
+    let (values_diff, values) = preview.values.unwrap_or_default();
+    let input = PreviewInput {
+        old: preview.old.0.to_owned(),
+        new: preview.new.0.to_owned(),
+        old_label: preview.old.1.to_owned(),
+        new_label: preview.new.1.to_owned(),
+        namespace: preview.namespace.to_owned(),
+        values_diff: values_diff.to_owned(),
+        values: values.to_vec(),
+        lookup_objects: preview
+            .lookup
+            .map(|lookup| lookup.objects.clone())
+            .unwrap_or_default(),
+        lookup_whole: preview.lookup.is_some_and(|lookup| lookup.whole_preview),
+    };
+    let mut compared = kubach_core::runtime::blocking(move || compare(&input)).await;
     let mut out = json!({
         "preview": true,
         "note": note,
-        "objects": preview.objects,
         "clusterObjects": preview.cluster,
         "needsTheUsersAttention": preview
             .findings
             .iter()
             .map(|f| format!("{}: {}", f.path, f.message))
             .collect::<Vec<_>>(),
-        "diff": if preview.diff.trim().is_empty() {
-            "no object changes"
-        } else {
-            preview.diff
-        },
+        "summary": compared.summary.take(),
     });
-    if let Some(diff) = preview.values_diff {
-        out["valuesDiff"] = json!(if diff.trim().is_empty() {
-            "the values did not change"
-        } else {
-            diff
+    if let Some(lookup) = preview.lookup {
+        out["lookup"] = json!({
+            "status": lookup.status,
+            "note": lookup.note,
+            "wholePreview": lookup.whole_preview,
+            "objects": lookup.objects,
         });
     }
-    serde_json::to_string_pretty(&out).unwrap_or_default()
+    out["fullDiff"] = sync::lock(ctx.session.helm_previews()).keep(
+        preview.release,
+        preview.namespace,
+        preview.elsewhere.to_vec(),
+        compared,
+    );
+    Ok(ToolOutput::read(
+        serde_json::to_string_pretty(&out).unwrap_or_default(),
+    ))
+}
+
+/// A preview from `helm template`: the dry run would need the user's
+/// credentials.
+const TEMPLATE_NOTE: &str = "Rendered with helm template, without the cluster: this chart needs \
+     the user's own credentials (cluster-scoped objects, RBAC or other namespaces), so the \
+     server-side dry run runs only when you call without preview and the user allows it.";
+
+/// [`TEMPLATE_NOTE`] of a render that read the cluster for `lookup` (#114).
+const TEMPLATE_READ_NOTE: &str = "Rendered with helm template under the session's \
+     ServiceAccount, read-only, for the chart's lookup calls: this chart needs the user's own \
+     credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side dry run \
+     runs only when you call without preview and the user allows it.";
+
+const LOOKUP_READ: &str = "The chart uses lookup, and it read the namespace's objects in this \
+     render: the diff has no false changes from it.";
+const LOOKUP_MISSING: &str = "The chart uses lookup, which found nothing in this render: it ran \
+     without the cluster. A change to these objects may be false (a generated TLS Secret looks \
+     recreated, for example) and is not proof of a real one. The diff the user sees after \
+     allowing the call has lookup working.";
+const LOOKUP_MISSING_WHOLE: &str = "The chart uses lookup, which found nothing in this render: it \
+     ran without the cluster. Kubach cannot tell which objects depend on it, so any change in \
+     this diff may be false (a generated TLS Secret looks recreated, for example). The diff the \
+     user sees after allowing the call has lookup working.";
+const LOOKUP_UNKNOWN: &str = "Kubach could not read the chart's templates, so it cannot tell \
+     whether the chart uses lookup. If it does, any change in this diff may be false. The diff \
+     the user sees after allowing the call has lookup working.";
+
+/// What a `helm template` preview says about `lookup` (#114).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LookupNote {
+    /// `read`: the render saw the cluster. `unavailable`: it did not.
+    /// `unknown`: Kubach could not read the templates.
+    pub status: &'static str,
+    pub note: &'static str,
+    /// Any object may be misstated, not only `objects`.
+    pub whole_preview: bool,
+    /// Objects that depend on `lookup`, when not read.
+    pub objects: Vec<String>,
+}
+
+impl LookupNote {
+    fn read() -> Self {
+        Self {
+            status: "read",
+            note: LOOKUP_READ,
+            whole_preview: false,
+            objects: Vec::new(),
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            status: "unknown",
+            note: LOOKUP_UNKNOWN,
+            whole_preview: true,
+            objects: Vec::new(),
+        }
+    }
+
+    fn unavailable(whole_preview: bool, objects: Vec<String>) -> Self {
+        Self {
+            status: "unavailable",
+            note: if whole_preview {
+                LOOKUP_MISSING_WHOLE
+            } else {
+                LOOKUP_MISSING
+            },
+            whole_preview,
+            objects,
+        }
+    }
+}
+
+/// `helm template` with `lookup` working, under the namespace's temporary
+/// ServiceAccount, its Role widened only to read (#114): `--dry-run=server`
+/// without `--validate`. Never the user's credentials, which nobody allowed
+/// here, so nothing of a vault context reaches the disk either: helm gets
+/// the kubeconfig with the cluster only and the ServiceAccount's token. The
+/// ServiceAccount has no rights on cluster-scoped objects or in other
+/// namespaces, so a `lookup` of those fails the render.
+async fn render_on_cluster(
+    ctx: &Ctx<'_>,
+    env: &HelmEnv,
+    binary: &Path,
+    template: &TemplateRequest,
+) -> Result<String, ToolError> {
+    let namespace = &template.namespace;
+    let run = helm_run(ctx, env, namespace, false).await?;
+    with_role(ctx, namespace, helm_read_rules(), async {
+        helm_cli::template_on_cluster(
+            Some(binary),
+            &run.target,
+            template,
+            helm_cli::DEFAULT_TIMEOUT,
+        )
+        .await
+        .map_err(helm_error)
+    })
+    .await
+}
+
+/// What `lookup` means for a preview from `helm template`: a render that
+/// read the cluster if the chart needs one and one could be done, and what
+/// to tell the agent. The reason a render failed is not passed on: helm's
+/// errors quote templates, and the agent needs only the marks.
+async fn lookup_render(
+    ctx: &Ctx<'_>,
+    env: &HelmEnv,
+    binary: &Path,
+    template: &TemplateRequest,
+    rendered: Option<&str>,
+    previous: &str,
+) -> (Option<String>, Option<LookupNote>) {
+    let templates =
+        helm_cli::chart_templates(Some(binary), &template.chart, helm_cli::DEFAULT_TIMEOUT).await;
+    let Ok(files) = templates else {
+        return (None, Some(LookupNote::unknown()));
+    };
+    let used = kubach_core::runtime::blocking(move || lookup_use(&files)).await;
+    if !used.is_used() {
+        return (None, None);
+    }
+    if let Ok(text) = render_on_cluster(ctx, env, binary, template).await {
+        return (Some(text), Some(LookupNote::read()));
+    }
+    let Some(text) = rendered.map(str::to_owned) else {
+        return (None, Some(LookupNote::unavailable(true, Vec::new())));
+    };
+    let namespace = template.namespace.clone();
+    let previous = previous.to_owned();
+    let note = kubach_core::runtime::blocking(move || {
+        let found = lookup_objects(&text, &used);
+        // An object of such a template the render lost looks removed.
+        let gone = lookup_objects(&previous, &used);
+        let mut objects: Vec<String> = Vec::new();
+        for object in found.objects.iter().chain(&gone.objects) {
+            let label = object_label(object, &namespace);
+            if !objects.contains(&label) {
+                objects.push(label);
+            }
+        }
+        LookupNote::unavailable(found.whole_render, objects)
+    })
+    .await;
+    (None, Some(note))
+}
+
+/// What a preview from `helm template` compares.
+struct TemplatePreview<'a> {
+    template: &'a TemplateRequest,
+    /// `helm template` without the cluster.
+    rendered: Option<&'a str>,
+    findings: &'a [Finding],
+    previous_manifest: &'a str,
+    previous_label: &'a str,
+    /// Manifests scanned besides the render.
+    scanned: &'a [&'a str],
+    elsewhere: &'a [Elsewhere],
+    values: Option<(&'a str, &'a [Value])>,
+}
+
+/// The preview of a chart whose dry run needs the user's credentials:
+/// `helm template`, without asking anyone.
+async fn template_preview(
+    ctx: &Ctx<'_>,
+    env: &HelmEnv,
+    binary: &Path,
+    preview: &TemplatePreview<'_>,
+) -> Result<ToolOutput, ToolError> {
+    let namespace = &preview.template.namespace;
+    let (live, lookup) = lookup_render(
+        ctx,
+        env,
+        binary,
+        preview.template,
+        preview.rendered,
+        preview.previous_manifest,
+    )
+    .await;
+    let rendered = live.as_deref().or(preview.rendered);
+    // What lookup found may change what the chart renders.
+    let (findings, mut elsewhere) = match &live {
+        Some(live) => {
+            let mut manifests = vec![live.as_str()];
+            manifests.extend(preview.scanned);
+            let scan = scan(ctx, namespace, &manifests).await?;
+            (scan.findings, scan.elsewhere)
+        }
+        None => (preview.findings.to_vec(), Vec::new()),
+    };
+    elsewhere.extend_from_slice(preview.elsewhere);
+    preview_output(
+        ctx,
+        &PreviewText {
+            release: &preview.template.release,
+            namespace,
+            cluster: &[],
+            findings: &findings,
+            elsewhere: &elsewhere,
+            old: (preview.previous_manifest, preview.previous_label),
+            new: (rendered.unwrap_or_default(), "helm template"),
+            values: preview.values,
+            lookup: lookup.as_ref(),
+        },
+        if live.is_some() {
+            TEMPLATE_READ_NOTE
+        } else {
+            TEMPLATE_NOTE
+        },
+    )
+    .await
 }
 
 const DRY_RUN_NEXT: &str = "If you allow it, Kubach runs the server-side dry run with your \
@@ -1971,32 +2322,24 @@ pub(crate) async fn install(
     let rendered = rendered(ctx, &binary, &template).await;
     let scan = scan(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
-    let (previous_manifest, previous_label) = ("", "nothing installed");
-    let preview_values_diff: Option<&str> = None;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     if as_user && a.preview {
-        // The dry run would need the user's credentials: what helm
-        // template renders, without asking anyone.
-        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
-        let diff = masked_diff(
-            previous_manifest,
-            rendered.as_deref().unwrap_or_default(),
-            previous_label,
-            "helm template",
+        return template_preview(
+            ctx,
+            &env,
+            &binary,
+            &TemplatePreview {
+                template: &template,
+                rendered: rendered.as_deref(),
+                findings: &scan.findings,
+                previous_manifest: "",
+                previous_label: "nothing installed",
+                scanned: &[],
+                elsewhere: &scan.elsewhere,
+                values: None,
+            },
         )
         .await;
-        return Ok(ToolOutput::read(preview_text(
-            &PreviewText {
-                objects: &objects,
-                cluster: &[],
-                findings: &scan.findings,
-                diff: &diff,
-                values_diff: preview_values_diff,
-            },
-            "Rendered with helm template, without the cluster: this chart needs the user's own \
-             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
-             dry run runs only when you call without preview and the user allows it.",
-        )));
     }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
@@ -2065,23 +2408,22 @@ pub(crate) async fn install(
         ..base_change
     };
     if a.preview {
-        let diff = masked_diff(
-            "",
-            preview_release.manifest.expose(),
-            "nothing installed",
-            "after the install",
-        )
-        .await;
-        return Ok(ToolOutput::read(preview_text(
+        return preview_output(
+            ctx,
             &PreviewText {
-                objects: &preview.objects,
+                release: &a.release,
+                namespace: &namespace,
                 cluster: &preview.cluster,
                 findings: &preview.findings,
-                diff: &diff,
-                values_diff: None,
+                elsewhere: &preview.elsewhere,
+                old: ("", "nothing installed"),
+                new: (&release_manifest(&preview_release), "after the install"),
+                values: None,
+                lookup: None,
             },
             PREVIEW_NEXT,
-        )));
+        )
+        .await;
     }
     let details = format!(
         "Objects of the server-side dry run:\n{}",
@@ -2175,6 +2517,8 @@ pub(crate) struct UpgradeValues {
     pub yaml: Sensitive<String>,
     pub masked: String,
     pub diff: String,
+    /// [`changed_values`], for a preview's summary (#115).
+    pub changes: Vec<Value>,
 }
 
 /// The values of an upgrade from `edit` and the current revision, merged,
@@ -2208,6 +2552,7 @@ pub(crate) fn upgrade_values_now(
             &format!("values of revision {revision}"),
             "values after the upgrade",
         ),
+        changes: changed_values(current, &new),
         yaml: Sensitive::new(yaml),
     }
 }
@@ -2314,9 +2659,7 @@ pub(crate) async fn upgrade(
     let rendered = rendered(ctx, &binary, &template).await;
     let current_manifest = release_manifest(&current);
     let previous_label = format!("revision {}", current.revision);
-    let (previous_manifest, previous_label) =
-        (current.manifest.expose().as_str(), previous_label.as_str());
-    let preview_values_diff = Some(values.diff.as_str());
+    let preview_values = Some((values.diff.as_str(), values.changes.as_slice()));
     let scan = scan(
         ctx,
         &namespace,
@@ -2326,28 +2669,23 @@ pub(crate) async fn upgrade(
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere).await?;
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
     if as_user && a.preview {
-        // The dry run would need the user's credentials: what helm
-        // template renders, without asking anyone.
-        let objects = rendered_objects(rendered.as_deref(), &namespace).await;
-        let diff = masked_diff(
-            previous_manifest,
-            rendered.as_deref().unwrap_or_default(),
-            previous_label,
-            "helm template",
+        return template_preview(
+            ctx,
+            &env,
+            &binary,
+            &TemplatePreview {
+                template: &template,
+                rendered: rendered.as_deref(),
+                findings: &scan.findings,
+                // `helm template` prints hooks: the revision's count too.
+                previous_manifest: &current_manifest,
+                previous_label: &previous_label,
+                scanned: &[&current_manifest],
+                elsewhere: &scan.elsewhere,
+                values: preview_values,
+            },
         )
         .await;
-        return Ok(ToolOutput::read(preview_text(
-            &PreviewText {
-                objects: &objects,
-                cluster: &[],
-                findings: &scan.findings,
-                diff: &diff,
-                values_diff: preview_values_diff,
-            },
-            "Rendered with helm template, without the cluster: this chart needs the user's own \
-             credentials (cluster-scoped objects, RBAC or other namespaces), so the server-side \
-             dry run runs only when you call without preview and the user allows it.",
-        )));
     }
     if as_user {
         let objects = rendered_objects(rendered.as_deref(), &namespace).await;
@@ -2386,13 +2724,6 @@ pub(crate) async fn upgrade(
     // The dry run may show more than helm template did (#21).
     authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere).await?;
     let others = other_namespaces(scan.elsewhere.iter().chain(&preview.elsewhere));
-    let diff = masked_diff(
-        current.manifest.expose(),
-        preview_release.manifest.expose(),
-        &format!("revision {}", current.revision),
-        "after the upgrade",
-    )
-    .await;
     let change = HelmChange {
         version: Some(preview_release.chart.version.clone()),
         objects: preview.objects.clone(),
@@ -2408,17 +2739,30 @@ pub(crate) async fn upgrade(
         ..base_change
     };
     if a.preview {
-        return Ok(ToolOutput::read(preview_text(
+        return preview_output(
+            ctx,
             &PreviewText {
-                objects: &preview.objects,
+                release: &a.release,
+                namespace: &namespace,
                 cluster: &preview.cluster,
                 findings: &preview.findings,
-                diff: &diff,
-                values_diff: Some(values.diff.as_str()),
+                elsewhere: &preview.elsewhere,
+                old: (&current_manifest, &previous_label),
+                new: (&release_manifest(&preview_release), "after the upgrade"),
+                values: preview_values,
+                lookup: None,
             },
             PREVIEW_NEXT,
-        )));
+        )
+        .await;
     }
+    let diff = masked_diff(
+        current.manifest.expose(),
+        preview_release.manifest.expose(),
+        &format!("revision {}", current.revision),
+        "after the upgrade",
+    )
+    .await;
     let details = if diff.trim().is_empty() {
         "The dry run changes no object.".to_owned()
     } else {

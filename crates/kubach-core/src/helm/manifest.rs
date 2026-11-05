@@ -74,6 +74,23 @@ pub(super) fn documents(manifest: &str) -> Vec<(ManifestResource, Value)> {
         .collect()
 }
 
+/// The objects of `helm template`'s output, each with the template of its
+/// `# Source:` comment (#114).
+pub(super) fn manifest_documents(manifest: &str) -> Vec<(Option<String>, ManifestResource)> {
+    split(manifest)
+        .into_iter()
+        .flat_map(|text| {
+            let source = text
+                .lines()
+                .find_map(|line| line.strip_prefix("# Source: "))
+                .map(|path| path.trim().to_owned());
+            documents(text)
+                .into_iter()
+                .map(move |(resource, _)| (source.clone(), resource))
+        })
+        .collect()
+}
+
 /// Documents split on `---` lines.
 fn split(manifest: &str) -> Vec<&str> {
     let mut starts = vec![0];
@@ -136,38 +153,93 @@ impl ManifestDiff {
     }
 }
 
-/// Compares the `old` (deployed) manifest with the `new` one.
-pub fn diff_manifests(old: &str, new: &str) -> ManifestDiff {
+/// One object an upgrade changes, with both sides as parsed: Secret values
+/// included, so masking them is up to whoever shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectChange {
+    pub kind: ChangeKind,
+    /// The new object, or the old one when removed.
+    pub resource: ManifestResource,
+    pub old: Option<Sensitive<Value>>,
+    pub new: Option<Sensitive<Value>>,
+}
+
+/// What differs between two manifests, object by object (#115).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectChanges {
+    /// Added, changed and removed objects, in that order.
+    pub changes: Vec<ObjectChange>,
+    /// Objects on both sides that stay as they are.
+    pub unchanged: usize,
+}
+
+/// Compares `old` with `new` object by object.
+pub fn object_changes(old: &str, new: &str) -> ObjectChanges {
     let index = |manifest: &str| -> BTreeMap<_, _> {
         documents(manifest)
             .into_iter()
             .map(|(resource, value)| (resource.key(), (resource, value)))
             .collect()
     };
-    let (before, after) = (index(old), index(new));
-    let mut changes = Vec::new();
-    for (key, (resource, value)) in &after {
-        let kind = match before.get(key) {
+    let (mut before, after) = (index(old), index(new));
+    let mut found = ObjectChanges::default();
+    for (key, (resource, value)) in after {
+        let previous = before.remove(&key).map(|(_, old)| old);
+        let kind = match &previous {
             None => ChangeKind::Added,
-            Some((_, old)) if old != value => ChangeKind::Changed,
-            Some(_) => continue,
+            Some(old) if *old != value => ChangeKind::Changed,
+            Some(_) => {
+                found.unchanged += 1;
+                continue;
+            }
         };
-        changes.push(ResourceChange {
+        found.changes.push(ObjectChange {
             kind,
-            resource: resource.clone(),
+            resource,
+            old: previous.map(Sensitive::new),
+            new: Some(Sensitive::new(value)),
         });
     }
-    for (key, (resource, _)) in &before {
-        if !after.contains_key(key) {
-            changes.push(ResourceChange {
-                kind: ChangeKind::Removed,
-                resource: resource.clone(),
-            });
-        }
+    for (resource, value) in before.into_values() {
+        found.changes.push(ObjectChange {
+            kind: ChangeKind::Removed,
+            resource,
+            old: Some(Sensitive::new(value)),
+            new: None,
+        });
     }
-    changes.sort_by(|a, b| (a.kind, &a.resource).cmp(&(b.kind, &b.resource)));
+    found
+        .changes
+        .sort_by(|a, b| (a.kind, &a.resource).cmp(&(b.kind, &b.resource)));
+    found
+}
+
+/// Documents of `manifest` that hold something but give no object: they do
+/// not parse, or have no kind or name. [`object_changes`] cannot see them.
+pub fn unreadable_documents(manifest: &str) -> usize {
+    split(manifest)
+        .into_iter()
+        .map(|text| match yaml::parse(text) {
+            Ok(docs) => docs
+                .iter()
+                .filter(|doc| resource(&doc.value).is_none())
+                .count(),
+            Err(_) => 1,
+        })
+        .sum()
+}
+
+/// Compares the `old` (deployed) manifest with the `new` one.
+pub fn diff_manifests(old: &str, new: &str) -> ManifestDiff {
     ManifestDiff {
-        changes,
+        changes: object_changes(old, new)
+            .changes
+            .into_iter()
+            .map(|change| ResourceChange {
+                kind: change.kind,
+                resource: change.resource,
+            })
+            .collect(),
         text: Sensitive::new(unified_diff(old, new, "deployed", "upgrade")),
     }
 }
@@ -257,6 +329,33 @@ metadata:
         let text = diff.text.expose();
         assert!(text.starts_with("--- deployed\n+++ upgrade\n"), "{text}");
         assert!(text.contains("-  replicas: 1\n+  replicas: 3\n"), "{text}");
+    }
+
+    #[test]
+    fn object_changes_keep_both_sides_and_count_the_rest() {
+        let upgraded = DEPLOYED
+            .replace("replicas: 1", "replicas: 3")
+            .replace("kind: Role\n", "kind: RoleBinding\n");
+        let found = object_changes(DEPLOYED, &upgraded);
+        assert_eq!(found.unchanged, 2);
+        let changed = &found.changes[1];
+        assert_eq!(changed.kind, ChangeKind::Changed);
+        let replicas = |side: &Option<Sensitive<Value>>| {
+            side.as_ref().unwrap().expose()["spec"]["replicas"].clone()
+        };
+        assert_eq!(
+            (replicas(&changed.old), replicas(&changed.new)),
+            (1.into(), 3.into())
+        );
+        assert!(found.changes[0].old.is_none() && found.changes[2].new.is_none());
+    }
+
+    #[test]
+    fn counts_the_documents_it_cannot_read() {
+        let manifest = "---\n# only a comment\n---\nkind: [\n---\nkind: ConfigMap\nmetadata:\n  name: a\n---\nkind: Secret\n";
+        assert_eq!(unreadable_documents(manifest), 2);
+        assert_eq!(unreadable_documents(DEPLOYED), 0);
+        assert_eq!(unreadable_documents(""), 0);
     }
 
     #[test]

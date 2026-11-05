@@ -32,6 +32,9 @@ agent-title-helm-rollback = Roll back the Helm release?
 agent-title-helm-uninstall = Uninstall the Helm release?
 agent-title-chart-source = Allow a chart source?
 agent-title-use-context = Let the agent work in this context?
+agent-title-namespaces = Let the agent read more namespaces?
+agent-title-batch-scale = Scale these objects?
+agent-title-batch-restart = Restart these objects?
 agent-title-call = Approve the agent's change?
 agent-title-secret-create = Enter values for a new Secret
 agent-title-secret-update = Change a Secret
@@ -48,6 +51,8 @@ agent-command-header =
         [one] { $count } argument, { $bytes } bytes · ␣ marks a space, \n a line break, \u{"{"}…{"}"} an invisible character
        *[other] { $count } arguments, { $bytes } bytes · ␣ marks a space, \n a line break, \u{"{"}…{"}"} an invisible character
     }
+agent-batch-objects = Objects that will change: { $count }
+agent-batch-left-out = Not included, will not change: { $count }
 agent-no-longer-pending = This request is no longer pending.
 agent-dangerous-title = Escapes the namespace boundary or reads Secrets
 # $message is what a finding does, $path where; both in English.
