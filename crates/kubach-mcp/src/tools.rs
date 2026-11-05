@@ -1262,6 +1262,9 @@ fn session_info(session: &Session) -> String {
             "hidden on this context"
         },
         "boundaries": boundaries,
+        "waitingForUser": session.waiting().list(),
+        "waitingForUserMeaning": "Calls of this session waiting for the user's answer in the \
+            Kubach window right now; a slow call not listed here is not waiting for the user.",
         "expiresAt": scope.expires_at.to_string(),
         "grants": session.grants().entries(),
         "notAskedAgain": session.remembered(),

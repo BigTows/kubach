@@ -7,7 +7,7 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationDelivery};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -16,7 +16,7 @@ use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentia
 use kubach_ui::measure;
 
 use super::{AgentState, Notice, countdown, global, secret_dialog};
-use crate::settings::{SettingsTarget, open_settings};
+use crate::settings::{AppSettings, SettingsTarget, open_settings};
 
 /// Shows pending confirmations and notices in `window` as they arrive.
 /// Call once for the main window.
@@ -26,9 +26,95 @@ pub fn watch_confirmations<V: 'static>(window: &mut Window, cx: &mut Context<V>)
     };
     cx.observe_in(&agent, window, |_, agent, window, cx| {
         show_notices(&agent, window, cx);
+        // Before `show_next` raises the window.
+        notify_system(&agent, window, cx);
         show_next(agent, window, cx)
     })
     .detach();
+    // The user came back on their own: the notification has done its job.
+    cx.observe_window_activation(window, move |_, window, cx| {
+        if window.is_window_active() {
+            retract_system_notice(&agent, window, cx);
+        }
+    })
+    .detach();
+}
+
+/// Tags the system notification about pending confirmations: there is one
+/// at a time, the newest question replaces it.
+struct AgentWaiting;
+
+/// The system notification about pending confirmations (#102).
+#[derive(Debug, Default)]
+pub(super) struct SystemNotice {
+    /// The newest confirmation the user was told of, or that came while
+    /// they were in the window.
+    seen: u64,
+    /// A notification may be on screen.
+    posted: bool,
+}
+
+impl SystemNotice {
+    /// Whether confirmation `newest` calls for a notification: a question
+    /// not seen yet, with the window hidden or not focused. Notes it as
+    /// seen either way, so coming back later does not repeat it.
+    fn should_post(&mut self, newest: u64, window_active: bool, enabled: bool) -> bool {
+        if newest <= self.seen {
+            return false;
+        }
+        self.seen = newest;
+        let post = enabled && !window_active;
+        self.posted |= post;
+        post
+    }
+
+    /// Whether a notification has to go: nothing waits, or the user is back.
+    fn should_retract(&mut self) -> bool {
+        std::mem::take(&mut self.posted)
+    }
+}
+
+/// Tells the user through the OS that an agent waits for them, if they are
+/// not in the window. Clicking it brings up the window with the question,
+/// which `show_next` opened there. The text names the kind of question,
+/// the agent and the context, not what the agent wrote: it may show on a
+/// lock screen.
+fn notify_system(agent: &Entity<AgentState>, window: &mut Window, cx: &mut App) {
+    let Some((id, request)) = agent
+        .read(cx)
+        .pending
+        .back()
+        .map(|pending| (pending.id, pending.request.clone()))
+    else {
+        retract_system_notice(agent, window, cx);
+        return;
+    };
+    let enabled = AppSettings::try_global(cx)
+        .is_none_or(|settings| settings.read(cx).get().agent.system_notifications);
+    let active = window.is_window_active();
+    let post = agent.update(cx, |state, _| {
+        state.system_notice.should_post(id, active, enabled)
+    });
+    if !post {
+        return;
+    }
+    window.push_notification(
+        Notification::info(t!(
+            "agent-system-notification-body",
+            client = request.client.as_str(),
+            context = request.context.as_str()
+        ))
+        .id::<AgentWaiting>()
+        .title(title(&request))
+        .delivery(NotificationDelivery::System),
+        cx,
+    );
+}
+
+fn retract_system_notice(agent: &Entity<AgentState>, window: &mut Window, cx: &mut App) {
+    if agent.update(cx, |state, _| state.system_notice.should_retract()) {
+        window.remove_notification::<AgentWaiting>(cx);
+    }
 }
 
 fn show_notices(agent: &Entity<AgentState>, window: &mut Window, cx: &mut App) {
@@ -1014,7 +1100,27 @@ impl Render for ConfirmView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgPart, VISIBLE_SPACE, arg_parts, arg_text};
+    use super::{ArgPart, SystemNotice, VISIBLE_SPACE, arg_parts, arg_text};
+
+    /// Only a new question with the window hidden or not focused posts
+    /// (#102), and only what was posted is retracted.
+    #[test]
+    fn a_system_notice_goes_out_once_and_only_away_from_the_window() {
+        let mut notice = SystemNotice::default();
+        assert!(!notice.should_post(1, true, true), "the user is there");
+        assert!(!notice.should_retract());
+        assert!(
+            !notice.should_post(1, false, true),
+            "leaving the window does not repeat an old question"
+        );
+        assert!(notice.should_post(2, false, true));
+        assert!(!notice.should_post(2, false, true), "already told");
+        assert!(notice.should_retract());
+        assert!(!notice.should_retract());
+        assert!(!notice.should_post(3, false, false), "turned off");
+        assert!(!notice.should_retract());
+        assert!(!notice.should_post(3, false, true), "not told late");
+    }
 
     fn text(s: &str) -> ArgPart {
         ArgPart::Text(s.into())

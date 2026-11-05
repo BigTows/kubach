@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
-use crate::confirm::Confirmer;
+use crate::confirm::{AnnouncingConfirmer, Confirmer};
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
@@ -154,16 +154,21 @@ impl McpServer {
     ) -> CallOutcome {
         let started = Instant::now();
         self.inner.session.note_call(client);
+        let confirmer = AnnouncingConfirmer {
+            confirmer: self.inner.confirmer.as_ref(),
+            waiting: self.inner.session.waiting(),
+            progress: progress.as_ref(),
+        };
         let ctx = Ctx {
             session: &self.inner.session,
             registry: &self.inner.registry,
-            confirmer: self.inner.confirmer.as_ref(),
+            confirmer: &confirmer,
             client_name: client,
             tool,
             decisions: std::sync::Mutex::new(Vec::new()),
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
-            progress,
+            progress: progress.clone(),
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
             remembered: std::sync::Mutex::new(None),
@@ -402,7 +407,7 @@ impl McpServer {
         format!(
             "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
              {access}. Access says which tools you may call without asking for more; it \
-             approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
+             approves no change. {CONFIRMED}{more} {WAITS}{helm} {namespaces} Cluster-scoped resources \
              and calls across all namespaces are not available, except nodes: list_nodes, \
              describe_node and top_nodes read them (they need access to nodes). For images \
              without a shell (distroless) use debug_container, then exec into it. \
@@ -434,29 +439,7 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let client = client_name(&context);
-        // Live phases of a long call as MCP progress notifications, when
-        // the client asked for them with a progress token.
-        let progress: Option<tools::Progress> = request
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get_progress_token())
-            .map(|token| {
-                let peer = context.peer.clone();
-                let step = Arc::new(std::sync::atomic::AtomicU32::new(0));
-                Arc::new(move |phase: String| {
-                    let peer = peer.clone();
-                    let token = token.clone();
-                    let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    tokio::spawn(async move {
-                        let _ = peer
-                            .notify_progress(
-                                rmcp::model::ProgressNotificationParam::new(token, f64::from(n))
-                                    .with_message(phase),
-                            )
-                            .await;
-                    });
-                }) as tools::Progress
-            });
+        let progress = progress_of(&context);
         let outcome = self
             .call_with_progress(
                 &client,
@@ -473,6 +456,28 @@ impl ServerHandler for McpServer {
         }
         .into())
     }
+}
+
+/// Live phases of a call and waits for the user (#116) as MCP progress
+/// notifications, when the client asked for them with a progress token.
+pub(crate) fn progress_of(context: &RequestContext<RoleServer>) -> Option<tools::Progress> {
+    // rmcp hands `_meta` to the handler here, not in the request's params.
+    let token = context.meta.get_progress_token()?;
+    let peer = context.peer.clone();
+    let step = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    Some(Arc::new(move |phase: String| {
+        let peer = peer.clone();
+        let token = token.clone();
+        let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            let _ = peer
+                .notify_progress(
+                    rmcp::model::ProgressNotificationParam::new(token, f64::from(n))
+                        .with_message(phase),
+                )
+                .await;
+        });
+    }))
 }
 
 /// The MCP client's self-reported name (for the audit log only; it is not
@@ -514,6 +519,13 @@ const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, 
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
      (not for deletions or Secrets); the result of such a call then says it was approved that \
      way.";
+
+/// What the agent is told about calls waiting for the user (#116): only
+/// clients that send a progress token get a notification.
+pub(crate) const WAITS: &str = "A call that needs the user's answer waits for it in the Kubach \
+     window, for at most 5 minutes, and may look stuck: Kubach says so in a progress notification \
+     if your client asks for those, and session_info lists such calls under waitingForUser at any \
+     time. Tell the user to look at the Kubach window instead of repeating the call.";
 
 /// Whether every real call of tool `name` is confirmed by the user (a dry
 /// run of `apply_manifest` is not).

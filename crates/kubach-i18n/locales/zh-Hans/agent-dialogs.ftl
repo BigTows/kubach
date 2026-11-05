@@ -8,6 +8,7 @@ agent-security-settings = 安全设置
 agent-notice-reveal-off = 已关闭显示 Secrets
 agent-notice-refused = 已拒绝代理
 agent-notice-text = { $text }
+agent-system-notification-body = { $client } 正在 Kubach 中等待你的答复（上下文 { $context }）。
 agent-notice-mcp-off = { $summary }：此上下文已关闭 AI 代理访问。
 agent-notice-session-only = 仅在本会话中允许
 agent-notice-session-only-text = 无法写入设置文件，因此该权限仅在会话结束前有效。
