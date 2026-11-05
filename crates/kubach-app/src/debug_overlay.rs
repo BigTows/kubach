@@ -44,7 +44,7 @@ const SLOW_FRAME: Duration = Duration::from_micros(16_667);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new(
-        "secondary-shift-d",
+        kubach_ui::secondary!("shift-d"),
         ToggleDebugOverlay,
         None,
     )]);

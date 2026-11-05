@@ -40,8 +40,8 @@ const CONTEXT: &str = "SelectableLines";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("secondary-c", CopySelection, Some(CONTEXT)),
-        KeyBinding::new("secondary-a", SelectAllLines, Some(CONTEXT)),
+        KeyBinding::new(crate::secondary!("c"), CopySelection, Some(CONTEXT)),
+        KeyBinding::new(crate::secondary!("a"), SelectAllLines, Some(CONTEXT)),
         KeyBinding::new("escape", ClearSelection, Some(CONTEXT)),
     ]);
 }

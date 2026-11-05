@@ -331,7 +331,7 @@ impl Render for WorkloadPods {
                 // A long list scrolls inside the block; the wheel over it
                 // does not scroll the details around it (#392).
                 div()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .id("workload-pods-list")

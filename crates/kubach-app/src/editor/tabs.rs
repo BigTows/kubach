@@ -21,7 +21,11 @@ actions!(
 );
 
 pub(super) fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-w", CloseTab, Some(KEY_CONTEXT))]);
+    cx.bind_keys([KeyBinding::new(
+        kubach_ui::secondary!("w"),
+        CloseTab,
+        Some(KEY_CONTEXT),
+    )]);
 }
 
 /// The active tab after closing editor tab `closed`, with `remaining` editor

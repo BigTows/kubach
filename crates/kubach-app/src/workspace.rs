@@ -76,26 +76,40 @@ macro_rules! for_each_cluster_shortcut {
     };
 }
 
+/// Keystrokes of the hotbar shortcuts, by tile: `KeyBinding::new` takes only
+/// static strings.
+const CLUSTER_KEYS: [[&str; 2]; 9] = [
+    ["cmd-1", "ctrl-1"],
+    ["cmd-2", "ctrl-2"],
+    ["cmd-3", "ctrl-3"],
+    ["cmd-4", "ctrl-4"],
+    ["cmd-5", "ctrl-5"],
+    ["cmd-6", "ctrl-6"],
+    ["cmd-7", "ctrl-7"],
+    ["cmd-8", "ctrl-8"],
+    ["cmd-9", "ctrl-9"],
+];
+
 /// `cmd-1…9` (and `ctrl-1…9`) jump to the first nine hotbar tiles.
 pub fn bind_keys(cx: &mut App) {
     macro_rules! bind {
         ($ix:literal, $action:ident) => {
-            let key = $ix + 1;
+            let [cmd, ctrl] = CLUSTER_KEYS[$ix];
             cx.bind_keys([
-                KeyBinding::new(&format!("cmd-{key}"), $action, None),
-                KeyBinding::new(&format!("ctrl-{key}"), $action, None),
+                KeyBinding::new(cmd, $action, None),
+                KeyBinding::new(ctrl, $action, None),
             ]);
         };
     }
     for_each_cluster_shortcut!(bind);
     cx.bind_keys([
-        KeyBinding::new("secondary-f", FocusSearch, None),
-        KeyBinding::new("secondary-shift-n", PickNamespaces, None),
+        KeyBinding::new(kubach_ui::secondary!("f"), FocusSearch, None),
+        KeyBinding::new(kubach_ui::secondary!("shift-n"), PickNamespaces, None),
         KeyBinding::new("ctrl-`", NewTerminal, None),
         // Back to where a jump came from (#395): `⌘[` on macOS, `Ctrl+[`
         // and `Alt+←` elsewhere. A terminal keeps them: `Ctrl+[` is Esc
         // and `Alt+←` moves by word in a shell.
-        KeyBinding::new("secondary-[", GoBack, None),
+        KeyBinding::new(kubach_ui::secondary!("["), GoBack, None),
         KeyBinding::new(
             "ctrl-[",
             NoAction,
