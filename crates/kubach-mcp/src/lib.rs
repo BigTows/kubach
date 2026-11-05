@@ -41,7 +41,12 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod all_namespaces;
+mod batch_tools;
 mod debug_tools;
+mod event_tools;
+mod fields;
+mod helm_preview;
 mod log_level;
 mod node_maintenance;
 mod node_tools;
@@ -50,6 +55,7 @@ mod secret_tools;
 pub mod secret_write;
 mod tools;
 mod topology_tools;
+mod wait_tools;
 
 #[cfg(test)]
 mod testutil;
@@ -57,8 +63,8 @@ mod testutil;
 pub use access::{Access, Raises};
 pub use audit::{AuditEntry, AuditLog, DecidedBy};
 pub use confirm::{
-    ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
-    WaitingCall, WaitingCalls,
+    BatchAction, BatchChange, BatchObject, ConfirmationDecision, ConfirmationRequest, Confirmer,
+    DenyAll, RequestKind, ScriptedConfirmer, WaitingCall, WaitingCalls,
 };
 pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{

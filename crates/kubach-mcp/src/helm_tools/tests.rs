@@ -966,3 +966,245 @@ fn a_vault_kubeconfig_shows_nothing_and_goes_to_a_private_file() {
     drop(file);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 }
+
+/// The render for `lookup` adds rights that only read, and none outside
+/// the namespace (#114).
+#[test]
+fn the_rules_for_lookup_only_read() {
+    let rules = helm_read_rules();
+    assert!(!rules.is_empty());
+    for rule in &rules {
+        assert!(!rule.verbs.is_empty());
+        assert!(
+            rule.verbs
+                .iter()
+                .all(|verb| ["get", "list", "watch"].contains(&verb.as_str())),
+            "{rule:?}"
+        );
+        assert!(
+            !rule
+                .api_groups
+                .iter()
+                .flatten()
+                .any(|group| group == "rbac.authorization.k8s.io"),
+            "{rule:?}"
+        );
+    }
+}
+
+// ------------------------------------------------------ preview summary (#115)
+
+fn preview_input(old: &str, new: &str) -> crate::helm_preview::PreviewInput {
+    crate::helm_preview::PreviewInput {
+        old: old.to_owned(),
+        new: new.to_owned(),
+        old_label: "revision 1".into(),
+        new_label: "after the upgrade".into(),
+        namespace: NS.to_owned(),
+        values_diff: String::new(),
+        values: Vec::new(),
+        lookup_objects: Vec::new(),
+        lookup_whole: false,
+    }
+}
+
+fn compared(old: &str, new: &str) -> crate::helm_preview::Compared {
+    crate::helm_preview::compare(&preview_input(old, new))
+}
+
+const SUMMARY_OLD: &str = "---\nkind: Deployment\napiVersion: apps/v1\nmetadata:\n  name: web\n\
+spec:\n  template:\n    spec:\n      containers:\n      - name: app\n        image: web:1\n      \
+- name: side\n        image: side:1\n---\nkind: ConfigMap\napiVersion: v1\nmetadata:\n  \
+name: app\ndata:\n  level: info\n  gone: x\n  DB_PASSWORD: old-pass\n---\nkind: Secret\n\
+apiVersion: v1\nmetadata:\n  name: db\ndata:\n  pw: aHVudGVyMg==\n  same: c2FtZQ==\n---\n\
+kind: Service\napiVersion: v1\nmetadata:\n  name: web\n---\nkind: Job\napiVersion: batch/v1\n\
+metadata:\n  name: old-job\n---\nkind: PersistentVolumeClaim\napiVersion: v1\nmetadata:\n  \
+name: data\n  annotations:\n    helm.sh/resource-policy: keep\n";
+
+const SUMMARY_NEW: &str = "---\nkind: Deployment\napiVersion: apps/v1\nmetadata:\n  name: web\n\
+spec:\n  template:\n    spec:\n      containers:\n      - name: side\n        image: side:1\n      \
+- name: app\n        image: web:2\n---\nkind: ConfigMap\napiVersion: v1\nmetadata:\n  name: app\n\
+data:\n  level: debug\n  fresh: y\n  DB_PASSWORD: new-pass\n  blob: QWJjZGVmZ2hpSktMTU5PUDEyMzQ1Njc4OTA\n\
+---\nkind: Secret\napiVersion: v1\nmetadata:\n  name: db\ndata:\n  pw: aHVudGVyMw==\n  \
+same: c2FtZQ==\n---\nkind: Service\napiVersion: v1\nmetadata:\n  name: web\n---\nkind: Pod\n\
+apiVersion: v1\nmetadata:\n  name: fresh\nspec:\n  containers:\n  - name: a\n    image: a:1\n";
+
+#[test]
+fn a_summary_says_what_changes_and_nothing_secret() {
+    let found = compared(SUMMARY_OLD, SUMMARY_NEW);
+    let summary = &found.summary;
+    assert_eq!(
+        summary["counts"],
+        json!({"added": 1, "changed": 3, "removed": 2, "unchanged": 1})
+    );
+    assert_eq!(summary["added"], json!([{"object": "Pod fresh"}]));
+    assert_eq!(
+        summary["removed"],
+        json!([{"object": "Job old-job"},
+               {"object": "PersistentVolumeClaim data", "kept": true}])
+    );
+    // By container name: `side` moved, only `app` is a change.
+    assert_eq!(
+        summary["images"],
+        json!([
+            {"object": "Pod fresh", "path": "spec.containers[a].image", "new": "a:1"},
+            {"object": "Deployment web", "new": "web:2", "old": "web:1",
+             "path": "spec.template.spec.containers[app].image"},
+        ])
+    );
+    assert_eq!(
+        summary["secretKeys"],
+        json!([{"object": "Secret db", "key": "pw", "change": "changed"}])
+    );
+    assert_eq!(
+        summary["configMapKeys"],
+        json!([
+            {"object": "ConfigMap app", "key": "DB_PASSWORD", "change": "changed",
+             "old": "*** (8 bytes)", "new": "*** (8 bytes)"},
+            {"object": "ConfigMap app", "key": "blob", "change": "added",
+             "new": "*** (35 bytes)"},
+            {"object": "ConfigMap app", "key": "fresh", "change": "added", "new": "y"},
+            {"object": "ConfigMap app", "key": "gone", "change": "removed", "old": "x"},
+            {"object": "ConfigMap app", "key": "level", "change": "changed",
+             "old": "info", "new": "debug"},
+        ])
+    );
+    assert!(summary.get("omitted").is_none(), "{summary}");
+    let everything: String = format!("{summary} {found:?}");
+    for value in [
+        "old-pass",
+        "new-pass",
+        "aHVudGVyMg",
+        "aHVudGVyMw",
+        "QWJjZGVm",
+    ] {
+        assert!(!everything.contains(value), "{value}: {everything}");
+    }
+}
+
+#[test]
+fn the_kept_diff_shows_that_a_masked_value_changed() {
+    let found = format!("{:?}", compared(SUMMARY_OLD, SUMMARY_NEW).entries);
+    // The same size on both sides: without the mark nothing would show.
+    assert!(found.contains("*** (7 bytes, changed)"), "{found}");
+    assert!(found.contains("*** (8 bytes, changed)"), "{found}");
+}
+
+#[test]
+fn a_summary_marks_what_lookup_may_misstate() {
+    let marked = |list: &Value| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["lookupAffected"] == true)
+            .count()
+    };
+    let some = crate::helm_preview::compare(&crate::helm_preview::PreviewInput {
+        lookup_objects: vec!["Secret db".to_owned(), "Job old-job".to_owned()],
+        ..preview_input(SUMMARY_OLD, SUMMARY_NEW)
+    });
+    assert_eq!(marked(&some.summary["changed"]), 1);
+    assert_eq!(marked(&some.summary["removed"]), 1);
+    assert_eq!(marked(&some.summary["secretKeys"]), 1);
+    assert_eq!(marked(&some.summary["configMapKeys"]), 0);
+    assert_eq!(marked(&some.summary["added"]), 0);
+
+    let all = crate::helm_preview::compare(&crate::helm_preview::PreviewInput {
+        lookup_whole: true,
+        ..preview_input(SUMMARY_OLD, SUMMARY_NEW)
+    });
+    assert_eq!(marked(&all.summary["changed"]), 3);
+    assert_eq!(marked(&all.summary["added"]), 1);
+    assert_eq!(marked(&all.summary["images"]), 2);
+}
+
+#[test]
+fn a_big_chart_stays_a_short_summary_that_counts_what_it_cut() {
+    let name = "a-rather-long-object-name-of-a-chart-with-a-lot-of-objects";
+    let new: String = (0..2000)
+        .map(|n| format!("---\nkind: ConfigMap\nmetadata:\n  name: {name}-{n}\n"))
+        .collect();
+    let found = compared("", &new);
+    let summary = &found.summary;
+    assert_eq!(summary["counts"]["added"], 2000);
+    let shown = summary["added"].as_array().unwrap().len();
+    assert!(shown < 2000);
+    assert_eq!(summary["omitted"]["added"], 2000 - shown, "{summary}");
+    assert!(summary.to_string().len() <= crate::helm_preview::SUMMARY_BYTES + 200);
+    assert_eq!(found.entries.len(), 2000);
+    assert!(found.complete);
+}
+
+#[test]
+fn documents_that_cannot_be_read_are_counted() {
+    let found = compared(
+        "",
+        "---\nkind: [\n---\nkind: ConfigMap\nmetadata:\n  name: a\n",
+    );
+    assert_eq!(found.summary["unreadableDocuments"], 1);
+    assert_eq!(found.summary["counts"]["added"], 1);
+}
+
+#[test]
+fn changed_values_are_rows_of_masked_paths() {
+    let old = json!({
+        "image": {"tag": "1.0"},
+        "auth": {"password": "old-pass"},
+        "gone": true,
+        "same": 1,
+        "long": "x".repeat(500),
+        "list": [1, 2],
+    });
+    let new = json!({
+        "image": {"tag": "2.0"},
+        "auth": {"password": "new-pass"},
+        "fresh": "aGVsbG8tdGhpcy1pcy1hLXNlY3JldDEyMw",
+        "same": 1,
+        "long": "y".repeat(500),
+        "list": [1, 3],
+    });
+    let rows = crate::helm_preview::changed_values(&old, &new);
+    assert_eq!(
+        rows,
+        vec![
+            json!({"path": "auth.password", "change": "changed",
+                   "old": "*** (8 bytes)", "new": "*** (8 bytes)"}),
+            json!({"path": "fresh", "change": "added", "new": "*** (34 bytes)"}),
+            json!({"path": "gone", "change": "removed", "old": true}),
+            json!({"path": "image.tag", "change": "changed", "old": "1.0", "new": "2.0"}),
+            json!({"path": "list", "change": "changed", "old": [1, 2], "new": [1, 3]}),
+            json!({"path": "long", "change": "changed"}),
+        ]
+    );
+    assert!(crate::helm_preview::changed_values(&old, &old).is_empty());
+}
+
+#[test]
+fn pages_add_up_to_the_text_and_stay_in_their_size() {
+    use crate::helm_preview::{PAGE_BYTES, pages};
+    let lines: String = (0..20_000).map(|n| format!("line {n} é\n")).collect();
+    let one_line = "é".repeat(PAGE_BYTES);
+    for text in [lines.as_str(), one_line.as_str(), "short\n"] {
+        let found = pages(text);
+        assert!(found.iter().all(|page| page.len() <= PAGE_BYTES));
+        assert_eq!(found.concat(), text);
+    }
+    assert!(pages(&lines).iter().all(|page| page.ends_with('\n')));
+    assert!(pages("").is_empty());
+}
+
+#[test]
+fn a_session_keeps_only_its_last_previews() {
+    use crate::helm_preview::{MAX_KEPT_PREVIEWS, PreviewStore};
+    let mut store = PreviewStore::default();
+    let ids: Vec<String> = (0..=MAX_KEPT_PREVIEWS)
+        .map(|_| {
+            let kept = store.keep("web", NS, Vec::new(), compared("", SUMMARY_NEW));
+            kept["previewId"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert!(!store.has(&ids[0]));
+    assert!(ids[1..].iter().all(|id| store.has(id)));
+    store.clear();
+    assert!(!store.has(&ids[1]));
+}

@@ -857,7 +857,7 @@ impl GraphView {
         true
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let delta = match event.delta {
             ScrollDelta::Pixels(p) => Pos::new(f32::from(p.x), f32::from(p.y)),
             ScrollDelta::Lines(l) => Pos::new(l.x * 24., l.y * 24.),
@@ -1322,7 +1322,7 @@ impl Render for GraphView {
                     }
                 }
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                 if !this.takes_wheel(window, cx) {
                     // Not focused yet: the page holding the graph scrolls.
                     if !this.wheel_hint {

@@ -449,7 +449,7 @@ impl TerminalView {
         }
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.scroll_remainder += event.delta.pixel_delta(self.cell.height).y;
         let lines = (self.scroll_remainder.as_f32() / self.cell.height.as_f32()).trunc() as i32;
         if lines == 0 {
@@ -1091,7 +1091,7 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .child(
                 canvas(
                     {

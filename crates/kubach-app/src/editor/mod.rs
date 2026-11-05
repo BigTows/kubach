@@ -88,7 +88,7 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalHub(hub));
     tabs::init(cx);
     cx.bind_keys([
-        KeyBinding::new("secondary-s", ReviewChanges, Some(KEY_CONTEXT)),
+        KeyBinding::new(kubach_ui::secondary!("s"), ReviewChanges, Some(KEY_CONTEXT)),
         KeyBinding::new(
             "ctrl-space",
             ShowCompletions,

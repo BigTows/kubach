@@ -49,6 +49,39 @@ pub(crate) fn scale_patch(replicas: i32) -> Value {
     json!({"spec": {"replicas": replicas}})
 }
 
+/// `patch` for one object only: with `metadata.uid` in it the API server
+/// refuses an object of the same name created since, whatever was read
+/// before (#108).
+fn for_uid(mut patch: Value, uid: &str) -> Value {
+    patch["metadata"] = json!({"uid": uid});
+    patch
+}
+
+/// Scales the object `name` if it still is `uid`, through the scale
+/// subresource like [`action::SCALE`]. `api` is the object's kind in its
+/// namespace.
+pub async fn scale_object(
+    api: &kube::Api<DynamicObject>,
+    name: &str,
+    uid: &str,
+    replicas: i32,
+) -> Result<(), kube::Error> {
+    let patch = Patch::Merge(for_uid(scale_patch(replicas), uid));
+    api.patch_scale(name, &patch_params(), &patch).await?;
+    Ok(())
+}
+
+/// Restarts the object `name` if it still is `uid`, like [`action::RESTART`].
+pub async fn restart_object(
+    api: &kube::Api<DynamicObject>,
+    name: &str,
+    uid: &str,
+) -> Result<(), kube::Error> {
+    let patch = Patch::Strategic(for_uid(restart_patch(&now_rfc3339()), uid));
+    api.patch(name, &patch_params(), &patch).await?;
+    Ok(())
+}
+
 /// Reads the `replicas` parameter.
 pub(crate) fn replicas_param(params: &ActionParams) -> Result<i32, PluginError> {
     let invalid = |reason: &str| PluginError::InvalidParam {

@@ -16,6 +16,7 @@ use std::borrow::Cow;
 
 use kubach_core::apply::yaml;
 use kubach_core::secrets::mask::{LAST_APPLIED, VALUE_FIELDS, is_secret_value, mask_named_values};
+use kube::api::{ApiResource, DynamicObject};
 use serde_json::Value;
 
 pub use kubach_core::redact::mask_text;
@@ -33,6 +34,29 @@ pub fn mask_object(value: &mut Value) {
         placeholder(size)
     });
     mask_secrets(value);
+}
+
+/// An object that went through [`mask_object`]; there is no other way to
+/// get one, so code that takes it cannot see an unmasked value.
+pub(crate) struct Masked(Value);
+
+impl Masked {
+    /// `object` of the kind `api`, masked. Masking goes by `kind`, and the
+    /// items of a list answer have none: without it a ConfigMap's values
+    /// would pass unmasked. So the kind the call resolved is always set.
+    pub(crate) fn object(object: &DynamicObject, api: &ApiResource) -> Self {
+        let mut value = serde_json::to_value(object).unwrap_or(Value::Null);
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("apiVersion".into(), api.api_version.clone().into());
+            fields.insert("kind".into(), api.kind.clone().into());
+        }
+        mask_object(&mut value);
+        Self(value)
+    }
+
+    pub(crate) fn value(&self) -> &Value {
+        &self.0
+    }
 }
 
 /// `*** (N bytes)`.
