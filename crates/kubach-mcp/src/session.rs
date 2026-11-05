@@ -20,8 +20,9 @@ use kube::{Client, Config};
 use serde::{Deserialize, Serialize};
 
 use crate::access::{Access, Raises};
+use crate::confirm::WaitingCalls;
 use crate::forwards::{SessionForwards, StopReason};
-use crate::grants::{Grant, GrantState, Grants};
+use crate::grants::{CustomRight, Grant, GrantState, Grants};
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
 use crate::remember::{Remembered, RememberedSet};
@@ -143,6 +144,8 @@ pub struct Session {
     /// One question to the user at a time per session, so two calls do not
     /// ask for the same right twice.
     ask: tokio::sync::Mutex<()>,
+    /// Calls waiting for the user's answer right now (#116).
+    waiting: WaitingCalls,
     /// Orders grant changes with the identities and Role patches that
     /// mirror them.
     role: tokio::sync::Mutex<()>,
@@ -170,6 +173,10 @@ pub enum HelmAccess {
     /// Client only: the user's own kubeconfig, as the app's Helm screens.
     User,
 }
+
+/// How long a call waits for a patched Role to take effect, at most.
+const ROLE_SETTLE_TRIES: usize = 30;
+const ROLE_SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// `(namespace, kind, name)` of an object the agent applied.
 pub type ChangedObject = (String, String, String);
@@ -221,6 +228,7 @@ impl Session {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
@@ -255,6 +263,7 @@ impl Session {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
@@ -265,6 +274,11 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.scope.id
+    }
+
+    /// Calls waiting for the user's answer right now (#116).
+    pub fn waiting(&self) -> &WaitingCalls {
+        &self.waiting
     }
 
     pub fn scope(&self) -> &SessionScope {
@@ -834,6 +848,57 @@ impl Session {
         &self.forwards
     }
 
+    /// Before a call on a custom resource in `namespace` (#103): a
+    /// temporary ServiceAccount's Role gets what the call uses, and the
+    /// call waits until the API server applies it. If the patch fails,
+    /// nothing is recorded and the error is returned.
+    pub(crate) async fn allow_custom_rights(
+        &self,
+        namespace: &str,
+        rights: &[CustomRight],
+    ) -> Result<(), SessionError> {
+        {
+            let _role = self.role.lock().await;
+            if !self.is_active() {
+                return Err(SessionError::Ended);
+            }
+            let mut next = self.grants();
+            if !next.add_custom_rights(namespace, rights) {
+                return Ok(());
+            }
+            self.sync_namespace(&next, namespace).await?;
+            *sync::lock(&self.grants) = next;
+        }
+        self.settle_rights(namespace, rights).await;
+        Ok(())
+    }
+
+    /// Waits, for a moment at most, until the namespace's temporary
+    /// ServiceAccount has `rights`: the API server's authorizer learns of a
+    /// patched Role a little later, and the call comes right after it. A
+    /// review that fails ends the wait: the call itself tells.
+    async fn settle_rights(&self, namespace: &str, rights: &[CustomRight]) {
+        let Some(boundary) = self.boundary(namespace) else {
+            return;
+        };
+        if boundary.identity.mode() != SessionMode::TemporaryServiceAccount {
+            return;
+        }
+        let client = boundary.identity.client();
+        for right in rights {
+            let access = ResourceAccess::new(&right.verb, &right.group, &right.resource)
+                .in_namespace(namespace);
+            for _ in 0..ROLE_SETTLE_TRIES {
+                match can_i(&client, &access).await {
+                    Ok(decision) if !decision.allowed => {
+                        tokio::time::sleep(ROLE_SETTLE_PAUSE).await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
     /// Before a port-forward in `namespace` starts (#17): a temporary
     /// ServiceAccount's Role gets `pods/portforward` there. If the patch
     /// fails, nothing is recorded and the error is returned.
@@ -1191,6 +1256,7 @@ mod tests {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,

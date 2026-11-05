@@ -4,7 +4,10 @@ use kubach_core::discovery::ApiCatalog;
 use kube::api::ApiResource;
 use kube::discovery::{ApiCapabilities, Scope};
 
+use kubach_core::plugin::BoxFuture;
+
 use crate::access::Access;
+use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer};
 use crate::scope::{SessionScope, SessionSpec};
 use crate::settings::{Profile, SecurityPolicy};
 
@@ -181,4 +184,32 @@ pub fn grants(list: &[crate::grants::Grant]) -> crate::grants::Grants {
         grants.set(grant.clone(), crate::grants::GrantState::Granted);
     }
     grants
+}
+
+/// Keeps every question open, as a user who has not answered yet, until
+/// [`Gate::release`]; then rejects it.
+pub struct Gate(tokio::sync::Semaphore);
+
+impl Gate {
+    pub fn new() -> Self {
+        Self(tokio::sync::Semaphore::new(0))
+    }
+
+    /// Answers every open and later question.
+    pub fn release(&self) {
+        self.0.close();
+    }
+}
+
+impl Confirmer for Gate {
+    fn confirm<'a>(
+        &'a self,
+        _request: &'a ConfirmationRequest,
+    ) -> BoxFuture<'a, ConfirmationDecision> {
+        Box::pin(async {
+            // Fails only once closed.
+            let _ = self.0.acquire().await;
+            ConfirmationDecision::Rejected { reason: None }
+        })
+    }
 }

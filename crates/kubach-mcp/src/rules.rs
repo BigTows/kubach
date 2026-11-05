@@ -6,6 +6,13 @@
 //! granted by accident: Secrets appear only through [`grant_rules`], when the
 //! session has Secret access in a namespace, or the user allowed revealing
 //! one Secret (#227, #15).
+//!
+//! Kinds outside these lists are the access `crds`. The Role names each of
+//! them only once a call used it ([`crate::grants::CustomRight`], #103): the API server
+//! refuses a Role with rights its author lacks, so listing every kind the
+//! cluster serves would fail for anyone without all of them.
+
+use std::collections::BTreeMap;
 
 use k8s_openapi::api::rbac::v1::PolicyRule;
 use kubach_core::rbac::ResourceAccess;
@@ -16,6 +23,11 @@ use crate::settings::Profile;
 
 const READ_VERBS: &[&str] = &["get", "list", "watch"];
 const WRITE_VERBS: &[&str] = &["create", "update", "patch", "delete"];
+/// What reading a custom resource uses; no `watch`, the tools never watch.
+pub const CUSTOM_READ_VERBS: &[&str] = &["get", "list"];
+/// What `apply_manifest` uses on a custom resource: a server-side apply,
+/// which creates the object when it is missing.
+pub const CUSTOM_APPLY_VERBS: &[&str] = &["create", "patch"];
 
 /// Readable resources by API group. No `secrets`.
 const READABLE: &[(&str, &[&str])] = &[
@@ -156,6 +168,10 @@ pub fn role_rules(profile: Profile) -> Vec<PolicyRule> {
 /// has in `namespace` so far within its `access` (#227 variant A, #15).
 /// Empty until the agent first works there.
 ///
+/// Custom resources: what calls used so far, while `read(ns)` (and for
+/// changes `modify(ns)` on the deploy profile) stands and the access has
+/// `crds`. Never Secrets, whatever is recorded.
+///
 /// Secret metadata needs `get`/`list` on all Secrets of the namespace, so
 /// their values pass through Kubach as well: that "the agent sees no values"
 /// is held by Kubach alone (ADR 0005). Revealing a Secret adds a rule for
@@ -206,7 +222,32 @@ pub fn grant_rules(grants: &Grants, namespace: &str, access: Access) -> Vec<Poli
             });
         }
     }
+    if access.crds && grants.is_granted(&Grant::read(namespace)) {
+        rules.extend(custom_rules(
+            grants,
+            namespace,
+            modify && profile >= Profile::Deploy,
+        ));
+    }
     rules
+}
+
+/// One rule per custom resource used in `namespace`, with the verbs used.
+fn custom_rules(grants: &Grants, namespace: &str, writes: bool) -> Vec<PolicyRule> {
+    let mut verbs: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+    for right in grants.custom_rights_in(namespace) {
+        let secrets = right.group.is_empty() && right.resource.split('/').next() == Some("secrets");
+        if !secrets && (writes || !right.is_write()) {
+            verbs
+                .entry((&right.group, &right.resource))
+                .or_default()
+                .push(&right.verb);
+        }
+    }
+    verbs
+        .into_iter()
+        .map(|((group, resource), verbs)| rule(group, &[resource], &verbs))
+        .collect()
 }
 
 /// Whether the agent may write Secrets through the user (#230): the deploy
@@ -469,6 +510,67 @@ mod tests {
         assert_eq!(named[0].verbs, ["get"]);
         assert!(all.iter().any(|r| r.verbs.iter().any(|v| v == "delete")));
         assert!(all.iter().all(|r| !r.verbs.iter().any(|v| v == "*")));
+    }
+
+    #[test]
+    fn custom_resources_are_named_once_used_within_the_access() {
+        use crate::grants::CustomRight;
+        let crds = Access {
+            crds: true,
+            ..Access::NONE
+        };
+        let volumes = |verb| CustomRight::new("longhorn.io", "volumes", verb);
+        let custom = |grants: &Grants, access: Access| {
+            grant_rules(grants, "web", access)
+                .into_iter()
+                .filter(|r| r.api_groups.as_deref() == Some(&["longhorn.io".to_owned()][..]))
+                .collect::<Vec<_>>()
+        };
+        let mut granted = grants(&[Grant::read("web")]);
+        assert!(custom(&granted, crds).is_empty());
+
+        granted.add_custom_rights("web", &[volumes("get"), volumes("list")]);
+        let rules = custom(&granted, crds);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].verbs, ["get", "list"]);
+        assert_eq!(all_resources(&rules), ["volumes"]);
+        // Without the access, the reading right or in another namespace:
+        // nothing.
+        assert!(custom(&granted, Access::NONE).is_empty());
+        assert!(custom(&grants(&[]), crds).is_empty());
+        assert!(
+            grant_rules(&granted, "api", crds)
+                .iter()
+                .all(|r| r.api_groups.as_deref() != Some(&["longhorn.io".to_owned()][..]))
+        );
+
+        // Changes stand on `modify(ns)` and the deploy profile.
+        granted.add_custom_rights("web", &[volumes("delete")]);
+        assert_eq!(custom(&granted, crds)[0].verbs, ["get", "list"]);
+        let deploy = Access {
+            crds: true,
+            ..Access::profile(Profile::Deploy)
+        };
+        assert_eq!(custom(&granted, deploy)[0].verbs, ["get", "list"]);
+        granted.set(Grant::modify("web"), crate::grants::GrantState::Granted);
+        assert_eq!(custom(&granted, crds)[0].verbs, ["get", "list"]);
+        assert_eq!(custom(&granted, deploy)[0].verbs, ["delete", "get", "list"]);
+    }
+
+    #[test]
+    fn a_recorded_right_never_opens_secrets() {
+        use crate::grants::CustomRight;
+        let mut granted = grants(&[Grant::read("web"), Grant::modify("web")]);
+        granted.add_custom_rights("web", &[CustomRight::new("", "secrets", "list")]);
+        let access = Access {
+            crds: true,
+            ..Access::profile(Profile::Deploy)
+        };
+        assert!(
+            !all_resources(&grant_rules(&granted, "web", access))
+                .iter()
+                .any(|r| r == "secrets")
+        );
     }
 
     #[test]
