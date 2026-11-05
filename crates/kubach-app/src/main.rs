@@ -45,6 +45,9 @@ fn main() -> std::process::ExitCode {
         .with_assets(kubach_ui::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            // System notifications need it on Windows, as the bundle
+            // identifier of `Kubach.app` (#102).
+            cx.set_app_identity("dev.kubach.app", "Kubach");
             app_icon::set_dock_icon();
             shell_env::init(shell_env, cx);
             kubach_ui::theme::init(ThemeMode::Dark, cx);

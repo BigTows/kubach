@@ -26,8 +26,10 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::confirm::{notice_if_slow, waiting_text};
 use crate::proxy::ProxyServer;
-use crate::server::{McpServer, client_name};
+use crate::server::{McpServer, WAITS, client_name, progress_of};
+use crate::tools::Progress;
 use kubach_core::sync;
 
 /// Told to the agent while no session is active and nobody can choose one.
@@ -95,6 +97,9 @@ pub struct SharedServer {
     /// Why the last session ended, told to the agent until a new one
     /// starts: its tools vanish with it (#56).
     ended: Arc<RwLock<Option<String>>>,
+    /// The context the user is being asked about (#116): no session lists
+    /// that wait yet.
+    choosing: Arc<RwLock<Option<String>>>,
 }
 
 impl SharedServer {
@@ -219,6 +224,37 @@ impl SharedServer {
         tool: &str,
         args: &Map<String, Value>,
     ) -> Option<(String, bool, bool)> {
+        self.context_tool(client, tool, args, None).await
+    }
+
+    /// Asks `chooser` for `context`, letting the agent know when that waits
+    /// for the user (#116).
+    async fn choose(
+        &self,
+        chooser: &dyn ContextChooser,
+        context: &str,
+        client: &str,
+        progress: Option<&Progress>,
+    ) -> Result<ChosenSession, String> {
+        let asked = format!("working in context {context}");
+        let chosen = notice_if_slow(chooser.choose(context, client), || {
+            *sync::write(&self.choosing) = Some(context.to_owned());
+            if let Some(progress) = progress {
+                progress(waiting_text(&asked));
+            }
+        })
+        .await;
+        *sync::write(&self.choosing) = None;
+        chosen
+    }
+
+    async fn context_tool(
+        &self,
+        client: &str,
+        tool: &str,
+        args: &Map<String, Value>,
+        progress: Option<&Progress>,
+    ) -> Option<(String, bool, bool)> {
         let chooser = self.chooser()?;
         match tool {
             "list_contexts" => {
@@ -272,7 +308,7 @@ impl SharedServer {
                         false,
                     ));
                 }
-                match chooser.choose(name, client).await {
+                match self.choose(chooser.as_ref(), name, client, progress).await {
                     Ok(ChosenSession::Hosted(proxy)) => {
                         let text =
                             format!("The user allowed context {name}. {}", proxy.instructions());
@@ -308,12 +344,18 @@ impl SharedServer {
                 }
             }
             "session_info" if self.get().is_none() && self.hosted().is_none() => Some((
-                match self.ended() {
-                    Some(ended) => ended,
-                    None => "No context chosen yet: call list_contexts, then use_context. The \
+                match (sync::read(&self.choosing).clone(), self.ended()) {
+                    (Some(context), _) => format!(
+                        "use_context is waiting for the user's answer in the Kubach window about \
+                         context {context}. Tell the user to look at it."
+                    ),
+                    (None, Some(ended)) => ended,
+                    (None, None) => {
+                        "No context chosen yet: call list_contexts, then use_context. The \
                          user approves the context in the Kubach window; anything beyond the \
                          context's minimal access is asked for later, when a call needs it."
-                        .into(),
+                            .into()
+                    }
                 },
                 false,
                 false,
@@ -375,11 +417,12 @@ impl ServerHandler for SharedServer {
         } else if let Some(proxy) = self.hosted() {
             proxy.instructions()
         } else if self.chooser().is_some() {
-            "Kubach gives access to Kubernetes clusters the user allows. No context is chosen \
-             yet: call list_contexts, then use_context; the user approves it in the Kubach \
-             window. Anything beyond the context's minimal access is asked for later, when a \
-             call needs it."
-                .to_owned()
+            format!(
+                "Kubach gives access to Kubernetes clusters the user allows. No context is chosen \
+                 yet: call list_contexts, then use_context; the user approves it in the Kubach \
+                 window. Anything beyond the context's minimal access is asked for later, when a \
+                 call needs it. {WAITS}"
+            )
         } else {
             format!("Kubach gives access to Kubernetes clusters. {NO_SESSION}")
         };
@@ -408,8 +451,10 @@ impl ServerHandler for SharedServer {
     ) -> Result<CallToolResponse, ErrorData> {
         let client = client_name(&context);
         let args = request.arguments.clone().unwrap_or_default();
-        if let Some((text, is_error, changed)) =
-            self.call_context_tool(&client, &request.name, &args).await
+        let progress = progress_of(&context);
+        if let Some((text, is_error, changed)) = self
+            .context_tool(&client, &request.name, &args, progress.as_ref())
+            .await
         {
             if changed {
                 let _ = context.peer.notify_tool_list_changed().await;
@@ -423,7 +468,9 @@ impl ServerHandler for SharedServer {
             .into());
         }
         if let Some(proxy) = self.hosted() {
-            let (outcome, list_changed) = proxy.call(&client, &request.name, args).await;
+            let (outcome, list_changed) = proxy
+                .call_with_progress(&client, &request.name, args, progress)
+                .await;
             if list_changed {
                 let _ = context.peer.notify_tool_list_changed().await;
             }
@@ -517,6 +564,63 @@ mod tests {
                 Ok(McpServer::new(session, std::sync::Arc::new(DenyAll), None).into())
             })
         }
+    }
+
+    /// Keeps the agent waiting for the user until released; then refuses.
+    struct Stalled(tokio::sync::Semaphore);
+
+    impl ContextChooser for Stalled {
+        fn list(&self) -> BoxFuture<'_, Vec<ContextEntry>> {
+            Box::pin(async { Vec::new() })
+        }
+
+        fn choose<'a>(
+            &'a self,
+            context: &'a str,
+            _client: &'a str,
+        ) -> BoxFuture<'a, Result<ChosenSession, String>> {
+            Box::pin(async move {
+                let _ = self.0.acquire().await;
+                Err(format!("the user did not allow working in {context}"))
+            })
+        }
+    }
+
+    /// `use_context` has no session to list its wait in (#116).
+    #[tokio::test]
+    async fn a_context_waiting_for_the_user_is_announced() {
+        let shared = SharedServer::new();
+        let stalled = std::sync::Arc::new(Stalled(tokio::sync::Semaphore::new(0)));
+        shared.set_chooser(stalled.clone());
+        let told: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = told.clone();
+        let progress: crate::tools::Progress =
+            std::sync::Arc::new(move |text| sync::lock(&sink).push(text));
+        let call = {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let args = context("prod");
+                shared
+                    .context_tool("agent", "use_context", &args, Some(&progress))
+                    .await
+            })
+        };
+        tokio::time::sleep(crate::confirm::WAIT_NOTICE_AFTER * 3).await;
+        assert_eq!(sync::lock(&told).len(), 1);
+        assert!(sync::lock(&told)[0].contains("working in context prod"));
+        let (info, ..) = shared
+            .call_context_tool("agent", "session_info", &Map::new())
+            .await
+            .unwrap();
+        assert!(info.contains("waiting for the user's answer"), "{info}");
+        stalled.0.add_permits(1);
+        let (text, error, _) = call.await.unwrap().unwrap();
+        assert!(error, "{text}");
+        let (info, ..) = shared
+            .call_context_tool("agent", "session_info", &Map::new())
+            .await
+            .unwrap();
+        assert!(!info.contains("waiting"), "{info}");
     }
 
     fn names(shared: &SharedServer) -> Vec<String> {
