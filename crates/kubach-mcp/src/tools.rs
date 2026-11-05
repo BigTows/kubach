@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 
 use crate::access::Access;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
-use crate::grants::Grant;
+use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
 use crate::masking::{mask_object, mask_text, truncate};
 use crate::policy::{
@@ -38,7 +38,7 @@ use crate::policy::{
     service_account_changes, walk_fields,
 };
 use crate::remember::{RememberNote, rememberable};
-use crate::scope::NamespaceSource;
+use crate::scope::{NamespaceSource, SessionMode};
 use crate::secret_tools;
 use crate::secret_write;
 use crate::session::{Session, SessionError};
@@ -345,6 +345,8 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     for _ in 0..=MAX_GRANTS_PER_CALL {
         match ctx.session.policy().check(request) {
             Ok(allowed) => {
+                let rights = Policy::custom_rights(request, &allowed);
+                open_custom_rights(ctx, &allowed.namespace, rights).await?;
                 if !allowed.namespace.is_empty() {
                     *sync::lock(&ctx.namespace) = Some(allowed.namespace.clone());
                 }
@@ -372,6 +374,88 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     Err(ToolError::Failed(
         "this call needs too many rights at once".into(),
     ))
+}
+
+/// Sets up what a call uses on custom resources in `namespace` (#103): the
+/// policy allowed it, and a temporary ServiceAccount's Role has to follow,
+/// or the API server refuses the call. The user's own RBAC bounds it, so a
+/// missing right is said here. An impersonated identity has the rights the
+/// administrator gave it, whatever the user's are.
+pub(crate) async fn open_custom_rights(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    rights: Vec<CustomRight>,
+) -> Result<(), ToolError> {
+    if rights.is_empty() {
+        return Ok(());
+    }
+    let known = ctx.session.grants();
+    let new: Vec<CustomRight> = rights
+        .into_iter()
+        .filter(|right| !known.has_custom_right(namespace, right))
+        .collect();
+    if new.is_empty() || ctx.session.mode_in(namespace) == SessionMode::Impersonation {
+        return Ok(());
+    }
+    for right in &new {
+        ensure_rbac(
+            ctx,
+            namespace,
+            &[(&right.verb, &right.group, &right.resource)],
+        )
+        .await?;
+    }
+    ctx.session
+        .allow_custom_rights(namespace, &new)
+        .await
+        .map_err(|error| {
+            ToolError::Failed(format!(
+                "custom resources are allowed in this session, but Kubach could not extend the \
+                 session's rights in namespace {namespace}: {error}"
+            ))
+        })
+}
+
+/// A 403 from reading under the session's identity, as a reason the agent
+/// can act on: whose rights are short and who can change that (#103).
+fn explain_forbidden(ctx: &Ctx<'_>, allowed: &Allowed, verb: &str, error: ToolError) -> ToolError {
+    if !matches!(
+        error,
+        ToolError::Api {
+            code: Some(403),
+            ..
+        }
+    ) {
+        return error;
+    }
+    let namespace = &allowed.namespace;
+    let api = &kind_of(allowed).api;
+    let full = if api.group.is_empty() {
+        api.plural.clone()
+    } else {
+        format!("{}.{}", api.plural, api.group)
+    };
+    let why = match ctx.session.mode_in(namespace) {
+        SessionMode::ClientOnly => "your Kubernetes account has no such right".to_owned(),
+        SessionMode::Impersonation => format!(
+            "the identity prepared for Kubach ({}) has no such right; only the cluster \
+             administrator can extend it",
+            ctx.session.describe_identity(Some(namespace))
+        ),
+        SessionMode::TemporaryServiceAccount => {
+            "the session's temporary ServiceAccount does not have it yet; try once more, and if \
+             this repeats, the user's own rights have probably changed"
+                .to_owned()
+        }
+    };
+    Denial::new(
+        DenialCode::Rbac,
+        format!(
+            "the API server does not let this session {verb} {full} in namespace {namespace}: \
+             {why}. Asking the user again will not help: Kubach cannot grant RBAC rights"
+        ),
+    )
+    .into()
 }
 
 /// What the user is asked, in one line.
@@ -743,7 +827,9 @@ pub(crate) async fn run(
                 label_selector: a.label_selector.clone(),
             };
             let allowed = authorize(ctx, &request).await?;
-            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit).await
+            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit)
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
         }
         "get_resource" | "describe_resource" => {
             let a: ObjectArgs = parse(args)?;
@@ -753,11 +839,12 @@ pub(crate) async fn run(
                 namespace: a.namespace,
             };
             let allowed = authorize(ctx, &request).await?;
-            if tool == "get_resource" {
+            let result = if tool == "get_resource" {
                 get_resource(ctx, &allowed).await
             } else {
                 describe_resource(ctx, &allowed).await
-            }
+            };
+            result.map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
         }
         "list_events" => {
             let a: EventsArgs = parse(args)?;

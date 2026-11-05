@@ -105,6 +105,31 @@ pub struct GrantEntry {
     pub at_launch: bool,
 }
 
+/// One API verb on a resource outside the built-in lists: what a call on
+/// a custom resource uses (#103).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CustomRight {
+    pub group: String,
+    /// Plural resource, as in a Role.
+    pub resource: String,
+    pub verb: String,
+}
+
+impl CustomRight {
+    pub fn new(group: &str, resource: &str, verb: &str) -> Self {
+        Self {
+            group: group.to_owned(),
+            resource: resource.to_owned(),
+            verb: verb.to_owned(),
+        }
+    }
+
+    /// Whether it changes objects, so it stands on `modify(ns)`.
+    pub fn is_write(&self) -> bool {
+        !matches!(self.verb.as_str(), "get" | "list")
+    }
+}
+
 /// The grant table of one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
@@ -121,6 +146,12 @@ pub struct Grants {
     /// temporary ServiceAccount gets `pods/portforward` there while
     /// `read(ns)` stands and a forward runs.
     forwarding: std::collections::BTreeSet<String>,
+    /// What calls on custom resources used so far, per namespace (#103).
+    /// Not a right of its own: the user allows custom resources as a whole
+    /// (access `crds`). A temporary ServiceAccount gets these and nothing
+    /// more, because a Role holding a kind the user may not touch could not
+    /// be saved at all.
+    custom: std::collections::BTreeSet<(String, CustomRight)>,
 }
 
 impl Grants {
@@ -164,6 +195,36 @@ impl Grants {
         if matches!(grant, Grant::Read { .. }) {
             self.forwarding.remove(grant.namespace());
         }
+        match grant {
+            Grant::Read { namespace } => self.custom.retain(|(ns, _)| ns != namespace),
+            Grant::Modify { namespace } => self
+                .custom
+                .retain(|(ns, right)| ns != namespace || !right.is_write()),
+            Grant::Secret { .. } => {}
+        }
+    }
+
+    /// Records what a call on a custom resource in `namespace` uses.
+    /// Returns `false` if all of it was recorded already.
+    pub fn add_custom_rights(&mut self, namespace: &str, rights: &[CustomRight]) -> bool {
+        let mut added = false;
+        for right in rights {
+            added |= self.custom.insert((namespace.to_owned(), right.clone()));
+        }
+        added
+    }
+
+    /// Whether a call already used `right` in `namespace`.
+    pub fn has_custom_right(&self, namespace: &str, right: &CustomRight) -> bool {
+        self.custom.contains(&(namespace.to_owned(), right.clone()))
+    }
+
+    /// What calls on custom resources used in `namespace`, sorted.
+    pub fn custom_rights_in(&self, namespace: &str) -> impl Iterator<Item = &CustomRight> {
+        self.custom
+            .iter()
+            .filter(move |(ns, _)| ns == namespace)
+            .map(|(_, right)| right)
     }
 
     /// Marks whether the agent has a port-forward open in `namespace`
@@ -275,6 +336,24 @@ mod tests {
         grants.revoke(&Grant::modify("web"));
         assert!(grants.secret_writes_in("web").is_empty());
         assert_eq!(grants.secret_writes_in("api"), ["token"]);
+    }
+
+    #[test]
+    fn custom_rights_go_with_the_namespace_rights() {
+        let read = CustomRight::new("example.com", "widgets", "list");
+        let write = CustomRight::new("example.com", "widgets", "delete");
+        let mut grants = Grants::new();
+        assert!(grants.add_custom_rights("web", &[read.clone(), write.clone()]));
+        assert!(!grants.add_custom_rights("web", std::slice::from_ref(&read)));
+        grants.add_custom_rights("api", std::slice::from_ref(&read));
+
+        grants.revoke(&Grant::modify("web"));
+        assert!(grants.has_custom_right("web", &read));
+        assert!(!grants.has_custom_right("web", &write));
+
+        grants.revoke(&Grant::read("web"));
+        assert_eq!(grants.custom_rights_in("web").count(), 0);
+        assert!(grants.has_custom_right("api", &read));
     }
 
     #[test]
