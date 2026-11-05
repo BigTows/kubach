@@ -698,7 +698,10 @@ fn catalog() -> Vec<ToolSpec> {
                           StatefulSet, DaemonSet, ReplicaSet, Job, CronJob), or labelSelector; \
                           at most 10 pods and 20 containers per call. With several streams \
                           each line starts with [pod/container]; notes on top say what was \
-                          left out.",
+                          left out. minLevel filters by level across log formats (logfmt/slog, \
+                          JSON, klog); a note then gives the lines read, those with a recognized \
+                          level and those matched, so an empty result can be told from a format \
+                          it doesn't know.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -711,6 +714,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "allContainers": {"type": "boolean", "description": "Every container, init containers included"},
                         "filter": {"type": "string", "description": "Only lines containing this text (applied after masking)"},
                         "regex": {"type": "boolean", "description": "filter is a regular expression"},
+                        "minLevel": {"type": "string", "enum": ["trace", "debug", "info", "warn", "error", "fatal"], "description": "Only lines at this level or above, among the lines read (tailLines), together with filter. Recognizes logfmt/slog (level=error), JSON (level, severity, lvl; pino/bunyan numbers) and klog (E1103 ...). Lines without a recognized level, stack trace lines included, are excluded and counted in a note"},
                         "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Per container"},
                         "sinceSeconds": {"type": "integer", "minimum": 1},
                         "previous": {"type": "boolean"},
