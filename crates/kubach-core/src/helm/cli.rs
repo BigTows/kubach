@@ -249,26 +249,10 @@ impl HelmCommand {
     /// used; `.Capabilities` are helm's defaults and `lookup` finds nothing.
     /// `chart_dir` is where a stored chart was written (see [`Self::upgrade`]).
     pub fn template(request: &TemplateRequest, chart_dir: Option<&Path>) -> Self {
+        let (flags, positional) = Self::template_args(request, chart_dir, true);
         let mut args: Vec<OsString> = vec!["template".into()];
-        let chart: OsString = match (&request.chart, chart_dir) {
-            (UpgradeChart::Stored(_), Some(dir)) => dir.into(),
-            (UpgradeChart::Stored(chart), None) => format!("<stored {}>", chart.reference()).into(),
-            (UpgradeChart::Reference { chart, version }, _) => {
-                if let Some(version) = non_empty(version.as_deref()) {
-                    args.extend(["--version".into(), version.into()]);
-                }
-                chart.trim().into()
-            }
-        };
-        args.extend(["--values", "-", "--namespace"].map(OsString::from));
-        args.push(request.namespace.clone().into());
-        args.push(if request.is_upgrade {
-            "--is-upgrade".into()
-        } else {
-            "--include-crds".into()
-        });
-        let release = request.release.trim();
-        push_positional(&mut args, [release.into(), chart]);
+        args.extend(flags);
+        push_positional(&mut args, positional);
         Self {
             args,
             env: Vec::new(),
@@ -276,7 +260,71 @@ impl HelmCommand {
             secret_env: SecretEnv::default(),
             refusal: None,
         }
-        .for_release(release)
+        .for_release(request.release.trim())
+    }
+
+    /// `helm template` on `target` with `--dry-run=server` (#114): `lookup`
+    /// reads the cluster as `target`'s identity, nothing is written. For a
+    /// target of the session's own identity only.
+    pub fn template_on_cluster(
+        target: &HelmTarget,
+        request: &TemplateRequest,
+        chart_dir: Option<&Path>,
+    ) -> Self {
+        let (mut flags, positional) = Self::template_args(request, chart_dir, false);
+        flags.push("--dry-run=server".into());
+        let mut command = Self::new(target, &["template"], flags, positional);
+        command.stdin = Some(request.values.clone());
+        command.for_release(request.release.trim())
+    }
+
+    /// The flags and positional arguments of `helm template`; `namespace`:
+    /// with `--namespace`, which a target otherwise sets.
+    fn template_args(
+        request: &TemplateRequest,
+        chart_dir: Option<&Path>,
+        namespace: bool,
+    ) -> (Vec<OsString>, Vec<OsString>) {
+        let mut flags: Vec<OsString> = Vec::new();
+        let chart: OsString = match (&request.chart, chart_dir) {
+            (UpgradeChart::Stored(_), Some(dir)) => dir.into(),
+            (UpgradeChart::Stored(chart), None) => format!("<stored {}>", chart.reference()).into(),
+            (UpgradeChart::Reference { chart, version }, _) => {
+                if let Some(version) = non_empty(version.as_deref()) {
+                    flags.extend(["--version".into(), version.into()]);
+                }
+                chart.trim().into()
+            }
+        };
+        flags.extend(["--values", "-"].map(OsString::from));
+        if namespace {
+            flags.extend(["--namespace".into(), request.namespace.clone().into()]);
+        }
+        flags.push(if request.is_upgrade {
+            "--is-upgrade".into()
+        } else {
+            "--include-crds".into()
+        });
+        (flags, vec![request.release.trim().into(), chart])
+    }
+
+    /// `helm pull <chart> --destination <dir>`: the chart archive, with the
+    /// user's repositories and logins, as `helm template` fetches it. No
+    /// cluster is contacted.
+    pub fn pull(chart: &str, version: Option<&str>, destination: &Path) -> Self {
+        let mut args: Vec<OsString> = vec!["pull".into()];
+        if let Some(version) = non_empty(version) {
+            args.extend(["--version".into(), version.into()]);
+        }
+        args.extend(["--destination".into(), destination.into()]);
+        push_positional(&mut args, [chart.trim().into()]);
+        Self {
+            args,
+            env: Vec::new(),
+            stdin: None,
+            secret_env: SecretEnv::default(),
+            refusal: None,
+        }
     }
 
     /// `helm repo add <name> <url>`: writes the user's `repositories.yaml`
@@ -696,6 +744,71 @@ pub async fn template(
     output
 }
 
+/// Runs `helm template` for `request` on `target` (#114): as [`template`],
+/// with `lookup` answered by the cluster under `target`'s identity.
+pub async fn template_on_cluster(
+    helm: Option<&Path>,
+    target: &HelmTarget,
+    request: &TemplateRequest,
+    timeout: Duration,
+) -> Result<String, HelmCliError> {
+    let chart_dir = write_stored(&request.chart)?;
+    let command = HelmCommand::template_on_cluster(
+        target,
+        request,
+        chart_dir.as_ref().map(|(_, path)| path.as_path()),
+    );
+    let output = run(helm, &command, timeout).await;
+    drop(chart_dir);
+    output
+}
+
+/// The templates of `chart` for [`super::lookup::lookup_use`], each with its
+/// path as in `helm template`'s `# Source:` comments. A chart reference is
+/// fetched with `helm pull` to a temporary directory, removed afterwards;
+/// the cluster is not contacted either way (#114).
+pub async fn chart_templates(
+    helm: Option<&Path>,
+    chart: &UpgradeChart,
+    timeout: Duration,
+) -> Result<Vec<(String, String)>, HelmCliError> {
+    let (chart, version) = match chart {
+        UpgradeChart::Stored(stored) => {
+            let name = stored.metadata()["name"].as_str().unwrap_or_default();
+            return Ok(stored
+                .templates()
+                .iter()
+                .map(|file| {
+                    (
+                        format!("{name}/{}", file.name),
+                        String::from_utf8_lossy(&file.data).into_owned(),
+                    )
+                })
+                .collect());
+        }
+        UpgradeChart::Reference { chart, version } => (chart, version),
+    };
+    let failed = |error: std::io::Error| HelmCliError::Output(error.to_string());
+    let dir = tempfile::Builder::new()
+        .prefix("kubach-chart-")
+        .tempdir()
+        .map_err(failed)?;
+    let command = HelmCommand::pull(chart, version.as_deref(), dir.path());
+    run(helm, &command, timeout).await?;
+    let path = std::fs::read_dir(dir.path())
+        .map_err(failed)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "tgz"))
+        .ok_or_else(|| HelmCliError::Output("helm pull saved no chart".into()))?;
+    crate::runtime::blocking(move || {
+        let _dir = dir;
+        super::lookup::archive_templates(&std::fs::read(path)?)
+    })
+    .await
+    .map_err(failed)
+}
+
 /// Runs `command`, with `--debug` and its phases when watched.
 async fn run_progress(
     helm: Option<&Path>,
@@ -1030,6 +1143,76 @@ mod tests {
         assert_eq!(shown.last().unwrap(), "/tmp/x");
         request.release = "--kube-apiserver=x".into();
         assert!(HelmCommand::template(&request, None).refusal.is_some());
+    }
+
+    #[test]
+    fn template_on_a_cluster_is_pinned_to_the_target() {
+        let request = TemplateRequest {
+            release: "web".into(),
+            namespace: "apps".into(),
+            chart: UpgradeChart::Reference {
+                chart: "bitnami/nginx".into(),
+                version: None,
+            },
+            values: Sensitive::new("a: 1\n".into()),
+            is_upgrade: true,
+        };
+        let command = HelmCommand::template_on_cluster(&target(&["/k"]), &request, None);
+        assert_eq!(
+            args(&command),
+            [
+                "template",
+                "--values",
+                "-",
+                "--is-upgrade",
+                "--dry-run=server",
+                "--kube-context",
+                "minikube",
+                "--namespace",
+                "apps",
+                "--kubeconfig",
+                "/k",
+                "--",
+                "web",
+                "bitnami/nginx",
+            ]
+        );
+        assert_eq!(command.stdin.as_ref().unwrap().expose(), "a: 1\n");
+    }
+
+    #[tokio::test]
+    async fn a_stored_chart_gives_its_templates_without_helm() {
+        let chart = StoredChart::from_json(serde_json::json!({
+            "metadata": {"name": "web", "version": "1.0.0"},
+            "templates": [{"name": "templates/a.yaml", "data": "a2luZDogQQ=="}],
+        }))
+        .unwrap();
+        let files = chart_templates(None, &UpgradeChart::Stored(chart), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            files,
+            [("web/templates/a.yaml".to_owned(), "kind: A".to_owned())]
+        );
+    }
+
+    #[test]
+    fn pull_needs_no_cluster() {
+        let command = HelmCommand::pull(" repo/web ", Some("1.2.3"), Path::new("/tmp/x"));
+        assert_eq!(
+            args(&command),
+            [
+                "pull",
+                "--version",
+                "1.2.3",
+                "--destination",
+                "/tmp/x",
+                "--",
+                "repo/web",
+            ]
+        );
+        assert!(command.env.is_empty());
+        assert!(command.secret_env.expose().is_empty());
     }
 
     fn install_request() -> InstallRequest {

@@ -27,6 +27,7 @@ use kube::{Client, ResourceExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::all_namespaces;
@@ -164,6 +165,9 @@ pub(crate) struct Ctx<'a> {
     pub helm: Option<std::sync::Arc<crate::helm_tools::HelmEnv>>,
     /// Live phases of a long call (helm), for MCP progress notifications.
     pub progress: Option<Progress>,
+    /// Fires when the agent cancels the call or goes away: waits stop then
+    /// (#109). Other tools do not look at it.
+    pub cancel: CancellationToken,
     /// The namespace the call acts in once the policy allowed it, for the
     /// identity in the audit log.
     pub namespace: std::sync::Mutex<Option<String>>,
@@ -424,7 +428,12 @@ pub(crate) async fn open_custom_rights(
 
 /// A 403 from reading under the session's identity, as a reason the agent
 /// can act on: whose rights are short and who can change that (#103).
-fn explain_forbidden(ctx: &Ctx<'_>, allowed: &Allowed, verb: &str, error: ToolError) -> ToolError {
+pub(crate) fn explain_forbidden(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    verb: &str,
+    error: ToolError,
+) -> ToolError {
     if !matches!(
         error,
         ToolError::Api {
@@ -950,7 +959,11 @@ pub(crate) async fn run(
         "list_nodes" => crate::node_tools::list_nodes(ctx, args).await,
         "describe_node" => crate::node_tools::describe_node(ctx, args).await,
         "top_nodes" => crate::node_tools::top_nodes(ctx, args).await,
+        "cordon_node" => crate::node_maintenance::cordon_node(ctx, args, true).await,
+        "uncordon_node" => crate::node_maintenance::cordon_node(ctx, args, false).await,
+        "drain_node" => crate::node_maintenance::drain_node(ctx, args).await,
         "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
+        "wait_for_condition" => crate::wait_tools::wait_for_condition(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
         "helm_show_values" => helm_tools::show_values(ctx, args).await,
         "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
@@ -1165,7 +1178,7 @@ fn name_of(allowed: &Allowed) -> &str {
 
 /// Defense in depth: objects returned by a namespaced endpoint must be in
 /// that namespace.
-fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
+pub(crate) fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
     if obj.metadata.namespace.as_deref() == Some(namespace) {
         Ok(())
     } else {
@@ -1597,7 +1610,7 @@ async fn list_resources(
 }
 
 /// A list answer cut by its `limit`: the server has more items.
-fn has_more(metadata: &ListMeta) -> bool {
+pub(crate) fn has_more(metadata: &ListMeta) -> bool {
     metadata.continue_.as_deref().is_some_and(|c| !c.is_empty())
 }
 
