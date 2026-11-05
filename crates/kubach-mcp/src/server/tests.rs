@@ -102,6 +102,19 @@ fn selected_pod_logs(path: &str) -> String {
     format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
 }
 
+/// Logs of pod `levels-0`: every format `minLevel` knows, a line masking
+/// breaks the JSON of, and lines without a level.
+const LEVELED_LOGS: &str = r#"level=info msg=started
+level=error msg="disk full" password=hunter2
+{"level":"warn","token_count":5,"msg":"slow"}
+{"level":50,"msg":"boom"}
+{"level":30,"msg":"level=error in a message"}
+E1103 12:00:00.000000       1 main.go:1] failed
+I1103 12:00:00.000000       1 main.go:2] ok
+    at main.go:3
+plain error text
+"#;
+
 /// Pods for `debug_container` (#64): `distroless-0` takes any debug
 /// container, `restricted-0` only one with a restricted security context,
 /// `locked-0` none (Pod Security refuses), `pending-0` is not running. Once
@@ -420,6 +433,10 @@ impl FakeApi {
                                 "metadata": {"name": "db", "namespace": NS, "uid": "7"},
                                 "spec": {"selector": {"matchLabels": {"app": "db"}}}});
                             ("200 OK", db.to_string())
+                        } else if method == "GET"
+                            && path.starts_with(&format!("{pods}/levels-0/log"))
+                        {
+                            ("200 OK", LEVELED_LOGS.to_owned())
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
@@ -647,6 +664,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ("get_logs", json!({"pod": "web-0", "allContainers": true, "container": "app"})),
         ("get_logs", json!({"pod": "web-0", "filter": "(", "regex": true})),
         ("get_logs", json!({"pod": "web-0", "filter": ""})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": "loud"})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": ""})),
         ("list_events", json!({"kind": "Secret", "name": "db"})),
         ("scale", json!({"kind": "Deployment", "name": "web/../../x", "replicas": 1})),
         ("delete_resource", json!({"kind": "RoleBinding", "name": "x"})),
@@ -1542,6 +1561,98 @@ async fn logs_by_selector_are_filtered_per_line_after_masking() {
         "{}",
         outcome.text
     );
+}
+
+#[tokio::test]
+async fn logs_by_min_level_cover_the_formats_and_count_what_was_read() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let call = |arguments: Value| f.server.call("agent", "get_logs", args(arguments));
+
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel warn: 9 read, 7 with a recognized level, 4 matched; \
+             2 without a recognized level were excluded)",
+            "",
+            "level=error msg=\"disk full\" password=***",
+            "{\"level\":\"warn\",\"token_count\":***,\"msg\":\"slow\"}",
+            "{\"level\":50,\"msg\":\"boom\"}",
+            "E1103 12:00:00.000000       1 main.go:1] failed",
+        ]
+    );
+
+    // Both narrow the result, and the note says so.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "error", "filter": "boom"})).await;
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel error: 9 read, 7 with a recognized level, 1 matched and the filter; \
+             2 without a recognized level were excluded)",
+            "",
+            "{\"level\":50,\"msg\":\"boom\"}",
+        ]
+    );
+
+    // The level comes from the masked line, and the filter can't see past it.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn", "filter": "hunter2"})).await;
+    assert!(!outcome.text.contains("hunter2"), "{}", outcome.text);
+    assert!(
+        outcome.text.contains("0 matched and the filter"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.contains("no line matched"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
+async fn logs_in_an_unknown_format_say_so_under_min_level() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "minLevel": "error"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome
+            .text
+            .starts_with("(minLevel error: 9 read, 0 with a recognized level, 0 matched; "),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("says nothing about their levels"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("ERROR db-0"), "{}", outcome.text);
+
+    // Without minLevel nothing changes: no counts, the same note.
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "filter": "absent"})),
+        )
+        .await;
+    assert!(
+        outcome.text.starts_with("(no line matched the filter)"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("minLevel"), "{}", outcome.text);
 }
 
 #[tokio::test]
