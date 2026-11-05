@@ -14,6 +14,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
@@ -154,6 +155,21 @@ impl McpServer {
         args: Map<String, Value>,
         progress: Option<tools::Progress>,
     ) -> CallOutcome {
+        self.call_cancellable(client, tool, args, progress, CancellationToken::new())
+            .await
+    }
+
+    /// [`McpServer::call_with_progress`] for a call `cancel` can stop: rmcp
+    /// lets a cancelled call run on, only the tool can end it (#109). It
+    /// ends as any call does, with its audit line.
+    pub(crate) async fn call_cancellable(
+        &self,
+        client: &str,
+        tool: &str,
+        args: Map<String, Value>,
+        progress: Option<tools::Progress>,
+        cancel: CancellationToken,
+    ) -> CallOutcome {
         let started = Instant::now();
         self.inner.session.note_call(client);
         let confirmer = AnnouncingConfirmer {
@@ -171,6 +187,7 @@ impl McpServer {
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
             progress: progress.clone(),
+            cancel,
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
             remembered: std::sync::Mutex::new(None),
@@ -446,11 +463,12 @@ impl ServerHandler for McpServer {
         let client = client_name(&context);
         let progress = progress_of(&context);
         let outcome = self
-            .call_with_progress(
+            .call_cancellable(
                 &client,
                 &request.name,
                 request.arguments.unwrap_or_default(),
                 progress,
+                context.ct.clone(),
             )
             .await;
         let content = vec![ContentBlock::text(outcome.text)];
@@ -524,6 +542,12 @@ const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, 
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
      (not for deletions, Secrets or nodes); the result of such a call then says it was approved that \
      way.";
+
+/// Whether a call of `tool` ends when it is cancelled. A relayed call of
+/// any other tool runs on as before, a change above all.
+pub(crate) fn stops_on_cancel(tool: &str) -> bool {
+    tool == "wait_for_condition"
+}
 
 /// What the agent is told about calls waiting for the user (#116): only
 /// clients that send a progress token get a notification.
@@ -941,6 +965,30 @@ fn catalog() -> Vec<ToolSpec> {
                     "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
                 })),
                 &["kind", "name"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "wait_for_condition",
+            description: "Wait until an object has a status condition, appears or goes away, \
+                          like kubectl wait, instead of polling get_resource. Pick objects by \
+                          exactly one of name and labelSelector. With labelSelector, a status \
+                          condition is met when every matching object has it and at least one \
+                          matches, exists when at least one matches, deleted when none matches \
+                          (also when none did from the start). Returns when met, or at the \
+                          timeout (default 120s, at most 600s) with the final state: what was \
+                          found, and the objects that do not meet it and why. A read that is \
+                          not allowed fails at once. The first call on a custom resource asks \
+                          the user, as list_resources and get_resource do.",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string", "description": "One object; it need not exist yet"},
+                    "labelSelector": {"type": "string", "description": "All objects it matches, e.g. app=web. Met means: for a status condition all of them and at least one, for exists at least one, for deleted none"},
+                    "condition": {"type": "string", "description": "A status condition as Type=Status (Ready=True, Available=False; Status is True, False or Unknown), exists (the object appears) or deleted (it goes away). A status condition about an older generation of the object does not count"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "condition"],
             ),
             read_only: true,
             destructive: false,
@@ -1419,3 +1467,5 @@ fn catalog() -> Vec<ToolSpec> {
 mod crd_access_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_tests;
