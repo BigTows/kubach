@@ -43,7 +43,7 @@ use rmcp::model::Tool;
 
 use kubach_core::secrets::value::wipe;
 
-use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer};
+use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, WaitingCall};
 use crate::grants::{Grant, GrantEntry};
 use crate::hosted::{Gone, HostedSessions};
 use crate::scope::SessionMode;
@@ -449,6 +449,15 @@ async fn hosted_call_route(State(handler): State<Handler>, body: Bytes) -> Respo
     json(&result)
 }
 
+async fn hosted_waiting_route(State(handler): State<Handler>, body: Bytes) -> Response {
+    match parse::<HostedId>(&body) {
+        Ok(HostedId { id, key }) => {
+            json(&hosted_or_unknown(&handler).and_then(|h| h.waiting(&id, &key)))
+        }
+        Err(response) => *response,
+    }
+}
+
 async fn hosted_ping_route(State(handler): State<Handler>, body: Bytes) -> Response {
     match parse::<HostedId>(&body) {
         Ok(HostedId { id, key }) => {
@@ -493,6 +502,7 @@ pub(crate) fn router(handler: Handler) -> axum::Router {
         .route("/hosted/start", post(host_route))
         .route("/hosted/tools", post(hosted_tools_route))
         .route("/hosted/call", post(hosted_call_route))
+        .route("/hosted/waiting", post(hosted_waiting_route))
         .route("/hosted/ping", post(hosted_ping_route))
         .route("/hosted/end", post(hosted_end_route))
         .with_state(handler)
@@ -645,6 +655,16 @@ impl BridgeClient {
             args,
         };
         self.answer("/hosted/call", &call).await
+    }
+
+    /// Calls of hosted session `id` waiting for the user's answer (#116).
+    /// An older app answers 404.
+    pub async fn hosted_waiting(
+        &self,
+        id: &str,
+        key: &str,
+    ) -> Result<Result<Vec<WaitingCall>, Gone>, BridgeError> {
+        self.answer("/hosted/waiting", &hosted_id(id, key)).await
     }
 
     /// Tells the app the process of hosted session `id` is alive.

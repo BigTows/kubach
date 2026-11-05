@@ -103,3 +103,7 @@ settings-audit-recent = 最近的调用
 settings-audit-file = 最新的在前。文件：{ $path }
 settings-audit-no-folder = 操作系统没有设置文件夹：不会记录任何内容。
 settings-audit-show-file = 显示文件
+
+settings-group-agent-notifications = 通知
+settings-agent-system-notifications = 代理请求通知
+settings-agent-system-notifications-description = 当代理等待你的答复且 Kubach 窗口已隐藏或未获得焦点时，显示系统通知。

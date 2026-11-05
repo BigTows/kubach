@@ -437,6 +437,9 @@ pub struct Agent {
     pub http_enabled: bool,
     /// Fixed, so agent configs keep working across restarts.
     pub http_port: u16,
+    /// A system notification when an agent waits for the user's answer and
+    /// the window is hidden or not focused (#102).
+    pub system_notifications: bool,
 }
 
 impl Default for Agent {
@@ -444,6 +447,7 @@ impl Default for Agent {
         Self {
             http_enabled: false,
             http_port: DEFAULT_MCP_PORT,
+            system_notifications: true,
         }
     }
 }
