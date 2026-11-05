@@ -1234,7 +1234,8 @@ fn catalog() -> Vec<ToolSpec> {
                           the user's approval. Returns the forward's id and 127.0.0.1:<port>; \
                           the forward ends with the session, or when you disconnect from Kubach \
                           (over HTTP: close the MCP session, or two minutes without an open \
-                          connection or a request).",
+                          stream or a request, once no connection runs through the forward). \
+                          port_forward_list tells why a forward closed.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -1257,7 +1258,8 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "port_forward_list",
             description: "Port-forwards of this session: target, ports, local address, state and \
-                          last error.",
+                          last error, then the last closed ones (state closed) with reason, \
+                          detail and closedAt.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
