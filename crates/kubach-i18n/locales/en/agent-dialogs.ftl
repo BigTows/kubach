@@ -12,6 +12,7 @@ agent-notice-reveal-off = Revealing Secrets is off
 agent-notice-refused = Agent refused
 # What the agent asked, in English.
 agent-notice-text = { $text }
+agent-system-notification-body = { $client } is waiting for your answer in Kubach (context { $context }).
 # $summary is what the agent asked, in English.
 agent-notice-mcp-off = { $summary }: AI agent access is off for this context.
 agent-notice-session-only = Allowed for this session only

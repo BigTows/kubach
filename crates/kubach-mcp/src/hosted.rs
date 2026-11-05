@@ -21,6 +21,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::ExternalSession;
+use crate::confirm::WaitingCall;
 use crate::server::{CallOutcome, McpServer, stops_on_cancel};
 use crate::session::Session;
 use kubach_core::sync;
@@ -249,6 +250,13 @@ impl HostedSessions {
             text: format!("the call failed: {error}"),
             is_error: true,
         }))
+    }
+
+    /// Calls of session `id` waiting for the user's answer right now (#116).
+    pub fn waiting(&self, id: &str, key: &str) -> Result<Vec<WaitingCall>, Gone> {
+        self.state()
+            .server(id, key)
+            .map(|server| server.session().waiting().list())
     }
 
     /// The process of `id` is alive.

@@ -613,6 +613,8 @@ pub struct AgentState {
     next_pending: u64,
     /// The pending confirmation the main window shows.
     shown: Option<u64>,
+    /// What the system notification about pending confirmations knows of.
+    system_notice: confirm_dialog::SystemNotice,
     /// Notices for the main window, oldest first.
     notices: VecDeque<Notice>,
     /// Errors of taking back a right, for the sessions screen.
@@ -733,6 +735,7 @@ impl AgentState {
             pending: VecDeque::new(),
             next_pending: 0,
             shown: None,
+            system_notice: confirm_dialog::SystemNotice::default(),
             notices: VecDeque::new(),
             grant_error: None,
             audit,

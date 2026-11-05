@@ -57,6 +57,7 @@ pub use access::{Access, Raises};
 pub use audit::{AuditEntry, AuditLog, DecidedBy};
 pub use confirm::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
+    WaitingCall, WaitingCalls,
 };
 pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{

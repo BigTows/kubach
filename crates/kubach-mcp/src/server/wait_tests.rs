@@ -605,6 +605,58 @@ async fn progress_tells_each_new_state_once_and_masked() {
     assert!(!told[1].contains("hunter2"), "{told:?}");
 }
 
+/// Hears the progress notifications of its calls.
+struct ProgressClient(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl rmcp::ClientHandler for ProgressClient {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0.send(params.message.unwrap_or_default()).ok();
+    }
+}
+
+/// All the way to a real client, through the token in `context.meta`.
+#[tokio::test]
+async fn progress_reaches_an_mcp_client() {
+    let f = fixture(Box::new(|n, _| match n {
+        0 => not_found(),
+        1 => Some((OK, pod("web-0", "False"))),
+        _ => Some((OK, pod("web-0", "True"))),
+    }))
+    .await;
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = f.server.clone();
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (told, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let client = ProgressClient(told).serve(client_io).await.unwrap();
+    // The rmcp client sends a progress token with every request.
+    let done = client
+        .call_tool(
+            CallToolRequestParams::new("wait_for_condition")
+                .with_arguments(args(by_name("Ready=True", 20))),
+        )
+        .await
+        .unwrap();
+    assert_ne!(done.is_error, Some(true));
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(2), heard.recv())
+            .await
+            .expect("a progress notification")
+            .unwrap()
+    };
+    assert_eq!(next().await, format!("Pod {NS}/web-0: not found"));
+    let state = next().await;
+    assert!(state.contains("Ready=False"), "{state}");
+    assert!(!state.contains("hunter2"), "{state}");
+    client.cancel().await.unwrap();
+}
+
 /// The session stays usable: a wait holds no lock while it waits.
 #[tokio::test]
 async fn other_calls_go_on_during_a_wait() {
