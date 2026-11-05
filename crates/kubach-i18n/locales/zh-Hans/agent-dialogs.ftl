@@ -28,6 +28,8 @@ agent-title-helm-uninstall = 卸载 Helm release？
 agent-title-chart-source = 允许 chart 源？
 agent-title-use-context = 允许代理在此上下文中工作？
 agent-title-namespaces = 允许代理读取更多命名空间？
+agent-title-batch-scale = 缩放这些对象？
+agent-title-batch-restart = 重启这些对象？
 agent-title-call = 批准代理的更改？
 agent-title-secret-create = 为新 Secret 输入值
 agent-title-secret-update = 更改 Secret
@@ -38,6 +40,8 @@ agent-title-secret-delete = 为代理删除 Secret？
 
 agent-arg-empty = （空）
 agent-command-header = { $count } 个参数，{ $bytes } 字节 · ␣ 表示空格，\n 表示换行，\u{"{"}…{"}"} 表示不可见字符
+agent-batch-objects = 将被更改的对象：{ $count }
+agent-batch-left-out = 未包含，不会更改：{ $count }
 agent-no-longer-pending = 此请求已不再等待。
 agent-dangerous-title = 越过 namespace 边界或读取 Secrets
 agent-dangerous-line = { $message } — { $path }

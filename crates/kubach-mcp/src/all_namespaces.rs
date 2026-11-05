@@ -20,13 +20,13 @@ use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, RequestKind, ask};
+use crate::event_tools::{EventFilter, MAX_EVENTS_READ, read_events, window_note};
 use crate::fields::Fields;
 use crate::policy::{Allowed, Denial, DenialCode, Request};
 use crate::scope::SessionMode;
 use crate::tools::{
-    Ctx, MAX_LIST_ITEMS, MAX_OUTPUT_BYTES, Selectors, ToolError, ToolOutput, authorize,
-    ensure_rbac, event_line, event_time, explain_selector, finish, kind_of, known_namespaces,
-    read_events, read_rows, table_heading,
+    Ctx, MAX_OUTPUT_BYTES, Selectors, ToolError, ToolOutput, authorize, ensure_rbac, event_line,
+    event_time, explain_selector, finish, kind_of, known_namespaces, read_rows, table_heading,
 };
 use kubach_core::sync;
 
@@ -60,18 +60,20 @@ const NO_ROOM: &str = "left out, the answer reached its size limit; lower `limit
 
 /// What an `allNamespaces` answer covers.
 #[derive(Debug, Default)]
-struct Coverage {
+pub(crate) struct Coverage {
     /// The session is pinned: its namespaces are all it can see.
     pinned: bool,
     read: Vec<String>,
     /// Namespaces left out, by why.
-    gaps: BTreeMap<String, Vec<String>>,
+    pub(crate) gaps: BTreeMap<String, Vec<String>>,
     /// Read, but with more items than the answer holds.
     cut: Vec<String>,
+    /// The read stopped at its bound: what it never reached is unknown.
+    unfinished: Vec<String>,
     /// Why other namespaces may exist that nobody here knows of.
-    unknown: Option<String>,
+    pub(crate) unknown: Option<String>,
     /// The answer to the question of this call, if it asked one.
-    answer: Option<&'static str>,
+    pub(crate) answer: Option<&'static str>,
 }
 
 impl Coverage {
@@ -85,7 +87,12 @@ impl Coverage {
     }
 
     fn is_complete(&self) -> bool {
-        self.gaps.is_empty() && self.cut.is_empty() && self.unknown.is_none()
+        self.everything_read() && self.cut.is_empty()
+    }
+
+    /// All there is was read, whether or not the answer holds it all.
+    fn everything_read(&self) -> bool {
+        self.gaps.is_empty() && self.unfinished.is_empty() && self.unknown.is_none()
     }
 
     /// The note the answer starts with.
@@ -118,6 +125,15 @@ impl Coverage {
                 self.cut.join(", ")
             );
         }
+        if !self.unfinished.is_empty() {
+            let _ = writeln!(
+                out,
+                "Not read to the end, newer events may be missing in: {}. At most \
+                 {MAX_EVENTS_READ} are read per namespace, in no time order; narrow with type, \
+                 reason or kind + name",
+                self.unfinished.join(", ")
+            );
+        }
         if let Some(unknown) = &self.unknown {
             let _ = writeln!(out, "Other namespaces may exist: {unknown}");
         }
@@ -133,6 +149,7 @@ impl Coverage {
                 "namespaces": self.read,
                 "notCovered": self.gaps,
                 "cut": self.cut,
+                "unfinished": self.unfinished,
                 "complete": self.is_complete(),
                 "question": self.answer,
             })),
@@ -143,7 +160,7 @@ impl Coverage {
     /// Takes a namespace's failure in. A selector the server turns down is
     /// wrong everywhere, and the session's end stops everything: those fail
     /// the call.
-    fn failed(
+    pub(crate) fn failed(
         &mut self,
         namespace: String,
         error: ToolError,
@@ -176,7 +193,7 @@ impl Coverage {
 
 /// The namespaces to read: granted or pinned ones, and the others once the
 /// user allowed opening them. Never a revoked one.
-async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
+pub(crate) async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
     let session = ctx.session;
     let mut coverage = Coverage {
         pinned: session.scope().pinned(),
@@ -193,12 +210,71 @@ async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
     };
     let plan = session.policy().all_namespaces_plan(&known);
     coverage.gap(REFUSED, plan.refused);
-    let mut targets = plan.readable;
-    let mut unopened = plan.unopened;
+    let summary = format!(
+        "{} wants to read all namespaces on {}: {} more for this session",
+        ctx.client_name,
+        session.scope().context,
+        plan.unopened.len()
+    );
+    opened(ctx, plan.readable, plan.unopened, coverage, summary).await
+}
+
+/// The namespaces out of `names` a batch may work in (#108), with a gap for
+/// each of the others. The agent named them, so one unopened namespace opens
+/// as in a call naming it. Several would set up identities across a cluster
+/// on one call, and that is asked once, as for `allNamespaces`.
+pub(crate) async fn named_targets(
+    ctx: &Ctx<'_>,
+    names: &[String],
+) -> Result<(Vec<String>, Coverage), ToolError> {
+    let session = ctx.session;
+    let mut coverage = Coverage {
+        pinned: session.scope().pinned(),
+        ..Coverage::default()
+    };
+    let (usable, plan) = {
+        let policy = session.policy();
+        let mut usable = Vec::new();
+        for name in names {
+            match policy.namespace(Some(name)) {
+                Ok(name) => usable.push(name),
+                Err(denial) => coverage.gap(denial.message, vec![name.clone()]),
+            }
+        }
+        let plan = policy.all_namespaces_plan(&usable);
+        (usable, plan)
+    };
+    let named = |mut found: Vec<String>| {
+        found.retain(|name| usable.contains(name));
+        found
+    };
+    coverage.gap(REFUSED, named(plan.refused));
+    let mut readable = named(plan.readable);
+    let mut unopened = named(plan.unopened);
+    if unopened.len() < 2 {
+        readable.append(&mut unopened);
+    }
+    let summary = format!(
+        "{} wants to change objects on {} in {} namespaces it has not opened yet",
+        ctx.client_name,
+        session.scope().context,
+        unopened.len()
+    );
+    opened(ctx, readable, unopened, coverage, summary).await
+}
+
+/// `targets`, and `unopened` once the user allowed opening them.
+async fn opened(
+    ctx: &Ctx<'_>,
+    mut targets: Vec<String>,
+    mut unopened: Vec<String>,
+    mut coverage: Coverage,
+    summary: String,
+) -> Result<(Vec<String>, Coverage), ToolError> {
     if unopened.is_empty() {
         return Ok((targets, coverage));
     }
-    match may_open(ctx, &unopened, &mut coverage).await? {
+    match may_open(ctx, &unopened, summary, &mut coverage).await? {
         Ok(()) => {
             let rest = unopened.split_off(unopened.len().min(MAX_OPENED_PER_CALL));
             targets.extend(unopened);
@@ -217,6 +293,7 @@ async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
 async fn may_open(
     ctx: &Ctx<'_>,
     names: &[String],
+    summary: String,
     coverage: &mut Coverage,
 ) -> Result<Result<(), String>, ToolError> {
     let session = ctx.session;
@@ -240,12 +317,7 @@ async fn may_open(
         client: ctx.client_name.to_owned(),
         tool: ctx.tool.to_owned(),
         namespace: String::new(),
-        summary: format!(
-            "{} wants to read all namespaces on {}: {} more for this session",
-            ctx.client_name,
-            scope.context,
-            names.len()
-        ),
+        summary,
         details: format!(
             "Namespaces: {}{more}\n\nKubach reads them one by one and sets up access in each, \
              as when the agent names a namespace: a temporary ServiceAccount where your rights \
@@ -292,7 +364,10 @@ async fn may_open(
 }
 
 /// Runs `read` on `namespaces`, a few at a time; the results come sorted.
-async fn fan_out<T, F, Fut>(namespaces: Vec<String>, read: F) -> Vec<(String, Result<T, ToolError>)>
+pub(crate) async fn fan_out<T, F, Fut>(
+    namespaces: Vec<String>,
+    read: F,
+) -> Vec<(String, Result<T, ToolError>)>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
@@ -310,7 +385,11 @@ where
 }
 
 /// Reads with a time limit, and past the moment a fresh Role takes effect.
-async fn settled<T, F, Fut>(ctx: &Ctx<'_>, allowed: &Allowed, read: F) -> Result<T, ToolError>
+pub(crate) async fn settled<T, F, Fut>(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    read: F,
+) -> Result<T, ToolError>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
@@ -339,7 +418,7 @@ where
 
 /// The namespaces of this call were each their own; none speaks for it in
 /// the audit log, which gets them from the call's coverage.
-fn forget_namespace(ctx: &Ctx<'_>) {
+pub(crate) fn forget_namespace(ctx: &Ctx<'_>) {
     *sync::lock(&ctx.namespace) = None;
 }
 
@@ -424,10 +503,11 @@ pub(crate) async fn list_resources(
 }
 
 /// `list_events` with `allNamespaces`: the newest `limit` events across the
-/// namespaces read.
+/// namespaces read. No namespace needs to give more than that.
 pub(crate) async fn list_events(
     ctx: &Ctx<'_>,
     request: &Request,
+    filter: &EventFilter,
     limit: usize,
 ) -> Result<ToolOutput, ToolError> {
     let Request::Events { object, .. } = request else {
@@ -442,46 +522,62 @@ pub(crate) async fn list_events(
         };
         let allowed = authorize(ctx, &one).await?;
         ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
-        settled(ctx, &allowed, || read_events(ctx, &allowed)).await
+        settled(ctx, &allowed, || read_events(ctx, &allowed, filter, limit)).await
     })
     .await;
     forget_namespace(ctx);
 
     let mut events = Vec::new();
+    // Per namespace, the events found and not shown.
+    let mut hidden = BTreeMap::new();
     for (namespace, result) in results {
         match result {
-            Ok((found, more)) => {
-                events.extend(found.into_iter().map(|event| (namespace.clone(), event)));
-                if more {
-                    coverage.cut.push(namespace.clone());
+            Ok(read) => {
+                hidden.insert(namespace.clone(), read.found);
+                events.extend(
+                    read.events
+                        .into_iter()
+                        .map(|event| (namespace.clone(), event)),
+                );
+                if read.more {
+                    coverage.unfinished.push(namespace.clone());
                 }
                 coverage.read.push(namespace);
             }
             Err(error) => coverage.failed(namespace, error, None)?,
         }
     }
+    let found: usize = hidden.values().sum();
     events.sort_by_key(|(_, event)| event_time(event));
+    let shown = &events[events.len().saturating_sub(limit)..];
     let now = Timestamp::now();
-    let skip = events.len().saturating_sub(limit);
-    let mut body = String::new();
-    for (namespace, event) in events.iter().skip(skip) {
-        let _ = writeln!(body, "{namespace}\t{}", event_line(event, now));
+    let mut rows = String::new();
+    for (namespace, event) in shown {
+        let _ = writeln!(rows, "{namespace}\t{}", event_line(event, now));
+        if let Some(count) = hidden.get_mut(namespace) {
+            *count -= 1;
+        }
     }
-    if body.is_empty() {
+    coverage.cut = hidden
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(namespace, _)| namespace)
+        .collect();
+
+    let mut body = String::new();
+    if let Some(since) = filter.since_seconds() {
+        let missing = (!coverage.everything_read()).then_some("as the coverage note says");
+        body.push_str(&window_note(since, shown.len(), found, missing));
+    }
+    body.push_str(&rows);
+    if rows.is_empty() {
         body.push_str("(no events)\n");
     }
-    if skip > 0 {
+    if shown.len() < found {
         let _ = writeln!(
             body,
-            "(the newest {limit} of {} events read; raise `limit`, at most 200)",
-            events.len()
-        );
-    }
-    if !coverage.cut.is_empty() {
-        let _ = writeln!(
-            body,
-            "(at most {MAX_LIST_ITEMS} events are read per namespace; newer ones may be missing \
-             where the coverage note says so)"
+            "(the newest {} of {found} events read; raise `limit`, at most 200)",
+            shown.len()
         );
     }
     Ok(coverage.output(&body))
@@ -531,6 +627,18 @@ mod tests {
         };
         assert!(unknown.note().starts_with("Coverage: PARTIAL"));
         assert!(unknown.note().contains("Other namespaces may exist"));
+
+        let unfinished = Coverage {
+            read: names(&["a"]),
+            unfinished: names(&["a"]),
+            ..Coverage::default()
+        };
+        assert!(unfinished.note().starts_with("Coverage: PARTIAL"));
+        assert!(
+            unfinished
+                .note()
+                .contains("newer events may be missing in: a")
+        );
     }
 
     #[test]

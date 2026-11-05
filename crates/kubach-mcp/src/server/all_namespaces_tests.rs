@@ -30,11 +30,16 @@ enum Reply {
     Status(&'static str, u16),
 }
 
+/// An answer to an event list: the status line and the body.
+pub(super) type EventsReply = fn(&str) -> (String, Value);
+
 #[derive(Clone, Default)]
-struct Cluster {
+pub(super) struct Cluster {
     /// The namespaces it lists; `None`: listing them is forbidden.
     namespaces: Option<Vec<&'static str>>,
     replies: BTreeMap<&'static str, Reply>,
+    /// Answers event lists, given the whole path; default: [`events`].
+    events: Option<EventsReply>,
 }
 
 fn status(line: &str, code: u16) -> Value {
@@ -72,8 +77,15 @@ fn events(namespace: &str) -> Value {
 }
 
 impl Cluster {
-    fn answer(&self, path: &str) -> (String, Value) {
-        let path = path.split('?').next().unwrap_or(path);
+    pub(super) fn with_events(events: EventsReply) -> Self {
+        Self {
+            events: Some(events),
+            ..Self::default()
+        }
+    }
+
+    fn answer(&self, full_path: &str) -> (String, Value) {
+        let path = full_path.split('?').next().unwrap_or(full_path);
         let ok = |body| ("200 OK".to_owned(), body);
         if path == "/api/v1/namespaces" {
             return match &self.namespaces {
@@ -93,7 +105,10 @@ impl Cluster {
         let mut parts = path.trim_start_matches("/api/v1/namespaces/").split('/');
         let namespace = parts.next().unwrap_or_default();
         if parts.next() == Some("events") {
-            return ok(events(namespace));
+            return match self.events {
+                Some(answer) => answer(full_path),
+                None => ok(events(namespace)),
+            };
         }
         match self.replies.get(namespace) {
             Some(Reply::Pods(names)) => ok(pods(namespace, names, "")),
@@ -103,7 +118,7 @@ impl Cluster {
         }
     }
 
-    async fn serve(self) -> (String, Arc<Mutex<Vec<String>>>) {
+    pub(super) async fn serve(self) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -225,6 +240,7 @@ fn four_teams() -> Cluster {
             ("team-c", Reply::Pods(&["c-0"])),
             ("team-d", Reply::Pods(&["d-0"])),
         ]),
+        ..Cluster::default()
     }
 }
 
@@ -382,6 +398,7 @@ async fn namespaces_nobody_may_list_make_the_answer_partial() {
     let cluster = Cluster {
         namespaces: None,
         replies: BTreeMap::from([("team-a", Reply::Pods(&["a-0"]))]),
+        ..Cluster::default()
     };
     let (url, _) = cluster.serve().await;
     let session = session(&url, &[], &["team-a"], &[]);
@@ -461,8 +478,14 @@ async fn events_merge_across_namespaces_newest_kept() {
     let server = McpServer::new(session, Arc::new(DenyAll), None);
     let call = args(json!({"allNamespaces": true, "limit": 2}));
     let outcome = server.call("agent", "list_events", call).await;
+    // The limit left events out: both namespaces had more than is shown.
     assert!(
-        outcome.text.starts_with("Coverage: complete"),
+        outcome.text.starts_with("Coverage: PARTIAL"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("more items exist in: team-a, team-b"),
         "{}",
         outcome.text
     );

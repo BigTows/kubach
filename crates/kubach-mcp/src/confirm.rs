@@ -92,6 +92,10 @@ pub enum RequestKind {
     /// (#107): a yes opens them for this and later such calls, until the
     /// session ends. One question for all of them, never one per namespace.
     Namespaces { names: Vec<String> },
+    /// A batch of scales or restarts (#108): one question for every object
+    /// it will change, never remembered. `namespace` of the request is
+    /// empty when the batch spans several.
+    Batch { batch: Box<BatchChange> },
     /// The agent chose this context with `use_context` (#421): a yes
     /// starts a session there, without namespaces or rights. `context` of
     /// the request names it; `session_id` is empty, no session runs yet.
@@ -101,6 +105,56 @@ pub enum RequestKind {
         /// `kubeconfig` or `vault`.
         source: String,
     },
+}
+
+/// What a [`BatchChange`] does to its objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BatchAction {
+    Scale,
+    Restart,
+}
+
+/// One object a batch changes, as the user approves it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchObject {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// Replicas now and after a scale; `None` for a restart.
+    pub replicas: Option<(i64, i64)>,
+}
+
+impl BatchObject {
+    /// `Deployment shop/web`.
+    pub fn label(&self) -> String {
+        format!("{} {}/{}", self.kind, self.namespace, self.name)
+    }
+
+    /// `3 → 0`, for a scale.
+    pub fn change(&self) -> Option<String> {
+        self.replicas.map(|(from, to)| format!("{from} → {to}"))
+    }
+}
+
+/// The content of a [`RequestKind::Batch`]: `objects` is exactly what will
+/// change, in full; the UI must show every one of them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchChange {
+    pub action: BatchAction,
+    pub objects: Vec<BatchObject>,
+    /// What the agent asked for and the batch does not include, with why.
+    pub left_out: Vec<String>,
+}
+
+impl BatchChange {
+    /// The namespaces of the objects, sorted.
+    pub fn namespaces(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.objects.iter().map(|o| o.namespace.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// What the user is asked to approve.
