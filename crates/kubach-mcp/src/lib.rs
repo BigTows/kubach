@@ -43,6 +43,7 @@ pub mod transport;
 
 mod all_namespaces;
 mod debug_tools;
+mod fields;
 mod log_level;
 mod node_maintenance;
 mod node_tools;

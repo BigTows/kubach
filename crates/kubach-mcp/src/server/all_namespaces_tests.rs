@@ -146,7 +146,7 @@ impl Cluster {
     }
 }
 
-fn session(url: &str, pinned: &[&str], read: &[&str], refused: &[&str]) -> Arc<Session> {
+pub(super) fn session(url: &str, pinned: &[&str], read: &[&str], refused: &[&str]) -> Arc<Session> {
     session_under(&permissive(), url, pinned, read, refused)
 }
 
@@ -185,7 +185,7 @@ fn session_under(
     session
 }
 
-fn args(value: Value) -> Map<String, Value> {
+pub(super) fn args(value: Value) -> Map<String, Value> {
     match value {
         Value::Object(map) => map,
         _ => panic!("not an object"),

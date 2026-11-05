@@ -628,6 +628,24 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
     })
 }
 
+/// The `fields` argument of `get_resource` and `list_resources` (#110).
+fn fields_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 32,
+        "description": "Only these fields of each object, masked as in the whole object; \
+                        metadata.name and metadata.namespace are always kept. A path is keys \
+                        joined by dots, with [N] or [*] for list items and ['key'] for a key \
+                        with dots or slashes: spec.strategy.type, \
+                        spec.template.spec.containers[*].image, \
+                        metadata.labels['app.kubernetes.io/name']. Paths that match nothing in \
+                        an object are listed under fieldsNotFound in it; a malformed path is an \
+                        error",
+    })
+}
+
 fn kind_props(extra: Value) -> Value {
     let mut props = json!({
         "kind": {"type": "string", "description": "Kind or plural resource, e.g. Deployment or deployments"},
@@ -683,7 +701,8 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_resources",
-            description: "List resources of a kind in a namespace, as a table. With allNamespaces \
+            description: "List resources of a kind in a namespace, as a table; with fields, as one \
+                          YAML document per object, holding only those fields. With allNamespaces \
                           true: in every namespace this session may read, one by one under each \
                           namespace's identity, not cluster-wide. The answer starts with its \
                           coverage: which namespaces were read and which were not, and why; a \
@@ -695,6 +714,7 @@ fn catalog() -> Vec<ToolSpec> {
                     "fieldSelector": {"type": "string", "description": "field=value, field==value or field!=value, comma-separated, e.g. spec.nodeName=node-1 or status.phase=Running. Fields depend on the kind; not metadata.namespace"},
                     "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most items, per namespace with allNamespaces"},
+                    "fields": fields_schema(),
                 })),
                 &["kind"],
             ),
@@ -703,9 +723,10 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_resource",
-            description: "One resource as YAML (Secret values and last-applied-configuration masked).",
+            description: "One resource as YAML (Secret values and last-applied-configuration \
+                          masked); with fields, only those fields.",
             schema: object_schema(
-                kind_props(json!({"name": {"type": "string"}})),
+                kind_props(json!({"name": {"type": "string"}, "fields": fields_schema()})),
                 &["kind", "name"],
             ),
             read_only: true,
@@ -1457,6 +1478,8 @@ fn catalog() -> Vec<ToolSpec> {
 mod all_namespaces_tests;
 #[cfg(test)]
 mod crd_access_tests;
+#[cfg(test)]
+mod fields_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

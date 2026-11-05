@@ -20,6 +20,7 @@ use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, RequestKind, ask};
+use crate::fields::Fields;
 use crate::policy::{Allowed, Denial, DenialCode, Request};
 use crate::scope::SessionMode;
 use crate::tools::{
@@ -349,6 +350,7 @@ pub(crate) async fn list_resources(
     allowed: &Allowed,
     request: &Request,
     limit: Option<u32>,
+    fields: Option<&Fields>,
 ) -> Result<ToolOutput, ToolError> {
     let Request::List {
         kind,
@@ -373,7 +375,10 @@ pub(crate) async fn list_resources(
             field_selector: field_selector.clone(),
         };
         let allowed = authorize(ctx, &one).await?;
-        settled(ctx, &allowed, || read_rows(ctx, &allowed, selectors, limit)).await
+        settled(ctx, &allowed, || {
+            read_rows(ctx, &allowed, selectors, limit, fields)
+        })
+        .await
     })
     .await;
     forget_namespace(ctx);
@@ -391,7 +396,11 @@ pub(crate) async fn list_resources(
         };
         let mut section = String::new();
         for line in &found.lines {
-            let _ = writeln!(section, "{namespace}\t{line}");
+            // A document of `fields` names its namespace itself.
+            let _ = match fields {
+                Some(_) => writeln!(section, "{line}"),
+                None => writeln!(section, "{namespace}\t{line}"),
+            };
         }
         if rows.len() + section.len() > MAX_ROWS_BYTES {
             coverage.gap(NO_ROOM, vec![namespace]);
@@ -404,10 +413,13 @@ pub(crate) async fn list_resources(
         }
         coverage.read.push(namespace);
     }
-    let heading = table_heading(ctx, kind_of(allowed));
+    let heading = match fields {
+        Some(_) => String::new(),
+        None => format!("NAMESPACE\t{}\n", table_heading(ctx, kind_of(allowed))),
+    };
     let read = coverage.read.len();
     Ok(coverage.output(&format!(
-        "NAMESPACE\t{heading}\n{rows}({shown} {plural} in {read} namespaces)"
+        "{heading}{rows}({shown} {plural} in {read} namespaces)"
     )))
 }
 

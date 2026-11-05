@@ -32,10 +32,11 @@ use tokio_util::sync::CancellationToken;
 use crate::access::Access;
 use crate::all_namespaces;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
+use crate::fields::Fields;
 use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
 use crate::log_level::{Level, LevelCounts};
-use crate::masking::{mask_object, mask_text, truncate};
+use crate::masking::{Masked, mask_object, mask_text, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
     service_account_changes, walk_fields,
@@ -229,6 +230,7 @@ struct ListArgs {
     limit: Option<u32>,
     #[serde(default)]
     all_namespaces: bool,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +240,16 @@ struct ObjectArgs {
     api_version: Option<String>,
     name: String,
     namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetArgs {
+    kind: String,
+    api_version: Option<String>,
+    name: String,
+    namespace: Option<String>,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -835,6 +847,7 @@ pub(crate) async fn run(
         }
         "list_resources" => {
             let a: ListArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
             let request = Request::List {
                 kind: kind_ref(a.kind, a.api_version),
                 namespace: a.namespace,
@@ -844,18 +857,38 @@ pub(crate) async fn run(
             };
             let allowed = authorize(ctx, &request).await?;
             if a.all_namespaces {
-                return all_namespaces::list_resources(ctx, &allowed, &request, a.limit).await;
+                return all_namespaces::list_resources(
+                    ctx,
+                    &allowed,
+                    &request,
+                    a.limit,
+                    fields.as_ref(),
+                )
+                .await;
             }
             let selectors = Selectors {
                 label: a.label_selector.as_deref(),
                 field: a.field_selector.as_deref(),
             };
-            list_resources(ctx, &allowed, selectors, a.limit)
+            list_resources(ctx, &allowed, selectors, a.limit, fields.as_ref())
                 .await
                 .map_err(|error| explain_selector(error, selectors.field))
                 .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
         }
-        "get_resource" | "describe_resource" => {
+        "get_resource" => {
+            let a: GetArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
+            let request = Request::Get {
+                kind: kind_ref(a.kind, a.api_version),
+                name: a.name,
+                namespace: a.namespace,
+            };
+            let allowed = authorize(ctx, &request).await?;
+            get_resource(ctx, &allowed, fields.as_ref())
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+        }
+        "describe_resource" => {
             let a: ObjectArgs = parse(args)?;
             let request = Request::Get {
                 kind: kind_ref(a.kind, a.api_version),
@@ -863,12 +896,9 @@ pub(crate) async fn run(
                 namespace: a.namespace,
             };
             let allowed = authorize(ctx, &request).await?;
-            let result = if tool == "get_resource" {
-                get_resource(ctx, &allowed).await
-            } else {
-                describe_resource(ctx, &allowed).await
-            };
-            result.map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+            describe_resource(ctx, &allowed)
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
         }
         "list_events" => {
             let a: EventsArgs = parse(args)?;
@@ -1498,7 +1528,8 @@ pub(crate) struct Selectors<'a> {
     pub field: Option<&'a str>,
 }
 
-/// The rows of one namespace, without the heading.
+/// The rows of one namespace, without the heading: table lines or, with
+/// `fields`, one YAML document each.
 pub(crate) struct Rows {
     pub lines: Vec<String>,
     /// The answer was cut by its `limit`: the server has more items.
@@ -1523,6 +1554,7 @@ pub(crate) async fn read_rows(
     allowed: &Allowed,
     selectors: Selectors<'_>,
     limit: Option<u32>,
+    fields: Option<&Fields>,
 ) -> Result<Rows, ToolError> {
     let kind = kind_of(allowed);
     let client = ctx.session.client_in(&allowed.namespace)?;
@@ -1541,13 +1573,14 @@ pub(crate) async fn read_rows(
         .items
         .iter()
         .filter(|obj| ensure_namespace(obj, &allowed.namespace).is_ok())
-        .map(|obj| {
-            plugin
+        .map(|obj| match fields {
+            Some(fields) => fields.row(&Masked::object(obj, &kind.api)),
+            None => plugin
                 .cells(obj)
                 .iter()
                 .map(|c| render_cell(c, now))
                 .collect::<Vec<_>>()
-                .join("\t")
+                .join("\t"),
         })
         .collect();
     Ok(Rows {
@@ -1585,11 +1618,15 @@ async fn list_resources(
     allowed: &Allowed,
     selectors: Selectors<'_>,
     limit: Option<u32>,
+    fields: Option<&Fields>,
 ) -> Result<ToolOutput, ToolError> {
     let kind = kind_of(allowed);
-    let rows = read_rows(ctx, allowed, selectors, limit).await?;
-    let mut out = table_heading(ctx, kind);
-    out.push('\n');
+    let rows = read_rows(ctx, allowed, selectors, limit, fields).await?;
+    let mut out = String::new();
+    if fields.is_none() {
+        out = table_heading(ctx, kind);
+        out.push('\n');
+    }
     for line in &rows.lines {
         out.push_str(line);
         out.push('\n');
@@ -1614,11 +1651,17 @@ pub(crate) fn has_more(metadata: &ListMeta) -> bool {
     metadata.continue_.as_deref().is_some_and(|c| !c.is_empty())
 }
 
-async fn get_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
+async fn get_resource(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    fields: Option<&Fields>,
+) -> Result<ToolOutput, ToolError> {
     let obj = fetch(&ctx.session.client_in(&allowed.namespace)?, allowed).await?;
-    Ok(ToolOutput::read(finish(&core_apply::to_yaml(
-        &masked_value(&obj),
-    ))))
+    let text = match fields {
+        Some(fields) => fields.document(&Masked::object(&obj, &kind_of(allowed).api)),
+        None => core_apply::to_yaml(&masked_value(&obj)),
+    };
+    Ok(ToolOutput::read(finish(&text)))
 }
 
 async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
