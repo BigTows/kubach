@@ -59,8 +59,21 @@ pub(crate) fn helm_env(settings: &settings::Settings, in_file: bool) -> kubach_m
         kubeconfig: in_file.then(|| {
             kubach_core::helm::cli::kubeconfig_files(&settings.clusters.resolved_kubeconfig_paths())
         }),
+        vault: None,
         paths: kubach_core::helm::repo::HelmPaths::from_env(),
     }
+}
+
+/// `context` of the vault for a helm call the user allows under their
+/// credentials (#113): that one context only, written to a file just for
+/// that call, in the folder of the local terminal's temporary kubeconfigs
+/// (ADR 0015), which is cleared at quit and, after a crash, at the next
+/// start.
+fn vault_kubeconfig(contexts: &Contexts, context: &str) -> Option<kubach_mcp::VaultKubeconfig> {
+    Some(kubach_mcp::VaultKubeconfig::new(
+        contexts.single_context(context, None)?,
+        kubach_core::kubeconfig::temp::dir()?,
+    ))
 }
 
 /// Audit log of every MCP call, in the config directory (JSON lines).
@@ -1112,7 +1125,10 @@ impl AgentState {
             profile: Profile::Deploy,
             ttl: None,
         };
-        let helm = helm_env(&app_settings, !in_vault);
+        let mut helm = helm_env(&app_settings, !in_vault);
+        if in_vault {
+            helm.vault = vault_kubeconfig(&contexts, &context);
+        }
         let question = ConfirmationRequest {
             kind: RequestKind::UseContext {
                 server_url,
@@ -1267,10 +1283,12 @@ impl AgentState {
         };
         let confirmer: Arc<dyn Confirmer> = Arc::new(self.confirmer.clone());
         let audit = self.audit.clone();
-        // A vault context is in no kubeconfig file: Helm works there only
-        // under a server-side identity.
-        let helm =
-            AppSettings::try_global(cx).map(|settings| helm_env(settings.read(cx).get(), false));
+        // A vault context is in no kubeconfig file: Helm works there under
+        // a server-side identity, or for one call the user allows (#113).
+        let helm = AppSettings::try_global(cx).map(|settings| kubach_mcp::HelmEnv {
+            vault: vault_kubeconfig(&contexts, &plan.spec.context),
+            ..helm_env(settings.read(cx).get(), false)
+        });
         let pid = request.pid;
         // The agent's forwards run here and show on the "Port forwards"
         // screen (#17).

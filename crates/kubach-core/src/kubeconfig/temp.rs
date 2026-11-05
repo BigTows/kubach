@@ -1,6 +1,8 @@
 //! Temporary kubeconfig of a local terminal (#319, ADR 0015): one context —
 //! the one open in Kubach — with its namespace, written to a private file the
-//! terminal's shell gets as `KUBECONFIG`.
+//! terminal's shell gets as `KUBECONFIG`. An agent's helm call on a vault
+//! context under the user's credentials uses the same file for as long as
+//! helm runs (#113).
 //!
 //! The file holds credentials (tokens, client keys, materialized vault
 //! configs), so it is created readable by the owner only (`0600` from the
@@ -329,6 +331,20 @@ contexts:
         drop(file);
         assert!(!path.exists());
         assert!(second.path().exists());
+    }
+
+    #[test]
+    fn file_is_removed_when_a_panic_unwinds() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("kubeconfig");
+        let single = single_context(&config(), "prod", None).unwrap();
+        let panicked = std::panic::catch_unwind(|| {
+            let file = TempKubeconfig::create(&dir, &single).unwrap();
+            assert!(file.path().exists());
+            panic!("helm's caller panicked");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]
