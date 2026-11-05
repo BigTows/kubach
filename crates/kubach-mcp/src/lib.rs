@@ -41,6 +41,7 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod all_namespaces;
 mod debug_tools;
 mod node_tools;
 mod rollout_tools;

@@ -376,7 +376,9 @@ impl McpServer {
             )
         } else {
             "Pass `namespace` to the tools; list_namespaces shows the namespaces Kubach knows \
-             of. Any namespace works, as many as you need."
+             of. Any namespace works, as many as you need. For a question about all of them, \
+             pass allNamespaces to list_resources or list_events instead of calling namespace \
+             by namespace, and read the coverage note: it says what was left out."
                 .to_owned()
         };
         let more = " Tools beyond your access are marked \"Requires your approval in Kubach\": \
@@ -635,11 +637,18 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_resources",
-            description: "List resources of a kind in the session namespace, as a table.",
+            description: "List resources of a kind in a namespace, as a table. With allNamespaces \
+                          true: in every namespace this session may read, one by one under each \
+                          namespace's identity, not cluster-wide. The answer starts with its \
+                          coverage: which namespaces were read and which were not, and why; a \
+                          PARTIAL answer is not the whole cluster. Namespaces the session has \
+                          not opened yet are asked about once, in one question to the user.",
             schema: object_schema(
                 kind_props(json!({
                     "labelSelector": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "fieldSelector": {"type": "string", "description": "field=value, field==value or field!=value, comma-separated, e.g. spec.nodeName=node-1 or status.phase=Running. Fields depend on the kind; not metadata.namespace"},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most items, per namespace with allNamespaces"},
                 })),
                 &["kind"],
             ),
@@ -668,11 +677,15 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_events",
-            description: "Recent events in the namespace, optionally for one object (kind + name).",
+            description: "Recent events in a namespace, optionally for one object (kind + name). \
+                          With allNamespaces true: in every namespace this session may read, \
+                          the newest across them, with the same coverage note as \
+                          list_resources.",
             schema: object_schema(
                 kind_props(json!({
                     "name": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most events, in all with allNamespaces"},
                 })),
                 &[],
             ),
@@ -1324,6 +1337,8 @@ fn catalog() -> Vec<ToolSpec> {
     ]
 }
 
+#[cfg(test)]
+mod all_namespaces_tests;
 #[cfg(test)]
 mod crd_access_tests;
 #[cfg(test)]

@@ -624,7 +624,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ]);
     }
     attempts.extend([
-        ("list_resources", json!({"kind": "Pod", "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Pod", "namespace": NS, "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Secret", "allNamespaces": true})),
         ("list_resources", json!({"kind": "Pod", "fieldSelector": "metadata.namespace=kube-system"})),
         ("list_resources", json!({"kind": "Namespace"})),
         ("list_resources", json!({"kind": "nodes"})),
