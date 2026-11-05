@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use rmcp::model::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::ExternalSession;
 use crate::confirm::WaitingCall;
-use crate::server::{CallOutcome, McpServer};
+use crate::server::{CallOutcome, McpServer, stops_on_cancel};
 use crate::session::Session;
 use kubach_core::sync;
 
@@ -231,7 +232,24 @@ impl HostedSessions {
         args: Map<String, Value>,
     ) -> Result<CallOutcome, Gone> {
         let server = self.state().server(id, key)?;
-        Ok(server.call(client, tool, args).await)
+        if !stops_on_cancel(tool) {
+            return Ok(server.call(client, tool, args).await);
+        }
+        // A cancelled call reaches the app as a dropped request, which
+        // drops this future. On its own task the call still ends through
+        // its audit line (#109).
+        let cancel = CancellationToken::new();
+        let _dropped = cancel.clone().drop_guard();
+        let (client, tool) = (client.to_owned(), tool.to_owned());
+        let call = tokio::spawn(async move {
+            server
+                .call_cancellable(&client, &tool, args, None, cancel)
+                .await
+        });
+        Ok(call.await.unwrap_or_else(|error| CallOutcome {
+            text: format!("the call failed: {error}"),
+            is_error: true,
+        }))
     }
 
     /// Calls of session `id` waiting for the user's answer right now (#116).
