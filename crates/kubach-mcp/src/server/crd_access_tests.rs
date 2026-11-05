@@ -389,3 +389,73 @@ async fn an_impersonated_identity_without_the_right_is_explained() {
     // Here the API server decides: the user's own rights say nothing.
     assert_eq!(cluster.lock().unwrap().volume_reads, 1);
 }
+
+fn wait_for_volume() -> Map<String, Value> {
+    match json!({"kind": "Volume", "apiVersion": "longhorn.io/v1beta2", "namespace": NS,
+                 "labelSelector": "app=data", "condition": "exists", "timeoutSeconds": 60})
+    {
+        Value::Object(map) => map,
+        _ => unreachable!(),
+    }
+}
+
+/// `wait_for_condition` reads as `list_resources` does (#109): the first
+/// call asks and extends the Role, with `get` and `list`, not `watch`.
+#[tokio::test]
+async fn a_wait_on_a_custom_resource_takes_the_first_use_path() {
+    let (url, cluster) = start_cluster(true).await;
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = server_on(&url, &SecurityPolicy::default(), confirmer.clone()).await;
+
+    let outcome = server
+        .call("agent", "wait_for_condition", wait_for_volume())
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(access_questions(&confirmer), [CRDS]);
+    {
+        let cluster = cluster.lock().unwrap();
+        assert!(cluster.role_allows(GROUP, "volumes", "get"));
+        assert!(cluster.role_allows(GROUP, "volumes", "list"));
+        assert!(!cluster.role_allows(GROUP, "volumes", "watch"));
+    }
+    let outcome = server
+        .call("agent", "wait_for_condition", wait_for_volume())
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert_eq!(access_questions(&confirmer), [CRDS], "asked once");
+    server.session().close().await.unwrap();
+}
+
+/// A wait the user's own RBAC rules out says so at once, without reading.
+#[tokio::test]
+async fn a_wait_beyond_the_users_rbac_fails_at_once() {
+    let (url, cluster) = start_cluster(false).await;
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = server_on(&url, &SecurityPolicy::default(), confirmer.clone()).await;
+
+    let started = std::time::Instant::now();
+    let outcome = server
+        .call("agent", "wait_for_condition", wait_for_volume())
+        .await;
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("no right to"), "{}", outcome.text);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(cluster.lock().unwrap().volume_reads, 0);
+    server.session().close().await.unwrap();
+}
+
+/// A denied first use does not start waiting either.
+#[tokio::test]
+async fn a_wait_the_user_refuses_fails_at_once() {
+    let (url, cluster) = start_cluster(true).await;
+    let confirmer = Arc::new(ScriptedConfirmer::denying());
+    let server = server_on(&url, &SecurityPolicy::default(), confirmer.clone()).await;
+
+    let outcome = server
+        .call("agent", "wait_for_condition", wait_for_volume())
+        .await;
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert_eq!(access_questions(&confirmer), [CRDS]);
+    assert_eq!(cluster.lock().unwrap().volume_reads, 0);
+    server.session().close().await.unwrap();
+}

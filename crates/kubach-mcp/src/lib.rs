@@ -50,6 +50,7 @@ mod secret_tools;
 pub mod secret_write;
 mod tools;
 mod topology_tools;
+mod wait_tools;
 
 #[cfg(test)]
 mod testutil;

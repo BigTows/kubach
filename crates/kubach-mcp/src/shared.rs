@@ -469,7 +469,7 @@ impl ServerHandler for SharedServer {
         }
         if let Some(proxy) = self.hosted() {
             let (outcome, list_changed) = proxy
-                .call_with_progress(&client, &request.name, args, progress)
+                .call_cancellable(&client, &request.name, args, progress, &context.ct)
                 .await;
             if list_changed {
                 let _ = context.peer.notify_tool_list_changed().await;
