@@ -1944,6 +1944,14 @@ users:
 "#;
 
     #[test]
+    fn helm_gets_a_vault_context_only_if_it_is_known() {
+        let contexts = kubach_core::Contexts::from_yaml(KUBECONFIG).unwrap();
+        let vault = super::vault_kubeconfig(&contexts, "dev").unwrap();
+        assert!(!format!("{vault:?}").contains("secret-token"));
+        assert!(super::vault_kubeconfig(&contexts, "missing").is_none());
+    }
+
+    #[test]
     fn the_agent_may_choose_only_allowed_contexts() {
         use kubach_core::Contexts;
         use kubach_core::settings::{ContextKey, ContextPolicy, Settings};
