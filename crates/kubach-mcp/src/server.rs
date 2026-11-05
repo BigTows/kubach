@@ -113,6 +113,8 @@ impl McpServer {
                         .find("metrics.k8s.io", "PodMetrics")
                         .is_some(),
                     "get_secret_value" => scope.policy.reveal_allowed(),
+                    // Refused in a pinned session; drain_node still previews.
+                    "cordon_node" | "uncordon_node" => !scope.pinned(),
                     _ => true,
                 };
                 let needed = tool_access(spec.name);
@@ -402,7 +404,10 @@ impl McpServer {
              {access}. Access says which tools you may call without asking for more; it \
              approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
              and calls across all namespaces are not available, except nodes: list_nodes, \
-             describe_node and top_nodes read them (they need access to nodes). For images \
+             describe_node and top_nodes read them (they need access to nodes), and \
+             cordon_node, uncordon_node and drain_node change them with the user's credentials \
+             (they need access to nodes and changes; drain_node with preview shows the pods \
+             first). For images \
              without a shell (distroless) use debug_container, then exec into it. \
              {secrets}{writes} Call \
              `session_info` for details.",
@@ -506,11 +511,11 @@ struct ToolSpec {
 /// [`Confirmation::Required`](crate::policy::Confirmation::Required), and
 /// only what [`rememberable`](crate::remember::rememberable) allows may
 /// skip the window after "don't ask again".
-const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets), \
+const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets, nodes), \
      command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
      machine) is previewed and confirmed by the user one by one, even within your access. The \
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
-     (not for deletions or Secrets); the result of such a call then says it was approved that \
+     (not for deletions, Secrets or nodes); the result of such a call then says it was approved that \
      way.";
 
 /// Whether every real call of tool `name` is confirmed by the user (a dry
@@ -546,6 +551,11 @@ fn tool_access(name: &str) -> Option<Access> {
         | "helm_release_history"
         | "helm_get_values" => need(Profile::ReadOnly, true),
         "list_nodes" | "describe_node" | "top_nodes" => Some(Access {
+            nodes: true,
+            ..Access::NONE
+        }),
+        "cordon_node" | "uncordon_node" | "drain_node" => Some(Access {
+            profile: Profile::Deploy,
             nodes: true,
             ..Access::NONE
         }),
@@ -747,6 +757,46 @@ fn catalog() -> Vec<ToolSpec> {
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
+        },
+        ToolSpec {
+            name: "cordon_node",
+            description: "Marks a node unschedulable, like kubectl cordon: running pods stay. \
+                          Runs with the user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "uncordon_node",
+            description: "Makes a node schedulable again, like kubectl uncordon. Runs with the \
+                          user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "drain_node",
+            description: "Cordons a node and evicts its pods through the Eviction API, so \
+                          PodDisruptionBudgets hold: a pod they block is retried until the \
+                          timeout. Runs with the user's credentials after they confirm the node \
+                          and every pod. There is no force: pods without a controller are \
+                          reported and left in place. DaemonSet pods without ignoreDaemonsets \
+                          and pods with emptyDir data without deleteEmptyDirData stop the call \
+                          before anything changes. The node stays cordoned afterwards. Pods of \
+                          namespaces this session may not read are only counted.",
+            schema: object_schema(
+                json!({
+                    "name": {"type": "string"},
+                    "ignoreDaemonsets": {"type": "boolean", "description": "Leave DaemonSet pods on the node instead of stopping. Default false"},
+                    "deleteEmptyDirData": {"type": "boolean", "description": "Evict pods with emptyDir volumes too; their data is lost. Default false"},
+                    "podSelector": {"type": "string", "description": "Only pods with these labels, e.g. app=web. The whole node is cordoned all the same"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "For evictions, budget retries and waiting for the pods to go. Default 300"},
+                    "preview": {"type": "boolean", "description": "Only show which pods would be evicted, are blocked by a PodDisruptionBudget or have no controller, without asking the user or changing anything. Call again without preview to do it"},
+                }),
+                &["name"],
+            ),
+            read_only: false,
+            destructive: true,
         },
         ToolSpec {
             name: "get_topology",
