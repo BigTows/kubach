@@ -88,6 +88,10 @@ async fn fake_api_with(pods: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
                     let method = parts.next().unwrap_or("").to_owned();
                     let path = parts.next().unwrap_or("").to_owned();
                     log.lock().unwrap().push(format!("{method} {path}"));
+                    // A connection through `slow-0` stays open.
+                    if path.contains("/slow-0/portforward") {
+                        std::future::pending::<()>().await;
+                    }
                     let pods = format!("/api/v1/namespaces/{NS}/pods");
                     let named = path
                         .strip_prefix(&format!("{pods}/"))
@@ -517,11 +521,10 @@ async fn the_user_stops_a_forward_in_kubach_and_the_session_notices() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!f.server.session().grants().is_forwarding(NS));
-    let listed = f
-        .server
-        .call("agent", "port_forward_list", Map::new())
-        .await;
-    assert!(listed.text.contains("No port-forwards"), "{}", listed.text);
+    let listed = listed(&f).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["state"], "closed");
+    assert_eq!(listed[0]["reason"], "user");
 }
 
 #[tokio::test]
@@ -773,4 +776,195 @@ async fn a_silent_agent_loses_its_forwards_after_the_grace() {
     assert!(closed_within(addr, Duration::from_secs(10)).await);
     assert!(stop_audited(&f.audit_path, "disconnected").await);
     endpoint.shutdown().await;
+}
+
+// ------------------------------------------- closed forwards stay (#104)
+
+/// What `port_forward_list` shows.
+async fn listed(f: &Fixture) -> Vec<Value> {
+    let outcome = f
+        .server
+        .call("agent", "port_forward_list", Map::new())
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    serde_json::from_str(&outcome.text).unwrap_or_else(|_| panic!("{}", outcome.text))
+}
+
+/// Connects to `addr` and waits until forward `id` has its last error: the
+/// fake API has no port-forward.
+async fn fail_a_connection(f: &Fixture, id: u64, addr: SocketAddr) -> String {
+    drop(TcpStream::connect(addr).await.unwrap());
+    let manager = f.server.session().forwards().manager();
+    for _ in 0..250 {
+        if let Some(error) = manager.get(id).and_then(|info| info.last_error) {
+            return error;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no error on forward {id}");
+}
+
+#[tokio::test]
+async fn a_forward_closed_for_silence_stays_listed_with_why() {
+    let f = fixture(true).await;
+    let endpoint = endpoint(&f, Duration::from_millis(500)).await;
+    initialize(endpoint.addr.port()).await;
+    let (id, addr) = start(&f, "service/web", json!("http")).await;
+    let error = fail_a_connection(&f, id, addr).await;
+    assert!(closed_within(addr, Duration::from_secs(10)).await);
+    assert!(f.server.session().is_active());
+
+    let list = listed(&f).await;
+    assert_eq!(list.len(), 1, "{list:?}");
+    let forward = &list[0];
+    assert_eq!(forward["id"], id);
+    assert_eq!(forward["state"], "closed");
+    assert_eq!(forward["reason"], "disconnected");
+    assert!(
+        forward["detail"].as_str().unwrap().contains("disconnected"),
+        "{forward}"
+    );
+    assert_eq!(forward["lastError"], error.as_str());
+    assert_eq!(forward["address"], addr.to_string());
+    assert_eq!(forward["target"], "svc/web");
+    assert_eq!(forward["activeConnections"], 0);
+    let closed_at: k8s_openapi::jiff::Timestamp =
+        forward["closedAt"].as_str().unwrap().parse().unwrap();
+    assert!(closed_at <= k8s_openapi::jiff::Timestamp::now());
+
+    // A new forward works, and comes before the closed one.
+    let (again, _) = start(&f, "service/web", json!("http")).await;
+    let list = listed(&f).await;
+    assert_eq!(list[0]["id"], again);
+    assert_eq!(list[0]["state"], "ready");
+    assert_eq!(list[1]["id"], id);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_forward_in_use_outlives_a_silent_agent() {
+    let ready = pod()["status"].clone();
+    let f = fixture_with(true, vec![pod_with("slow-0", ready)]).await;
+    let grace = Duration::from_secs(1);
+    let endpoint = endpoint(&f, grace).await;
+    initialize(endpoint.addr.port()).await;
+    let (used, addr) = start(&f, "pod/slow-0", json!(8080)).await;
+    let (idle, _) = start(&f, "pod/slow-0", json!(8080)).await;
+    let _connection = TcpStream::connect(addr).await.unwrap();
+    let manager = f.server.session().forwards().manager();
+    for _ in 0..100 {
+        if manager.get(used).unwrap().active_connections == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(manager.get(used).unwrap().active_connections, 1);
+
+    for _ in 0..500 {
+        if manager.get(idle).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(manager.get(idle).is_none(), "the idle forward stopped");
+    tokio::time::sleep(grace).await;
+    assert!(manager.get(used).is_some(), "the used forward stays");
+    assert!(f.server.session().grants().is_forwarding(NS));
+    let closed = f.server.session().forwards().closed();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].info.id, idle);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_users_stop_keeps_the_last_error() {
+    let f = fixture(true).await;
+    let (id, addr) = start(&f, "pod/web-0", json!(8080)).await;
+    let error = fail_a_connection(&f, id, addr).await;
+    let forwards = f.server.session().forwards();
+    // What the watcher does on each change of the manager.
+    assert!(forwards.reconcile().is_empty());
+    assert!(forwards.manager().stop(id));
+    assert!(stop_audited(&f.audit_path, "user").await);
+    let closed = forwards.closed();
+    assert_eq!(closed[0].reason, super::StopReason::User);
+    assert_eq!(closed[0].info.last_error.as_deref(), Some(error.as_str()));
+}
+
+#[tokio::test]
+async fn stopping_a_closed_forward_says_when_and_why_it_closed() {
+    let f = fixture(true).await;
+    let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+    let call = async || {
+        f.server
+            .call("agent", "port_forward_stop", args(json!({"id": id})))
+            .await
+    };
+    assert!(!call().await.is_error);
+    let list = listed(&f).await;
+    assert_eq!(list[0]["reason"], "agent");
+    let again = call().await;
+    assert!(again.is_error);
+    assert!(again.text.contains("already closed"), "{}", again.text);
+    assert!(
+        again.text.contains(list[0]["closedAt"].as_str().unwrap()),
+        "{}",
+        again.text
+    );
+    assert!(again.text.contains("port_forward_stop"), "{}", again.text);
+}
+
+#[tokio::test]
+async fn revoking_and_the_sessions_end_are_kept_as_reasons() {
+    let f = fixture(true).await;
+    let (first, _) = start(&f, "pod/web-0", json!(8080)).await;
+    f.server.session().revoke(&Grant::read(NS)).await.unwrap();
+    f.server.session().set_grants(grants(&[Grant::read(NS)]));
+    let (second, _) = start(&f, "pod/web-0", json!(8080)).await;
+    f.server.session().close().await.unwrap();
+    let closed: Vec<_> = f
+        .server
+        .session()
+        .forwards()
+        .closed()
+        .into_iter()
+        .map(|closed| (closed.info.id, closed.reason.label()))
+        .collect();
+    assert_eq!(closed, [(second, "session-ended"), (first, "revoked")]);
+}
+
+#[tokio::test]
+async fn a_session_remembers_a_bounded_number_of_closed_forwards() {
+    let f = fixture(true).await;
+    let mut ids = Vec::new();
+    for _ in 0..super::MAX_CLOSED_FORWARDS + 3 {
+        let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+        f.server
+            .session()
+            .forwards()
+            .stop(id, super::StopReason::Agent);
+        ids.push(id);
+    }
+    let closed: Vec<u64> = listed(&f)
+        .await
+        .iter()
+        .map(|forward| forward["id"].as_u64().unwrap())
+        .collect();
+    ids.reverse();
+    ids.truncate(super::MAX_CLOSED_FORWARDS);
+    assert_eq!(closed, ids, "the newest, newest first");
+}
+
+#[tokio::test]
+async fn closed_forwards_do_not_count_against_the_limit() {
+    let f = fixture(true).await;
+    for _ in 0..super::MAX_FORWARDS_PER_SESSION {
+        let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+        f.server
+            .session()
+            .forwards()
+            .stop(id, super::StopReason::Agent);
+    }
+    start(&f, "pod/web-0", json!(8080)).await;
+    assert_eq!(f.server.session().forwards().count(), 1);
 }
