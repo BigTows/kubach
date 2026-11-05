@@ -18,6 +18,11 @@
 //! and uninstalled with it. Its cluster-scoped objects are deleted at the
 //! end whatever happens; run it with `KUBACH_TEST_NAMESPACE=kubach-test-18`.
 //!
+//! `a_vault_context_runs_a_chart_with_crds_as_the_user` (#113) is the same
+//! flow with the context given as a vault context is: no kubeconfig file,
+//! only a temporary one while helm runs; run it with
+//! `KUBACH_TEST_NAMESPACE=kubach-test-113`.
+//!
 //! `objects_in_another_namespace_run_as_the_user_only_with_consent` (#21)
 //! puts cert-manager's leader election Role into a second namespace
 //! (`<namespace>-b`); run it with `KUBACH_TEST_NAMESPACE=kubach-test-21`. It
@@ -45,7 +50,7 @@ use kubach_core::plugin::BoxFuture;
 use kubach_mcp::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, HelmAction, HelmCredentials, HelmEnv,
     McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session, SessionSpec,
-    USER_IDENTITY,
+    USER_IDENTITY, VaultKubeconfig,
 };
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -109,6 +114,7 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let user = Client::try_from(base.clone()).unwrap();
@@ -399,7 +405,28 @@ async fn crds_gone(user: &Client, release: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a cluster, helm and quay.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
 async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
+    chart_with_crds(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster, helm and quay.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_vault_context_runs_a_chart_with_crds_as_the_user() {
+    chart_with_crds(true).await;
+}
+
+async fn chart_with_crds(in_vault: bool) {
     let (base, context, namespace) = config().await;
+    let kubeconfigs = tempfile::tempdir().unwrap();
+    let helm = HelmEnv {
+        binary: kubach_core::settings::find_on_path("helm"),
+        kubeconfig: (!in_vault).then(|| kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: in_vault.then(|| {
+            let all = Kubeconfig::read().unwrap();
+            let single = kubach_core::kubeconfig::temp::single_context(&all, &context, None);
+            VaultKubeconfig::new(single.unwrap(), kubeconfigs.path().to_owned())
+        }),
+        paths: HelmPaths::from_env(),
+    };
     let user = Client::try_from(base.clone()).unwrap();
     let crds: Api<CustomResourceDefinition> = Api::all(user.clone());
     assert!(
@@ -430,7 +457,7 @@ async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(cert_manager_flow(base, context, flow_namespace))
+            .block_on(cert_manager_flow(base, context, flow_namespace, helm))
     });
     let outcome = tokio::task::spawn_blocking(move || flow.join())
         .await
@@ -446,9 +473,11 @@ async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
         std::panic::resume_unwind(panic);
     }
     assert!(gone, "the CRDs of the release are still there");
+    let left = std::fs::read_dir(kubeconfigs.path()).unwrap().count();
+    assert_eq!(left, 0, "a temporary kubeconfig stayed on disk");
 }
 
-async fn cert_manager_flow(base: Config, context: String, namespace: String) {
+async fn cert_manager_flow(base: Config, context: String, namespace: String, helm: HelmEnv) {
     let policy = SecurityPolicy {
         mcp_enabled: true,
         temporary_objects: true,
@@ -468,11 +497,7 @@ async fn cert_manager_flow(base: Config, context: String, namespace: String) {
         requests: Mutex::default(),
     });
     let server = McpServer::new(session.clone(), confirmer.clone(), None);
-    server.set_helm(HelmEnv {
-        binary: kubach_core::settings::find_on_path("helm"),
-        kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
-        paths: HelmPaths::from_env(),
-    });
+    server.set_helm(helm);
     let values = format!(
         "crds:\n  enabled: true\n  keep: false\nglobal:\n  leaderElection:\n    namespace: \
          {namespace}\nstartupapicheck:\n  enabled: false\n"
@@ -725,6 +750,7 @@ async fn other_namespace_flow(base: Config, context: String, namespace: String, 
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let user = Client::try_from(base.clone()).unwrap();
@@ -868,6 +894,7 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let secret = "s3cret-value-22";

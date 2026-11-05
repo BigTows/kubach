@@ -58,7 +58,9 @@ use kubach_core::helm::{
     Driver, HelmError, ManifestResource, Release, Releases, Sensitive, manifest_resources, oci,
     unified_diff,
 };
+use kubach_core::kubeconfig::temp::TempKubeconfig;
 use kubach_core::secrets::mask::{ends_with_sensitive_word, is_sensitive_name};
+use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -109,15 +111,57 @@ const USER_REASON: &str = "the chart has cluster-scoped objects, RBAC or objects
                            namespaces that the namespace's temporary ServiceAccount cannot create; \
                            the user allowed this one call under their own credentials";
 
+/// What the user reads before allowing a call on a vault context (#113).
+const VAULT_NOTE: &str = "This context is in the vault: while helm runs, its credentials are in \
+                          a temporary file only you can read, removed as soon as helm exits.";
+
 /// What the session knows about the user's `helm`: the binary Kubach uses
 /// (settings, `PATH` or downloaded), the kubeconfig files of the context
 /// for client-only namespaces (`None`: the context is not in a file, such
-/// as a vault context), and where the repositories are.
+/// as a vault context), a vault context's credentials for a call the user
+/// allowed under them (#113), and where the repositories are.
 #[derive(Clone, Debug, Default)]
 pub struct HelmEnv {
     pub binary: Option<PathBuf>,
     pub kubeconfig: Option<Vec<PathBuf>>,
+    pub vault: Option<VaultKubeconfig>,
     pub paths: Option<HelmPaths>,
+}
+
+/// A vault context for `helm`, which reads credentials only from a file
+/// (#113). It stays in memory, as the session's own client does, and only
+/// for a call the user allowed under their credentials goes to a
+/// [`TempKubeconfig`] for the time helm runs (ADR 0005, 0015). Only the app
+/// has one: a `kubach mcp` process never sees the vault's credentials.
+#[derive(Clone)]
+pub struct VaultKubeconfig {
+    /// One context, its cluster and user.
+    config: Arc<Kubeconfig>,
+    /// Where temporary kubeconfigs live, so that a file left by a crash is
+    /// removed on the next start.
+    dir: PathBuf,
+}
+
+impl VaultKubeconfig {
+    /// `config` as `Contexts::single_context` gives it, `dir` as
+    /// `kubeconfig::temp::dir`.
+    pub fn new(config: Kubeconfig, dir: PathBuf) -> Self {
+        Self {
+            config: Arc::new(config),
+            dir,
+        }
+    }
+
+    /// The owner-only file for one helm process, removed when dropped.
+    fn write(&self) -> std::io::Result<TempKubeconfig> {
+        TempKubeconfig::create(&self.dir, &self.config)
+    }
+}
+
+impl std::fmt::Debug for VaultKubeconfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultKubeconfig").finish_non_exhaustive()
+    }
 }
 
 /// What a Helm change does, for the dialog.
@@ -1038,6 +1082,9 @@ struct HelmRun {
     identity: String,
     /// Holds a generated kubeconfig (cluster only) while helm runs.
     _dir: Option<tempfile::TempDir>,
+    /// Holds a vault context's kubeconfig (#113). Whoever waits for
+    /// anything but helm, such as the user's answer, drops the run first.
+    _vault: Option<TempKubeconfig>,
 }
 
 /// Variables of the user's environment that would change who helm is.
@@ -1077,8 +1124,9 @@ async fn helm_run(
     let no_file = || {
         ToolError::Failed(
             "Helm needs this context in a kubeconfig file in this namespace (the session uses \
-             your own credentials here, and Kubach does not write them to disk); a vault context \
-             works with Helm only where the session has a ServiceAccount"
+             your own credentials here); a vault context works with Helm where the session has \
+             a ServiceAccount, and Kubach writes its credentials to a temporary file only for a \
+             call the user allowed under them"
                 .into(),
         )
     };
@@ -1087,7 +1135,7 @@ async fn helm_run(
     } else {
         ctx.session.describe_identity(Some(namespace))
     };
-    let (context, kubeconfig, dir) = match access {
+    let (context, kubeconfig, dir, vault) = match access {
         HelmAccess::Token { kubeconfig, token } => {
             let dir = tempfile::Builder::new()
                 .prefix("kubach-helm-")
@@ -1097,7 +1145,7 @@ async fn helm_run(
             write_private(&path, &kubeconfig)
                 .map_err(|error| ToolError::Failed(error.to_string()))?;
             set(&mut vars, "HELM_KUBETOKEN", token);
-            ("kubach".to_owned(), vec![path], Some(dir))
+            ("kubach".to_owned(), vec![path], Some(dir), None)
         }
         HelmAccess::Impersonate { user, groups } => {
             set(&mut vars, "HELM_KUBEASUSER", user);
@@ -1105,12 +1153,42 @@ async fn helm_run(
                 set(&mut vars, "HELM_KUBEASGROUPS", groups.join(","));
             }
             let files = env.kubeconfig.clone().ok_or_else(no_file)?;
-            (ctx.session.scope().context.clone(), files, None)
+            (ctx.session.scope().context.clone(), files, None, None)
         }
-        HelmAccess::User => {
-            let files = env.kubeconfig.clone().ok_or_else(no_file)?;
-            (ctx.session.scope().context.clone(), files, None)
-        }
+        HelmAccess::User => match (&env.kubeconfig, &env.vault) {
+            (Some(files), _) => (
+                ctx.session.scope().context.clone(),
+                files.clone(),
+                None,
+                None,
+            ),
+            (None, Some(vault)) if as_user => {
+                // Locking the vault ends the session: nothing is written
+                // after that.
+                if !ctx.session.is_active() {
+                    return Err(Denial::new(
+                        DenialCode::SessionEnded,
+                        "the session ended before helm could run",
+                    )
+                    .into());
+                }
+                // The kind only: the file's text never reaches a message.
+                let file = vault.write().map_err(|error| {
+                    ToolError::Failed(format!(
+                        "Kubach could not write the temporary kubeconfig for helm: {}",
+                        error.kind()
+                    ))
+                })?;
+                let path = file.path().to_owned();
+                (
+                    ctx.session.scope().context.clone(),
+                    vec![path],
+                    None,
+                    Some(file),
+                )
+            }
+            _ => return Err(no_file()),
+        },
     };
     Ok(HelmRun {
         target: HelmTarget {
@@ -1122,6 +1200,7 @@ async fn helm_run(
         },
         identity,
         _dir: dir,
+        _vault: vault,
     })
 }
 
@@ -1694,22 +1773,25 @@ async fn ask_user_credentials(
     env: &HelmEnv,
     allowed: &Allowed,
     mut change: HelmChange,
-    details: String,
+    mut details: String,
     findings: &[Finding],
 ) -> Result<(), ToolError> {
     let objects: Vec<String> = findings.iter().map(|f| f.path.clone()).collect();
-    if env.kubeconfig.is_none() {
+    if env.kubeconfig.is_none() && env.vault.is_none() {
         return Err(Denial::new(
             DenialCode::ClusterScoped,
             format!(
                 "the namespace's temporary ServiceAccount cannot create or delete: {}; running \
-                 helm with the user's credentials needs this context in a kubeconfig file, and \
-                 it is not (a vault context). Turn these off in the values or ask the user to do \
-                 it from Kubach's Helm screen",
+                 helm with the user's credentials needs this context's kubeconfig, and this \
+                 session has none. Turn these off in the values or ask the user to do it from \
+                 Kubach's Helm screen",
                 objects.join(", ")
             ),
         )
         .into());
+    }
+    if env.kubeconfig.is_none() {
+        let _ = write!(details, "\n\n{VAULT_NOTE}");
     }
     change.credentials = HelmCredentials::AskUser;
     change.identity = USER_IDENTITY.to_owned();
@@ -1948,6 +2030,9 @@ pub(crate) async fn install(
         }
     })
     .await?;
+    let identity = run.identity.clone();
+    // Nothing of the run stays on disk while the user decides.
+    drop(run);
     let mut preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
     // The dry run may show more than helm template did (#21).
     authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere).await?;
@@ -1969,7 +2054,7 @@ pub(crate) async fn install(
             .or_else(|| Some(preview_release.chart.version.clone())),
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
-        identity: run.identity.clone(),
+        identity,
         credentials: if as_user {
             HelmCredentials::User
         } else {
@@ -2019,6 +2104,7 @@ pub(crate) async fn install(
         .map_err(helm_error)
     })
     .await?;
+    drop(run);
     let output = match output {
         UpgradeOutcome::Applied(output) => output,
         UpgradeOutcome::Preview(_) => String::new(),
@@ -2293,6 +2379,9 @@ pub(crate) async fn upgrade(
         }
     })
     .await?;
+    let identity = run.identity.clone();
+    // Nothing of the run stays on disk while the user decides.
+    drop(run);
     let preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
     // The dry run may show more than helm template did (#21).
     authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere).await?;
@@ -2308,7 +2397,7 @@ pub(crate) async fn upgrade(
         version: Some(preview_release.chart.version.clone()),
         objects: preview.objects.clone(),
         cluster_objects: preview.cluster.clone(),
-        identity: run.identity.clone(),
+        identity,
         credentials: if as_user {
             HelmCredentials::User
         } else {
@@ -2352,6 +2441,7 @@ pub(crate) async fn upgrade(
         .map_err(helm_error)
     })
     .await?;
+    drop(run);
     let output = match output {
         UpgradeOutcome::Applied(output) => output,
         UpgradeOutcome::Preview(_) => String::new(),
@@ -2475,6 +2565,7 @@ pub(crate) async fn rollback(
         .map_err(helm_error)
     })
     .await?;
+    drop(run);
     let release = current_release(ctx, &namespace, &a.release).await;
     let phases = sync::lock(&phases).clone();
     Ok(changed_as(
@@ -2571,6 +2662,7 @@ pub(crate) async fn uninstall(
         .map_err(helm_error)
     })
     .await?;
+    drop(run);
     let phases = sync::lock(&phases).clone();
     Ok(changed_as(
         result_text(
