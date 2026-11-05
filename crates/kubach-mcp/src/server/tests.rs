@@ -213,6 +213,49 @@ fn helm_storage() -> Value {
     })
 }
 
+/// What release `infra` has: an object no temporary ServiceAccount may
+/// touch, next to a namespaced one.
+const INFRA_MANIFEST: &str = "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\n\
+     metadata:\n  name: infra-reader\nrules: []\n---\napiVersion: v1\nkind: ConfigMap\n\
+     metadata:\n  name: infra\n";
+
+fn infra_release(revision: u32) -> Value {
+    json!({
+        "name": "infra", "namespace": NS, "version": revision,
+        "info": {"status": "deployed", "description": "Upgrade complete"},
+        "chart": {"metadata": {"name": "infra", "version": "1.0.0"}},
+        "config": {},
+        "manifest": INFRA_MANIFEST,
+    })
+}
+
+/// Revision `revision` of release `infra` in its storage Secret.
+fn infra_storage(revision: u32) -> Value {
+    use base64::Engine as _;
+    let payload = kubach_core::helm::encode_release(&infra_release(revision));
+    json!({
+        "apiVersion": "v1", "kind": "Secret", "type": "helm.sh/release.v1",
+        "metadata": {"name": format!("sh.helm.release.v1.infra.v{revision}"), "namespace": NS,
+                     "labels": {"owner": "helm", "name": "infra",
+                                "version": revision.to_string()}},
+        "data": {"release": base64::engine::general_purpose::STANDARD.encode(payload)},
+    })
+}
+
+/// The labels of `infra`'s storage: revisions 1 and 2.
+fn infra_metadata() -> Value {
+    let item = |revision: u32| {
+        json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata",
+               "metadata": {"name": format!("sh.helm.release.v1.infra.v{revision}"),
+                            "namespace": NS,
+                            "labels": {"owner": "helm", "name": "infra",
+                                       "version": revision.to_string(),
+                                       "status": "deployed"}}})
+    };
+    json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadataList",
+           "metadata": {}, "items": [item(1), item(2)]})
+}
+
 /// Lists the topology tools read (#327): Deployment `web` with its
 /// ReplicaSet, Service `web` (80 → 8080) selecting it, ConfigMap
 /// `app-config`, Ingress `web` and a default-deny NetworkPolicy.
@@ -322,8 +365,17 @@ impl FakeApi {
                         let secrets = format!("/api/v1/namespaces/{NS}/secrets");
                         let pods = format!("/api/v1/namespaces/{NS}/pods");
                         let storage = format!("{secrets}/sh.helm.release.v1.web.v");
+                        let infra = format!("{secrets}/sh.helm.release.v1.infra.v");
                         let (status, body) = if method == "GET" && path == format!("{storage}2") {
                             ("200 OK", helm_storage().to_string())
+                        } else if method == "GET" && path.starts_with(&infra) {
+                            let revision = path[infra.len()..].parse().unwrap_or(0);
+                            ("200 OK", infra_storage(revision).to_string())
+                        } else if method == "GET"
+                            && path.starts_with(&format!("{secrets}?"))
+                            && path.contains("name%3Dinfra")
+                        {
+                            ("200 OK", infra_metadata().to_string())
                         } else if method == "GET" && path == format!("{storage}9") {
                             (
                                 "403 Forbidden",
@@ -3529,4 +3581,409 @@ async fn debug_container_needs_debug_access_rbac_and_valid_input() {
         outcome.text
     );
     assert!(api.writes().is_empty(), "{:?}", api.writes());
+}
+
+/// The token of the vault context in the tests of #113.
+#[cfg(unix)]
+const VAULT_TOKEN: &str = "vault-token-of-113";
+
+/// Answers every question with a yes, except the one about the user's
+/// credentials when `allow_user` is off, and notes what each window showed
+/// and which temporary kubeconfigs were on disk meanwhile.
+#[cfg(unix)]
+struct VaultConfirmer {
+    dir: std::path::PathBuf,
+    allow_user: bool,
+    /// Closed while the user is asked about their credentials: the vault
+    /// locked.
+    locks: Mutex<Option<Arc<Session>>>,
+    helm: Mutex<Vec<(crate::helm_tools::HelmChange, String, usize)>>,
+}
+
+#[cfg(unix)]
+impl crate::confirm::Confirmer for VaultConfirmer {
+    fn confirm<'a>(
+        &'a self,
+        request: &'a crate::confirm::ConfirmationRequest,
+    ) -> kubach_core::plugin::BoxFuture<'a, crate::confirm::ConfirmationDecision> {
+        Box::pin(async move {
+            use crate::confirm::ConfirmationDecision;
+            use crate::helm_tools::HelmCredentials;
+            let RequestKind::Helm { helm } = &request.kind else {
+                return ConfirmationDecision::Approved;
+            };
+            let files = vault_files(&self.dir);
+            self.helm
+                .lock()
+                .unwrap()
+                .push(((**helm).clone(), request.details.clone(), files));
+            if helm.credentials != HelmCredentials::AskUser {
+                return ConfirmationDecision::Approved;
+            }
+            let locks = self.locks.lock().unwrap().take();
+            if let Some(session) = locks {
+                let _ = session.close().await;
+            }
+            if self.allow_user {
+                ConfirmationDecision::Approved
+            } else {
+                ConfirmationDecision::Rejected { reason: None }
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+fn vault_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, Iterator::count)
+}
+
+/// A session under a temporary ServiceAccount on a vault context, with a
+/// fake `helm` that notes how it was called and what its kubeconfig was.
+#[cfg(unix)]
+struct VaultHelm {
+    _api: FakeApi,
+    server: McpServer,
+    confirmer: Arc<VaultConfirmer>,
+    audit_path: std::path::PathBuf,
+    /// Where the temporary kubeconfigs go.
+    kubeconfigs: std::path::PathBuf,
+    log: std::path::PathBuf,
+    root: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// `on_change`: shell run for a real (not dry) change.
+    async fn start(allow_user: bool, on_change: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let kubeconfigs = root.path().join("run").join("kubeconfig");
+        let log = root.path().join("helm.log");
+        let manifest = root.path().join("manifest.yaml");
+        std::fs::write(&manifest, INFRA_MANIFEST).unwrap();
+        let dry_run = root.path().join("dry-run.json");
+        std::fs::write(&dry_run, infra_release(3).to_string()).unwrap();
+        let helm = root.path().join("helm");
+        std::fs::write(
+            &helm,
+            format!(
+                r#"#!/bin/sh
+kubeconfig=; context=; dry=; previous=
+for argument in "$@"; do
+  [ "$previous" = --kubeconfig ] && kubeconfig="$argument"
+  [ "$previous" = --kube-context ] && context="$argument"
+  [ "$argument" = --dry-run=server ] && dry=dry
+  previous="$argument"
+done
+if [ "$1" = template ]; then cat '{manifest}'; exit 0; fi
+{{
+  printf '%s %s context=%s token=%s ' "$1" "$dry" "$context" "${{HELM_KUBETOKEN:-none}}"
+  printf 'file=%s ' "$(ls -l "$kubeconfig" | cut -c1-10)"
+  printf 'dir=%s ' "$(ls -ld "$(dirname "$kubeconfig")" | cut -c1-10)"
+  printf 'credentials=%s\n' "$(grep -c '{VAULT_TOKEN}' "$kubeconfig")"
+}} >> '{log}'
+case "$1" in install|upgrade) cat > /dev/null ;; esac
+if [ -n "$dry" ]; then cat '{dry_run}'; exit 0; fi
+{on_change}
+echo 'STATUS: deployed'
+"#,
+                manifest = manifest.display(),
+                log = log.display(),
+                dry_run = dry_run.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let api = FakeApi::start().await;
+        let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+        let scope = scope_with(Profile::Deploy, &permissive(), &[NS]);
+        let context = scope.context.clone();
+        let identity = Identity::TemporaryServiceAccount(
+            crate::identity::TemporaryServiceAccount::fake(client, NS),
+        );
+        let capabilities: HashSet<Capability> = Capability::ALL.into_iter().collect();
+        let session = Session::from_parts(scope, identity, catalog(), capabilities);
+        session.set_grants(grants(&[Grant::read(NS)]));
+        let audit_path = root.path().join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+        let confirmer = Arc::new(VaultConfirmer {
+            dir: kubeconfigs.clone(),
+            allow_user,
+            locks: Mutex::default(),
+            helm: Mutex::default(),
+        });
+        let server = McpServer::new(session, confirmer.clone(), Some(audit));
+        let config = kube::config::Kubeconfig::from_yaml(&format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {context}\n\
+             clusters: [{{name: c, cluster: {{server: 'https://vault.example.com'}}}}]\n\
+             users: [{{name: u, user: {{token: {VAULT_TOKEN}}}}}]\n\
+             contexts: [{{name: {context}, context: {{cluster: c, user: u}}}}]\n"
+        ))
+        .unwrap();
+        server.set_helm(crate::helm_tools::HelmEnv {
+            binary: Some(helm),
+            kubeconfig: None,
+            vault: Some(crate::helm_tools::VaultKubeconfig::new(
+                config,
+                kubeconfigs.clone(),
+            )),
+            paths: None,
+        });
+        Self {
+            _api: api,
+            server,
+            confirmer,
+            audit_path,
+            kubeconfigs,
+            log,
+            root,
+        }
+    }
+
+    /// What helm said about each call it got with a kubeconfig.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `(credentials, temporary kubeconfigs on disk)` of each Helm window.
+    fn windows(&self) -> Vec<(crate::helm_tools::HelmCredentials, usize)> {
+        self.confirmer
+            .helm
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(change, _, files)| (change.credentials, *files))
+            .collect()
+    }
+
+    /// Neither the answer nor the audit log has the vault's credentials
+    /// or says where they were, and nothing is left on disk.
+    fn assert_clean(&self, answer: &str) {
+        let audit = std::fs::read_to_string(&self.audit_path).unwrap_or_default();
+        let root = self.root.path().display().to_string();
+        for text in [answer, audit.as_str()] {
+            assert!(!text.contains(VAULT_TOKEN), "credentials leaked");
+            assert!(!text.contains(&root), "a path leaked");
+        }
+        assert_eq!(vault_files(&self.kubeconfigs), 0);
+    }
+}
+
+#[cfg(unix)]
+fn vault_call(kind: &str, dry: bool, context: &str) -> String {
+    let dry = if dry { "dry" } else { "" };
+    format!(
+        "{kind} {dry} context={context} token=none file=-rw------- dir=drwx------ credentials=1"
+    )
+}
+
+/// The flow of a kubeconfig context on a vault context (#113): asked with
+/// the objects, a dry run as the user, the diff window, the install. The
+/// credentials reach helm in an owner-only file only while it runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_runs_as_the_user_after_consent() {
+    use crate::helm_tools::{HelmCredentials, USER_IDENTITY};
+    let f = VaultHelm::start(true, "").await;
+    let context = f.server.session().scope().context.clone();
+
+    let install = f
+        .server
+        .call(
+            "agent",
+            "helm_install",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!install.is_error, "{}", install.text);
+    assert_eq!(
+        f.calls(),
+        [
+            vault_call("install", true, &context),
+            vault_call("install", false, &context),
+        ]
+    );
+    // No file while the user decides, in either window.
+    assert_eq!(
+        f.windows(),
+        [(HelmCredentials::AskUser, 0), (HelmCredentials::User, 0)]
+    );
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (asked, details, _) = &windows[0];
+        assert_eq!(asked.identity, USER_IDENTITY);
+        assert_eq!(asked.user_objects, ["ClusterRole infra-reader"]);
+        assert!(details.contains("temporary file"), "{details}");
+        let (diff, _, _) = &windows[1];
+        assert_eq!(diff.identity, USER_IDENTITY);
+        assert!(
+            diff.cluster_objects
+                .iter()
+                .any(|object| object.contains("ClusterRole infra-reader")),
+            "{:?}",
+            diff.cluster_objects
+        );
+    }
+    f.assert_clean(&install.text);
+    let audit = audit_lines(&f.audit_path);
+    let line = audit.last().unwrap();
+    assert_eq!(line["change"]["ranAs"], "user", "{line}");
+
+    // Upgrading goes the same way.
+    let upgrade = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!upgrade.is_error, "{}", upgrade.text);
+    assert_eq!(f.calls().len(), 4);
+    assert_eq!(f.calls()[2], vault_call("upgrade", true, &context));
+    assert_eq!(f.calls()[3], vault_call("upgrade", false, &context));
+    assert_eq!(
+        f.windows()[2..],
+        [(HelmCredentials::AskUser, 0), (HelmCredentials::User, 0)]
+    );
+    f.assert_clean(&upgrade.text);
+
+    // A rollback and an uninstall ask once and run once.
+    for (tool, kind, arguments) in [
+        (
+            "helm_rollback",
+            "rollback",
+            json!({"release": "infra", "revision": 1, "namespace": NS}),
+        ),
+        (
+            "helm_uninstall",
+            "uninstall",
+            json!({"release": "infra", "namespace": NS}),
+        ),
+    ] {
+        let windows = f.windows().len();
+        let outcome = f.server.call("agent", tool, args(arguments)).await;
+        assert!(!outcome.is_error, "{tool}: {}", outcome.text);
+        assert_eq!(
+            f.calls().last().unwrap(),
+            &vault_call(kind, false, &context)
+        );
+        assert_eq!(f.windows()[windows..], [(HelmCredentials::AskUser, 0)]);
+        f.assert_clean(&outcome.text);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_writes_nothing_without_consent() {
+    let f = VaultHelm::start(false, "").await;
+    let refused = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(refused.is_error);
+    assert!(refused.text.contains("did not allow"), "{}", refused.text);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(!f.kubeconfigs.exists());
+    f.assert_clean(&refused.text);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_writes_nothing_once_the_vault_locks() {
+    let f = VaultHelm::start(true, "").await;
+    *f.confirmer.locks.lock().unwrap() = Some(f.server.session().clone());
+    let ended = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(ended.is_error);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(!f.kubeconfigs.exists());
+    f.assert_clean(&ended.text);
+}
+
+/// A failing helm: its error reaches the agent, the file does not stay.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_failing_on_a_vault_context_leaves_no_file() {
+    let f = VaultHelm::start(true, "echo 'Error: cannot delete' >&2; exit 1").await;
+    let failed = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(failed.is_error);
+    assert!(failed.text.contains("cannot delete"), "{}", failed.text);
+    assert_eq!(f.calls().len(), 1);
+    f.assert_clean(&failed.text);
+}
+
+/// The agent goes away while helm runs: dropping the call removes the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cancelled_helm_call_on_a_vault_context_leaves_no_file() {
+    let f = VaultHelm::start(true, "sleep 5").await;
+    let mut call = Box::pin(f.server.call(
+        "agent",
+        "helm_uninstall",
+        args(json!({"release": "infra", "namespace": NS})),
+    ));
+    while f.calls().is_empty() {
+        tokio::select! {
+            outcome = &mut call => panic!("helm ended early: {}", outcome.text),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+    assert_eq!(vault_files(&f.kubeconfigs), 1);
+    drop(call);
+    f.assert_clean("");
+}
+
+/// A session with neither a kubeconfig file nor the vault's credentials
+/// refuses before asking anyone.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_with_no_kubeconfig_at_all_is_refused_before_asking() {
+    let f = VaultHelm::start(true, "").await;
+    let binary = f.root.path().join("helm");
+    f.server.set_helm(crate::helm_tools::HelmEnv {
+        binary: Some(binary),
+        ..crate::helm_tools::HelmEnv::default()
+    });
+    let refused = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(refused.is_error);
+    assert!(refused.text.contains("ClusterRole"), "{}", refused.text);
+    assert!(f.windows().is_empty());
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
 }
