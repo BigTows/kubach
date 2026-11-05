@@ -20,12 +20,12 @@ use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, RequestKind, ask};
+use crate::event_tools::{EventFilter, MAX_EVENTS_READ, read_events, window_note};
 use crate::policy::{Allowed, Denial, DenialCode, Request};
 use crate::scope::SessionMode;
 use crate::tools::{
-    Ctx, MAX_LIST_ITEMS, MAX_OUTPUT_BYTES, Selectors, ToolError, ToolOutput, authorize,
-    ensure_rbac, event_line, event_time, explain_selector, finish, kind_of, known_namespaces,
-    read_events, read_rows, table_heading,
+    Ctx, MAX_OUTPUT_BYTES, Selectors, ToolError, ToolOutput, authorize, ensure_rbac, event_line,
+    event_time, explain_selector, finish, kind_of, known_namespaces, read_rows, table_heading,
 };
 use kubach_core::sync;
 
@@ -67,6 +67,8 @@ struct Coverage {
     gaps: BTreeMap<String, Vec<String>>,
     /// Read, but with more items than the answer holds.
     cut: Vec<String>,
+    /// The read stopped at its bound: what it never reached is unknown.
+    unfinished: Vec<String>,
     /// Why other namespaces may exist that nobody here knows of.
     unknown: Option<String>,
     /// The answer to the question of this call, if it asked one.
@@ -84,7 +86,12 @@ impl Coverage {
     }
 
     fn is_complete(&self) -> bool {
-        self.gaps.is_empty() && self.cut.is_empty() && self.unknown.is_none()
+        self.everything_read() && self.cut.is_empty()
+    }
+
+    /// All there is was read, whether or not the answer holds it all.
+    fn everything_read(&self) -> bool {
+        self.gaps.is_empty() && self.unfinished.is_empty() && self.unknown.is_none()
     }
 
     /// The note the answer starts with.
@@ -117,6 +124,15 @@ impl Coverage {
                 self.cut.join(", ")
             );
         }
+        if !self.unfinished.is_empty() {
+            let _ = writeln!(
+                out,
+                "Not read to the end, newer events may be missing in: {}. At most \
+                 {MAX_EVENTS_READ} are read per namespace, in no time order; narrow with type, \
+                 reason or kind + name",
+                self.unfinished.join(", ")
+            );
+        }
         if let Some(unknown) = &self.unknown {
             let _ = writeln!(out, "Other namespaces may exist: {unknown}");
         }
@@ -132,6 +148,7 @@ impl Coverage {
                 "namespaces": self.read,
                 "notCovered": self.gaps,
                 "cut": self.cut,
+                "unfinished": self.unfinished,
                 "complete": self.is_complete(),
                 "question": self.answer,
             })),
@@ -412,10 +429,11 @@ pub(crate) async fn list_resources(
 }
 
 /// `list_events` with `allNamespaces`: the newest `limit` events across the
-/// namespaces read.
+/// namespaces read. No namespace needs to give more than that.
 pub(crate) async fn list_events(
     ctx: &Ctx<'_>,
     request: &Request,
+    filter: &EventFilter,
     limit: usize,
 ) -> Result<ToolOutput, ToolError> {
     let Request::Events { object, .. } = request else {
@@ -430,46 +448,62 @@ pub(crate) async fn list_events(
         };
         let allowed = authorize(ctx, &one).await?;
         ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
-        settled(ctx, &allowed, || read_events(ctx, &allowed)).await
+        settled(ctx, &allowed, || read_events(ctx, &allowed, filter, limit)).await
     })
     .await;
     forget_namespace(ctx);
 
     let mut events = Vec::new();
+    // Per namespace, the events found and not shown.
+    let mut hidden = BTreeMap::new();
     for (namespace, result) in results {
         match result {
-            Ok((found, more)) => {
-                events.extend(found.into_iter().map(|event| (namespace.clone(), event)));
-                if more {
-                    coverage.cut.push(namespace.clone());
+            Ok(read) => {
+                hidden.insert(namespace.clone(), read.found);
+                events.extend(
+                    read.events
+                        .into_iter()
+                        .map(|event| (namespace.clone(), event)),
+                );
+                if read.more {
+                    coverage.unfinished.push(namespace.clone());
                 }
                 coverage.read.push(namespace);
             }
             Err(error) => coverage.failed(namespace, error, None)?,
         }
     }
+    let found: usize = hidden.values().sum();
     events.sort_by_key(|(_, event)| event_time(event));
+    let shown = &events[events.len().saturating_sub(limit)..];
     let now = Timestamp::now();
-    let skip = events.len().saturating_sub(limit);
-    let mut body = String::new();
-    for (namespace, event) in events.iter().skip(skip) {
-        let _ = writeln!(body, "{namespace}\t{}", event_line(event, now));
+    let mut rows = String::new();
+    for (namespace, event) in shown {
+        let _ = writeln!(rows, "{namespace}\t{}", event_line(event, now));
+        if let Some(count) = hidden.get_mut(namespace) {
+            *count -= 1;
+        }
     }
-    if body.is_empty() {
+    coverage.cut = hidden
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(namespace, _)| namespace)
+        .collect();
+
+    let mut body = String::new();
+    if let Some(since) = filter.since_seconds() {
+        let missing = (!coverage.everything_read()).then_some("as the coverage note says");
+        body.push_str(&window_note(since, shown.len(), found, missing));
+    }
+    body.push_str(&rows);
+    if rows.is_empty() {
         body.push_str("(no events)\n");
     }
-    if skip > 0 {
+    if shown.len() < found {
         let _ = writeln!(
             body,
-            "(the newest {limit} of {} events read; raise `limit`, at most 200)",
-            events.len()
-        );
-    }
-    if !coverage.cut.is_empty() {
-        let _ = writeln!(
-            body,
-            "(at most {MAX_LIST_ITEMS} events are read per namespace; newer ones may be missing \
-             where the coverage note says so)"
+            "(the newest {} of {found} events read; raise `limit`, at most 200)",
+            shown.len()
         );
     }
     Ok(coverage.output(&body))
@@ -519,6 +553,18 @@ mod tests {
         };
         assert!(unknown.note().starts_with("Coverage: PARTIAL"));
         assert!(unknown.note().contains("Other namespaces may exist"));
+
+        let unfinished = Coverage {
+            read: names(&["a"]),
+            unfinished: names(&["a"]),
+            ..Coverage::default()
+        };
+        assert!(unfinished.note().starts_with("Coverage: PARTIAL"));
+        assert!(
+            unfinished
+                .note()
+                .contains("newer events may be missing in: a")
+        );
     }
 
     #[test]
