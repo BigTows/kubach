@@ -520,6 +520,7 @@ pub(crate) async fn wait_for_condition(
             namespace: a.namespace,
             all_namespaces: false,
             label_selector: a.label_selector.clone(),
+            field_selector: None,
         },
         _ => {
             return Err(Denial::new(
