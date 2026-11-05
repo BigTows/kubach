@@ -946,6 +946,7 @@ pub(crate) async fn run(
         "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
         "helm_rollback" => helm_tools::rollback(ctx, args).await,
         "helm_uninstall" => helm_tools::uninstall(ctx, args).await,
+        "helm_preview_diff" => crate::helm_preview::preview_diff(ctx, args).await,
         "can_reach" => topology_tools::can_reach(ctx, args).await,
         "apply_manifest" => {
             let a: ApplyArgs = parse(args)?;

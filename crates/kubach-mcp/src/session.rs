@@ -23,6 +23,7 @@ use crate::access::{Access, Raises};
 use crate::confirm::WaitingCalls;
 use crate::forwards::{SessionForwards, StopReason};
 use crate::grants::{CustomRight, Grant, GrantState, Grants};
+use crate::helm_preview::PreviewStore;
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
 use crate::remember::{Remembered, RememberedSet};
@@ -158,6 +159,9 @@ pub struct Session {
     /// Kinds of change per namespace the user said not to ask about again
     /// in this session (#30). Only in memory.
     remembered: Mutex<RememberedSet>,
+    /// Helm previews the agent may still page through (#115). Only in
+    /// memory, masked, bounded.
+    helm_previews: Mutex<PreviewStore>,
     /// This session, for tasks that must not keep it alive.
     me: Weak<Session>,
 }
@@ -233,6 +237,7 @@ impl Session {
             changed: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         });
         spawn_ttl_guard(Arc::downgrade(&session), session.scope.deadline());
@@ -268,6 +273,7 @@ impl Session {
             changed: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         })
     }
@@ -543,6 +549,11 @@ impl Session {
             kind.to_owned(),
             name.to_owned(),
         ))
+    }
+
+    /// Helm previews kept for paging (#115).
+    pub(crate) fn helm_previews(&self) -> &Mutex<PreviewStore> {
+        &self.helm_previews
     }
 
     /// The user's answers so far.
@@ -978,6 +989,7 @@ impl Session {
             return Ok(());
         }
         self.forget_remembered();
+        sync::lock(&self.helm_previews).clear();
         self.forwards.stop_all(StopReason::SessionEnded);
         let boundaries: Vec<Arc<Boundary>> =
             sync::lock(&self.boundaries).values().cloned().collect();
@@ -1268,6 +1280,7 @@ mod tests {
             changed: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         })
     }

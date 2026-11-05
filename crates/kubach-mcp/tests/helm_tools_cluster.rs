@@ -157,17 +157,26 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     .await;
     assert_eq!(preview["preview"], true, "{preview}");
     assert!(
-        preview["objects"].to_string().contains("Deployment"),
+        preview["summary"]["added"]
+            .to_string()
+            .contains("Deployment"),
         "{preview}"
     );
+    let diff = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": preview["fullDiff"]["previewId"], "kind": "Deployment"}),
+    )
+    .await;
     assert!(
-        preview["diff"]
+        diff["diff"]
             .as_str()
             .unwrap_or_default()
             .contains("kind: Deployment"),
-        "{preview}"
+        "{diff}"
     );
     assert!(!preview.to_string().contains("s3cret-value"), "{preview}");
+    assert!(!diff.to_string().contains("s3cret-value"), "{diff}");
     assert!(
         !confirmer
             .requests()
@@ -957,6 +966,65 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     );
     assert_eq!(confirmer.requests().len(), before);
 
+    // Its preview, from the server-side dry run: a summary with the changed
+    // values and objects, the full diff by object (#115).
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({
+            "release": PATCH_RELEASE,
+            "namespace": namespace,
+            "valuesPatch": "replicaCount: 2\nextra:\n  password: another-secret-value\n",
+            "preview": true,
+        }),
+    )
+    .await;
+    let summary = &preview["summary"];
+    assert_eq!(
+        summary["values"],
+        json!([
+            {"path": "extra.password", "change": "changed",
+             "old": format!("*** ({} bytes)", secret.len()), "new": "*** (20 bytes)"},
+            {"path": "replicaCount", "change": "changed", "old": 1, "new": 2},
+        ]),
+        "{preview}"
+    );
+    assert!(
+        summary["changed"].to_string().contains("Deployment"),
+        "{preview}"
+    );
+    let id = &preview["fullDiff"]["previewId"];
+    let values = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": id, "kind": "Values"}),
+    )
+    .await;
+    assert!(
+        values["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+replicaCount: 2"),
+        "{values}"
+    );
+    let objects = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": id, "kind": "Deployment"}),
+    )
+    .await;
+    assert!(
+        objects["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replicas"),
+        "{objects}"
+    );
+    for text in [preview.to_string(), values.to_string(), objects.to_string()] {
+        assert!(!text.contains(secret), "the preview leaks");
+        assert!(!text.contains("another-secret-value"), "the preview leaks");
+    }
+
     // The patch: only the named keys change.
     let upgraded = call(
         &server,
@@ -1168,7 +1236,19 @@ async fn lookup_flow(base: Config, context: String, namespace: String) {
     )
     .await;
     assert_eq!(preview["lookup"]["status"], "read", "{preview}");
-    let diff = preview["diff"].as_str().unwrap_or_default();
+    assert!(
+        !preview["summary"]["secretKeys"]
+            .to_string()
+            .contains("tls.key"),
+        "{preview}"
+    );
+    let page = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": preview["fullDiff"]["previewId"]}),
+    )
+    .await;
+    let diff = page["diff"].as_str().unwrap_or_default();
     assert!(!diff.contains("id:"), "{diff}");
     assert!(!diff.contains("tls.key"), "{diff}");
     assert!(

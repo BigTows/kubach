@@ -42,6 +42,7 @@ pub mod shared;
 pub mod transport;
 
 mod debug_tools;
+mod helm_preview;
 mod log_level;
 mod node_maintenance;
 mod node_tools;
