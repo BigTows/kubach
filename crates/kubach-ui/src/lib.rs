@@ -19,6 +19,20 @@ pub use age::{AgeTicker, format_age, format_since, unix_now};
 pub use components::*;
 pub use tokens::Tone;
 
+/// The static keystroke with the platform's main modifier, `cmd` on macOS and
+/// `ctrl` elsewhere: `secondary!("shift-n")`. `KeyBinding::new` panics on the
+/// `secondary-` prefix: GPUI resolves it only when it knows the host OS.
+#[macro_export]
+macro_rules! secondary {
+    ($keys:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $keys)
+        } else {
+            concat!("ctrl-", $keys)
+        }
+    };
+}
+
 /// Registers the components' key bindings (e.g. `cmd-a` in checkable
 /// tables). Call once at startup, after `gpui_kit::init`.
 pub fn init(cx: &mut gpui_kit::App) {

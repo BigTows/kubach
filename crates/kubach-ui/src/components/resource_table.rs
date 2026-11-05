@@ -887,7 +887,7 @@ impl TableDelegate for ResourceTableDelegate {
         tr.when(self.is_checked(row_ix), |tr| tr.bg(tint))
             .on_click(cx.listener(move |state, event: &ClickEvent, _, cx| {
                 let modifiers = event.modifiers();
-                if !(modifiers.shift || modifiers.secondary()) {
+                if !(modifiers.shift || modifiers.secondary(cx)) {
                     return;
                 }
                 state.delegate_mut().check_row(row_ix, modifiers.shift);

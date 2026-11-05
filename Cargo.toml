@@ -32,7 +32,7 @@ fluent-bundle = "0.16.0"
 fluent-syntax = "0.12.0"
 futures = "0.3.34"
 # tree-sitter-yaml: syntax highlighting in the YAML editor.
-gpui-kit = { version = "0.8.0", features = ["tree-sitter-yaml"] }
+gpui-kit = { version = "0.8.1", features = ["tree-sitter-yaml"] }
 http = "1.5.0"
 # Streaming the body of tool downloads (#131). Already in the tree through kube.
 http-body-util = "0.1.5"
@@ -121,7 +121,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 # the tree on Linux through gpui.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 zeroize = { version = "1.9.1", features = ["derive", "serde"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2"] }
 
 # GPUI is far too slow unoptimized (scrolling stutters), so dependencies are
 # optimized even in dev builds; workspace crates stay fast to rebuild.
