@@ -681,6 +681,13 @@ impl Session {
                 base,
             ),
             #[cfg(test)]
+            Identities::Fixed(Identity::TemporaryServiceAccount(_)) => {
+                return Ok(HelmAccess::Token {
+                    kubeconfig: "apiVersion: v1\nkind: Config\n".to_owned(),
+                    token: "fake-sa-token".to_owned(),
+                });
+            }
+            #[cfg(test)]
             Identities::Fixed(_) => return Ok(HelmAccess::User),
         };
         Ok(match &boundary.identity {

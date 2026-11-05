@@ -32,6 +32,11 @@
 //! with `valuesPatch` and reads its values masked; run it with
 //! `KUBACH_TEST_NAMESPACE=kubach-test-22`. It creates and deletes the
 //! namespace itself.
+//!
+//! `a_preview_reads_lookup_under_the_service_account` (#114) previews a chart
+//! with `lookup` and a ClusterRole; run it with
+//! `KUBACH_TEST_NAMESPACE=kubach-test-114`. It creates and deletes the
+//! namespace and needs no registry.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -997,5 +1002,227 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
         json!({"release": PATCH_RELEASE, "namespace": namespace}),
     )
     .await;
+    session.close().await.unwrap();
+}
+
+const LOOKUP_RELEASE: &str = "kubach-lookup";
+const LOOKUP_ROLE: &str = "kubach-test-114-reader";
+
+/// A chart that keeps what it generated through `lookup`, and has a
+/// ClusterRole, so its dry run needs the user's credentials. With
+/// `clusterLookup` it reads a Namespace too, which no temporary
+/// ServiceAccount may.
+fn write_lookup_chart(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(
+        dir.join("Chart.yaml"),
+        "apiVersion: v2\nname: keeper\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("values.yaml"), "clusterLookup: false\n").unwrap();
+    std::fs::write(
+        dir.join("templates/kept.yaml"),
+        r#"{{- $old := lookup "v1" "ConfigMap" .Release.Namespace "keeper-id" }}
+{{- $key := lookup "v1" "Secret" .Release.Namespace "keeper-tls" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keeper-id
+data:
+  id: {{ if $old }}{{ $old.data.id }}{{ else }}{{ uuidv4 }}{{ end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keeper-tls
+data:
+  tls.key: {{ if $key }}{{ index $key.data "tls.key" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("templates/cluster.yaml"),
+        format!(
+            r#"{{{{- if .Values.clusterLookup }}}}
+{{{{- $ns := lookup "v1" "Namespace" "" "default" }}}}
+{{{{- end }}}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {LOOKUP_ROLE}
+rules: []
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A preview of a chart with `lookup` that needs the user's credentials
+/// (#114): `lookup` reads the namespace under the temporary ServiceAccount,
+/// and what the ServiceAccount cannot read leaves marks, not an error. Run
+/// it with `KUBACH_TEST_NAMESPACE=kubach-test-114`. The namespace and the
+/// ClusterRole are deleted at the start and at the end whatever happens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster and helm (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_preview_reads_lookup_under_the_service_account() {
+    let (base, context, namespace) = config().await;
+    let user = Client::try_from(base.clone()).unwrap();
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    let cluster_roles: Api<ClusterRole> = Api::all(user.clone());
+    let _ = cluster_roles
+        .delete(LOOKUP_ROLE, &DeleteParams::default())
+        .await;
+    assert!(drop_namespaces(&namespaces, &[&namespace]).await);
+    let object: Namespace =
+        serde_json::from_value(json!({"metadata": {"name": namespace}})).unwrap();
+    namespaces
+        .create(&Default::default(), &object)
+        .await
+        .unwrap();
+    let flow_namespace = namespace.clone();
+    let flow = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(lookup_flow(base, context, flow_namespace))
+    });
+    let outcome = tokio::task::spawn_blocking(move || flow.join())
+        .await
+        .unwrap();
+    let _ = cluster_roles
+        .delete(LOOKUP_ROLE, &DeleteParams::default())
+        .await;
+    let dropped = drop_namespaces(&namespaces, &[&namespace]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(dropped, "the test's namespace is still there");
+}
+
+async fn lookup_flow(base: Config, context: String, namespace: String) {
+    use kubach_core::helm::Driver;
+    use kubach_core::helm::Sensitive;
+    use kubach_core::helm::cli::{self as helm_cli, HelmTarget, InstallRequest, SecretEnv};
+
+    let binary = kubach_core::settings::find_on_path("helm");
+    let chart = tempfile::tempdir().unwrap();
+    write_lookup_chart(chart.path());
+    // The release as the test's user: its chart is kept in the release,
+    // which an upgrade without `chart` takes.
+    let target = HelmTarget {
+        context: context.clone(),
+        kubeconfig: helm_cli::kubeconfig_files(&[]),
+        namespace: namespace.clone(),
+        driver: Driver::Secret,
+        secret_env: SecretEnv::default(),
+    };
+    helm_cli::install(
+        binary.as_deref(),
+        &target,
+        &InstallRequest {
+            release: LOOKUP_RELEASE.into(),
+            chart: chart.path().display().to_string(),
+            version: None,
+            values: Sensitive::new(String::new()),
+            create_namespace: false,
+        },
+        false,
+        Duration::from_secs(120),
+    )
+    .await
+    .unwrap();
+
+    let policy = SecurityPolicy {
+        mcp_enabled: true,
+        temporary_objects: true,
+        ..SecurityPolicy::default()
+    };
+    let spec = SessionSpec {
+        context,
+        server_url: base.cluster_url.to_string(),
+        namespaces: Vec::new(),
+        profile: Profile::Deploy,
+        ttl: Some(Duration::from_secs(900)),
+        hints: Vec::new(),
+    };
+    let session = Session::start(&base, &spec, &policy).await.unwrap();
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    server.set_helm(HelmEnv {
+        binary,
+        kubeconfig: Some(helm_cli::kubeconfig_files(&[])),
+        vault: None,
+        paths: HelmPaths::from_env(),
+    });
+    let user = Client::try_from(base.clone()).unwrap();
+    let roles: Api<Role> = Api::namespaced(user.clone(), &namespace);
+    let role = format!("kubach-mcp-{}", session.id());
+
+    // What the release has is read: the generated id and key stay, so the
+    // diff has no false change.
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "read", "{preview}");
+    let diff = preview["diff"].as_str().unwrap_or_default();
+    assert!(!diff.contains("id:"), "{diff}");
+    assert!(!diff.contains("tls.key"), "{diff}");
+    assert!(
+        preview["needsTheUsersAttention"]
+            .to_string()
+            .contains("ClusterRole"),
+        "{preview}"
+    );
+
+    // Back to the granted rights: the Secrets it read were for the render.
+    let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
+    assert!(
+        !rules.iter().any(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource == "secrets")
+        }),
+        "{rules:?}"
+    );
+
+    // A lookup the ServiceAccount cannot do: the render without the cluster,
+    // with its marks.
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true,
+               "valuesPatch": "clusterLookup: true\n"}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(
+        preview["lookup"]["objects"],
+        json!([
+            "Secret keeper-tls",
+            "ConfigMap keeper-id",
+            "ClusterRole kubach-test-114-reader"
+        ]),
+        "{preview}"
+    );
+    assert_eq!(preview["lookup"]["wholePreview"], false, "{preview}");
+
+    // Nobody was asked for either preview, and nothing changed.
+    assert!(helm_changes(&confirmer.requests()).is_empty());
+    let revisions = call(
+        &server,
+        "helm_release_history",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace}),
+    )
+    .await;
+    assert_eq!(
+        revisions.to_string().matches("\"revision\"").count(),
+        1,
+        "{revisions}"
+    );
     session.close().await.unwrap();
 }

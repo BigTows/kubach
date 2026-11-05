@@ -966,3 +966,28 @@ fn a_vault_kubeconfig_shows_nothing_and_goes_to_a_private_file() {
     drop(file);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 }
+
+/// The render for `lookup` adds rights that only read, and none outside
+/// the namespace (#114).
+#[test]
+fn the_rules_for_lookup_only_read() {
+    let rules = helm_read_rules();
+    assert!(!rules.is_empty());
+    for rule in &rules {
+        assert!(!rule.verbs.is_empty());
+        assert!(
+            rule.verbs
+                .iter()
+                .all(|verb| ["get", "list", "watch"].contains(&verb.as_str())),
+            "{rule:?}"
+        );
+        assert!(
+            !rule
+                .api_groups
+                .iter()
+                .flatten()
+                .any(|group| group == "rbac.authorization.k8s.io"),
+            "{rule:?}"
+        );
+    }
+}
