@@ -57,7 +57,7 @@ pub use audit::{AuditEntry, AuditLog, DecidedBy};
 pub use confirm::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
 };
-pub use grants::{Grant, GrantEntry, GrantState, Grants};
+pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{
     HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY, VaultKubeconfig,
 };

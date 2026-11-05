@@ -1325,4 +1325,6 @@ fn catalog() -> Vec<ToolSpec> {
 }
 
 #[cfg(test)]
+mod crd_access_tests;
+#[cfg(test)]
 mod tests;

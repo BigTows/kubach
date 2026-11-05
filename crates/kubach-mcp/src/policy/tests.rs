@@ -2600,3 +2600,60 @@ fn debug_containers_are_like_exec_and_check_their_input() {
         DenialCode::InvalidInput
     );
 }
+
+#[test]
+fn custom_rights_name_what_a_call_uses_beyond_the_lists() {
+    let rights = |request: Request| {
+        let allowed = check(Profile::Deploy, request.clone()).unwrap();
+        Policy::custom_rights(&request, &allowed)
+            .into_iter()
+            .map(|right| format!("{} {}.{}", right.verb, right.resource, right.group))
+            .collect::<Vec<_>>()
+    };
+    let widget = || KindRef {
+        kind: "Widget".into(),
+        api_version: Some("example.com/v1".into()),
+    };
+    let reads = ["get widgets.example.com", "list widgets.example.com"];
+
+    assert_eq!(
+        rights(Request::List {
+            kind: widget(),
+            namespace: Some(NS.into()),
+            all_namespaces: false,
+            label_selector: None,
+        }),
+        reads
+    );
+    assert_eq!(
+        rights(Request::Delete {
+            kind: widget(),
+            name: "w".into(),
+            namespace: Some(NS.into()),
+        }),
+        [reads[0], reads[1], "delete widgets.example.com"]
+    );
+    assert_eq!(
+        rights(Request::Apply {
+            yaml: "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\n".into(),
+            namespace: Some(NS.into()),
+            dry_run: true,
+        }),
+        [
+            reads[0],
+            reads[1],
+            "create widgets.example.com",
+            "patch widgets.example.com"
+        ]
+    );
+    // Built-in kinds are the Role's anyway.
+    assert!(
+        rights(Request::List {
+            kind: KindRef::new("Deployment"),
+            namespace: Some(NS.into()),
+            all_namespaces: false,
+            label_selector: None,
+        })
+        .is_empty()
+    );
+}
