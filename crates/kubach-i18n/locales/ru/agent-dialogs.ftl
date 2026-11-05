@@ -30,6 +30,9 @@ agent-title-helm-rollback = Откатить релиз Helm?
 agent-title-helm-uninstall = Удалить релиз Helm?
 agent-title-chart-source = Разрешить источник чартов?
 agent-title-use-context = Разрешить агенту работать в этом контексте?
+agent-title-namespaces = Разрешить агенту читать другие namespace?
+agent-title-batch-scale = Масштабировать эти объекты?
+agent-title-batch-restart = Перезапустить эти объекты?
 agent-title-call = Одобрить изменение агента?
 agent-title-secret-create = Введите значения нового Secret
 agent-title-secret-update = Изменение Secret
@@ -46,6 +49,8 @@ agent-command-header =
         [many] { $count } аргументов, байт: { $bytes } · ␣ — пробел, \n — перевод строки, \u{"{"}…{"}"} — невидимый символ
        *[other] { $count } аргумента, байт: { $bytes } · ␣ — пробел, \n — перевод строки, \u{"{"}…{"}"} — невидимый символ
     }
+agent-batch-objects = Изменятся объекты: { $count }
+agent-batch-left-out = Не войдут и не изменятся: { $count }
 agent-no-longer-pending = Этот запрос больше не ждёт ответа.
 agent-dangerous-title = Выходит за границу namespace или читает Secrets
 agent-dangerous-line = { $message } — { $path }

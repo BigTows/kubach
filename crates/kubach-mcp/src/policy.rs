@@ -16,15 +16,17 @@
 //!
 //! Namespaces (#401): a session pinned at launch keeps to its namespaces;
 //! otherwise the agent names any valid namespace, as many as it needs.
-//! Cluster-scoped resources and all-namespace calls stay refused; only
-//! [`Request::ListNamespaces`] reads namespace names.
+//! Cluster-scoped resources stay refused; only [`Request::ListNamespaces`]
+//! reads namespace names. `allNamespaces` is never one cluster-wide call:
+//! [`Policy::all_namespaces_plan`] names the namespaces, and each is read as
+//! its own [`Request`] (#107).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use kubach_core::apply::{self, ResolvedManifest};
 use kubach_core::discovery::{ApiCatalog, ResourceKind};
-use kubach_core::secrets::mask::is_core_secret;
+use kubach_core::secrets::mask::{is_core_secret, is_sensitive_name};
 use kubach_core::workload_pods::Workload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +43,8 @@ use crate::settings::Profile;
 pub const MAX_APPLY_BYTES: usize = 512 * 1024;
 /// Most documents in one `apply`.
 pub const MAX_APPLY_DOCUMENTS: usize = 20;
+/// Longest label or field selector, in bytes.
+const MAX_SELECTOR_BYTES: usize = 1024;
 /// Most namespaces in one topology request: each may need its own read
 /// right, and a call asks for at most three.
 pub const MAX_TOPOLOGY_NAMESPACES: usize = 3;
@@ -106,8 +110,12 @@ pub enum Request {
     List {
         kind: KindRef,
         namespace: Option<String>,
+        /// Every namespace the session may read (#107): this request only
+        /// clears the kind and selectors, and each namespace is then
+        /// checked as a request of its own.
         all_namespaces: bool,
         label_selector: Option<String>,
+        field_selector: Option<String>,
     },
     /// `get` and `describe`.
     Get {
@@ -118,6 +126,8 @@ pub enum Request {
     Events {
         namespace: Option<String>,
         object: Option<(KindRef, String)>,
+        /// As in [`Request::List`] (#107).
+        all_namespaces: bool,
     },
     /// `get_logs`: exactly one of a pod, a workload (kind + name) or a
     /// label selector picks the pods.
@@ -469,6 +479,19 @@ impl From<SessionMode> for NamespaceModes {
     }
 }
 
+/// Where an `allNamespaces` call may read (#107).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamespacePlan {
+    /// Read right away: granted already, or pinned at launch.
+    pub readable: Vec<String>,
+    /// Known, but the session has not opened them yet. Opening one sets up
+    /// its identity, so one call never does that for a whole cluster
+    /// without the user's yes.
+    pub unopened: Vec<String>,
+    /// Refused or revoked: never read.
+    pub refused: Vec<String>,
+}
+
 /// The policy of one session.
 pub struct Policy<'a> {
     scope: &'a SessionScope,
@@ -629,6 +652,15 @@ impl<'a> Policy<'a> {
     pub fn required_grants(&self, request: &Request, allowed: &Allowed) -> Vec<Grant> {
         let read = Grant::read(allowed.namespace.clone());
         let mut needed = match request {
+            // Each namespace is checked on its own afterwards (#107).
+            Request::List {
+                all_namespaces: true,
+                ..
+            }
+            | Request::Events {
+                all_namespaces: true,
+                ..
+            } => Vec::new(),
             Request::Info
             | Request::ListKinds
             | Request::ListNamespaces
@@ -719,6 +751,11 @@ impl<'a> Policy<'a> {
             rights
         };
         match request {
+            // Set up namespace by namespace (#107).
+            Request::List {
+                all_namespaces: true,
+                ..
+            } => Vec::new(),
             Request::List { .. }
             | Request::Get { .. }
             | Request::Scale { .. }
@@ -824,17 +861,15 @@ impl<'a> Policy<'a> {
                 namespace,
                 all_namespaces,
                 label_selector,
+                field_selector,
             } => {
-                if *all_namespaces {
-                    return Err(Denial::new(
-                        DenialCode::Namespace,
-                        "listing across all namespaces is not allowed in this session",
-                    ));
-                }
                 if let Some(selector) = label_selector {
                     check_selector(selector)?;
                 }
-                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                if let Some(selector) = field_selector {
+                    check_field_selector(selector)?;
+                }
+                let mut allowed = self.target(namespace.as_deref(), *all_namespaces)?;
                 allowed.kind = Some(self.read_kind(kind)?);
                 Ok(allowed)
             }
@@ -848,8 +883,12 @@ impl<'a> Policy<'a> {
                 allowed.name = Some(object_name(name)?);
                 Ok(allowed)
             }
-            Request::Events { namespace, object } => {
-                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+            Request::Events {
+                namespace,
+                object,
+                all_namespaces,
+            } => {
+                let mut allowed = self.target(namespace.as_deref(), *all_namespaces)?;
                 if let Some((kind, name)) = object {
                     allowed.kind = Some(self.read_kind(kind)?);
                     allowed.name = Some(object_name(name)?);
@@ -1308,6 +1347,49 @@ impl<'a> Policy<'a> {
         Ok(namespace.to_owned())
     }
 
+    /// The plan of a call on one namespace or, with `all_namespaces`, of
+    /// one that names none: its namespace stays empty.
+    fn target(&self, namespace: Option<&str>, all_namespaces: bool) -> Result<Allowed, Denial> {
+        if !all_namespaces {
+            return Ok(self.allowed(self.namespace(namespace)?));
+        }
+        if namespace.is_some() {
+            return Err(Denial::new(
+                DenialCode::InvalidInput,
+                "give either namespace or allNamespaces, not both",
+            ));
+        }
+        Ok(self.allowed(String::new()))
+    }
+
+    /// Sorts the namespaces of an `allNamespaces` call (#107). A pinned
+    /// session keeps to its namespaces whatever is `known`; otherwise
+    /// `known` adds to the ones the session reads already. A revoked
+    /// namespace is refused here, whichever way it was found.
+    pub fn all_namespaces_plan(&self, known: &[String]) -> NamespacePlan {
+        let mut names: Vec<String> = self.namespaces_in_use();
+        if !self.scope.pinned() {
+            names.extend(known.iter().cloned());
+            names.extend(self.grants.entries().into_iter().filter_map(|entry| {
+                matches!(entry.grant, Grant::Read { .. })
+                    .then(|| entry.grant.namespace().to_owned())
+            }));
+        }
+        names.sort();
+        names.dedup();
+        let mut plan = NamespacePlan::default();
+        for name in names {
+            match self.grants.state(&Grant::read(name.clone())) {
+                Some(GrantState::Denied) => plan.refused.push(name),
+                Some(GrantState::Granted) => plan.readable.push(name),
+                None if self.scope.pinned() => plan.readable.push(name),
+                None if names::is_dns_label(&name) => plan.unopened.push(name),
+                None => {}
+            }
+        }
+        plan
+    }
+
     /// A kind the agent may read: served, namespaced, not a Secret, and in
     /// the built-in allowlist unless the session has custom resources
     /// (#192, asked for on request since #15).
@@ -1723,11 +1805,69 @@ fn check_image(image: &str) -> Result<(), Denial> {
 }
 
 fn check_selector(selector: &str) -> Result<(), Denial> {
-    if selector.len() > 1024 || selector.chars().any(char::is_control) {
+    if selector.len() > MAX_SELECTOR_BYTES || selector.chars().any(char::is_control) {
         return Err(Denial::new(
             DenialCode::InvalidInput,
             "invalid label selector",
         ));
+    }
+    Ok(())
+}
+
+/// A `fieldSelector` as the API server reads it: `field=value`,
+/// `field==value` or `field!=value`, comma-separated. A namespace is chosen
+/// with `namespace`, not here. A field that may hold a credential is
+/// refused: selecting on it would tell a guess from a miss, for a value
+/// masking keeps from the agent (a custom resource's `selectableFields`).
+fn check_field_selector(selector: &str) -> Result<(), Denial> {
+    let invalid = |why: &str| {
+        Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "invalid fieldSelector {selector:?}: {why}. Expected field=value, field==value \
+                 or field!=value, comma-separated, for example spec.nodeName=node-1"
+            ),
+        )
+    };
+    if selector.len() > MAX_SELECTOR_BYTES {
+        return Err(invalid("it is too long"));
+    }
+    let field_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+    };
+    for term in selector.split(',') {
+        let (field, value) = term
+            .split_once("!=")
+            .or_else(|| term.split_once("=="))
+            .or_else(|| term.split_once('='))
+            .ok_or_else(|| invalid("a term has no operator"))?;
+        if !field.split('.').all(field_part) {
+            return Err(invalid("a field name is malformed"));
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !"=!,\\".contains(c))
+        {
+            return Err(invalid("a value has characters a selector cannot carry"));
+        }
+        if field.eq_ignore_ascii_case("metadata.namespace") {
+            return Err(Denial::new(
+                DenialCode::Namespace,
+                "fieldSelector cannot choose a namespace: pass `namespace` or `allNamespaces`",
+            ));
+        }
+        if is_sensitive_name(field) {
+            return Err(Denial::new(
+                DenialCode::Secret,
+                format!(
+                    "fieldSelector cannot select on {field}: the name says it may hold a \
+                     credential, and matching on it would reveal a masked value"
+                ),
+            ));
+        }
     }
     Ok(())
 }

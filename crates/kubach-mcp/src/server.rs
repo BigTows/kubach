@@ -177,6 +177,11 @@ impl McpServer {
             waiting: self.inner.session.waiting(),
             progress: progress.as_ref(),
         };
+        let audit_object = |object: tools::ObjectAudit| {
+            if let Some(audit) = &self.inner.audit {
+                let _ = audit.record(&self.object_entry(client, tool, object));
+            }
+        };
         let ctx = Ctx {
             session: &self.inner.session,
             registry: &self.inner.registry,
@@ -191,6 +196,7 @@ impl McpServer {
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
             remembered: std::sync::Mutex::new(None),
+            audit_object: &audit_object,
         };
         let result = tools::run(&ctx, tool, &args).await;
         let decisions = sync::into_inner(ctx.decisions);
@@ -306,6 +312,28 @@ impl McpServer {
         Ok(())
     }
 
+    /// The audit line of one object of a batch (#108).
+    fn object_entry(&self, client: &str, tool: &str, object: tools::ObjectAudit) -> AuditEntry {
+        AuditEntry {
+            time: Timestamp::now().to_string(),
+            session: self.inner.session.id().to_owned(),
+            client: client.to_owned(),
+            tool: tool.to_owned(),
+            args: object.args,
+            change: None,
+            decided_by: object.decided_by,
+            remembered: None,
+            allowed: object.allowed,
+            reason: object.reason,
+            identity: self
+                .inner
+                .session
+                .describe_identity(Some(&object.namespace)),
+            result: object.result,
+            duration_ms: 0,
+        }
+    }
+
     /// The audit line of one answer for a right.
     fn grant_entry(&self, client: &str, tool: &str, decision: &GrantDecision) -> AuditEntry {
         AuditEntry {
@@ -400,7 +428,9 @@ impl McpServer {
             )
         } else {
             "Pass `namespace` to the tools; list_namespaces shows the namespaces Kubach knows \
-             of. Any namespace works, as many as you need."
+             of. Any namespace works, as many as you need. For a question about all of them, \
+             pass allNamespaces to list_resources or list_events instead of calling namespace \
+             by namespace, and read the coverage note: it says what was left out."
                 .to_owned()
         };
         let more = " Tools beyond your access are marked \"Requires your approval in Kubach\": \
@@ -541,7 +571,7 @@ const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, 
      machine) is previewed and confirmed by the user one by one, even within your access. The \
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
      (not for deletions, Secrets or nodes); the result of such a call then says it was approved that \
-     way.";
+     way. For many objects use scale_batch and rollout_restart_batch: one window lists them all.";
 
 /// Whether a call of `tool` ends when it is cancelled. A relayed call of
 /// any other tool runs on as before, a change above all.
@@ -578,10 +608,17 @@ fn tool_access(name: &str) -> Option<Access> {
         "get_logs" | "exec" | "debug_container" | "port_forward_start" => {
             need(Profile::Debug, false)
         }
-        "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
-        | "helm_upgrade" | "helm_rollback" | "helm_uninstall" | "helm_preview_diff" => {
-            need(Profile::Deploy, false)
-        }
+        "apply_manifest"
+        | "scale"
+        | "scale_batch"
+        | "rollout_restart"
+        | "rollout_restart_batch"
+        | "delete_resource"
+        | "helm_install"
+        | "helm_upgrade"
+        | "helm_rollback"
+        | "helm_uninstall"
+        | "helm_preview_diff" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
         "list_secrets"
         | "check_secret"
@@ -642,6 +679,27 @@ fn kind_props(extra: Value) -> Value {
     props
 }
 
+/// What `scale_batch` and `rollout_restart_batch` take (#108): `object` is
+/// one item of `objects`, `extra` the tool's own arguments.
+fn batch_props(object: Value, extra: Value) -> Value {
+    let mut props = kind_props(json!({
+        "objects": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": crate::batch_tools::MAX_OBJECTS,
+            "description": "The objects to change; kind and namespace default to the top-level ones. Not with labelSelector",
+            "items": object_schema(object, &["name"]),
+        },
+        "labelSelector": {"type": "string", "description": "Instead of objects: every object of `kind` that matches, found before the user is asked"},
+        "namespaces": {"type": "array", "items": {"type": "string"}, "description": "With labelSelector: several namespaces instead of `namespace`"},
+        "allNamespaces": {"type": "boolean", "description": "With labelSelector: every namespace this session may read, as in list_resources"},
+    }));
+    if let (Some(props), Value::Object(extra)) = (props.as_object_mut(), extra) {
+        props.extend(extra);
+    }
+    props
+}
+
 /// How helm_install and helm_upgrade describe `preview` (#68).
 const PREVIEW_HELP: &str = "Only show what would change, as a short summary of the server-side \
      dry run: objects added, changed and removed, image changes, changed ConfigMap and Secret \
@@ -686,11 +744,18 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_resources",
-            description: "List resources of a kind in the session namespace, as a table.",
+            description: "List resources of a kind in a namespace, as a table. With allNamespaces \
+                          true: in every namespace this session may read, one by one under each \
+                          namespace's identity, not cluster-wide. The answer starts with its \
+                          coverage: which namespaces were read and which were not, and why; a \
+                          PARTIAL answer is not the whole cluster. Namespaces the session has \
+                          not opened yet are asked about once, in one question to the user.",
             schema: object_schema(
                 kind_props(json!({
                     "labelSelector": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "fieldSelector": {"type": "string", "description": "field=value, field==value or field!=value, comma-separated, e.g. spec.nodeName=node-1 or status.phase=Running. Fields depend on the kind; not metadata.namespace"},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most items, per namespace with allNamespaces"},
                 })),
                 &["kind"],
             ),
@@ -719,11 +784,15 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_events",
-            description: "Recent events in the namespace, optionally for one object (kind + name).",
+            description: "Recent events in a namespace, optionally for one object (kind + name). \
+                          With allNamespaces true: in every namespace this session may read, \
+                          the newest across them, with the same coverage note as \
+                          list_resources.",
             schema: object_schema(
                 kind_props(json!({
                     "name": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most events, in all with allNamespaces"},
                 })),
                 &[],
             ),
@@ -952,6 +1021,59 @@ fn catalog() -> Vec<ToolSpec> {
             destructive: false,
         },
         ToolSpec {
+            name: "scale_batch",
+            description: "Scale many Deployments, StatefulSets or ReplicaSets at once: a list of \
+                          objects or a labelSelector, in one or several namespaces. Kubach finds \
+                          the objects first, the user approves them in one window with old and \
+                          new replicas, and only those objects are changed, by UID: one that \
+                          appears later is reported, not touched. Objects that fail or are left \
+                          out are named and do not stop the others. The result gives each \
+                          object's original replicas and the arguments that roll the batch back.",
+            schema: object_schema(
+                batch_props(
+                    json!({
+                        "kind": {"type": "string"},
+                        "apiVersion": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "name": {"type": "string"},
+                        "replicas": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "For this object, instead of the top-level replicas"},
+                    }),
+                    json!({
+                        "replicas": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "For every object that names none"},
+                    }),
+                ),
+                &[],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "rollout_restart_batch",
+            description: "Rollout restart of many Deployments, StatefulSets or DaemonSets at \
+                          once: a list of objects or a labelSelector, in one or several \
+                          namespaces. Kubach finds the objects first, the user approves them in \
+                          one window, and only those objects are restarted, by UID: one that \
+                          appears later is reported, not touched. Objects that fail or are left \
+                          out are named and do not stop the others. The call returns once the \
+                          restarts are sent; use wait_for_rollout to see them finish.",
+            schema: object_schema(
+                batch_props(
+                    json!({
+                        "kind": {"type": "string"},
+                        "apiVersion": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "name": {"type": "string"},
+                    }),
+                    json!({
+                        "concurrency": {"type": "integer", "minimum": 1, "maximum": crate::batch_tools::MAX_CONCURRENCY, "description": "Restarts sent at the same time, default 4. It paces the requests, not the rollouts: they go on after the call"},
+                    }),
+                ),
+                &[],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
             name: "wait_for_rollout",
             description: "Wait until a Deployment, StatefulSet or DaemonSet has rolled out, like \
                           kubectl rollout status --timeout: after scale, rollout_restart, \
@@ -1165,10 +1287,13 @@ fn catalog() -> Vec<ToolSpec> {
             name: "helm_search_charts",
             description: "Search Helm charts of the repositories added in Kubach (like helm search \
                           repo), or list the versions of an oci:// chart (`oci`); the user is \
-                          asked once to allow a registry not added in Kubach.",
+                          asked once to allow a registry not added in Kubach. A query never \
+                          finds oci:// charts. An empty result says why (`reason`, `note`), \
+                          which repositories were searched (`searched`) and which have no \
+                          loaded index (`withoutIndex`).",
             schema: object_schema(
                 json!({
-                    "query": {"type": "string", "description": "Part of repo/chart, a description or a keyword; empty lists all"},
+                    "query": {"type": "string", "description": "One substring of repo/chart, a description or a keyword; empty lists all"},
                     "oci": {"type": "string", "description": "oci://registry/path of one chart, instead of query"},
                     "versions": {"type": "boolean", "default": false, "description": "Every version, not only the latest"},
                     "devel": {"type": "boolean", "default": false, "description": "Include pre-releases"},
@@ -1463,6 +1588,10 @@ fn catalog() -> Vec<ToolSpec> {
     ]
 }
 
+#[cfg(test)]
+mod all_namespaces_tests;
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod crd_access_tests;
 #[cfg(test)]

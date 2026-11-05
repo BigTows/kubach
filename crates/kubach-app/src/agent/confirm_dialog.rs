@@ -12,7 +12,10 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, Wind
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_i18n::t;
-use kubach_mcp::{ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentials, RequestKind};
+use kubach_mcp::{
+    BatchAction, BatchChange, ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentials,
+    RequestKind,
+};
 use kubach_ui::measure;
 
 use super::{AgentState, Notice, countdown, global, secret_dialog};
@@ -164,6 +167,11 @@ fn title(request: &ConfirmationRequest) -> String {
         },
         RequestKind::ChartSource { .. } => t!("agent-title-chart-source"),
         RequestKind::UseContext { .. } => t!("agent-title-use-context"),
+        RequestKind::Namespaces { .. } => t!("agent-title-namespaces"),
+        RequestKind::Batch { batch } => match batch.action {
+            BatchAction::Scale => t!("agent-title-batch-scale"),
+            BatchAction::Restart => t!("agent-title-batch-restart"),
+        },
         RequestKind::Secret { secret } => secret_dialog::title(secret),
         RequestKind::Call | RequestKind::RevealBlocked { .. } => t!("agent-title-call"),
     }
@@ -294,6 +302,56 @@ fn command_block(command: &[String], cx: &App) -> impl IntoElement + use<> {
                         .child(styled_arg(arg, cx)),
                 )
         }))
+}
+
+/// A batch (#108): every object it will change, each on its own line with
+/// its old and new replicas, then what it leaves out. Nothing is cut: this
+/// list is what the user approves, and the tool bounds its length.
+fn batch_block(batch: &BatchChange, cx: &App) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .id("confirm-batch")
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(theme.muted)
+                .text_xs()
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("agent-batch-objects", count = batch.objects.len())),
+                )
+                .children(batch.objects.iter().map(|object| {
+                    div()
+                        .flex()
+                        .gap_2()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground)
+                        .child(div().flex_1().min_w_0().child(object.label()))
+                        .children(
+                            object
+                                .change()
+                                .map(|change| div().flex_shrink_0().child(change)),
+                        )
+                })),
+        )
+        .when(!batch.left_out.is_empty(), |this| {
+            this.child(warning_block(
+                t!("agent-batch-left-out", count = batch.left_out.len()),
+                batch.left_out.clone(),
+                theme.warning,
+                cx,
+            ))
+        })
 }
 
 /// Height the dialog's title, paddings, margins and our buttons take
@@ -562,7 +620,9 @@ impl Render for ConfirmView {
         };
         let source = matches!(
             request.kind,
-            RequestKind::ChartSource { .. } | RequestKind::UseContext { .. }
+            RequestKind::ChartSource { .. }
+                | RequestKind::UseContext { .. }
+                | RequestKind::Namespaces { .. }
         );
         // Access beyond the minimum (#15).
         let access = match &request.kind {
@@ -579,10 +639,16 @@ impl Render for ConfirmView {
             .is_some_and(|secret| secret.op == kubach_mcp::SecretOp::Delete);
         let degraded = agent.server_limits_warning(&request.session_id, &request.namespace);
         let degraded_shown = degraded.is_some();
+        // A batch across namespaces has no one namespace (#108).
+        let namespace = match &request.kind {
+            RequestKind::Batch { batch } => batch.namespaces().join(", "),
+            _ => request.namespace.clone(),
+        };
 
         let details = match &request.kind {
             // Exec is a command, not a diff: no colors, every argument apart.
             RequestKind::Exec { command } => Some(command_block(command, cx).into_any_element()),
+            RequestKind::Batch { batch } => Some(batch_block(batch, cx).into_any_element()),
             _ => (grant.is_none()
                 && access.is_none()
                 && !source
@@ -822,7 +888,7 @@ impl Render for ConfirmView {
                             })
                             .child(field(
                                 t!("agent-field-namespace"),
-                                request.namespace.clone(),
+                                namespace,
                                 label_width,
                                 cx,
                             ))
