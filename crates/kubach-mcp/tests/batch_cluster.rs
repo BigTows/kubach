@@ -97,14 +97,15 @@ impl Confirmer for Late {
 
 async fn replicas(api: &Api<Deployment>, name: &str) -> i32 {
     let deployment = api.get(name).await.unwrap();
-    deployment.spec.unwrap().replicas.unwrap()
+    deployment.spec.replicas.unwrap()
 }
 
 async fn restarted(api: &Api<Deployment>, name: &str) -> bool {
     let deployment = api.get(name).await.unwrap();
     deployment
         .spec
-        .and_then(|spec| spec.template.metadata)
+        .template
+        .metadata
         .and_then(|metadata| metadata.annotations)
         .is_some_and(|annotations| annotations.contains_key("kubectl.kubernetes.io/restartedAt"))
 }
