@@ -63,6 +63,7 @@ pub use storage::{
 };
 pub use vpa::VerticalPodAutoscalerPlugin;
 pub use workloads::{DaemonSetPlugin, DeploymentPlugin, ReplicaSetPlugin, StatefulSetPlugin};
+pub use workloads::{restart_object, scale_object};
 
 use super::ObjectRef;
 use super::{
