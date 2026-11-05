@@ -1918,6 +1918,70 @@ async fn works_over_the_mcp_protocol() {
     client.cancel().await.unwrap();
 }
 
+/// Hears the progress notifications of its calls.
+struct ProgressClient(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl rmcp::ClientHandler for ProgressClient {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0.send(params.message.unwrap_or_default()).ok();
+    }
+}
+
+/// A call waiting for the user says so through the protocol right away,
+/// to a client with a progress token, and any call of `session_info` meanwhile
+/// shows it (#116).
+#[tokio::test]
+async fn a_call_waiting_for_the_user_says_so_over_the_mcp_protocol() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let gate = Arc::new(crate::testutil::Gate::new());
+    let server = McpServer::new(f.server.session().clone(), gate.clone(), None);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (told, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let client = ProgressClient(told).serve(client_io).await.unwrap();
+    assert!(
+        client
+            .peer_info()
+            .and_then(|info| info.instructions.clone())
+            .is_some_and(|text| text.contains("waitingForUser"))
+    );
+
+    // The rmcp client sends a progress token with every request.
+    let scale = CallToolRequestParams::new("scale").with_arguments(args(
+        json!({"kind": "Deployment", "name": "web", "replicas": 3}),
+    ));
+    let peer = client.peer().clone();
+    let call = tokio::spawn(async move { peer.call_tool(scale).await });
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), heard.recv())
+        .await
+        .expect("a progress notification")
+        .unwrap();
+    assert!(message.contains("Kubach window"), "{message}");
+    assert!(message.contains("web"), "{message}");
+
+    let info = client
+        .call_tool(CallToolRequestParams::new("session_info"))
+        .await
+        .unwrap();
+    let info = serde_json::to_value(&info.content).unwrap();
+    let info = info[0]["text"].as_str().unwrap();
+    let info: Value = serde_json::from_str(info).unwrap();
+    assert_eq!(info["waitingForUser"][0]["tool"], "scale");
+
+    gate.release();
+    let done = call.await.unwrap().unwrap();
+    assert_eq!(done.is_error, Some(true));
+    assert!(f.server.session().waiting().list().is_empty());
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn http_requires_the_bearer_token() {
     let f = fixture(Profile::ReadOnly, permissive(), false).await;

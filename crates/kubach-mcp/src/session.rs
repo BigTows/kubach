@@ -20,6 +20,7 @@ use kube::{Client, Config};
 use serde::{Deserialize, Serialize};
 
 use crate::access::{Access, Raises};
+use crate::confirm::WaitingCalls;
 use crate::forwards::{SessionForwards, StopReason};
 use crate::grants::{CustomRight, Grant, GrantState, Grants};
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
@@ -143,6 +144,8 @@ pub struct Session {
     /// One question to the user at a time per session, so two calls do not
     /// ask for the same right twice.
     ask: tokio::sync::Mutex<()>,
+    /// Calls waiting for the user's answer right now (#116).
+    waiting: WaitingCalls,
     /// Orders grant changes with the identities and Role patches that
     /// mirror them.
     role: tokio::sync::Mutex<()>,
@@ -225,6 +228,7 @@ impl Session {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
@@ -259,6 +263,7 @@ impl Session {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
@@ -269,6 +274,11 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.scope.id
+    }
+
+    /// Calls waiting for the user's answer right now (#116).
+    pub fn waiting(&self) -> &WaitingCalls {
+        &self.waiting
     }
 
     pub fn scope(&self) -> &SessionScope {
@@ -1246,6 +1256,7 @@ mod tests {
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
             forwards,
