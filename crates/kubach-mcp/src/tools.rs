@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::all_namespaces;
+use crate::audit::DecidedBy;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
 use crate::event_tools::{EventFilter, list_events};
 use crate::grants::{CustomRight, Grant};
@@ -178,6 +179,23 @@ pub(crate) struct Ctx<'a> {
     /// Whether the change ran on an earlier "don't ask again" or the user
     /// ticked it now (#30), for the audit log and the agent.
     pub remembered: std::sync::Mutex<Option<RememberNote>>,
+    /// Writes one object of a batch to the audit log at once (#108): the
+    /// call's own line comes last and says little about each of them.
+    pub audit_object: &'a (dyn Fn(ObjectAudit) + Send + Sync),
+}
+
+/// What happened to one object of a batch, for the audit log (#108).
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectAudit {
+    /// The object: kind, namespace, name, UID, replicas.
+    pub args: Value,
+    pub namespace: String,
+    pub decided_by: DecidedBy,
+    pub allowed: bool,
+    pub reason: Option<String>,
+    /// `ok`, `unchanged`, `left-out`, `rejected`, `not-touched`, `error` or
+    /// an HTTP status code.
+    pub result: String,
 }
 
 /// One answer for a right, as the audit log records it: never a value.
@@ -979,6 +997,7 @@ pub(crate) async fn run(
         "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
         "helm_rollback" => helm_tools::rollback(ctx, args).await,
         "helm_uninstall" => helm_tools::uninstall(ctx, args).await,
+        "helm_preview_diff" => crate::helm_preview::preview_diff(ctx, args).await,
         "can_reach" => topology_tools::can_reach(ctx, args).await,
         "apply_manifest" => {
             let a: ApplyArgs = parse(args)?;
@@ -991,6 +1010,8 @@ pub(crate) async fn run(
             let allowed = authorize(ctx, &request).await?;
             apply_manifest(ctx, &allowed, dry_run).await
         }
+        "scale_batch" => crate::batch_tools::scale(ctx, args).await,
+        "rollout_restart_batch" => crate::batch_tools::restart(ctx, args).await,
         "scale" => {
             let a: ScaleArgs = parse(args)?;
             let request = Request::Scale {

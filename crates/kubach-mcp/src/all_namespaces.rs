@@ -59,20 +59,20 @@ const NO_ROOM: &str = "left out, the answer reached its size limit; lower `limit
 
 /// What an `allNamespaces` answer covers.
 #[derive(Debug, Default)]
-struct Coverage {
+pub(crate) struct Coverage {
     /// The session is pinned: its namespaces are all it can see.
     pinned: bool,
     read: Vec<String>,
     /// Namespaces left out, by why.
-    gaps: BTreeMap<String, Vec<String>>,
+    pub(crate) gaps: BTreeMap<String, Vec<String>>,
     /// Read, but with more items than the answer holds.
     cut: Vec<String>,
     /// The read stopped at its bound: what it never reached is unknown.
     unfinished: Vec<String>,
     /// Why other namespaces may exist that nobody here knows of.
-    unknown: Option<String>,
+    pub(crate) unknown: Option<String>,
     /// The answer to the question of this call, if it asked one.
-    answer: Option<&'static str>,
+    pub(crate) answer: Option<&'static str>,
 }
 
 impl Coverage {
@@ -159,7 +159,7 @@ impl Coverage {
     /// Takes a namespace's failure in. A selector the server turns down is
     /// wrong everywhere, and the session's end stops everything: those fail
     /// the call.
-    fn failed(
+    pub(crate) fn failed(
         &mut self,
         namespace: String,
         error: ToolError,
@@ -192,7 +192,7 @@ impl Coverage {
 
 /// The namespaces to read: granted or pinned ones, and the others once the
 /// user allowed opening them. Never a revoked one.
-async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
+pub(crate) async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
     let session = ctx.session;
     let mut coverage = Coverage {
         pinned: session.scope().pinned(),
@@ -209,12 +209,71 @@ async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
     };
     let plan = session.policy().all_namespaces_plan(&known);
     coverage.gap(REFUSED, plan.refused);
-    let mut targets = plan.readable;
-    let mut unopened = plan.unopened;
+    let summary = format!(
+        "{} wants to read all namespaces on {}: {} more for this session",
+        ctx.client_name,
+        session.scope().context,
+        plan.unopened.len()
+    );
+    opened(ctx, plan.readable, plan.unopened, coverage, summary).await
+}
+
+/// The namespaces out of `names` a batch may work in (#108), with a gap for
+/// each of the others. The agent named them, so one unopened namespace opens
+/// as in a call naming it. Several would set up identities across a cluster
+/// on one call, and that is asked once, as for `allNamespaces`.
+pub(crate) async fn named_targets(
+    ctx: &Ctx<'_>,
+    names: &[String],
+) -> Result<(Vec<String>, Coverage), ToolError> {
+    let session = ctx.session;
+    let mut coverage = Coverage {
+        pinned: session.scope().pinned(),
+        ..Coverage::default()
+    };
+    let (usable, plan) = {
+        let policy = session.policy();
+        let mut usable = Vec::new();
+        for name in names {
+            match policy.namespace(Some(name)) {
+                Ok(name) => usable.push(name),
+                Err(denial) => coverage.gap(denial.message, vec![name.clone()]),
+            }
+        }
+        let plan = policy.all_namespaces_plan(&usable);
+        (usable, plan)
+    };
+    let named = |mut found: Vec<String>| {
+        found.retain(|name| usable.contains(name));
+        found
+    };
+    coverage.gap(REFUSED, named(plan.refused));
+    let mut readable = named(plan.readable);
+    let mut unopened = named(plan.unopened);
+    if unopened.len() < 2 {
+        readable.append(&mut unopened);
+    }
+    let summary = format!(
+        "{} wants to change objects on {} in {} namespaces it has not opened yet",
+        ctx.client_name,
+        session.scope().context,
+        unopened.len()
+    );
+    opened(ctx, readable, unopened, coverage, summary).await
+}
+
+/// `targets`, and `unopened` once the user allowed opening them.
+async fn opened(
+    ctx: &Ctx<'_>,
+    mut targets: Vec<String>,
+    mut unopened: Vec<String>,
+    mut coverage: Coverage,
+    summary: String,
+) -> Result<(Vec<String>, Coverage), ToolError> {
     if unopened.is_empty() {
         return Ok((targets, coverage));
     }
-    match may_open(ctx, &unopened, &mut coverage).await? {
+    match may_open(ctx, &unopened, summary, &mut coverage).await? {
         Ok(()) => {
             let rest = unopened.split_off(unopened.len().min(MAX_OPENED_PER_CALL));
             targets.extend(unopened);
@@ -233,6 +292,7 @@ async fn targets(ctx: &Ctx<'_>) -> Result<(Vec<String>, Coverage), ToolError> {
 async fn may_open(
     ctx: &Ctx<'_>,
     names: &[String],
+    summary: String,
     coverage: &mut Coverage,
 ) -> Result<Result<(), String>, ToolError> {
     let session = ctx.session;
@@ -256,12 +316,7 @@ async fn may_open(
         client: ctx.client_name.to_owned(),
         tool: ctx.tool.to_owned(),
         namespace: String::new(),
-        summary: format!(
-            "{} wants to read all namespaces on {}: {} more for this session",
-            ctx.client_name,
-            scope.context,
-            names.len()
-        ),
+        summary,
         details: format!(
             "Namespaces: {}{more}\n\nKubach reads them one by one and sets up access in each, \
              as when the agent names a namespace: a temporary ServiceAccount where your rights \
@@ -308,7 +363,10 @@ async fn may_open(
 }
 
 /// Runs `read` on `namespaces`, a few at a time; the results come sorted.
-async fn fan_out<T, F, Fut>(namespaces: Vec<String>, read: F) -> Vec<(String, Result<T, ToolError>)>
+pub(crate) async fn fan_out<T, F, Fut>(
+    namespaces: Vec<String>,
+    read: F,
+) -> Vec<(String, Result<T, ToolError>)>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
@@ -326,7 +384,11 @@ where
 }
 
 /// Reads with a time limit, and past the moment a fresh Role takes effect.
-async fn settled<T, F, Fut>(ctx: &Ctx<'_>, allowed: &Allowed, read: F) -> Result<T, ToolError>
+pub(crate) async fn settled<T, F, Fut>(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    read: F,
+) -> Result<T, ToolError>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
@@ -355,7 +417,7 @@ where
 
 /// The namespaces of this call were each their own; none speaks for it in
 /// the audit log, which gets them from the call's coverage.
-fn forget_namespace(ctx: &Ctx<'_>) {
+pub(crate) fn forget_namespace(ctx: &Ctx<'_>) {
     *sync::lock(&ctx.namespace) = None;
 }
 

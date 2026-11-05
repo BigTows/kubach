@@ -268,6 +268,14 @@ fn other_questions_are_always_asked() {
         RequestKind::ChartSource {
             source: "oci://example.com/charts".into(),
         },
+        // Whatever its tool: a batch is never remembered (#108).
+        RequestKind::Batch {
+            batch: Box::new(crate::confirm::BatchChange {
+                action: crate::confirm::BatchAction::Scale,
+                objects: Vec::new(),
+                left_out: Vec::new(),
+            }),
+        },
         RequestKind::UseContext {
             server_url: "https://127.0.0.1".into(),
             source: "kubeconfig".into(),
