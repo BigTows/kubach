@@ -189,7 +189,7 @@ fn auth_failure(
         }
         // `cmd` is the whole command with its arguments and environment
         // (secrets included): only the stderr and exit code are shown.
-        AuthError::AuthExecRun { cmd, status, out } => {
+        AuthError::AuthExecRun { cmd, out } => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stderr = stderr.trim();
             let path = crate::env::path();
@@ -202,9 +202,9 @@ fn auth_failure(
                 return (FailureKind::ExecNotFound, Some(detail));
             }
             let detail = if stderr.is_empty() {
-                match status.code() {
+                match out.status.code() {
                     Some(code) => format!("Exited with code {code}"),
-                    None => format!("Stopped: {status}"),
+                    None => format!("Stopped: {}", out.status),
                 }
             } else {
                 crate::redact::mask_secrets(stderr)
@@ -465,12 +465,11 @@ mod tests {
         let error =
             ClusterError::Unreachable(kube::Error::Auth(kube::client::AuthError::AuthExecRun {
                 cmd: r#"AWS_SECRET_ACCESS_KEY="S3CR3T" "aws" "--oidc-client-secret=S3CR3T""#.into(),
-                status,
-                out: std::process::Output {
+                out: Box::new(std::process::Output {
                     status,
                     stdout: b"S3CR3T".to_vec(),
                     stderr: b"denied: token=S3CR3T".to_vec(),
-                },
+                }),
             }));
         let failure = ConnectionFailure::classify(&error);
         assert_eq!(failure.kind, FailureKind::ExecFailed);
@@ -490,12 +489,11 @@ mod tests {
             let status = std::process::ExitStatus::from_raw(1 << 8);
             ClusterError::Client(kube::Error::Auth(kube::client::AuthError::AuthExecRun {
                 cmd: "kubectl".into(),
-                status,
-                out: std::process::Output {
+                out: Box::new(std::process::Output {
                     status,
                     stdout: Vec::new(),
                     stderr: stderr.as_bytes().to_vec(),
-                },
+                }),
             }))
         };
         let missing = ConnectionFailure::classify(&run(

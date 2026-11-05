@@ -66,6 +66,7 @@ pub fn builder(config: kube::Config) -> Result<ClientBuilder<GenericService>, ku
     connector.set_connect_timeout(config.connect_timeout);
     connector.set_read_timeout(config.read_timeout);
     connector.set_write_timeout(config.write_timeout);
+    connector.set_reset_reader_on_write(config.reset_reader_on_write);
     let client: hyper_util::client::legacy::Client<_, Body> =
         hyper_util::client::legacy::Builder::new(TokioExecutor::new())
             .pool_idle_timeout(POOL_IDLE)

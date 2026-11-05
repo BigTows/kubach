@@ -187,12 +187,12 @@ fn exit_text(status: &std::process::ExitStatus) -> String {
 /// masked).
 pub fn auth_error_text(error: &AuthError) -> String {
     match error {
-        AuthError::AuthExecRun { cmd, status, out } => {
+        AuthError::AuthExecRun { cmd, out } => {
             let stderr = stderr_text(&out.stderr);
             let head = format!(
                 "auth plugin {} failed with {}",
                 program_label(cmd),
-                exit_text(status)
+                exit_text(&out.status)
             );
             if stderr.is_empty() {
                 head
@@ -222,14 +222,13 @@ fn auth_exec_text(message: &str) -> String {
 /// `Display` and `Debug` are safe wherever it ends up.
 pub fn sanitize_auth_error(error: AuthError) -> AuthError {
     match error {
-        AuthError::AuthExecRun { cmd, status, out } => AuthError::AuthExecRun {
+        AuthError::AuthExecRun { cmd, out } => AuthError::AuthExecRun {
             cmd: program_name(&cmd).unwrap_or_else(|| "exec plugin".into()),
-            status,
-            out: Output {
+            out: Box::new(Output {
                 status: out.status,
                 stdout: Vec::new(),
                 stderr: stderr_text(&out.stderr).into_bytes(),
-            },
+            }),
         },
         AuthError::AuthExec(message) => {
             let text = auth_exec_text(&message);
@@ -331,12 +330,11 @@ mod tests {
         let status = failed_status();
         AuthError::AuthExecRun {
             cmd: format!("{cmd:?}"),
-            status,
-            out: Output {
+            out: Box::new(Output {
                 status,
                 stdout: format!("{{\"token\":\"{SECRET}\"}}").into_bytes(),
                 stderr: stderr.as_bytes().to_vec(),
-            },
+            }),
         }
     }
 
@@ -410,12 +408,11 @@ mod tests {
         assert!(!sanitize_auth_error(error).to_string().contains(SECRET));
         let run = AuthError::AuthExecRun {
             cmd: format!("/opt/gcloud config-helper --secret={SECRET}"),
-            status: failed_status(),
-            out: Output {
+            out: Box::new(Output {
                 status: failed_status(),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-            },
+            }),
         };
         assert_eq!(
             auth_error_text(&run),
