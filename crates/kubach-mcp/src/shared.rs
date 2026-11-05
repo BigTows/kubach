@@ -423,7 +423,9 @@ impl ServerHandler for SharedServer {
             .into());
         }
         if let Some(proxy) = self.hosted() {
-            let (outcome, list_changed) = proxy.call(&client, &request.name, args).await;
+            let (outcome, list_changed) = proxy
+                .call_cancellable(&client, &request.name, args, &context.ct)
+                .await;
             if list_changed {
                 let _ = context.peer.notify_tool_list_changed().await;
             }
