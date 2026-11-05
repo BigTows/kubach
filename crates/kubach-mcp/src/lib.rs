@@ -41,6 +41,7 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod all_namespaces;
 mod debug_tools;
 mod log_level;
 mod node_maintenance;

@@ -164,6 +164,7 @@ fn title(request: &ConfirmationRequest) -> String {
         },
         RequestKind::ChartSource { .. } => t!("agent-title-chart-source"),
         RequestKind::UseContext { .. } => t!("agent-title-use-context"),
+        RequestKind::Namespaces { .. } => t!("agent-title-namespaces"),
         RequestKind::Secret { secret } => secret_dialog::title(secret),
         RequestKind::Call | RequestKind::RevealBlocked { .. } => t!("agent-title-call"),
     }
@@ -562,7 +563,9 @@ impl Render for ConfirmView {
         };
         let source = matches!(
             request.kind,
-            RequestKind::ChartSource { .. } | RequestKind::UseContext { .. }
+            RequestKind::ChartSource { .. }
+                | RequestKind::UseContext { .. }
+                | RequestKind::Namespaces { .. }
         );
         // Access beyond the minimum (#15).
         let access = match &request.kind {

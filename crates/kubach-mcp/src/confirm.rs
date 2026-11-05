@@ -88,6 +88,10 @@ pub enum RequestKind {
     /// Using charts from a source not added in Kubach (an `oci://`
     /// repository) for the rest of the session (#418).
     ChartSource { source: String },
+    /// An `allNamespaces` call found namespaces the session has not opened
+    /// (#107): a yes opens them for this and later such calls, until the
+    /// session ends. One question for all of them, never one per namespace.
+    Namespaces { names: Vec<String> },
     /// The agent chose this context with `use_context` (#421): a yes
     /// starts a session there, without namespaces or rights. `context` of
     /// the request names it; `session_id` is empty, no session runs yet.
