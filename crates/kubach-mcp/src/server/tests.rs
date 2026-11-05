@@ -4426,7 +4426,10 @@ async fn a_lookup_preview_renders_under_the_service_account() {
         let text = preview.to_string();
         assert!(!text.contains("cmVhbC1rZXktZnJvbS1jbHVzdGVy"), "{text}");
         assert!(!text.contains("real-key-from-cluster"), "{text}");
-        assert!(preview["diff"].as_str().unwrap().contains("infra-tls"));
+        assert!(
+            preview["summary"].to_string().contains("Secret infra-tls"),
+            "{preview}"
+        );
         assert!(
             text.contains("ClusterRole infra-reader"),
             "the render's findings: {text}"
@@ -4449,6 +4452,11 @@ async fn a_lookup_preview_marks_the_objects_when_the_render_fails() {
     assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
     assert_eq!(preview["lookup"]["objects"], json!(["Secret infra-tls"]));
     assert_eq!(preview["lookup"]["wholePreview"], false);
+    assert_eq!(
+        preview["summary"]["added"],
+        json!([{"object": "Secret infra-tls", "lookupAffected": true}]),
+        "{preview}"
+    );
     assert!(
         preview["lookup"]["note"]
             .as_str()
@@ -4475,6 +4483,14 @@ async fn a_lookup_preview_marks_everything_when_the_mapping_is_unreliable() {
     assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
     assert_eq!(preview["lookup"]["wholePreview"], true);
     assert!(
+        preview["summary"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["lookupAffected"] == true),
+        "{preview}"
+    );
+    assert!(
         preview["lookup"]["note"]
             .as_str()
             .unwrap()
@@ -4492,6 +4508,209 @@ async fn a_lookup_preview_says_when_the_templates_are_unknown() {
     assert_eq!(preview["lookup"]["status"], "unknown", "{preview}");
     assert_eq!(preview["lookup"]["wholePreview"], true);
     assert!(f.renders().is_empty());
+}
+
+/// A render of a large chart: a changed ConfigMap, a Secret and a Deployment,
+/// and enough objects that the diff takes pages (#115).
+#[cfg(unix)]
+fn large_render(mark: &str) -> String {
+    let mut render = format!(
+        "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
+         name: infra-reader\nrules: []\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  \
+         name: infra\ndata:\n  level: debug\n  DB_PASSWORD: hunter2-in-a-config-map\n---\n\
+         apiVersion: v1\nkind: Secret\nmetadata:\n  name: infra-tls\ndata:\n  \
+         tls.key: Z2VuZXJhdGVk\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  \
+         name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        \
+         image: web:{mark}\n"
+    );
+    for n in 0..40 {
+        let filler = format!("{mark}-{n} ").repeat(150);
+        render.push_str(&format!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: filler-{n}\ndata:\n  \
+             text: {filler}\n"
+        ));
+    }
+    render
+}
+
+#[cfg(unix)]
+impl VaultHelm {
+    async fn preview_diff(&self, query: Value) -> Result<Value, String> {
+        let outcome = self
+            .server
+            .call("agent", "helm_preview_diff", args(query))
+            .await;
+        self.assert_clean(&outcome.text);
+        if outcome.is_error {
+            return Err(outcome.text);
+        }
+        Ok(serde_json::from_str(&outcome.text).unwrap())
+    }
+}
+
+/// The default answer is a summary, the full diff comes by object and by
+/// page, and a render that changes meanwhile does not reach the pages.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_is_a_summary_and_its_pages_are_of_one_render() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let manifest = f.root.path().join("manifest.yaml");
+    std::fs::write(&manifest, large_render("one")).unwrap();
+
+    let preview = f.preview("helm_upgrade").await;
+    let text = preview.to_string();
+    assert!(preview.get("diff").is_none(), "{text}");
+    assert!(text.len() < 16 * 1024, "{} bytes", text.len());
+    let summary = &preview["summary"];
+    assert_eq!(summary["counts"]["added"], 42, "{summary}");
+    assert_eq!(summary["counts"]["changed"], 1, "{summary}");
+    assert_eq!(summary["counts"]["unchanged"], 1, "{summary}");
+    assert_eq!(
+        summary["images"][0],
+        json!({"object": "Deployment web", "new": "web:one",
+               "path": "spec.template.spec.containers[app].image"})
+    );
+    assert_eq!(
+        summary["configMapKeys"],
+        json!([
+            {"object": "ConfigMap infra", "key": "DB_PASSWORD", "change": "added",
+             "new": "*** (23 bytes)"},
+            {"object": "ConfigMap infra", "key": "level", "change": "added", "new": "debug"},
+        ])
+    );
+    assert!(!text.contains("hunter2"), "{text}");
+
+    let id = preview["fullDiff"]["previewId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pages = preview["fullDiff"]["pages"].as_u64().unwrap();
+    assert!(pages >= 2, "{preview}");
+
+    // The chart renders differently from now on; the kept pages do not.
+    let first = f.preview_diff(json!({"previewId": id})).await.unwrap();
+    assert_eq!(first["pages"], pages);
+    assert_eq!(first["nextPage"], 2);
+    std::fs::write(&manifest, large_render("two")).unwrap();
+    let mut whole = first["diff"].as_str().unwrap().to_owned();
+    for page in 2..=pages {
+        let next = f
+            .preview_diff(json!({"previewId": id, "page": page}))
+            .await
+            .unwrap();
+        assert_eq!(next["pages"], pages);
+        whole.push_str(next["diff"].as_str().unwrap());
+    }
+    assert_eq!(
+        whole.len() as u64,
+        preview["fullDiff"]["bytes"].as_u64().unwrap()
+    );
+    assert!(whole.contains("image: web:one"), "{whole}");
+    assert!(
+        !whole.contains("web:two") && !whole.contains("two-0"),
+        "another render"
+    );
+    assert!(!whole.contains("hunter2") && !whole.contains("Z2VuZXJhdGVk"));
+    assert!(whole.contains("*** (9 bytes)"), "{whole}");
+    assert!(f.renders().is_empty());
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+
+    // A filter takes the objects, and the same text.
+    let one = f
+        .preview_diff(json!({"previewId": id, "kind": "deployment", "name": "we"}))
+        .await
+        .unwrap();
+    assert_eq!(one["matchedObjects"], 1);
+    assert_eq!(one["pages"], 1);
+    let diff = one["diff"].as_str().unwrap();
+    assert!(diff.starts_with("=== added Deployment web\n"), "{diff}");
+    assert!(
+        diff.contains("image: web:one") && !diff.contains("filler"),
+        "{diff}"
+    );
+    assert!(one.get("nextPage").is_none());
+    let none = f
+        .preview_diff(json!({"previewId": id, "kind": "Ingress"}))
+        .await
+        .unwrap();
+    assert_eq!(none["matchedObjects"], 0);
+    assert!(none["diff"].as_str().unwrap().contains("no change matches"));
+
+    let beyond = f
+        .preview_diff(json!({"previewId": id, "page": pages + 1}))
+        .await
+        .unwrap_err();
+    assert!(beyond.contains("does not exist"), "{beyond}");
+
+    // A new preview is a new render, under another id.
+    let again = f.preview("helm_upgrade").await;
+    assert_ne!(again["fullDiff"]["previewId"], json!(id));
+    assert_eq!(again["summary"]["images"][0]["new"], "web:two", "{again}");
+}
+
+/// A preview that fell out of the session says so; nothing renders anew.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_no_longer_kept_says_so() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let first = f.preview("helm_install").await;
+    let id = first["fullDiff"]["previewId"].clone();
+    for _ in 0..crate::helm_preview::MAX_KEPT_PREVIEWS {
+        f.preview("helm_install").await;
+    }
+    let gone = f.preview_diff(json!({"previewId": id})).await.unwrap_err();
+    assert!(gone.contains("is not kept"), "{gone}");
+    assert!(gone.contains("new render"), "{gone}");
+    assert!(f.renders().is_empty());
+}
+
+/// The kept diff ends with the session.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_closed_session_keeps_no_preview() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let preview = f.preview("helm_install").await;
+    let id = preview["fullDiff"]["previewId"].as_str().unwrap();
+    f.server.session().close().await.unwrap();
+    let text = f
+        .server
+        .call("agent", "helm_preview_diff", args(json!({"previewId": id})))
+        .await;
+    assert!(text.is_error, "{}", text.text);
+}
+
+/// The summary is for the agent: the window keeps the whole diff, however
+/// the summary would cut it (#115).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_confirmation_window_keeps_the_full_diff() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let mut release = infra_release(3);
+    release["manifest"] = json!(large_render("one"));
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (_, details, _) = windows.last().unwrap();
+    assert!(details.starts_with("--- revision"), "{details}");
+    assert!(details.contains("after the upgrade"), "{details}");
+    for n in 0..40 {
+        assert!(details.contains(&format!("filler-{n}\n")), "filler-{n}");
+    }
+    assert!(details.contains("image: web:one"), "{details}");
+    assert!(!details.contains("previewId"), "{details}");
+    assert!(!details.contains("hunter2"), "{details}");
 }
 
 /// A chart without `lookup`: the preview is as before, and the cluster is

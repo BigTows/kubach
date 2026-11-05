@@ -831,6 +831,7 @@ Settings → Tools, иначе `PATH`, иначе скачанный Kubach; б�
 | `helm_list_releases`, `helm_release_history` | `read(ns)` | релизы namespace и ревизии релиза (хранилище релизов читается клиентом namespace) |
 | `helm_get_values` (#22) | `read(ns)` | пользовательские values релиза или ревизии с маскированием (см. «Изменение (#22)») |
 | `helm_install`, `helm_upgrade`, `helm_rollback`, `helm_uninstall` | потолок deploy + apply (#417), `read(ns)`, `modify(ns)` | изменение с превью и подтверждением |
+| `helm_preview_diff` (#115) | как у превью | полный замаскированный diff сохранённого превью, по объектам и страницам ([ADR 0006](0006-helm.md#сводка-превью-и-полный-diff-115)) |
 
 Поток изменения: policy (потолок, права namespace) → источник чарта → превью → подтверждение →
 выполнение → результат.

@@ -442,7 +442,9 @@ impl McpServer {
              helm_release_history and helm_get_values (a release's values, secrets masked) read \
              Helm's storage Secrets, so they need access to Secrets like list_secrets; \
              helm_install, helm_upgrade, helm_rollback and helm_uninstall run a server-side dry \
-             run that the user approves in Kubach. To change a few values of a release, pass \
+             run that the user approves in Kubach. With preview, helm_install and helm_upgrade \
+             answer with a summary and helm_preview_diff pages the full diff of that render. To \
+             change a few values of a release, pass \
              only them to helm_upgrade as valuesPatch: Kubach merges it into the release's \
              values (values replaces them all). A chart with \
              cluster-scoped objects (CRDs, ClusterRoles, webhooks), RBAC or objects in other \
@@ -615,7 +617,8 @@ fn tool_access(name: &str) -> Option<Access> {
         | "helm_install"
         | "helm_upgrade"
         | "helm_rollback"
-        | "helm_uninstall" => need(Profile::Deploy, false),
+        | "helm_uninstall"
+        | "helm_preview_diff" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
         "list_secrets"
         | "check_secret"
@@ -698,9 +701,10 @@ fn batch_props(object: Value, extra: Value) -> Value {
 }
 
 /// How helm_install and helm_upgrade describe `preview` (#68).
-const PREVIEW_HELP: &str = "Only show what would change: the server-side dry run's objects and \
-     masked manifest diff (and values diff), without asking the user or changing anything. Call \
-     again without preview to do it";
+const PREVIEW_HELP: &str = "Only show what would change, as a short summary of the server-side \
+     dry run: objects added, changed and removed, image changes, changed ConfigMap and Secret \
+     keys and changed values, secrets masked, without asking the user or changing anything. \
+     helm_preview_diff gives the full diff by previewId. Call again without preview to do it";
 
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
@@ -1421,6 +1425,24 @@ fn catalog() -> Vec<ToolSpec> {
             ),
             read_only: false,
             destructive: true,
+        },
+        ToolSpec {
+            name: "helm_preview_diff",
+            description: "The full masked diff of a helm_install or helm_upgrade preview, by \
+                          previewId, object by object. Nothing is rendered again: all pages \
+                          come from the render of that preview, kept for this session (its \
+                          last few previews). Secret values stay masked.",
+            schema: object_schema(
+                json!({
+                    "previewId": {"type": "string", "description": "fullDiff.previewId of the preview"},
+                    "kind": {"type": "string", "description": "Only objects of this kind, e.g. Deployment; Values is the values diff"},
+                    "name": {"type": "string", "description": "Only objects whose name contains this"},
+                    "page": {"type": "integer", "minimum": 1, "default": 1, "description": "Page of the filtered diff"},
+                }),
+                &["previewId"],
+            ),
+            read_only: true,
+            destructive: false,
         },
         ToolSpec {
             name: "helm_rollback",
