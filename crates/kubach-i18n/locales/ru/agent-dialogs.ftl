@@ -30,6 +30,7 @@ agent-title-helm-rollback = Откатить релиз Helm?
 agent-title-helm-uninstall = Удалить релиз Helm?
 agent-title-chart-source = Разрешить источник чартов?
 agent-title-use-context = Разрешить агенту работать в этом контексте?
+agent-title-namespaces = Разрешить агенту читать другие namespace?
 agent-title-call = Одобрить изменение агента?
 agent-title-secret-create = Введите значения нового Secret
 agent-title-secret-update = Изменение Secret

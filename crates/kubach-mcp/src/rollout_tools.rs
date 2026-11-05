@@ -64,20 +64,24 @@ pub(crate) fn step(obj: &DynamicObject, health: &Health) -> Step {
     }
 }
 
+/// A wait's `timeoutSeconds`: the default without one, capped at
+/// [`MAX_TIMEOUT`].
+pub(crate) fn wait_timeout(seconds: Option<u64>) -> Result<Duration, ToolError> {
+    match seconds {
+        None => Ok(DEFAULT_TIMEOUT),
+        Some(0) => {
+            Err(Denial::new(DenialCode::InvalidInput, "timeoutSeconds must be above 0").into())
+        }
+        Some(seconds) => Ok(Duration::from_secs(seconds).min(MAX_TIMEOUT)),
+    }
+}
+
 pub(crate) async fn wait_for_rollout(
     ctx: &Ctx<'_>,
     args: &Map<String, Value>,
 ) -> Result<ToolOutput, ToolError> {
     let a: WaitArgs = parse(args)?;
-    let timeout = match a.timeout_seconds {
-        None => DEFAULT_TIMEOUT,
-        Some(0) => {
-            return Err(
-                Denial::new(DenialCode::InvalidInput, "timeoutSeconds must be above 0").into(),
-            );
-        }
-        Some(seconds) => Duration::from_secs(seconds).min(MAX_TIMEOUT),
-    };
+    let timeout = wait_timeout(a.timeout_seconds)?;
     let request = Request::Get {
         kind: kind_ref(a.kind, a.api_version),
         name: a.name,
@@ -306,7 +310,7 @@ pub(crate) fn pod_line(object: &DynamicObject, now: Timestamp) -> String {
     line
 }
 
-fn first_line(text: &str) -> &str {
+pub(crate) fn first_line(text: &str) -> &str {
     let line = text.lines().next().unwrap_or_default();
     match line.char_indices().nth(200) {
         Some((at, _)) => &line[..at],
@@ -321,7 +325,9 @@ mod tests {
     use kube::api::DynamicObject;
     use serde_json::json;
 
-    use super::{Step, pod_line, step};
+    use std::time::Duration;
+
+    use super::{Step, pod_line, step, wait_timeout};
 
     fn health(object: serde_json::Value) -> Step {
         let obj: DynamicObject = serde_json::from_value(object).unwrap();
@@ -337,6 +343,18 @@ mod tests {
             "metadata": {"name": "web", "namespace": "ns", "generation": 3},
             "spec": spec, "status": status,
         })
+    }
+
+    #[test]
+    fn a_timeout_has_a_default_and_a_cap() {
+        assert_eq!(wait_timeout(None).unwrap(), Duration::from_secs(120));
+        assert_eq!(wait_timeout(Some(30)).unwrap(), Duration::from_secs(30));
+        assert_eq!(wait_timeout(Some(601)).unwrap(), Duration::from_secs(600));
+        assert_eq!(
+            wait_timeout(Some(u64::MAX)).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert!(wait_timeout(Some(0)).is_err());
     }
 
     #[test]

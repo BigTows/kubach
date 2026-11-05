@@ -641,7 +641,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ]);
     }
     attempts.extend([
-        ("list_resources", json!({"kind": "Pod", "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Pod", "namespace": NS, "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Secret", "allNamespaces": true})),
         ("list_resources", json!({"kind": "Pod", "fieldSelector": "metadata.namespace=kube-system"})),
         ("list_resources", json!({"kind": "Namespace"})),
         ("list_resources", json!({"kind": "nodes"})),
@@ -3844,13 +3845,30 @@ impl VaultHelm {
             &helm,
             format!(
                 r#"#!/bin/sh
-kubeconfig=; context=; dry=; previous=
+kubeconfig=; context=; dry=; previous=; destination=
 for argument in "$@"; do
   [ "$previous" = --kubeconfig ] && kubeconfig="$argument"
   [ "$previous" = --kube-context ] && context="$argument"
+  [ "$previous" = --destination ] && destination="$argument"
   [ "$argument" = --dry-run=server ] && dry=dry
   previous="$argument"
 done
+if [ "$1" = pull ]; then
+  [ -d '{chart}' ] || {{ echo 'Error: no such chart' >&2; exit 1; }}
+  tar -czf "$destination/infra-1.0.0.tgz" -C '{chart}' infra
+  exit 0
+fi
+if [ "$1" = template ] && [ -n "$dry" ]; then
+  {{
+    printf 'context=%s token=%s ' "$context" "${{HELM_KUBETOKEN:-none}}"
+    printf 'credentials=%s vault-files=%s\n' "$(grep -c '{VAULT_TOKEN}' "$kubeconfig")" \
+      "$(ls '{kubeconfigs}' 2>/dev/null | wc -l | tr -d ' ')"
+  }} >> '{renders}'
+  cat > /dev/null
+  [ -f '{live}' ] || {{ echo 'Error: secrets "password=hunter2" is forbidden' >&2; exit 1; }}
+  cat '{live}'
+  exit 0
+fi
 if [ "$1" = template ]; then cat '{manifest}'; exit 0; fi
 {{
   printf '%s %s context=%s token=%s ' "$1" "$dry" "$context" "${{HELM_KUBETOKEN:-none}}"
@@ -3866,6 +3884,10 @@ echo 'STATUS: deployed'
                 manifest = manifest.display(),
                 log = log.display(),
                 dry_run = dry_run.display(),
+                chart = root.path().join("chart").display(),
+                live = root.path().join("live.yaml").display(),
+                renders = root.path().join("renders.log").display(),
+                kubeconfigs = kubeconfigs.display(),
             ),
         )
         .unwrap();
@@ -4322,4 +4344,164 @@ async fn a_chart_search_with_results_keeps_its_answer() {
                      at with oci; the user is asked to allow its registry.",
         })
     );
+}
+
+/// `# Source:` comments as `helm template` writes them.
+#[cfg(unix)]
+const LOOKUP_RENDER: &str = "---\n# Source: infra/templates/secret.yaml\napiVersion: v1\n\
+     kind: Secret\nmetadata:\n  name: infra-tls\ndata:\n  tls.key: Z2VuZXJhdGVk\n---\n\
+     # Source: infra/templates/config.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  \
+     name: infra\n---\n# Source: infra/templates/rbac.yaml\n\
+     apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
+     name: infra-reader\nrules: []\n";
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// The chart `helm pull` gives, and what `helm template` renders.
+    fn lookup_chart(&self, secret_template: &str) {
+        let templates = self.root.path().join("chart/infra/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            self.root.path().join("chart/infra/Chart.yaml"),
+            "name: infra\n",
+        )
+        .unwrap();
+        std::fs::write(templates.join("secret.yaml"), secret_template).unwrap();
+        std::fs::write(templates.join("config.yaml"), "kind: ConfigMap\n").unwrap();
+        std::fs::write(self.root.path().join("manifest.yaml"), LOOKUP_RENDER).unwrap();
+    }
+
+    /// How helm was called for a render on the cluster.
+    fn renders(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.path().join("renders.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn preview(&self, tool: &str) -> Value {
+        let outcome = self
+            .server
+            .call(
+                "agent",
+                tool,
+                args(
+                    json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                            "namespace": NS, "preview": true}),
+                ),
+            )
+            .await;
+        assert!(!outcome.is_error, "{tool}: {}", outcome.text);
+        // Nobody asked, nothing of the user's on disk, helm changed nothing.
+        assert!(self.windows().is_empty());
+        assert!(self.calls().is_empty(), "{:?}", self.calls());
+        assert!(!self.kubeconfigs.exists());
+        self.assert_clean(&outcome.text);
+        serde_json::from_str(&outcome.text).unwrap()
+    }
+}
+
+#[cfg(unix)]
+const USES_LOOKUP: &str = r#"{{ $old := lookup "v1" "Secret" "ns" "infra-tls" }}"#;
+
+/// A chart with `lookup` that needs the user's credentials (#114): the
+/// preview renders under the ServiceAccount's token, with the cluster-only
+/// kubeconfig and before anyone is asked. What it read stays masked.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_renders_under_the_service_account() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(USES_LOOKUP);
+    let live = LOOKUP_RENDER.replace("Z2VuZXJhdGVk", "cmVhbC1rZXktZnJvbS1jbHVzdGVy");
+    std::fs::write(f.root.path().join("live.yaml"), live).unwrap();
+    for tool in ["helm_install", "helm_upgrade"] {
+        let preview = f.preview(tool).await;
+        assert_eq!(preview["lookup"]["status"], "read", "{preview}");
+        assert_eq!(preview["lookup"]["wholePreview"], false);
+        assert!(
+            preview["note"].as_str().unwrap().contains("ServiceAccount"),
+            "{preview}"
+        );
+        let text = preview.to_string();
+        assert!(!text.contains("cmVhbC1rZXktZnJvbS1jbHVzdGVy"), "{text}");
+        assert!(!text.contains("real-key-from-cluster"), "{text}");
+        assert!(preview["diff"].as_str().unwrap().contains("infra-tls"));
+        assert!(
+            text.contains("ClusterRole infra-reader"),
+            "the render's findings: {text}"
+        );
+    }
+    assert_eq!(
+        f.renders(),
+        vec!["context=kubach token=fake-sa-token credentials=0 vault-files=0"; 2]
+    );
+}
+
+/// The ServiceAccount cannot render it: the objects of the templates with
+/// `lookup` are marked, and helm's error stays out of the answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_marks_the_objects_when_the_render_fails() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(USES_LOOKUP);
+    let preview = f.preview("helm_upgrade").await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(preview["lookup"]["objects"], json!(["Secret infra-tls"]));
+    assert_eq!(preview["lookup"]["wholePreview"], false);
+    assert!(
+        preview["lookup"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("may be false"),
+        "{preview}"
+    );
+    let text = preview.to_string();
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("forbidden"), "{text}");
+    assert!(!text.contains("Z2VuZXJhdGVk"), "{text}");
+    assert_eq!(f.renders().len(), 1);
+}
+
+/// A computed include: which objects depend on `lookup` cannot be told.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_marks_everything_when_the_mapping_is_unreliable() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(&format!(
+        r#"{USES_LOOKUP}{{{{ include (print $.Template.BasePath "/x.yaml") . }}}}"#
+    ));
+    let preview = f.preview("helm_install").await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(preview["lookup"]["wholePreview"], true);
+    assert!(
+        preview["lookup"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("any change"),
+        "{preview}"
+    );
+}
+
+/// The chart's templates cannot be read: the preview says it does not know.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_says_when_the_templates_are_unknown() {
+    let f = VaultHelm::start(true, "").await;
+    let preview = f.preview("helm_install").await;
+    assert_eq!(preview["lookup"]["status"], "unknown", "{preview}");
+    assert_eq!(preview["lookup"]["wholePreview"], true);
+    assert!(f.renders().is_empty());
+}
+
+/// A chart without `lookup`: the preview is as before, and the cluster is
+/// not contacted for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_without_lookup_is_not_marked() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n# lookup is only a word here\n");
+    let preview = f.preview("helm_install").await;
+    assert!(preview.get("lookup").is_none(), "{preview}");
+    assert!(f.renders().is_empty());
 }

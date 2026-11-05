@@ -14,6 +14,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
@@ -113,6 +114,8 @@ impl McpServer {
                         .find("metrics.k8s.io", "PodMetrics")
                         .is_some(),
                     "get_secret_value" => scope.policy.reveal_allowed(),
+                    // Refused in a pinned session; drain_node still previews.
+                    "cordon_node" | "uncordon_node" => !scope.pinned(),
                     _ => true,
                 };
                 let needed = tool_access(spec.name);
@@ -152,6 +155,21 @@ impl McpServer {
         args: Map<String, Value>,
         progress: Option<tools::Progress>,
     ) -> CallOutcome {
+        self.call_cancellable(client, tool, args, progress, CancellationToken::new())
+            .await
+    }
+
+    /// [`McpServer::call_with_progress`] for a call `cancel` can stop: rmcp
+    /// lets a cancelled call run on, only the tool can end it (#109). It
+    /// ends as any call does, with its audit line.
+    pub(crate) async fn call_cancellable(
+        &self,
+        client: &str,
+        tool: &str,
+        args: Map<String, Value>,
+        progress: Option<tools::Progress>,
+        cancel: CancellationToken,
+    ) -> CallOutcome {
         let started = Instant::now();
         self.inner.session.note_call(client);
         let confirmer = AnnouncingConfirmer {
@@ -169,6 +187,7 @@ impl McpServer {
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
             progress: progress.clone(),
+            cancel,
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
             remembered: std::sync::Mutex::new(None),
@@ -381,7 +400,9 @@ impl McpServer {
             )
         } else {
             "Pass `namespace` to the tools; list_namespaces shows the namespaces Kubach knows \
-             of. Any namespace works, as many as you need."
+             of. Any namespace works, as many as you need. For a question about all of them, \
+             pass allNamespaces to list_resources or list_events instead of calling namespace \
+             by namespace, and read the coverage note: it says what was left out."
                 .to_owned()
         };
         let more = " Tools beyond your access are marked \"Requires your approval in Kubach\": \
@@ -407,7 +428,10 @@ impl McpServer {
              {access}. Access says which tools you may call without asking for more; it \
              approves no change. {CONFIRMED}{more} {WAITS}{helm} {namespaces} Cluster-scoped resources \
              and calls across all namespaces are not available, except nodes: list_nodes, \
-             describe_node and top_nodes read them (they need access to nodes). For images \
+             describe_node and top_nodes read them (they need access to nodes), and \
+             cordon_node, uncordon_node and drain_node change them with the user's credentials \
+             (they need access to nodes and changes; drain_node with preview shows the pods \
+             first). For images \
              without a shell (distroless) use debug_container, then exec into it. \
              {secrets}{writes} Call \
              `session_info` for details.",
@@ -439,11 +463,12 @@ impl ServerHandler for McpServer {
         let client = client_name(&context);
         let progress = progress_of(&context);
         let outcome = self
-            .call_with_progress(
+            .call_cancellable(
                 &client,
                 &request.name,
                 request.arguments.unwrap_or_default(),
                 progress,
+                context.ct.clone(),
             )
             .await;
         let content = vec![ContentBlock::text(outcome.text)];
@@ -511,12 +536,18 @@ struct ToolSpec {
 /// [`Confirmation::Required`](crate::policy::Confirmation::Required), and
 /// only what [`rememberable`](crate::remember::rememberable) allows may
 /// skip the window after "don't ask again".
-const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets), \
+const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets, nodes), \
      command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
      machine) is previewed and confirmed by the user one by one, even within your access. The \
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
-     (not for deletions or Secrets); the result of such a call then says it was approved that \
+     (not for deletions, Secrets or nodes); the result of such a call then says it was approved that \
      way.";
+
+/// Whether a call of `tool` ends when it is cancelled. A relayed call of
+/// any other tool runs on as before, a change above all.
+pub(crate) fn stops_on_cancel(tool: &str) -> bool {
+    tool == "wait_for_condition"
+}
 
 /// What the agent is told about calls waiting for the user (#116): only
 /// clients that send a progress token get a notification.
@@ -558,6 +589,11 @@ fn tool_access(name: &str) -> Option<Access> {
         | "helm_release_history"
         | "helm_get_values" => need(Profile::ReadOnly, true),
         "list_nodes" | "describe_node" | "top_nodes" => Some(Access {
+            nodes: true,
+            ..Access::NONE
+        }),
+        "cordon_node" | "uncordon_node" | "drain_node" => Some(Access {
+            profile: Profile::Deploy,
             nodes: true,
             ..Access::NONE
         }),
@@ -647,11 +683,18 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_resources",
-            description: "List resources of a kind in the session namespace, as a table.",
+            description: "List resources of a kind in a namespace, as a table. With allNamespaces \
+                          true: in every namespace this session may read, one by one under each \
+                          namespace's identity, not cluster-wide. The answer starts with its \
+                          coverage: which namespaces were read and which were not, and why; a \
+                          PARTIAL answer is not the whole cluster. Namespaces the session has \
+                          not opened yet are asked about once, in one question to the user.",
             schema: object_schema(
                 kind_props(json!({
                     "labelSelector": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "fieldSelector": {"type": "string", "description": "field=value, field==value or field!=value, comma-separated, e.g. spec.nodeName=node-1 or status.phase=Running. Fields depend on the kind; not metadata.namespace"},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most items, per namespace with allNamespaces"},
                 })),
                 &["kind"],
             ),
@@ -680,11 +723,15 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_events",
-            description: "Recent events in the namespace, optionally for one object (kind + name).",
+            description: "Recent events in a namespace, optionally for one object (kind + name). \
+                          With allNamespaces true: in every namespace this session may read, \
+                          the newest across them, with the same coverage note as \
+                          list_resources.",
             schema: object_schema(
                 kind_props(json!({
                     "name": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most events, in all with allNamespaces"},
                 })),
                 &[],
             ),
@@ -763,6 +810,46 @@ fn catalog() -> Vec<ToolSpec> {
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
+        },
+        ToolSpec {
+            name: "cordon_node",
+            description: "Marks a node unschedulable, like kubectl cordon: running pods stay. \
+                          Runs with the user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "uncordon_node",
+            description: "Makes a node schedulable again, like kubectl uncordon. Runs with the \
+                          user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "drain_node",
+            description: "Cordons a node and evicts its pods through the Eviction API, so \
+                          PodDisruptionBudgets hold: a pod they block is retried until the \
+                          timeout. Runs with the user's credentials after they confirm the node \
+                          and every pod. There is no force: pods without a controller are \
+                          reported and left in place. DaemonSet pods without ignoreDaemonsets \
+                          and pods with emptyDir data without deleteEmptyDirData stop the call \
+                          before anything changes. The node stays cordoned afterwards. Pods of \
+                          namespaces this session may not read are only counted.",
+            schema: object_schema(
+                json!({
+                    "name": {"type": "string"},
+                    "ignoreDaemonsets": {"type": "boolean", "description": "Leave DaemonSet pods on the node instead of stopping. Default false"},
+                    "deleteEmptyDirData": {"type": "boolean", "description": "Evict pods with emptyDir volumes too; their data is lost. Default false"},
+                    "podSelector": {"type": "string", "description": "Only pods with these labels, e.g. app=web. The whole node is cordoned all the same"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "For evictions, budget retries and waiting for the pods to go. Default 300"},
+                    "preview": {"type": "boolean", "description": "Only show which pods would be evicted, are blocked by a PodDisruptionBudget or have no controller, without asking the user or changing anything. Call again without preview to do it"},
+                }),
+                &["name"],
+            ),
+            read_only: false,
+            destructive: true,
         },
         ToolSpec {
             name: "get_topology",
@@ -886,6 +973,30 @@ fn catalog() -> Vec<ToolSpec> {
                     "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
                 })),
                 &["kind", "name"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "wait_for_condition",
+            description: "Wait until an object has a status condition, appears or goes away, \
+                          like kubectl wait, instead of polling get_resource. Pick objects by \
+                          exactly one of name and labelSelector. With labelSelector, a status \
+                          condition is met when every matching object has it and at least one \
+                          matches, exists when at least one matches, deleted when none matches \
+                          (also when none did from the start). Returns when met, or at the \
+                          timeout (default 120s, at most 600s) with the final state: what was \
+                          found, and the objects that do not meet it and why. A read that is \
+                          not allowed fails at once. The first call on a custom resource asks \
+                          the user, as list_resources and get_resource do.",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string", "description": "One object; it need not exist yet"},
+                    "labelSelector": {"type": "string", "description": "All objects it matches, e.g. app=web. Met means: for a status condition all of them and at least one, for exists at least one, for deleted none"},
+                    "condition": {"type": "string", "description": "A status condition as Type=Status (Ready=True, Available=False; Status is True, False or Unknown), exists (the object appears) or deleted (it goes away). A status condition about an older generation of the object does not count"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "condition"],
             ),
             read_only: true,
             destructive: false,
@@ -1253,7 +1364,8 @@ fn catalog() -> Vec<ToolSpec> {
                           the user's approval. Returns the forward's id and 127.0.0.1:<port>; \
                           the forward ends with the session, or when you disconnect from Kubach \
                           (over HTTP: close the MCP session, or two minutes without an open \
-                          connection or a request).",
+                          stream or a request, once no connection runs through the forward). \
+                          port_forward_list tells why a forward closed.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -1276,7 +1388,8 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "port_forward_list",
             description: "Port-forwards of this session: target, ports, local address, state and \
-                          last error.",
+                          last error, then the last closed ones (state closed) with reason, \
+                          detail and closedAt.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -1344,6 +1457,10 @@ fn catalog() -> Vec<ToolSpec> {
 }
 
 #[cfg(test)]
+mod all_namespaces_tests;
+#[cfg(test)]
 mod crd_access_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_tests;

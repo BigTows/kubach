@@ -41,14 +41,17 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod all_namespaces;
 mod debug_tools;
 mod log_level;
+mod node_maintenance;
 mod node_tools;
 mod rollout_tools;
 mod secret_tools;
 pub mod secret_write;
 mod tools;
 mod topology_tools;
+mod wait_tools;
 
 #[cfg(test)]
 mod testutil;

@@ -74,6 +74,23 @@ pub(super) fn documents(manifest: &str) -> Vec<(ManifestResource, Value)> {
         .collect()
 }
 
+/// The objects of `helm template`'s output, each with the template of its
+/// `# Source:` comment (#114).
+pub(super) fn manifest_documents(manifest: &str) -> Vec<(Option<String>, ManifestResource)> {
+    split(manifest)
+        .into_iter()
+        .flat_map(|text| {
+            let source = text
+                .lines()
+                .find_map(|line| line.strip_prefix("# Source: "))
+                .map(|path| path.trim().to_owned());
+            documents(text)
+                .into_iter()
+                .map(move |(resource, _)| (source.clone(), resource))
+        })
+        .collect()
+}
+
 /// Documents split on `---` lines.
 fn split(manifest: &str) -> Vec<&str> {
     let mut starts = vec![0];

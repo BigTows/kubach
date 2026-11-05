@@ -137,6 +137,9 @@ pub struct Session {
     /// Chart sources (`oci://…` repositories) the user allowed or refused
     /// for this session (#418).
     chart_sources: Mutex<HashMap<String, bool>>,
+    /// The user's answer about opening every namespace for `allNamespaces`
+    /// calls (#107); `None` until asked.
+    all_namespaces: Mutex<Option<bool>>,
     closed: AtomicBool,
     activity: Mutex<Activity>,
     /// The user's answers so far; empty at the start.
@@ -224,6 +227,7 @@ impl Session {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
@@ -259,6 +263,7 @@ impl Session {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
@@ -662,6 +667,17 @@ impl Session {
 
     /// The user's answer about chart source `source` in this session, if
     /// asked (#418).
+    pub fn all_namespaces_answer(&self) -> Option<bool> {
+        *sync::lock(&self.all_namespaces)
+    }
+
+    /// Remembers the user's answer about `allNamespaces` until the session
+    /// ends (#107). A no keeps single-namespace calls working: it is about
+    /// opening namespaces in bulk, not about any one of them.
+    pub fn set_all_namespaces_answer(&self, allowed: bool) {
+        *sync::lock(&self.all_namespaces) = Some(allowed);
+    }
+
     pub fn chart_source(&self, source: &str) -> Option<bool> {
         sync::lock(&self.chart_sources).get(source).copied()
     }
@@ -680,6 +696,13 @@ impl Session {
                     .ok_or_else(|| SessionError::NotInSession(namespace.to_owned()))?,
                 base,
             ),
+            #[cfg(test)]
+            Identities::Fixed(Identity::TemporaryServiceAccount(_)) => {
+                return Ok(HelmAccess::Token {
+                    kubeconfig: "apiVersion: v1\nkind: Config\n".to_owned(),
+                    token: "fake-sa-token".to_owned(),
+                });
+            }
             #[cfg(test)]
             Identities::Fixed(_) => return Ok(HelmAccess::User),
         };
@@ -1252,6 +1275,7 @@ mod tests {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
