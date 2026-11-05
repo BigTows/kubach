@@ -30,15 +30,16 @@ use serde_json::{Map, Value, json};
 
 use crate::access::Access;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
-use crate::grants::Grant;
+use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
+use crate::log_level::{Level, LevelCounts};
 use crate::masking::{mask_object, mask_text, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
     service_account_changes, walk_fields,
 };
 use crate::remember::{RememberNote, rememberable};
-use crate::scope::NamespaceSource;
+use crate::scope::{NamespaceSource, SessionMode};
 use crate::secret_tools;
 use crate::secret_write;
 use crate::session::{Session, SessionError};
@@ -270,6 +271,8 @@ struct LogsArgs {
     filter: Option<String>,
     #[serde(default)]
     regex: bool,
+    /// Only lines at this level or above, whatever their format (#117).
+    min_level: Option<String>,
     namespace: Option<String>,
     tail_lines: Option<i64>,
     since_seconds: Option<i64>,
@@ -345,6 +348,8 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     for _ in 0..=MAX_GRANTS_PER_CALL {
         match ctx.session.policy().check(request) {
             Ok(allowed) => {
+                let rights = Policy::custom_rights(request, &allowed);
+                open_custom_rights(ctx, &allowed.namespace, rights).await?;
                 if !allowed.namespace.is_empty() {
                     *sync::lock(&ctx.namespace) = Some(allowed.namespace.clone());
                 }
@@ -372,6 +377,88 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     Err(ToolError::Failed(
         "this call needs too many rights at once".into(),
     ))
+}
+
+/// Sets up what a call uses on custom resources in `namespace` (#103): the
+/// policy allowed it, and a temporary ServiceAccount's Role has to follow,
+/// or the API server refuses the call. The user's own RBAC bounds it, so a
+/// missing right is said here. An impersonated identity has the rights the
+/// administrator gave it, whatever the user's are.
+pub(crate) async fn open_custom_rights(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    rights: Vec<CustomRight>,
+) -> Result<(), ToolError> {
+    if rights.is_empty() {
+        return Ok(());
+    }
+    let known = ctx.session.grants();
+    let new: Vec<CustomRight> = rights
+        .into_iter()
+        .filter(|right| !known.has_custom_right(namespace, right))
+        .collect();
+    if new.is_empty() || ctx.session.mode_in(namespace) == SessionMode::Impersonation {
+        return Ok(());
+    }
+    for right in &new {
+        ensure_rbac(
+            ctx,
+            namespace,
+            &[(&right.verb, &right.group, &right.resource)],
+        )
+        .await?;
+    }
+    ctx.session
+        .allow_custom_rights(namespace, &new)
+        .await
+        .map_err(|error| {
+            ToolError::Failed(format!(
+                "custom resources are allowed in this session, but Kubach could not extend the \
+                 session's rights in namespace {namespace}: {error}"
+            ))
+        })
+}
+
+/// A 403 from reading under the session's identity, as a reason the agent
+/// can act on: whose rights are short and who can change that (#103).
+fn explain_forbidden(ctx: &Ctx<'_>, allowed: &Allowed, verb: &str, error: ToolError) -> ToolError {
+    if !matches!(
+        error,
+        ToolError::Api {
+            code: Some(403),
+            ..
+        }
+    ) {
+        return error;
+    }
+    let namespace = &allowed.namespace;
+    let api = &kind_of(allowed).api;
+    let full = if api.group.is_empty() {
+        api.plural.clone()
+    } else {
+        format!("{}.{}", api.plural, api.group)
+    };
+    let why = match ctx.session.mode_in(namespace) {
+        SessionMode::ClientOnly => "your Kubernetes account has no such right".to_owned(),
+        SessionMode::Impersonation => format!(
+            "the identity prepared for Kubach ({}) has no such right; only the cluster \
+             administrator can extend it",
+            ctx.session.describe_identity(Some(namespace))
+        ),
+        SessionMode::TemporaryServiceAccount => {
+            "the session's temporary ServiceAccount does not have it yet; try once more, and if \
+             this repeats, the user's own rights have probably changed"
+                .to_owned()
+        }
+    };
+    Denial::new(
+        DenialCode::Rbac,
+        format!(
+            "the API server does not let this session {verb} {full} in namespace {namespace}: \
+             {why}. Asking the user again will not help: Kubach cannot grant RBAC rights"
+        ),
+    )
+    .into()
 }
 
 /// What the user is asked, in one line.
@@ -743,7 +830,9 @@ pub(crate) async fn run(
                 label_selector: a.label_selector.clone(),
             };
             let allowed = authorize(ctx, &request).await?;
-            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit).await
+            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit)
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
         }
         "get_resource" | "describe_resource" => {
             let a: ObjectArgs = parse(args)?;
@@ -753,11 +842,12 @@ pub(crate) async fn run(
                 namespace: a.namespace,
             };
             let allowed = authorize(ctx, &request).await?;
-            if tool == "get_resource" {
+            let result = if tool == "get_resource" {
                 get_resource(ctx, &allowed).await
             } else {
                 describe_resource(ctx, &allowed).await
-            }
+            };
+            result.map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
         }
         "list_events" => {
             let a: EventsArgs = parse(args)?;
@@ -804,6 +894,7 @@ pub(crate) async fn run(
                 .into());
             }
             let filter = line_filter(a.filter.as_deref(), a.regex)?;
+            let min_level = min_level(a.min_level.as_deref())?;
             let request = Request::Logs {
                 pod: a.pod.clone(),
                 workload,
@@ -822,7 +913,7 @@ pub(crate) async fn run(
                 rights.push(("get", kind.api.group.as_str(), kind.api.plural.as_str()));
             }
             ensure_rbac(ctx, &allowed.namespace, &rights).await?;
-            get_logs(ctx, &allowed, &a, filter.as_ref()).await
+            get_logs(ctx, &allowed, &a, filter.as_ref(), min_level).await
         }
         "top_pods" => {
             let a: NamespaceArgs = parse(args)?;
@@ -1161,6 +1252,9 @@ fn session_info(session: &Session) -> String {
             "hidden on this context"
         },
         "boundaries": boundaries,
+        "waitingForUser": session.waiting().list(),
+        "waitingForUserMeaning": "Calls of this session waiting for the user's answer in the \
+            Kubach window right now; a slow call not listed here is not waiting for the user.",
         "expiresAt": scope.expires_at.to_string(),
         "grants": session.grants().entries(),
         "notAskedAgain": session.remembered(),
@@ -1790,11 +1884,27 @@ fn log_streams(pods: &[Pod], args: &LogsArgs, notes: &mut Vec<String>) -> Vec<Lo
     streams
 }
 
+/// The `minLevel` of `get_logs`.
+fn min_level(name: Option<&str>) -> Result<Option<Level>, ToolError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    match Level::parse(name) {
+        Some(level) => Ok(Some(level)),
+        None => Err(Denial::new(
+            DenialCode::InvalidInput,
+            format!("minLevel must be one of {}", Level::NAMES),
+        )
+        .into()),
+    }
+}
+
 async fn get_logs(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
     args: &LogsArgs,
     filter: Option<&LineFilter>,
+    min_level: Option<Level>,
 ) -> Result<ToolOutput, ToolError> {
     let api: Api<Pod> = Api::namespaced(
         ctx.session.client_in(&allowed.namespace)?,
@@ -1880,6 +1990,7 @@ async fn get_logs(
     let prefixed = streams.len() > 1;
     let mut body = String::new();
     let mut matched = 0usize;
+    let mut levels = LevelCounts::default();
     for (index, stream) in streams.iter().enumerate() {
         if body.len() > MAX_OUTPUT_BYTES {
             let left: Vec<String> = streams[index..].iter().map(LogStream::label).collect();
@@ -1905,11 +2016,14 @@ async fn get_logs(
         // Masked before filtering: the filter must not probe what masking
         // hides.
         let masked = mask_text(&logs);
-        if !prefixed && filter.is_none() {
+        if !prefixed && filter.is_none() && min_level.is_none() {
             body.push_str(&masked);
             continue;
         }
         for line in masked.lines() {
+            if min_level.is_some_and(|min| !levels.admit(line, min)) {
+                continue;
+            }
             if filter.is_some_and(|f| !f.matches(line)) {
                 continue;
             }
@@ -1921,7 +2035,11 @@ async fn get_logs(
             body.push('\n');
         }
     }
-    if filter.is_some() && matched == 0 && !streams.is_empty() {
+    if let Some(min) = min_level {
+        if !streams.is_empty() {
+            notes.push(levels.note(min, matched, filter.is_some()));
+        }
+    } else if filter.is_some() && matched == 0 && !streams.is_empty() {
         notes.push("(no line matched the filter)".to_owned());
     }
     let text = if notes.is_empty() {

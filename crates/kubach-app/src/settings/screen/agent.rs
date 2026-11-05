@@ -225,10 +225,31 @@ impl SettingsScreen {
             return Vec::new();
         };
         let mut groups = vec![self.agent_server(settings, &state, cx)];
+        groups.push(self.agent_notifications(settings));
         groups.push(self.agent_connect(settings, &state, cx));
         groups.push(Self::agent_sessions(&state, cx));
         groups.push(Self::agent_audit(&state, cx));
         groups
+    }
+
+    fn agent_notifications(&self, settings: &Settings) -> Group {
+        let (title, description) = (
+            t!("settings-agent-system-notifications"),
+            t!("settings-agent-system-notifications-description"),
+        );
+        Group::new(t!("settings-group-agent-notifications")).entry(Entry::new(
+            searchable(
+                "notification system confirm request уведомление 通知",
+                &[&title, &description],
+            ),
+            ToggleRow::new("agent-system-notifications", title)
+                .description(description)
+                .checked(settings.agent.system_notifications)
+                .default_value(true)
+                .on_change(setter(&self.settings, |s, on: bool| {
+                    s.agent.system_notifications = on
+                })),
+        ))
     }
 
     fn agent_server(
