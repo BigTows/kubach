@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::access::{Access, Raises};
-use crate::grants::{Grant, GrantState, Grants};
+use crate::grants::{CustomRight, Grant, GrantState, Grants};
 use crate::names;
-use crate::rules::{is_readable, is_writable};
+use crate::rules::{CUSTOM_APPLY_VERBS, CUSTOM_READ_VERBS, is_readable, is_writable};
 use crate::scope::{SessionMode, SessionScope};
 use crate::secret_write::{self, CREATE_TYPES, MAX_KEYS, SecretOp};
 use crate::settings::Profile;
@@ -668,6 +668,46 @@ impl<'a> Policy<'a> {
         };
         needed.dedup();
         needed
+    }
+
+    /// What reading `kind` uses beyond the built-in allowlist (#103).
+    pub fn read_rights(kind: &ResourceKind) -> Vec<CustomRight> {
+        let api = &kind.api;
+        if is_core_secret(&api.group, &api.kind) || is_readable(&api.group, &api.plural) {
+            return Vec::new();
+        }
+        verbs_on(kind, CUSTOM_READ_VERBS)
+    }
+
+    /// What `request`, once allowed, uses on kinds beyond the built-in
+    /// lists (#103): a temporary ServiceAccount's Role has to name them.
+    /// Scaling and restarting have no custom kinds to act on: the generic
+    /// plugin only deletes, after reading the object.
+    pub fn custom_rights(request: &Request, allowed: &Allowed) -> Vec<CustomRight> {
+        let writes = |kind: &ResourceKind, verbs: &[&str]| {
+            let mut rights = Self::read_rights(kind);
+            if !is_writable(&kind.api.group, &kind.api.plural) {
+                rights.extend(verbs_on(kind, verbs));
+            }
+            rights
+        };
+        match request {
+            Request::List { .. }
+            | Request::Get { .. }
+            | Request::Scale { .. }
+            | Request::Restart { .. } => allowed.kind.iter().flat_map(Self::read_rights).collect(),
+            Request::Delete { .. } => allowed
+                .kind
+                .iter()
+                .flat_map(|kind| writes(kind, &["delete"]))
+                .collect(),
+            Request::Apply { .. } => allowed
+                .manifests
+                .iter()
+                .flat_map(|manifest| writes(&manifest.kind, CUSTOM_APPLY_VERBS))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The right a change in `namespace` needs: `modify(ns)` when the API
@@ -1451,6 +1491,13 @@ pub(crate) fn is_identity(group: &str, kind: &str) -> bool {
         || group == "authentication.k8s.io"
         || group == "certificates.k8s.io"
         || group == "admissionregistration.k8s.io"
+}
+
+fn verbs_on(kind: &ResourceKind, verbs: &[&str]) -> Vec<CustomRight> {
+    verbs
+        .iter()
+        .map(|verb| CustomRight::new(&kind.api.group, &kind.api.plural, verb))
+        .collect()
 }
 
 fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {

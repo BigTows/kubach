@@ -5,7 +5,8 @@
 //!   `Impersonate-Extra-kubach.io/session`. Nothing is created.
 //! - **Temporary ServiceAccount**: `kubach-mcp-<session>` with a Role that
 //!   holds exactly the rights the user granted so far (empty at the start,
-//!   patched on every grant and revocation, #227) and a RoleBinding (owned by the SA, so deleting the SA removes
+//!   patched on every grant and revocation, #227, and on the first call on
+//!   each custom resource, #103) and a RoleBinding (owned by the SA, so deleting the SA removes
 //!   everything), and a short-lived token from `TokenRequest`, refreshed in
 //!   memory.
 //! - **Client only**: the user's credentials.
@@ -219,6 +220,18 @@ pub struct TemporaryServiceAccount {
 }
 
 impl TemporaryServiceAccount {
+    /// An account that exists only in the test, on `client`.
+    #[cfg(test)]
+    pub(crate) fn fake(client: Client, namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            name: "kubach-mcp-test".to_owned(),
+            user_client: client.clone(),
+            client: Arc::new(RwLock::new(client)),
+            refresher: Mutex::new(None),
+        }
+    }
+
     /// Creates SA, Role and RoleBinding as the user and fetches a token.
     /// Partially created objects are deleted on failure.
     pub async fn create(

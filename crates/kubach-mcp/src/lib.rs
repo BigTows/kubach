@@ -58,8 +58,10 @@ pub use confirm::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
     WaitingCall, WaitingCalls,
 };
-pub use grants::{Grant, GrantEntry, GrantState, Grants};
-pub use helm_tools::{HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY};
+pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
+pub use helm_tools::{
+    HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY, VaultKubeconfig,
+};
 pub use identity::{Identity, sweep_expired};
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
 pub use remember::{Remembered, RememberedAction, rememberable};

@@ -24,9 +24,11 @@ use kube::api::{Api, DynamicObject, ListParams, TypeMeta};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::policy::{Allowed, Denial, DenialCode, KindRef, Request};
+use crate::policy::{Allowed, Denial, DenialCode, KindRef, Policy, Request};
 
-use crate::tools::{Ctx, MAX_OUTPUT_BYTES, ToolError, ToolOutput, authorize, parse};
+use crate::tools::{
+    Ctx, MAX_OUTPUT_BYTES, ToolError, ToolOutput, authorize, open_custom_rights, parse,
+};
 
 /// Most objects listed per kind and namespace.
 const MAX_OBJECTS: u32 = 2000;
@@ -332,6 +334,17 @@ async fn load(ctx: &Ctx<'_>, allowed: &Allowed, policies: bool) -> Loaded {
             continue;
         }
         for namespace in &allowed.namespaces {
+            // Gateway API and the like are custom resources (#103).
+            if let Err(error) =
+                open_custom_rights(ctx, namespace, Policy::read_rights(&resolved)).await
+            {
+                unavailable.push(json!({
+                    "kind": kind.kind(),
+                    "namespace": namespace,
+                    "reason": error.message(),
+                }));
+                continue;
+            }
             // Each namespace under its own identity (#401).
             let client = match ctx.session.client_in(namespace) {
                 Ok(client) => client,

@@ -923,3 +923,46 @@ fn helm_changes_of_older_peers_run_as_the_session() {
     assert!(old.user_objects.is_empty());
     assert!(old.namespaces.is_empty());
 }
+
+#[test]
+fn a_vault_kubeconfig_shows_nothing_and_goes_to_a_private_file() {
+    let config = Kubeconfig::from_yaml(
+        "apiVersion: v1\nkind: Config\ncurrent-context: vault\n\
+         clusters: [{name: c, cluster: {server: 'https://vault.example.com'}}]\n\
+         users: [{name: u, user: {token: vault-token}}]\n\
+         contexts: [{name: vault, context: {cluster: c, user: u}}]\n",
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("kubeconfig");
+    let vault = VaultKubeconfig::new(config, dir.clone());
+    let shown = format!(
+        "{:?}",
+        HelmEnv {
+            vault: Some(vault.clone()),
+            ..HelmEnv::default()
+        }
+    );
+    assert!(!shown.contains("vault-token"), "{shown}");
+    assert!(!shown.contains("vault.example.com"), "{shown}");
+
+    // Nothing is on disk until a call asks for it.
+    assert!(!dir.exists());
+    let file = vault.write().unwrap();
+    let path = file.path().to_owned();
+    assert!(path.starts_with(&dir));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("vault-token")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+    }
+    drop(file);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
