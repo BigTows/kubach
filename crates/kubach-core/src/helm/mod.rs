@@ -17,6 +17,7 @@ pub mod codec;
 pub mod diagnose;
 pub mod diff;
 pub mod live;
+pub mod lookup;
 pub mod manifest;
 pub mod oci;
 pub mod progress;
