@@ -45,6 +45,7 @@ mod all_namespaces;
 mod batch_tools;
 mod debug_tools;
 mod event_tools;
+mod fields;
 mod helm_preview;
 mod log_level;
 mod node_maintenance;
