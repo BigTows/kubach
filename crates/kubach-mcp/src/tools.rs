@@ -32,6 +32,7 @@ use crate::access::Access;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
 use crate::grants::Grant;
 use crate::helm_tools;
+use crate::log_level::{Level, LevelCounts};
 use crate::masking::{mask_object, mask_text, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
@@ -270,6 +271,8 @@ struct LogsArgs {
     filter: Option<String>,
     #[serde(default)]
     regex: bool,
+    /// Only lines at this level or above, whatever their format (#117).
+    min_level: Option<String>,
     namespace: Option<String>,
     tail_lines: Option<i64>,
     since_seconds: Option<i64>,
@@ -804,6 +807,7 @@ pub(crate) async fn run(
                 .into());
             }
             let filter = line_filter(a.filter.as_deref(), a.regex)?;
+            let min_level = min_level(a.min_level.as_deref())?;
             let request = Request::Logs {
                 pod: a.pod.clone(),
                 workload,
@@ -822,7 +826,7 @@ pub(crate) async fn run(
                 rights.push(("get", kind.api.group.as_str(), kind.api.plural.as_str()));
             }
             ensure_rbac(ctx, &allowed.namespace, &rights).await?;
-            get_logs(ctx, &allowed, &a, filter.as_ref()).await
+            get_logs(ctx, &allowed, &a, filter.as_ref(), min_level).await
         }
         "top_pods" => {
             let a: NamespaceArgs = parse(args)?;
@@ -1787,11 +1791,27 @@ fn log_streams(pods: &[Pod], args: &LogsArgs, notes: &mut Vec<String>) -> Vec<Lo
     streams
 }
 
+/// The `minLevel` of `get_logs`.
+fn min_level(name: Option<&str>) -> Result<Option<Level>, ToolError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    match Level::parse(name) {
+        Some(level) => Ok(Some(level)),
+        None => Err(Denial::new(
+            DenialCode::InvalidInput,
+            format!("minLevel must be one of {}", Level::NAMES),
+        )
+        .into()),
+    }
+}
+
 async fn get_logs(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
     args: &LogsArgs,
     filter: Option<&LineFilter>,
+    min_level: Option<Level>,
 ) -> Result<ToolOutput, ToolError> {
     let api: Api<Pod> = Api::namespaced(
         ctx.session.client_in(&allowed.namespace)?,
@@ -1877,6 +1897,7 @@ async fn get_logs(
     let prefixed = streams.len() > 1;
     let mut body = String::new();
     let mut matched = 0usize;
+    let mut levels = LevelCounts::default();
     for (index, stream) in streams.iter().enumerate() {
         if body.len() > MAX_OUTPUT_BYTES {
             let left: Vec<String> = streams[index..].iter().map(LogStream::label).collect();
@@ -1902,11 +1923,14 @@ async fn get_logs(
         // Masked before filtering: the filter must not probe what masking
         // hides.
         let masked = mask_text(&logs);
-        if !prefixed && filter.is_none() {
+        if !prefixed && filter.is_none() && min_level.is_none() {
             body.push_str(&masked);
             continue;
         }
         for line in masked.lines() {
+            if min_level.is_some_and(|min| !levels.admit(line, min)) {
+                continue;
+            }
             if filter.is_some_and(|f| !f.matches(line)) {
                 continue;
             }
@@ -1918,7 +1942,11 @@ async fn get_logs(
             body.push('\n');
         }
     }
-    if filter.is_some() && matched == 0 && !streams.is_empty() {
+    if let Some(min) = min_level {
+        if !streams.is_empty() {
+            notes.push(levels.note(min, matched, filter.is_some()));
+        }
+    } else if filter.is_some() && matched == 0 && !streams.is_empty() {
         notes.push("(no line matched the filter)".to_owned());
     }
     let text = if notes.is_empty() {
