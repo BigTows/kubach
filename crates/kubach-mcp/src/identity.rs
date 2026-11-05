@@ -219,6 +219,18 @@ pub struct TemporaryServiceAccount {
 }
 
 impl TemporaryServiceAccount {
+    /// An account that exists only in the test, on `client`.
+    #[cfg(test)]
+    pub(crate) fn fake(client: Client, namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            name: "kubach-mcp-test".to_owned(),
+            user_client: client.clone(),
+            client: Arc::new(RwLock::new(client)),
+            refresher: Mutex::new(None),
+        }
+    }
+
     /// Creates SA, Role and RoleBinding as the user and fetches a token.
     /// Partially created objects are deleted on failure.
     pub async fn create(
