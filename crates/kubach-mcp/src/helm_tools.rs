@@ -1021,10 +1021,14 @@ fn store_error(error: HelmError) -> ToolError {
 
 /// Names of the repositories added in Kubach (the user's helm).
 async fn repositories(env: &HelmEnv) -> Vec<repo::LoadedRepository> {
-    let Some(paths) = env.paths.clone() else {
-        return Vec::new();
-    };
-    kubach_core::runtime::blocking(move || repo::load(&paths, &[]).unwrap_or_default()).await
+    listed_repositories(env).await.unwrap_or_default()
+}
+
+/// The repositories added in Kubach; `None` when their list cannot be read,
+/// which is not the same as an empty list.
+async fn listed_repositories(env: &HelmEnv) -> Option<Vec<repo::LoadedRepository>> {
+    let paths = env.paths.clone()?;
+    kubach_core::runtime::blocking(move || repo::load(&paths, &[]).ok()).await
 }
 
 fn repository_names(loaded: &[repo::LoadedRepository]) -> Vec<String> {
@@ -1388,9 +1392,10 @@ pub(crate) async fn search(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
         ));
     }
-    let loaded = repositories(&env).await;
+    let listed = listed_repositories(&env).await;
+    let loaded = listed.as_deref().unwrap_or_default();
     let hits = repo::search(
-        &loaded,
+        loaded,
         &a.query,
         SearchOptions {
             all_versions: a.versions,
@@ -1424,22 +1429,86 @@ pub(crate) async fn search(
             })
         })
         .collect();
-    let out = json!({
+    let mut out = json!({
         "charts": rows,
         "more": hits.len() > MAX_SEARCH_ROWS,
         "repositories": repositories,
-        "note": if loaded.is_empty() {
-            "No repositories are added in Kubach. Only the user adds them (Kubach → Helm → \
-             Charts → Repositories); or pass oci to look at an oci:// chart, which the user is \
-             asked to allow."
-        } else {
-            "Charts of the repositories added in Kubach. An oci:// chart can be looked at with \
-             oci; the user is asked to allow its registry."
-        },
+        "note": "Charts of the repositories added in Kubach. An oci:// chart can be looked at \
+                 with oci; the user is asked to allow its registry.",
     });
+    if hits.is_empty() {
+        explain_empty_search(&mut out, listed.as_deref());
+    }
     Ok(ToolOutput::read(
         serde_json::to_string_pretty(&out).unwrap_or_default(),
     ))
+}
+
+/// Says in `out` why a chart search found nothing (#118); `listed` is what
+/// [`listed_repositories`] returned. Names only: a repository's URL may hold
+/// a login, and a parse error of the list or an index quotes the file.
+fn explain_empty_search(out: &mut Value, listed: Option<&[repo::LoadedRepository]>) {
+    const ONLY_THE_USER: &str = "Only the user adds repositories and updates their indexes, in \
+                                 Kubach (Helm → Charts → Repositories).";
+    let loaded = listed.unwrap_or_default();
+    let names = |ready: bool| -> Vec<&str> {
+        loaded
+            .iter()
+            .filter(|loaded| loaded.charts().is_some() == ready)
+            .map(|loaded| loaded.repository.name.as_str())
+            .collect()
+    };
+    let searched = names(true);
+    let without_index = names(false);
+    let (reason, note) = if listed.is_none() {
+        (
+            "repositoryListUnreadable",
+            "Kubach could not read Helm's repository list, so nothing was searched; repositories \
+             may still be added. Ask the user to check them in Kubach (Helm → Charts → \
+             Repositories)."
+                .to_owned(),
+        )
+    } else if loaded.is_empty() {
+        (
+            "noRepositories",
+            format!("No repositories are added in Kubach. {ONLY_THE_USER}"),
+        )
+    } else if searched.is_empty() {
+        (
+            "noLoadedIndex",
+            format!(
+                "Nothing was searched: no repository has a loaded index ({}). {ONLY_THE_USER}",
+                without_index.join(", ")
+            ),
+        )
+    } else {
+        let skipped = if without_index.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Not searched, no loaded index: {}. {ONLY_THE_USER}",
+                without_index.join(", ")
+            )
+        };
+        (
+            "noMatch",
+            format!(
+                "No chart matched in {}. The query is one substring of repo/chart, a description \
+                 or a keyword: a shorter one may match, and an empty one lists every chart.\
+                 {skipped}",
+                searched.join(", ")
+            ),
+        )
+    };
+    out["reason"] = json!(reason);
+    out["searched"] = json!(searched);
+    out["withoutIndex"] = json!(without_index);
+    out["note"] = json!(note);
+    out["ociCharts"] = json!(
+        "An oci:// chart is in no index, so a query never finds it. If its oci://registry/path \
+         is known, pass that as oci to list its versions, or as chart to helm_install; the user \
+         is asked to allow its registry."
+    );
 }
 
 pub(crate) async fn show_values(
