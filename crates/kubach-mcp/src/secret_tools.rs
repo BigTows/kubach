@@ -175,19 +175,19 @@ async fn workloads(client: &Client, namespace: &str, notes: &mut Vec<String>) ->
     collect!(
         Deployment,
         "Deployment",
-        |d: &Deployment| d.spec.as_ref().and_then(|s| s.template.spec.clone()),
+        |d: &Deployment| d.spec.template.spec.clone(),
         false
     );
     collect!(
         StatefulSet,
         "StatefulSet",
-        |s: &StatefulSet| s.spec.as_ref().and_then(|s| s.template.spec.clone()),
+        |s: &StatefulSet| s.spec.template.spec.clone(),
         false
     );
     collect!(
         DaemonSet,
         "DaemonSet",
-        |d: &DaemonSet| d.spec.as_ref().and_then(|s| s.template.spec.clone()),
+        |d: &DaemonSet| d.spec.template.spec.clone(),
         false
     );
     collect!(

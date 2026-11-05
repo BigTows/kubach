@@ -98,6 +98,10 @@ pub fn impersonation_config(
     let mut config = session_config(base, session_id)?;
     config.auth_info.impersonate = Some(user.to_owned());
     config.auth_info.impersonate_groups = (!groups.is_empty()).then(|| groups.to_vec());
+    // kube sends these too: `as-uid` and `as-user-extra` of the kubeconfig
+    // describe its own identity, not the session's.
+    config.auth_info.impersonate_uid = None;
+    config.auth_info.impersonate_user_extra = None;
     if with_session_extra {
         config
             .headers
@@ -475,6 +479,7 @@ async fn request_token(
     let seconds = token_seconds(remaining);
     let request = TokenRequest {
         spec: Some(TokenRequestSpec {
+            attestations: None,
             audiences: None,
             expiration_seconds: Some(seconds),
             bound_object_ref: None,
@@ -614,6 +619,17 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == SESSION_EXTRA_HEADER)
         );
+    }
+
+    #[test]
+    fn impersonation_drops_the_uid_and_extra_of_the_kubeconfig() {
+        let mut user = base();
+        user.auth_info.impersonate_uid = Some("1000".into());
+        user.auth_info.impersonate_user_extra =
+            Some([("team".to_owned(), vec!["ops".to_owned()])].into());
+        let config = impersonation_config(&user, "abc", "u", &[], false).unwrap();
+        assert!(config.auth_info.impersonate_uid.is_none());
+        assert!(config.auth_info.impersonate_user_extra.is_none());
     }
 
     #[test]

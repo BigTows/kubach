@@ -10,13 +10,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::channel::mpsc;
-use futures::future::{Either, join, select};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::future::{self, BoxFuture, Either, Shared, join, select};
+use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use kube::Client;
 use kube::api::{Api, AttachParams, AttachedProcess, TerminalSize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::StreamError;
 use crate::runtime::{self, BackgroundTask};
@@ -408,20 +408,19 @@ async fn drive(
     input: mpsc::UnboundedReceiver<Input>,
     events: mpsc::Sender<ExecEvent>,
 ) {
-    let stdout = pump_output(process.stdout(), events.clone(), ExecEvent::Stdout);
-    let stderr = pump_output(process.stderr(), events.clone(), ExecEvent::Stderr);
+    let status = finished(&mut process);
+    let stdout = process.stdout().map(|out| UntilFinished::new(out, &status));
+    let stderr = process.stderr().map(|out| UntilFinished::new(out, &status));
+    let stdout = pump_output(stdout, events.clone(), ExecEvent::Stdout);
+    let stderr = pump_output(stderr, events.clone(), ExecEvent::Stderr);
     let input = pump_input(process.stdin(), process.terminal_size(), input);
-    let status = process.take_status();
 
     // Output ends when the process exits; input may end earlier (EOF).
     let outputs = Box::pin(join(stdout, stderr));
     if let Either::Right((_, outputs)) = select(outputs, Box::pin(input)).await {
         outputs.await;
     }
-    let status = match status {
-        Some(status) => status.await,
-        None => None,
-    };
+    let status = status.await;
     let joined = process.join().await;
     let exit = match (status, joined) {
         (Some(status), _) => ExitStatus::from_status(&status),
@@ -430,6 +429,64 @@ async fn drive(
     };
     let mut events = events;
     let _ = events.send(ExecEvent::Exited(exit)).await;
+}
+
+/// Resolves with the process's status, or with `None` once kube's task that
+/// serves the connection is gone.
+type Finished = Shared<BoxFuture<'static, Option<Status>>>;
+
+fn finished(process: &mut AttachedProcess) -> Finished {
+    // Only the first call has the status, and this is the first call.
+    let status = process.take_status();
+    match status {
+        Some(status) => status.boxed().shared(),
+        None => future::ready(None).boxed().shared(),
+    }
+}
+
+/// A stdout or stderr pipe of kube that ends when the connection does.
+///
+/// The pipes get their EOF only on the normal end of kube's task: when it
+/// fails or is aborted the write half is dropped, which does not close a
+/// `SimplexStream`, and a plain read would wait forever. What the pipe still
+/// holds is read first: kube has written everything it got before it
+/// reports the status.
+struct UntilFinished<R> {
+    reader: R,
+    finished: Option<Finished>,
+}
+
+impl<R> UntilFinished<R> {
+    fn new(reader: R, finished: &Finished) -> Self {
+        Self {
+            reader,
+            finished: Some(finished.clone()),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for UntilFinished<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Poll::Ready(result) = Pin::new(&mut this.reader).poll_read(cx, buf) {
+            return Poll::Ready(result);
+        }
+        if let Some(finished) = &mut this.finished {
+            if finished.poll_unpin(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.finished = None;
+        }
+        // Written between the two polls, or nothing more will come.
+        match Pin::new(&mut this.reader).poll_read(cx, buf) {
+            Poll::Pending => Poll::Ready(Ok(())),
+            ready => ready,
+        }
+    }
 }
 
 async fn pump_output(
@@ -522,8 +579,9 @@ where
         ..Default::default()
     };
     let mut process = api.exec(pod, command, &params).await?;
-    let status = process.take_status();
-    let (stdout, stderr) = (process.stdout(), process.stderr());
+    let status = finished(&mut process);
+    let stdout = process.stdout().map(|out| UntilFinished::new(out, &status));
+    let stderr = process.stderr().map(|out| UntilFinished::new(out, &status));
     let truncated = std::sync::atomic::AtomicBool::new(false);
     let overflow = || {
         truncated.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -535,10 +593,7 @@ where
     )
     .await;
     let truncated = truncated.into_inner();
-    let status = match status {
-        Some(status) => status.await,
-        None => None,
-    };
+    let status = status.await;
     let joined = process.join().await;
     let status = match (status, joined) {
         (Some(status), _) => ExitStatus::from_status(&status),
@@ -598,6 +653,45 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{StatusCause, StatusDetails};
 
     use super::*;
+
+    fn not_finished() -> (futures::channel::oneshot::Sender<()>, Finished) {
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        (tx, rx.map(|_| None).boxed().shared())
+    }
+
+    #[tokio::test]
+    async fn a_pipe_ends_with_the_connection_and_keeps_what_it_holds() {
+        let (reader, mut writer) = tokio::io::simplex(64);
+        let (end, finished) = not_finished();
+        let mut reader = UntilFinished::new(reader, &finished);
+        writer.write_all(b"last words").await.unwrap();
+
+        // The write half goes away without a shutdown, like in an aborted task.
+        drop(writer);
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"last");
+        drop(end);
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b" words");
+    }
+
+    #[tokio::test]
+    async fn a_pipe_stays_open_while_the_connection_lives() {
+        let (reader, mut writer) = tokio::io::simplex(64);
+        let (_end, finished) = not_finished();
+        let mut reader = UntilFinished::new(reader, &finished);
+        let mut buf = [0u8; 8];
+        let quiet = tokio::time::timeout(Duration::from_millis(20), reader.read(&mut buf));
+        assert!(quiet.await.is_err());
+
+        writer.write_all(b"hi").await.unwrap();
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 2);
+        writer.shutdown().await.unwrap();
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn output_is_read_up_to_the_limit() {

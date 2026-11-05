@@ -326,6 +326,15 @@ fn generation_pending(obj: &DynamicObject, observed: Option<i64>) -> bool {
     matches!((obj.metadata.generation, observed), (Some(g), Some(o)) if o < g)
 }
 
+/// The `spec` of a decoded workload, `None` when the object has none.
+///
+/// k8s-openapi decodes a missing required `spec` as its default, and the
+/// default selector is the empty one, which selects every pod in the
+/// namespace: the related pods of an object without a spec must stay empty.
+fn present<T: Default + PartialEq>(spec: &T) -> Option<&T> {
+    (*spec != T::default()).then_some(spec)
+}
+
 fn n(v: Option<i32>) -> i32 {
     v.unwrap_or(0)
 }
@@ -333,11 +342,11 @@ fn n(v: Option<i32>) -> i32 {
 // ---------------------------------------------------------------- Deployment
 
 pub(crate) fn deployment_health(obj: &DynamicObject, d: &Deployment) -> Health {
-    let spec = d.spec.as_ref();
+    let spec = present(&d.spec);
     let status = d.status.clone().unwrap_or_default();
     let desired = spec.and_then(|s| s.replicas).unwrap_or(1);
     let conditions = status.conditions.clone().unwrap_or_default();
-    let cond = |t: &str| conditions.iter().find(|c| c.type_ == t);
+    let cond = |t: &str| conditions.iter().find(|c| c.type_.as_deref() == Some(t));
 
     if let Some(c) =
         cond("Progressing").filter(|c| c.reason.as_deref() == Some("ProgressDeadlineExceeded"))
@@ -373,7 +382,7 @@ pub(crate) fn deployment_health(obj: &DynamicObject, d: &Deployment) -> Health {
             msg!("state-old-replicas", count = replicas - updated),
         );
     }
-    if let Some(c) = cond("Available").filter(|c| c.status == "False") {
+    if let Some(c) = cond("Available").filter(|c| c.status.as_deref() == Some("False")) {
         let msg = c.message.clone().unwrap_or_else(|| "Unavailable".into());
         return Health::new(HealthStatus::Degraded, msg);
     }
@@ -419,7 +428,7 @@ impl ResourcePlugin for DeploymentPlugin {
         let Some(d) = decode::<Deployment>(obj) else {
             return fallback_cells(obj, &self.columns());
         };
-        let spec = d.spec.as_ref();
+        let spec = present(&d.spec);
         let status = d.status.clone().unwrap_or_default();
         let desired = spec.and_then(|s| s.replicas).unwrap_or(1);
         let mut cells = name_ns_cells(obj);
@@ -438,7 +447,7 @@ impl ResourcePlugin for DeploymentPlugin {
         let Some(d) = decode::<Deployment>(obj) else {
             return GenericPlugin.details(obj);
         };
-        let spec = d.spec.as_ref();
+        let spec = present(&d.spec);
         let status = d.status.clone().unwrap_or_default();
         let strategy = spec.and_then(|s| s.strategy.as_ref());
         let rolling_update = strategy.and_then(|s| s.rolling_update.as_ref());
@@ -529,7 +538,7 @@ impl ResourcePlugin for DeploymentPlugin {
         pod_selector_relations(
             obj,
             d.as_ref()
-                .and_then(|d| d.spec.as_ref())
+                .and_then(|d| present(&d.spec))
                 .map(|s| &s.selector),
             true,
         )
@@ -546,7 +555,7 @@ impl ResourcePlugin for DeploymentPlugin {
 // --------------------------------------------------------------- StatefulSet
 
 pub(crate) fn statefulset_health(obj: &DynamicObject, s: &StatefulSet) -> Health {
-    let spec = s.spec.as_ref();
+    let spec = present(&s.spec);
     let status = s.status.clone().unwrap_or_default();
     let desired = spec.and_then(|s| s.replicas).unwrap_or(1);
     if generation_pending(obj, status.observed_generation) {
@@ -606,7 +615,7 @@ impl ResourcePlugin for StatefulSetPlugin {
         let Some(s) = decode::<StatefulSet>(obj) else {
             return fallback_cells(obj, &self.columns());
         };
-        let spec = s.spec.as_ref();
+        let spec = present(&s.spec);
         let status = s.status.clone().unwrap_or_default();
         let mut cells = name_ns_cells(obj);
         cells.extend([
@@ -626,7 +635,7 @@ impl ResourcePlugin for StatefulSetPlugin {
         let Some(s) = decode::<StatefulSet>(obj) else {
             return GenericPlugin.details(obj);
         };
-        let spec = s.spec.as_ref();
+        let spec = present(&s.spec);
         let status = s.status.clone().unwrap_or_default();
         let desired = spec.and_then(|s| s.replicas).unwrap_or(1);
         let ns = obj.metadata.namespace.as_deref();
@@ -788,7 +797,7 @@ impl ResourcePlugin for StatefulSetPlugin {
         pod_selector_relations(
             obj,
             s.as_ref()
-                .and_then(|s| s.spec.as_ref())
+                .and_then(|s| present(&s.spec))
                 .map(|s| &s.selector),
             false,
         )
@@ -871,9 +880,7 @@ impl ResourcePlugin for DaemonSetPlugin {
             return fallback_cells(obj, &self.columns());
         };
         let status = d.status.clone().unwrap_or_default();
-        let node_selector = d
-            .spec
-            .as_ref()
+        let node_selector = present(&d.spec)
             .and_then(|s| s.template.spec.as_ref())
             .and_then(|s| s.node_selector.as_ref());
         let mut cells = name_ns_cells(obj);
@@ -894,7 +901,7 @@ impl ResourcePlugin for DaemonSetPlugin {
         let Some(d) = decode::<DaemonSet>(obj) else {
             return GenericPlugin.details(obj);
         };
-        let spec = d.spec.as_ref();
+        let spec = present(&d.spec);
         let status = d.status.clone().unwrap_or_default();
         let update = spec.and_then(|s| s.update_strategy.as_ref());
         let rolling_update = update.and_then(|u| u.rolling_update.as_ref());
@@ -965,7 +972,7 @@ impl ResourcePlugin for DaemonSetPlugin {
         pod_selector_relations(
             obj,
             d.as_ref()
-                .and_then(|d| d.spec.as_ref())
+                .and_then(|d| present(&d.spec))
                 .map(|s| &s.selector),
             false,
         )
@@ -983,13 +990,10 @@ impl ResourcePlugin for DaemonSetPlugin {
 
 pub(crate) fn replicaset_health(obj: &DynamicObject, r: &ReplicaSet) -> Health {
     let status = r.status.clone().unwrap_or_default();
-    let desired = r.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
-    if let Some(c) = status
-        .conditions
-        .iter()
-        .flatten()
-        .find(|c| c.type_ == "ReplicaFailure" && c.status == "True")
-    {
+    let desired = present(&r.spec).and_then(|s| s.replicas).unwrap_or(1);
+    if let Some(c) = status.conditions.iter().flatten().find(|c| {
+        c.type_.as_deref() == Some("ReplicaFailure") && c.status.as_deref() == Some("True")
+    }) {
         let msg = c
             .message
             .clone()
@@ -1040,7 +1044,12 @@ impl ResourcePlugin for ReplicaSetPlugin {
         let status = r.status.clone().unwrap_or_default();
         let mut cells = name_ns_cells(obj);
         cells.extend([
-            Cell::Number(r.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1).into()),
+            Cell::Number(
+                present(&r.spec)
+                    .and_then(|s| s.replicas)
+                    .unwrap_or(1)
+                    .into(),
+            ),
             Cell::Number(status.replicas.into()),
             Cell::Number(n(status.ready_replicas).into()),
             Cell::Status(replicaset_health(obj, &r)),
@@ -1053,7 +1062,7 @@ impl ResourcePlugin for ReplicaSetPlugin {
         let Some(r) = decode::<ReplicaSet>(obj) else {
             return GenericPlugin.details(obj);
         };
-        let spec = r.spec.as_ref();
+        let spec = present(&r.spec);
         let status = r.status.clone().unwrap_or_default();
         let mut overview = vec![Field::new(
             "Replicas",
@@ -1135,7 +1144,7 @@ impl ResourcePlugin for ReplicaSetPlugin {
         pod_selector_relations(
             obj,
             r.as_ref()
-                .and_then(|r| r.spec.as_ref())
+                .and_then(|r| present(&r.spec))
                 .map(|s| &s.selector),
             false,
         )
@@ -1204,6 +1213,52 @@ mod tests {
             panic!()
         };
         assert_eq!(pods.order, RelatedOrder::Ordinal);
+    }
+
+    /// Older API servers and partial objects: required fields may be absent.
+    #[test]
+    fn a_workload_without_a_spec_selects_nothing() {
+        let bare: Deployment = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "bare"},
+        }))
+        .unwrap();
+        assert!(present(&bare.spec).is_none());
+
+        let full: Deployment = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "full"},
+            "spec": {"selector": {"matchLabels": {"app": "x"}}, "template": {}},
+        }))
+        .unwrap();
+        assert!(present(&full.spec).is_some());
+    }
+
+    #[test]
+    fn a_condition_without_a_type_or_status_matches_nothing() {
+        let d: Deployment = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "generation": 1},
+            "spec": {"replicas": 1, "selector": {}, "template": {}},
+            "status": {
+                "observedGeneration": 1,
+                "replicas": 1,
+                "updatedReplicas": 1,
+                "availableReplicas": 1,
+                "conditions": [{"reason": "ProgressDeadlineExceeded"}, {"type": "Available"}],
+            },
+        }))
+        .unwrap();
+        let obj: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "generation": 1},
+        }))
+        .unwrap();
+        assert_eq!(deployment_health(&obj, &d).status, HealthStatus::Healthy);
     }
 
     fn deployment(spec_replicas: i32, status: Value) -> DynamicObject {

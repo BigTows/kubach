@@ -741,7 +741,11 @@ fn auth_of(user: &AuthInfo) -> Result<Auth, NotSimple> {
     if user.token_file.is_some() || user.client_certificate.is_some() || user.client_key.is_some() {
         return Err(NotSimple::Unsupported(Feature::CredentialFiles));
     }
-    if user.impersonate.is_some() || user.impersonate_groups.is_some() {
+    if user.impersonate.is_some()
+        || user.impersonate_uid.is_some()
+        || user.impersonate_groups.is_some()
+        || user.impersonate_user_extra.is_some()
+    {
         return Err(NotSimple::Unsupported(Feature::Impersonation));
     }
     if let Some(exec) = &user.exec {
