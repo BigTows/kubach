@@ -33,6 +33,7 @@ use crate::access::Access;
 use crate::all_namespaces;
 use crate::audit::DecidedBy;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
+use crate::event_tools::{EventFilter, list_events};
 use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
 use crate::log_level::{Level, LevelCounts};
@@ -278,6 +279,10 @@ struct EventsArgs {
     limit: Option<usize>,
     #[serde(default)]
     all_namespaces: bool,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    reason: Option<String>,
+    since_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -890,6 +895,7 @@ pub(crate) async fn run(
         }
         "list_events" => {
             let a: EventsArgs = parse(args)?;
+            let filter = EventFilter::new(a.event_type, a.reason, a.since_seconds)?;
             let object = match (a.kind, a.name) {
                 (Some(kind), Some(name)) => Some((kind_ref(kind, a.api_version), name)),
                 (None, None) => None,
@@ -909,10 +915,10 @@ pub(crate) async fn run(
             let allowed = authorize(ctx, &request).await?;
             let limit = a.limit.unwrap_or(50).min(200);
             if a.all_namespaces {
-                return all_namespaces::list_events(ctx, &request, limit).await;
+                return all_namespaces::list_events(ctx, &request, &filter, limit).await;
             }
             ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
-            let events = list_events(ctx, &allowed, limit).await?;
+            let events = list_events(ctx, &allowed, &filter, limit).await?;
             Ok(ToolOutput::read(events))
         }
         "get_logs" => {
@@ -1684,44 +1690,21 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             relation.kind, relation.target_kind, relation.label_selector
         );
     }
-    let events = list_events(ctx, allowed, 20)
+    let events = list_events(ctx, allowed, &EventFilter::default(), 20)
         .await
         .unwrap_or_else(|e| e.message());
     let _ = write!(out, "\nEvents:\n{events}");
     Ok(ToolOutput::read(finish(&out)))
 }
 
-/// The events of one namespace, oldest first, and whether more exist than
-/// were read.
-pub(crate) async fn read_events(
-    ctx: &Ctx<'_>,
-    allowed: &Allowed,
-) -> Result<(Vec<Event>, bool), ToolError> {
-    let api: Api<Event> = Api::namespaced(
-        ctx.session.client_in(&allowed.namespace)?,
-        &allowed.namespace,
-    );
-    let mut params = ListParams::default().limit(MAX_LIST_ITEMS);
-    if let (Some(kind), Some(name)) = (&allowed.kind, &allowed.name) {
-        params = params.fields(&format!(
-            "involvedObject.kind={},involvedObject.name={name}",
-            kind.api.kind
-        ));
-    }
-    let list = api.list(&params).await?;
-    let more = has_more(&list.metadata);
-    let mut events = list.items;
-    events.retain(|event| event.metadata.namespace.as_deref() == Some(allowed.namespace.as_str()));
-    events.sort_by_key(event_time);
-    Ok((events, more))
-}
-
 /// When an event last happened.
 pub(crate) fn event_time(event: &Event) -> Option<Timestamp> {
     event
-        .last_timestamp
+        .series
         .as_ref()
+        .and_then(|series| series.last_observed_time.as_ref())
         .map(|t| t.0)
+        .or(event.last_timestamp.as_ref().map(|t| t.0))
         .or(event.event_time.as_ref().map(|t| t.0))
         .or(event.metadata.creation_timestamp.as_ref().map(|t| t.0))
 }
@@ -1744,26 +1727,6 @@ pub(crate) fn event_line(event: &Event, now: Timestamp) -> String {
             .map(|c| format!(" (x{c})"))
             .unwrap_or_default(),
     )
-}
-
-async fn list_events(ctx: &Ctx<'_>, allowed: &Allowed, limit: usize) -> Result<String, ToolError> {
-    let (events, more) = read_events(ctx, allowed).await?;
-    let now = Timestamp::now();
-    let skip = events.len().saturating_sub(limit);
-    let mut out = String::new();
-    for event in events.iter().skip(skip) {
-        let _ = writeln!(out, "{}", event_line(event, now));
-    }
-    if out.is_empty() {
-        out.push_str("(no events)\n");
-    }
-    if more {
-        let _ = writeln!(
-            out,
-            "(only {MAX_LIST_ITEMS} events were read; more exist and newer ones may be missing)"
-        );
-    }
-    Ok(finish(&out))
 }
 
 /// At most this many pods per `get_logs` call, and streams (pod and

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
 use crate::confirm::{AnnouncingConfirmer, Confirmer};
+use crate::event_tools::MAX_SINCE_SECONDS;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
@@ -787,12 +788,18 @@ fn catalog() -> Vec<ToolSpec> {
             description: "Recent events in a namespace, optionally for one object (kind + name). \
                           With allNamespaces true: in every namespace this session may read, \
                           the newest across them, with the same coverage note as \
-                          list_resources.",
+                          list_resources. type and reason filter on the API server, before any \
+                          limit. sinceSeconds cannot: events are read page by page up to a \
+                          bound (5000 per namespace), the newest kept, and the first line says \
+                          whether the window was fully covered or cut.",
             schema: object_schema(
                 kind_props(json!({
                     "name": {"type": "string"},
                     "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most events, in all with allNamespaces"},
+                    "type": {"type": "string", "enum": ["Normal", "Warning"]},
+                    "reason": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9._:/-]+$", "description": "One event reason, e.g. BackOff"},
+                    "sinceSeconds": {"type": "integer", "minimum": 1, "maximum": MAX_SINCE_SECONDS, "description": "Only events last seen in this many seconds; API servers keep events about an hour by default"},
                 })),
                 &[],
             ),
@@ -1594,6 +1601,8 @@ mod all_namespaces_tests;
 mod batch_tests;
 #[cfg(test)]
 mod crd_access_tests;
+#[cfg(test)]
+mod event_filter_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
