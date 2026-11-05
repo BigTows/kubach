@@ -19,7 +19,10 @@
         <Component>
           <File Id="kubach.exe" Source="$(var.ExeFile)" KeyPath="yes">
             <Shortcut Name="Kubach" Directory="ProgramMenuFolder" Advertise="yes"
-                      Icon="kubach.ico" WorkingDirectory="INSTALLFOLDER" />
+                      Icon="kubach.ico" WorkingDirectory="INSTALLFOLDER">
+              <!-- The process sets the same id: taskbar and toasts (#102). -->
+              <ShortcutProperty Key="System.AppUserModel.ID" Value="dev.kubach.app" />
+            </Shortcut>
           </File>
         </Component>
         <Component>

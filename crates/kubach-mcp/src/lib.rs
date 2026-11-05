@@ -42,6 +42,8 @@ pub mod shared;
 pub mod transport;
 
 mod debug_tools;
+mod log_level;
+mod node_maintenance;
 mod node_tools;
 mod rollout_tools;
 mod secret_tools;
@@ -56,6 +58,7 @@ pub use access::{Access, Raises};
 pub use audit::{AuditEntry, AuditLog, DecidedBy};
 pub use confirm::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
+    WaitingCall, WaitingCalls,
 };
 pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{

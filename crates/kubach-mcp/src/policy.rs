@@ -53,6 +53,8 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
 /// Longest image reference of a debug container (#64).
 pub const MAX_IMAGE_REF_BYTES: usize = 512;
+/// Longest `timeoutSeconds` of a node drain (#105).
+pub const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 3600;
 /// Lowest local port an agent's port-forward may take (#17): well-known
 /// ports stay with the system and the user.
 pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
@@ -244,6 +246,22 @@ pub enum Request {
     Nodes {
         name: Option<String>,
     },
+    /// `cordon_node` and `uncordon_node` (#105). Like every write on a
+    /// node: the user's credentials for this one call, confirmed each time,
+    /// and never in a session pinned to namespaces.
+    NodeCordon {
+        name: String,
+        cordon: bool,
+    },
+    /// `drain_node` (#105): cordon, then evict the node's pods, those of
+    /// `pod_selector` when given. A `preview` only reads, so it needs no
+    /// more than reading nodes.
+    NodeDrain {
+        name: String,
+        pod_selector: Option<String>,
+        timeout_seconds: Option<u64>,
+        preview: bool,
+    },
     /// Helm releases of a namespace: list, history and values. Needs
     /// access to Secrets, where Helm stores them (#53).
     HelmRead {
@@ -269,7 +287,9 @@ impl Request {
             | Self::SecretWrite { .. }
             | Self::SecretCopy { .. }
             | Self::SecretDelete { .. }
+            | Self::NodeCordon { .. }
             | Self::HelmChange { .. } => true,
+            Self::NodeDrain { preview, .. } => !preview,
             _ => false,
         }
     }
@@ -533,7 +553,12 @@ impl<'a> Policy<'a> {
             | Request::SecretCompare { .. }
             | Request::SecretReveal { .. }
             | Request::HelmRead { .. } => need(Profile::ReadOnly, true),
-            Request::Nodes { .. } => Some(Access {
+            Request::Nodes { .. } | Request::NodeDrain { preview: true, .. } => Some(Access {
+                nodes: true,
+                ..Access::NONE
+            }),
+            Request::NodeCordon { .. } | Request::NodeDrain { .. } => Some(Access {
+                profile: Profile::Deploy,
                 nodes: true,
                 ..Access::NONE
             }),
@@ -608,7 +633,9 @@ impl<'a> Policy<'a> {
             | Request::ListKinds
             | Request::ListNamespaces
             | Request::HelmCharts
-            | Request::Nodes { .. } => Vec::new(),
+            | Request::Nodes { .. }
+            | Request::NodeCordon { .. }
+            | Request::NodeDrain { .. } => Vec::new(),
             Request::HelmRead { .. } => vec![read],
             Request::List { .. }
             | Request::Get { .. }
@@ -747,6 +774,40 @@ impl<'a> Policy<'a> {
                 let mut allowed = self.allowed(self.namespace(None).unwrap_or_default());
                 if let Some(name) = name {
                     allowed.name = Some(object_name(name)?);
+                }
+                Ok(allowed)
+            }
+            Request::NodeCordon { name, .. } => {
+                let mut allowed = self.node_write()?;
+                allowed.name = Some(object_name(name)?);
+                Ok(allowed)
+            }
+            Request::NodeDrain {
+                name,
+                pod_selector,
+                timeout_seconds,
+                preview,
+            } => {
+                let mut allowed = if *preview {
+                    self.allowed(String::new())
+                } else {
+                    self.node_write()?
+                };
+                allowed.name = Some(object_name(name)?);
+                if let Some(selector) = pod_selector {
+                    if selector.trim().is_empty() {
+                        return Err(Denial::new(
+                            DenialCode::InvalidInput,
+                            "podSelector must not be empty",
+                        ));
+                    }
+                    check_selector(selector)?;
+                }
+                if timeout_seconds.is_some_and(|t| !(1..=MAX_DRAIN_TIMEOUT_SECONDS).contains(&t)) {
+                    return Err(Denial::new(
+                        DenialCode::InvalidInput,
+                        format!("timeoutSeconds must be 1 to {MAX_DRAIN_TIMEOUT_SECONDS}"),
+                    ));
                 }
                 Ok(allowed)
             }
@@ -1099,6 +1160,25 @@ impl<'a> Policy<'a> {
         }
     }
 
+    /// A write on a node (#105): about no namespace, so the identity of
+    /// none applies, and confirmed each time. It reaches beyond any
+    /// namespace, so a session pinned to some never makes it.
+    fn node_write(&self) -> Result<Allowed, Denial> {
+        if self.scope.pinned() {
+            return Err(Denial::new(
+                DenialCode::ClusterScoped,
+                format!(
+                    "this session is limited to namespace(s) {}, and a change to a node reaches \
+                     every namespace on it. Start kubach mcp without --namespace to do this",
+                    self.scope.namespaces.join(", ")
+                ),
+            ));
+        }
+        let mut allowed = self.allowed(String::new());
+        allowed.confirmation = Confirmation::Required;
+        Ok(allowed)
+    }
+
     fn allowed(&self, namespace: String) -> Allowed {
         Allowed {
             namespace,
@@ -1161,6 +1241,10 @@ impl<'a> Policy<'a> {
             Request::SecretReveal { .. } => "revealing a Secret",
             Request::HelmRead { .. } => "reading Helm releases (Helm keeps them in Secrets)",
             Request::Nodes { .. } => "reading nodes (cluster-scoped, with the user's credentials)",
+            Request::NodeDrain { preview: true, .. } => "a drain preview (reads nodes and pods)",
+            Request::NodeCordon { .. } | Request::NodeDrain { .. } => {
+                "changing a node (cluster-scoped, with the user's credentials)"
+            }
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };

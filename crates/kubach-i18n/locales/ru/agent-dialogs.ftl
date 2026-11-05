@@ -11,6 +11,7 @@ agent-security-settings = Настройки безопасности
 agent-notice-reveal-off = Показ Secrets выключен
 agent-notice-refused = Агенту отказано
 agent-notice-text = { $text }
+agent-system-notification-body = { $client } ждёт вашего ответа в Kubach (контекст { $context }).
 agent-notice-mcp-off = { $summary }: доступ ИИ-агентов к этому контексту выключен.
 agent-notice-session-only = Разрешено только на эту сессию
 agent-notice-session-only-text = Файл настроек нельзя записать, поэтому доступ действует только до конца сессии.

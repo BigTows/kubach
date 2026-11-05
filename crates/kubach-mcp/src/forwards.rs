@@ -16,8 +16,18 @@
 //! app's HTTP endpoint (#34, [`crate::presence`]), with `read(ns)` revoked,
 //! or when the user stops them; each start and stop is in the audit log.
 //! They are never remembered for the app's next run.
+//!
+//! Nothing else closes one: a pod that restarts, a dropped or idle
+//! connection end that connection only, the local port stays and the next
+//! connection reaches for the pod again (`state`, `lastError`). A forward
+//! something still connects through outlives a silent agent until that
+//! connection ends (#104).
+//!
+//! The last [`MAX_CLOSED_FORWARDS`] closed forwards stay in
+//! `port_forward_list` with the reason, the time and the last error, so a
+//! forward that went away can be told from one that never was (#104).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::jiff::Timestamp;
@@ -40,7 +50,11 @@ use crate::tools::{Ctx, ToolError, ToolOutput, authorize, confirm_as, ensure_rba
 /// Most forwards one session keeps open at a time.
 pub const MAX_FORWARDS_PER_SESSION: usize = 8;
 
-/// Why an agent's forward stopped, for the audit log.
+/// Most closed forwards one session remembers; the oldest go first.
+pub const MAX_CLOSED_FORWARDS: usize = 16;
+
+/// Why an agent's forward stopped, for the audit log and
+/// `port_forward_list`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     /// The agent called `port_forward_stop`; the call is audited itself.
@@ -56,13 +70,26 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Agent => "agent",
             Self::User => "user",
             Self::SessionEnded => "session-ended",
             Self::Revoked => "revoked",
             Self::Disconnected => "disconnected",
+        }
+    }
+
+    /// The reason in words.
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Agent => "stopped with port_forward_stop",
+            Self::User => "stopped by the user in Kubach",
+            Self::SessionEnded => "the session ended",
+            Self::Revoked => "the user revoked reading the namespace of this forward",
+            Self::Disconnected => {
+                "the agent disconnected from Kubach (closed its MCP session, or was silent too long)"
+            }
         }
     }
 }
@@ -81,11 +108,32 @@ pub struct AgentForward {
     pub identity: String,
 }
 
+/// A running forward: what the session remembers of it, and how the
+/// manager last showed it. The user's stop leaves nothing in the manager
+/// to read the last error from.
+#[derive(Clone)]
+struct Tracked {
+    forward: AgentForward,
+    latest: ForwardInfo,
+}
+
+/// A forward that closed, as `port_forward_list` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedForward {
+    /// The forward when it closed, `last_error` included.
+    pub info: ForwardInfo,
+    pub forward: AgentForward,
+    pub reason: StopReason,
+    pub closed_at: Timestamp,
+}
+
 /// The forwards of one session.
 pub struct SessionForwards {
     session: String,
     manager: Mutex<PortForwardManager>,
-    tracked: Mutex<BTreeMap<ForwardId, AgentForward>>,
+    tracked: Mutex<BTreeMap<ForwardId, Tracked>>,
+    /// Newest first, at most [`MAX_CLOSED_FORWARDS`].
+    closed: Mutex<VecDeque<ClosedForward>>,
     audit: Mutex<Option<Arc<AuditLog>>>,
     /// Notices forwards the user stopped; started with the first forward.
     watch: Mutex<Option<BackgroundTask>>,
@@ -99,6 +147,7 @@ impl SessionForwards {
             session: session.to_owned(),
             manager: Mutex::new(PortForwardManager::new()),
             tracked: Mutex::default(),
+            closed: Mutex::default(),
             audit: Mutex::default(),
             watch: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
@@ -130,8 +179,13 @@ impl SessionForwards {
         let manager = self.manager();
         sync::lock(&self.tracked)
             .iter()
-            .filter_map(|(id, forward)| Some((manager.get(*id)?, forward.clone())))
+            .filter_map(|(id, tracked)| Some((manager.get(*id)?, tracked.forward.clone())))
             .collect()
+    }
+
+    /// The session's last closed forwards, newest first.
+    pub fn closed(&self) -> Vec<ClosedForward> {
+        sync::lock(&self.closed).iter().cloned().collect()
     }
 
     pub fn count(&self) -> usize {
@@ -142,18 +196,27 @@ impl SessionForwards {
     pub fn any_in(&self, namespace: &str) -> bool {
         sync::lock(&self.tracked)
             .values()
-            .any(|forward| forward.namespace == namespace)
+            .any(|tracked| tracked.forward.namespace == namespace)
     }
 
-    fn track(&self, id: ForwardId, forward: AgentForward) {
-        sync::lock(&self.tracked).insert(id, forward);
+    fn track(&self, info: ForwardInfo, forward: AgentForward) {
+        let tracked = Tracked {
+            forward,
+            latest: info.clone(),
+        };
+        sync::lock(&self.tracked).insert(info.id, tracked);
     }
 
     /// Stops forward `id` if it is this session's.
     pub fn stop(&self, id: ForwardId, reason: StopReason) -> Option<AgentForward> {
-        let forward = sync::lock(&self.tracked).remove(&id)?;
-        self.manager().stop(id);
-        self.record_stop(id, &forward, reason);
+        let mut tracked = sync::lock(&self.tracked).remove(&id)?;
+        let manager = self.manager();
+        if let Some(info) = manager.get(id) {
+            tracked.latest = info;
+        }
+        manager.stop(id);
+        let forward = tracked.forward.clone();
+        self.record_stop(tracked, reason);
         Some(forward)
     }
 
@@ -161,20 +224,12 @@ impl SessionForwards {
     pub fn stop_in(&self, namespace: &str, reason: StopReason) {
         let ids: Vec<ForwardId> = sync::lock(&self.tracked)
             .iter()
-            .filter(|(_, forward)| forward.namespace == namespace)
+            .filter(|(_, tracked)| tracked.forward.namespace == namespace)
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
             self.stop(id, reason);
         }
-    }
-
-    /// Namespaces the session forwards in.
-    fn namespaces(&self) -> Vec<String> {
-        sync::lock(&self.tracked)
-            .values()
-            .map(|forward| forward.namespace.clone())
-            .collect()
     }
 
     /// Stops every forward of the session.
@@ -188,24 +243,26 @@ impl SessionForwards {
     }
 
     /// Forgets forwards that are no longer in the manager (the user
-    /// stopped them) and records it. Returns their namespaces.
+    /// stopped them) and records it; notes how the others look now.
+    /// Returns the namespaces of the forgotten ones.
     pub(crate) fn reconcile(&self) -> Vec<String> {
         let manager = self.manager();
-        let gone: Vec<(ForwardId, AgentForward)> = {
-            let mut tracked = sync::lock(&self.tracked);
-            let ids: Vec<ForwardId> = tracked
-                .keys()
-                .copied()
-                .filter(|id| manager.get(*id).is_none())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| Some((id, tracked.remove(&id)?)))
-                .collect()
-        };
+        let mut gone = Vec::new();
+        sync::lock(&self.tracked).retain(|id, tracked| match manager.get(*id) {
+            Some(info) => {
+                tracked.latest = info;
+                true
+            }
+            None => {
+                gone.push(tracked.clone());
+                false
+            }
+        });
         gone.into_iter()
-            .map(|(id, forward)| {
-                self.record_stop(id, &forward, StopReason::User);
-                forward.namespace
+            .map(|tracked| {
+                let namespace = tracked.forward.namespace.clone();
+                self.record_stop(tracked, StopReason::User);
+                namespace
             })
             .collect()
     }
@@ -218,24 +275,35 @@ impl SessionForwards {
         }
     }
 
-    fn record_stop(&self, id: ForwardId, forward: &AgentForward, reason: StopReason) {
+    /// Keeps the closed forward for `port_forward_list` and audits the
+    /// stop; the agent's own is audited as a tool call.
+    fn record_stop(&self, tracked: Tracked, reason: StopReason) {
+        let Tracked {
+            forward,
+            latest: info,
+        } = tracked;
+        let id = info.id;
+        {
+            let mut closed = sync::lock(&self.closed);
+            closed.push_front(ClosedForward {
+                info,
+                forward: forward.clone(),
+                reason,
+                closed_at: Timestamp::now(),
+            });
+            closed.truncate(MAX_CLOSED_FORWARDS);
+        }
         if reason == StopReason::Agent {
             return;
         }
         let Some(audit) = sync::lock(&self.audit).clone() else {
             return;
         };
-        let (decided_by, why) = match reason {
-            StopReason::User => (DecidedBy::User, "stopped by the user in Kubach"),
-            StopReason::Revoked => (
-                DecidedBy::User,
-                "the user revoked reading the namespace of this forward",
-            ),
-            StopReason::Disconnected => (
-                DecidedBy::None,
-                "the agent disconnected from Kubach (closed its MCP session, or was silent too long)",
-            ),
-            StopReason::SessionEnded | StopReason::Agent => (DecidedBy::None, "the session ended"),
+        let decided_by = match reason {
+            StopReason::User | StopReason::Revoked => DecidedBy::User,
+            StopReason::Disconnected | StopReason::SessionEnded | StopReason::Agent => {
+                DecidedBy::None
+            }
         };
         let _ = audit.record(&AuditEntry {
             time: Timestamp::now().to_string(),
@@ -253,7 +321,7 @@ impl SessionForwards {
             decided_by,
             remembered: None,
             allowed: true,
-            reason: Some(why.into()),
+            reason: Some(reason.text().into()),
             identity: forward.identity.clone(),
             result: "stopped".into(),
             duration_ms: 0,
@@ -274,17 +342,27 @@ impl Drop for SessionForwards {
 
 /// The agent of `session` disconnected (#34): its forwards stop, and the
 /// temporary Role loses `pods/portforward` again. The session itself goes
-/// on, for the agent reconnecting. Returns how many forwards stopped.
+/// on, for the agent reconnecting. A forward with an open connection stays
+/// until that connection ends (#104): a client that holds no `GET` stream
+/// looks gone while it waits for a long job running through the forward.
+/// Called again and again while the agent is gone. Returns how many
+/// forwards stopped.
 pub(crate) async fn stop_disconnected(session: &Session) -> usize {
     let forwards = session.forwards();
-    let count = forwards.count();
-    if count == 0 {
-        return 0;
+    let idle: Vec<(ForwardId, String)> = forwards
+        .list()
+        .into_iter()
+        .filter(|(info, _)| info.active_connections == 0)
+        .map(|(info, forward)| (info.id, forward.namespace))
+        .collect();
+    let count = idle.len();
+    let mut namespaces = Vec::with_capacity(count);
+    for (id, namespace) in idle {
+        forwards.stop(id, StopReason::Disconnected);
+        namespaces.push(namespace);
     }
-    let mut namespaces = forwards.namespaces();
     namespaces.sort();
     namespaces.dedup();
-    forwards.stop_all(StopReason::Disconnected);
     for namespace in namespaces {
         session.end_forward(&namespace).await;
     }
@@ -434,7 +512,7 @@ pub(crate) async fn start(
         ));
     }
     forwards.track(
-        info.id,
+        info.clone(),
         AgentForward {
             namespace: namespace.clone(),
             target: info.source.clone(),
@@ -511,34 +589,45 @@ fn state(info: &ForwardInfo) -> &'static str {
     }
 }
 
-/// `port_forward_list`: this session's forwards, never anyone else's.
+/// A forward's fields in `port_forward_list`.
+fn listed(info: &ForwardInfo) -> Value {
+    json!({
+        "id": info.id,
+        "address": info.local_addr.to_string(),
+        "namespace": info.namespace,
+        "target": info.source,
+        "port": info.source_port,
+        "pod": info.pod,
+        "podPort": info.remote_port,
+        "state": state(info),
+        "activeConnections": info.active_connections,
+        "totalConnections": info.total_connections,
+        "lastError": info.last_error,
+    })
+}
+
+fn listed_closed(closed: &ClosedForward) -> Value {
+    let mut value = listed(&closed.info);
+    value["state"] = json!("closed");
+    value["activeConnections"] = json!(0);
+    value["reason"] = json!(closed.reason.label());
+    value["detail"] = json!(closed.reason.text());
+    value["closedAt"] = json!(closed.closed_at.to_string());
+    value
+}
+
+/// `port_forward_list`: this session's forwards, never anyone else's: the
+/// running ones by id, then the last closed ones, newest first.
 pub(crate) async fn list(
     ctx: &Ctx<'_>,
     args: &Map<String, Value>,
 ) -> Result<ToolOutput, ToolError> {
     parse::<NoArgs>(args)?;
     authorize(ctx, &Request::Info).await?;
-    let forwards: Vec<Value> = ctx
-        .session
-        .forwards()
-        .list()
-        .into_iter()
-        .map(|(info, _)| {
-            json!({
-                "id": info.id,
-                "address": info.local_addr.to_string(),
-                "namespace": info.namespace,
-                "target": info.source,
-                "port": info.source_port,
-                "pod": info.pod,
-                "podPort": info.remote_port,
-                "state": state(&info),
-                "activeConnections": info.active_connections,
-                "totalConnections": info.total_connections,
-                "lastError": info.last_error,
-            })
-        })
-        .collect();
+    let session = ctx.session.forwards();
+    let running = session.list().into_iter().map(|(info, _)| listed(&info));
+    let closed = session.closed();
+    let forwards: Vec<Value> = running.chain(closed.iter().map(listed_closed)).collect();
     let text = if forwards.is_empty() {
         "No port-forwards in this session.".to_owned()
     } else {
@@ -554,15 +643,22 @@ pub(crate) async fn stop(
 ) -> Result<ToolOutput, ToolError> {
     let a: StopArgs = parse(args)?;
     authorize(ctx, &Request::Info).await?;
-    let Some(forward) = ctx.session.forwards().stop(a.id, StopReason::Agent) else {
-        return Err(Denial::new(
-            DenialCode::InvalidInput,
-            format!(
+    let forwards = ctx.session.forwards();
+    let Some(forward) = forwards.stop(a.id, StopReason::Agent) else {
+        let closed = forwards.closed().into_iter().find(|c| c.info.id == a.id);
+        let text = match closed {
+            Some(closed) => format!(
+                "port-forward {} already closed at {}: {}",
+                a.id,
+                closed.closed_at,
+                closed.reason.text()
+            ),
+            None => format!(
                 "this session has no port-forward {}; port_forward_list shows its forwards",
                 a.id
             ),
-        )
-        .into());
+        };
+        return Err(Denial::new(DenialCode::InvalidInput, text).into());
     };
     ctx.session.end_forward(&forward.namespace).await;
     *sync::lock(&ctx.namespace) = Some(forward.namespace.clone());

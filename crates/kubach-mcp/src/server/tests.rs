@@ -102,6 +102,19 @@ fn selected_pod_logs(path: &str) -> String {
     format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
 }
 
+/// Logs of pod `levels-0`: every format `minLevel` knows, a line masking
+/// breaks the JSON of, and lines without a level.
+const LEVELED_LOGS: &str = r#"level=info msg=started
+level=error msg="disk full" password=hunter2
+{"level":"warn","token_count":5,"msg":"slow"}
+{"level":50,"msg":"boom"}
+{"level":30,"msg":"level=error in a message"}
+E1103 12:00:00.000000       1 main.go:1] failed
+I1103 12:00:00.000000       1 main.go:2] ok
+    at main.go:3
+plain error text
+"#;
+
 /// Pods for `debug_container` (#64): `distroless-0` takes any debug
 /// container, `restricted-0` only one with a restricted security context,
 /// `locked-0` none (Pod Security refuses), `pending-0` is not running. Once
@@ -420,6 +433,10 @@ impl FakeApi {
                                 "metadata": {"name": "db", "namespace": NS, "uid": "7"},
                                 "spec": {"selector": {"matchLabels": {"app": "db"}}}});
                             ("200 OK", db.to_string())
+                        } else if method == "GET"
+                            && path.starts_with(&format!("{pods}/levels-0/log"))
+                        {
+                            ("200 OK", LEVELED_LOGS.to_owned())
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
@@ -646,6 +663,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ("get_logs", json!({"pod": "web-0", "allContainers": true, "container": "app"})),
         ("get_logs", json!({"pod": "web-0", "filter": "(", "regex": true})),
         ("get_logs", json!({"pod": "web-0", "filter": ""})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": "loud"})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": ""})),
         ("list_events", json!({"kind": "Secret", "name": "db"})),
         ("scale", json!({"kind": "Deployment", "name": "web/../../x", "replicas": 1})),
         ("delete_resource", json!({"kind": "RoleBinding", "name": "x"})),
@@ -1544,6 +1563,98 @@ async fn logs_by_selector_are_filtered_per_line_after_masking() {
 }
 
 #[tokio::test]
+async fn logs_by_min_level_cover_the_formats_and_count_what_was_read() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let call = |arguments: Value| f.server.call("agent", "get_logs", args(arguments));
+
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel warn: 9 read, 7 with a recognized level, 4 matched; \
+             2 without a recognized level were excluded)",
+            "",
+            "level=error msg=\"disk full\" password=***",
+            "{\"level\":\"warn\",\"token_count\":***,\"msg\":\"slow\"}",
+            "{\"level\":50,\"msg\":\"boom\"}",
+            "E1103 12:00:00.000000       1 main.go:1] failed",
+        ]
+    );
+
+    // Both narrow the result, and the note says so.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "error", "filter": "boom"})).await;
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel error: 9 read, 7 with a recognized level, 1 matched and the filter; \
+             2 without a recognized level were excluded)",
+            "",
+            "{\"level\":50,\"msg\":\"boom\"}",
+        ]
+    );
+
+    // The level comes from the masked line, and the filter can't see past it.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn", "filter": "hunter2"})).await;
+    assert!(!outcome.text.contains("hunter2"), "{}", outcome.text);
+    assert!(
+        outcome.text.contains("0 matched and the filter"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.contains("no line matched"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
+async fn logs_in_an_unknown_format_say_so_under_min_level() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "minLevel": "error"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome
+            .text
+            .starts_with("(minLevel error: 9 read, 0 with a recognized level, 0 matched; "),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("says nothing about their levels"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("ERROR db-0"), "{}", outcome.text);
+
+    // Without minLevel nothing changes: no counts, the same note.
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "filter": "absent"})),
+        )
+        .await;
+    assert!(
+        outcome.text.starts_with("(no line matched the filter)"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("minLevel"), "{}", outcome.text);
+}
+
+#[tokio::test]
 async fn logs_of_many_pods_are_capped_and_say_what_was_left_out() {
     let f = fixture(Profile::Deploy, permissive(), false).await;
     let outcome = f
@@ -1915,6 +2026,70 @@ async fn works_over_the_mcp_protocol() {
     let audit = audit_lines(&f.audit_path);
     // The client's self-reported name ends up in the audit log.
     assert_ne!(audit[0]["client"], "");
+    client.cancel().await.unwrap();
+}
+
+/// Hears the progress notifications of its calls.
+struct ProgressClient(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl rmcp::ClientHandler for ProgressClient {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0.send(params.message.unwrap_or_default()).ok();
+    }
+}
+
+/// A call waiting for the user says so through the protocol right away,
+/// to a client with a progress token, and any call of `session_info` meanwhile
+/// shows it (#116).
+#[tokio::test]
+async fn a_call_waiting_for_the_user_says_so_over_the_mcp_protocol() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let gate = Arc::new(crate::testutil::Gate::new());
+    let server = McpServer::new(f.server.session().clone(), gate.clone(), None);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (told, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let client = ProgressClient(told).serve(client_io).await.unwrap();
+    assert!(
+        client
+            .peer_info()
+            .and_then(|info| info.instructions.clone())
+            .is_some_and(|text| text.contains("waitingForUser"))
+    );
+
+    // The rmcp client sends a progress token with every request.
+    let scale = CallToolRequestParams::new("scale").with_arguments(args(
+        json!({"kind": "Deployment", "name": "web", "replicas": 3}),
+    ));
+    let peer = client.peer().clone();
+    let call = tokio::spawn(async move { peer.call_tool(scale).await });
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), heard.recv())
+        .await
+        .expect("a progress notification")
+        .unwrap();
+    assert!(message.contains("Kubach window"), "{message}");
+    assert!(message.contains("web"), "{message}");
+
+    let info = client
+        .call_tool(CallToolRequestParams::new("session_info"))
+        .await
+        .unwrap();
+    let info = serde_json::to_value(&info.content).unwrap();
+    let info = info[0]["text"].as_str().unwrap();
+    let info: Value = serde_json::from_str(info).unwrap();
+    assert_eq!(info["waitingForUser"][0]["tool"], "scale");
+
+    gate.release();
+    let done = call.await.unwrap().unwrap();
+    assert_eq!(done.is_error, Some(true));
+    assert!(f.server.session().waiting().list().is_empty());
     client.cancel().await.unwrap();
 }
 
