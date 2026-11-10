@@ -1342,3 +1342,239 @@ fn a_values_diff_over_64_kb_is_whole() {
         "the last change"
     );
 }
+
+/// A Secret manifest of `data` and `stringData` entries, values as given.
+fn secret_manifest(name: &str, data: &[(&str, &str)], string_data: &[(&str, &str)]) -> String {
+    let mut text = format!("---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: {name}\n");
+    for (field, entries) in [("data", data), ("stringData", string_data)] {
+        if entries.is_empty() {
+            continue;
+        }
+        text.push_str(&format!("{field}:\n"));
+        for (key, value) in entries {
+            text.push_str(&format!("  {key}: {value}\n"));
+        }
+    }
+    text
+}
+
+/// The window's diff of two manifests, whole.
+fn window_text(old: &str, new: &str) -> String {
+    let diff = window_diff(old, new, "revision 1", "after the upgrade", usize::MAX);
+    assert_eq!(diff.cut, None);
+    diff.text
+}
+
+/// The lines of `diff` that start with `sign` and are about `key`.
+fn diff_lines<'a>(diff: &'a str, sign: char, key: &str) -> Vec<&'a str> {
+    diff.lines()
+        .filter(|line| line.starts_with(sign) && line[1..].trim_start().starts_with(key))
+        .collect()
+}
+
+/// A Secret value replaced by one of the same length is a change the
+/// window shows (#147): the two masks alone are the same text.
+#[test]
+fn the_window_shows_a_secret_value_changed_to_one_of_the_same_length() {
+    // "fake-old" and "fake-new" in base64, and the same as plain text.
+    for (old, new) in [
+        (
+            secret_manifest("db", &[("pw", "ZmFrZS1vbGQ="), ("user", "YWRtaW4=")], &[]),
+            secret_manifest("db", &[("pw", "ZmFrZS1uZXc="), ("user", "YWRtaW4=")], &[]),
+        ),
+        (
+            secret_manifest("db", &[], &[("pw", "fake-old"), ("user", "admin")]),
+            secret_manifest("db", &[], &[("pw", "fake-new"), ("user", "admin")]),
+        ),
+    ] {
+        let diff = window_text(&old, &new);
+        let (removed, added) = (diff_lines(&diff, '-', "pw:"), diff_lines(&diff, '+', "pw:"));
+        assert_eq!(removed.len(), 1, "{diff}");
+        assert_eq!(added.len(), 1, "{diff}");
+        assert!(removed[0].contains("*** (8 bytes)"), "{diff}");
+        assert!(added[0].contains("*** (8 bytes, changed)"), "{diff}");
+        // The value that stays is no line of the diff.
+        assert!(diff_lines(&diff, '-', "user:").is_empty(), "{diff}");
+        assert!(diff_lines(&diff, '+', "user:").is_empty(), "{diff}");
+        for value in [
+            "fake-old",
+            "fake-new",
+            "ZmFrZS1vbGQ",
+            "ZmFrZS1uZXc",
+            "admin",
+        ] {
+            assert!(!diff.contains(value), "{value} in {diff}");
+        }
+        // Another new value of that length gives the same text: nothing in
+        // it comes from the values.
+        let other = new
+            .replace("ZmFrZS1uZXc=", "b3RoZXJuZXc=")
+            .replace("fake-new", "othernew");
+        assert_ne!(other, new);
+        assert_eq!(window_text(&old, &other), diff);
+    }
+}
+
+/// What the user reads, as it is.
+#[test]
+fn the_window_marks_the_new_side_of_a_changed_secret_value() {
+    let old = secret_manifest("db", &[("pw", "ZmFrZS1vbGQ=")], &[("token", "fake-old")]);
+    let new = secret_manifest("db", &[("pw", "ZmFrZS1uZXc=")], &[("token", "fake-old")]);
+    assert_eq!(
+        window_text(&old, &new),
+        r#"--- revision 1
++++ after the upgrade
+@@ -3,6 +3,6 @@
+ metadata:
+   name: db
+ data:
+-  pw: "*** (8 bytes)"
++  pw: "*** (8 bytes, changed)"
+ stringData:
+   token: "*** (8 bytes)"
+"#
+    );
+}
+
+/// The values' diff goes the same way (#147): a list that grows still
+/// says which of its masked items changed.
+#[test]
+fn the_values_diff_marks_a_masked_item_of_a_list_that_grows() {
+    let old = json!({"tokens": ["fake-aaa", "fake-bbb"], "replicas": 1});
+    let new = json!({"tokens": ["fake-zzz", "fake-bbb", "fake-ccc"], "replicas": 1});
+    let diff = masked_values_diff(&old, &new, "before", "after");
+    assert_eq!(diff.matches("(8 bytes, changed)").count(), 1, "{diff}");
+    assert!(!diff.contains("fake-"), "{diff}");
+    let grown = json!({"tokens": ["fake-aaa", "fake-bbb", "fake-ccc"], "replicas": 1});
+    let diff = masked_values_diff(&old, &grown, "before", "after");
+    assert!(!diff.is_empty() && !diff.contains("changed"), "{diff}");
+}
+
+#[test]
+fn the_window_shows_a_secret_value_of_another_length_by_its_size() {
+    for (old, new) in [
+        (
+            secret_manifest("db", &[("pw", "ZmFrZS1vbGQ=")], &[]),
+            secret_manifest("db", &[("pw", "ZmFrZS1sb25nZXItbmV3")], &[]),
+        ),
+        (
+            secret_manifest("db", &[], &[("pw", "fake-old")]),
+            secret_manifest("db", &[], &[("pw", "fake-longer-new")]),
+        ),
+    ] {
+        let diff = window_text(&old, &new);
+        let (removed, added) = (diff_lines(&diff, '-', "pw:"), diff_lines(&diff, '+', "pw:"));
+        assert_eq!((removed.len(), added.len()), (1, 1), "{diff}");
+        assert!(removed[0].contains("*** (8 bytes)"), "{diff}");
+        assert!(added[0].contains("*** (15 bytes)"), "{diff}");
+        assert!(
+            !diff.contains("fake-") && !diff.contains("ZmFrZS"),
+            "{diff}"
+        );
+    }
+}
+
+#[test]
+fn the_window_has_no_line_for_a_secret_value_that_stays() {
+    let old = secret_manifest("db", &[("pw", "ZmFrZS1vbGQ=")], &[("token", "fake-token")]);
+    assert_eq!(window_text(&old, &old), "");
+    // Another object changes: the Secret is not in the diff.
+    let config = |level: &str| {
+        format!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\ndata:\n  \
+             level: {level}\n"
+        )
+    };
+    let diff = window_text(
+        &format!("{old}{}", config("info")),
+        &format!("{old}{}", config("debug")),
+    );
+    assert!(diff.contains("+  level: debug"), "{diff}");
+    assert!(!diff.contains("changed"), "{diff}");
+    for sign in ['-', '+'] {
+        assert!(diff_lines(&diff, sign, "pw:").is_empty(), "{diff}");
+        assert!(diff_lines(&diff, sign, "token:").is_empty(), "{diff}");
+    }
+}
+
+#[test]
+fn the_window_shows_secret_keys_added_and_removed() {
+    let old = secret_manifest(
+        "db",
+        &[("gone", "ZmFrZS1vbGQ="), ("kept", "ZmFrZS1vbGQ=")],
+        &[],
+    );
+    let new = secret_manifest(
+        "db",
+        &[("fresh", "ZmFrZS1uZXc="), ("kept", "ZmFrZS1vbGQ=")],
+        &[("plain", "fake-new")],
+    );
+    let diff = window_text(&old, &new);
+    assert_eq!(diff_lines(&diff, '-', "gone:").len(), 1, "{diff}");
+    assert_eq!(diff_lines(&diff, '+', "fresh:").len(), 1, "{diff}");
+    assert_eq!(diff_lines(&diff, '+', "plain:").len(), 1, "{diff}");
+    for sign in ['-', '+'] {
+        assert!(diff_lines(&diff, sign, "kept:").is_empty(), "{diff}");
+    }
+    // A key that is new has no value to differ from.
+    assert!(!diff.contains("changed"), "{diff}");
+    assert!(
+        !diff.contains("fake-") && !diff.contains("ZmFrZS"),
+        "{diff}"
+    );
+}
+
+/// Objects are compared by what they are, not by where they stand: a chart
+/// may list them in another order.
+#[test]
+fn the_window_compares_a_secret_with_itself_wherever_it_stands() {
+    let (a, b) = (
+        secret_manifest("a", &[], &[("pw", "fake-aaa")]),
+        secret_manifest("b", &[], &[("pw", "fake-bbb")]),
+    );
+    let fresh = secret_manifest("fresh", &[], &[("pw", "fake-new")]);
+    // `b` is the same, after a new object and before `a`, which changes.
+    let new = format!("{fresh}{b}{}", a.replace("fake-aaa", "fake-zzz"));
+    let diff = window_text(&format!("{a}{b}"), &new);
+    assert_eq!(diff.matches("(8 bytes, changed)").count(), 1, "{diff}");
+    let marked = diff.find("(8 bytes, changed)").unwrap();
+    let name = diff[..marked].rfind("name: ").unwrap();
+    assert!(diff[name..].starts_with("name: a\n"), "{diff}");
+}
+
+/// A value masked by its name outside a Secret, in a list that grows.
+#[test]
+fn the_window_shows_a_masked_variable_changed_in_a_list_that_grows() {
+    let pod = |password: &str, more: &str| {
+        format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers:\n  \
+             - name: app\n    image: app:1\n    env:\n    - name: DB_PASSWORD\n      \
+             value: {password}\n    - name: LOG_LEVEL\n      value: info\n{more}"
+        )
+    };
+    let extra = "    - name: API_TOKEN\n      value: fake-tok\n";
+    let diff = window_text(&pod("fake-old", ""), &pod("fake-new", extra));
+    assert_eq!(diff.matches("(8 bytes, changed)").count(), 1, "{diff}");
+    assert!(
+        diff.lines()
+            .any(|line| line.starts_with('+') && line.contains("name: API_TOKEN")),
+        "{diff}"
+    );
+    assert!(!diff.contains("fake-"), "{diff}");
+    // The same variables and one more: nothing is marked.
+    let diff = window_text(&pod("fake-old", ""), &pod("fake-old", extra));
+    assert!(!diff.contains("changed"), "{diff}");
+}
+
+/// A manifest that does not parse is shown as its outline; two of the same
+/// size still differ.
+#[test]
+fn the_window_says_that_unparsed_manifests_differ() {
+    let old = "kind: Secret\nmetadata:\n  name: db\ndata:\n  pw: ZmFrZS1vbGQ=\n  bad: [\n";
+    let new = old.replace("ZmFrZS1vbGQ=", "ZmFrZS1uZXc=");
+    let diff = window_text(old, &new);
+    assert!(diff.contains("unparsed YAML"), "{diff}");
+    assert!(diff.lines().any(|line| line.starts_with('+')), "{diff}");
+    assert!(!diff.contains("ZmFrZS"), "{diff}");
+    assert_eq!(window_text(old, old), "");
+}

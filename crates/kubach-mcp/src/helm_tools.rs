@@ -48,6 +48,7 @@
 //!   like a key or token, and `helm_upgrade` with `valuesPatch` merges the
 //!   patch in Kubach and answers with the masked diff of the values only.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -642,7 +643,8 @@ pub(crate) fn merge_values(values: &mut Value, patch: &Value) {
 }
 
 /// Marks a masked value of `new` that hides a changed value, which would
-/// otherwise look the same on both sides: `*** (N bytes, changed)`.
+/// otherwise look the same on both sides: `*** (N bytes, changed)`. The
+/// mark says that the two values differ and nothing else about them.
 pub(crate) fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_masked: &mut Value) {
     match (old, new, old_masked, new_masked) {
         (Value::Object(old), Value::Object(new), Value::Object(old_m), Value::Object(new_m)) => {
@@ -652,11 +654,26 @@ pub(crate) fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_mas
                 }
             }
         }
-        (Value::Array(old), Value::Array(new), Value::Array(old_m), Value::Array(new_m))
-            if old.len() == new.len() =>
-        {
+        (Value::Array(old), Value::Array(new), Value::Array(old_m), Value::Array(new_m)) => {
+            // Lists of the same length go item by item. In one that grew or
+            // shrank an item is compared with the one of its `name`
+            // (`env`, containers), or else with the one at its place.
+            let same_length = old.len() == new.len();
             for (index, masked) in new_m.iter_mut().enumerate() {
-                mark_changed(&old[index], &new[index], &old_m[index], masked);
+                let Some(item) = new.get(index) else {
+                    continue;
+                };
+                let at = match item["name"].as_str() {
+                    Some(name) if !same_length => {
+                        old.iter().position(|other| other["name"] == name)
+                    }
+                    _ => Some(index),
+                };
+                if let Some(at) = at
+                    && let (Some(o), Some(om)) = (old.get(at), old_m.get(at))
+                {
+                    mark_changed(o, item, om, masked);
+                }
             }
         }
         (old, new, old_masked, Value::String(text))
@@ -1361,8 +1378,8 @@ async fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> 
     .await
 }
 
-/// The diff of two manifests for the confirmation window, both masked,
-/// within `max` bytes ([`cut_diff`]).
+/// The diff of two manifests for the confirmation window, both masked
+/// ([`masked_sides`]), within `max` bytes ([`cut_diff`]).
 pub(crate) fn window_diff(
     old: &str,
     new: &str,
@@ -1370,9 +1387,84 @@ pub(crate) fn window_diff(
     new_label: &str,
     max: usize,
 ) -> WindowDiff {
-    let (old, new) = (masked_manifest(old), masked_manifest(new));
+    let (old, new) = masked_sides(old, new);
     let diff = unified_diff(&old, &new, old_label, new_label);
     cut_diff(diff, &old, &new, max)
+}
+
+/// What an object of a manifest is compared with on the other side: its
+/// `apiVersion`, `kind`, namespace and name.
+fn object_identity(object: &Value) -> [&str; 4] {
+    let text = |pointer: &str| {
+        object
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    [
+        text("/apiVersion"),
+        text("/kind"),
+        text("/metadata/namespace"),
+        text("/metadata/name"),
+    ]
+}
+
+/// Both manifests as [`masked_manifest`] writes them, for a diff. A masked
+/// value of `new` that differs from the one of the same object of `old`
+/// says so ([`mark_changed`], as in a preview and in the values' diff):
+/// two values of the same length have the same mask, and the diff would
+/// have no line for a Secret value that changes (#147). The mark is made
+/// from the comparison alone and holds nothing of either value.
+fn masked_sides(old: &str, new: &str) -> (String, String) {
+    let (Ok(old_objects), Ok(new_objects)) = (
+        kubach_core::apply::yaml::parse(old),
+        kubach_core::apply::yaml::parse(new),
+    ) else {
+        // Outlines: kinds, names and a size. Two texts of the same size
+        // must not look like no change.
+        let (old_masked, mut new_masked) = (masked_manifest(old), masked_manifest(new));
+        if old != new && old_masked == new_masked {
+            new_masked.push_str("\n<differs from the other side in text that is not shown>");
+        }
+        return (old_masked, new_masked);
+    };
+    let masked = |objects: &[kubach_core::apply::yaml::Manifest]| -> Vec<Value> {
+        objects
+            .iter()
+            .map(|manifest| {
+                let mut value = manifest.value.clone();
+                crate::masking::mask_object(&mut value);
+                value
+            })
+            .collect()
+    };
+    let (old_masked, mut new_masked) = (masked(&old_objects), masked(&new_objects));
+    // Objects of `old` by identity, in order: a manifest may hold the same
+    // one twice, and then the first goes with the first.
+    let mut places: HashMap<[&str; 4], VecDeque<usize>> = HashMap::new();
+    for (index, object) in old_objects.iter().enumerate() {
+        places
+            .entry(object_identity(&object.value))
+            .or_default()
+            .push_back(index);
+    }
+    for (object, object_masked) in new_objects.iter().zip(&mut new_masked) {
+        if let Some(at) = places
+            .get_mut(&object_identity(&object.value))
+            .and_then(VecDeque::pop_front)
+        {
+            mark_changed(
+                &old_objects[at].value,
+                &object.value,
+                &old_masked[at],
+                object_masked,
+            );
+        }
+    }
+    (
+        kubach_core::apply::yaml::to_yaml_multi(&old_masked),
+        kubach_core::apply::yaml::to_yaml_multi(&new_masked),
+    )
 }
 
 /// A manifest diff for the confirmation window: whole, or with what it
