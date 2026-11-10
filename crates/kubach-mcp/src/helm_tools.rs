@@ -87,6 +87,17 @@ pub const MAX_VALUES_BYTES: usize = 256 * 1024;
 const MAX_SEARCH_ROWS: usize = 50;
 /// NOTES returned to the agent, at most.
 const MAX_NOTES_BYTES: usize = 8 * 1024;
+/// A values diff in an answer to the agent and in the audit log, at most.
+const MAX_AGENT_DIFF_BYTES: usize = 64 * 1024;
+/// The manifest diff of a confirmation window, at most (#137). A release
+/// is kept in a Secret of 1 MiB compressed, so its manifest is a few MiB
+/// at the very most and so is its diff: the window shows it whole. What is
+/// larger is cut at a line and the window says how much it does not show
+/// ([`DiffCut`]). The request also has to fit the bridge
+/// ([`crate::bridge::MAX_CONFIRM_BODY_BYTES`]).
+pub const MAX_CONFIRM_DIFF_BYTES: usize = 8 * 1024 * 1024;
+/// Objects a [`DiffCut`] names; the rest are counted.
+const MAX_CUT_OBJECTS: usize = 50;
 /// `helm show values` and other calls without a cluster.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -258,6 +269,28 @@ pub struct HelmChange {
     /// stay as they are.
     #[serde(default)]
     pub values_diff: String,
+    /// What the diff in `details` leaves out, when it is larger than
+    /// [`MAX_CONFIRM_DIFF_BYTES`] (#137). The window must say so.
+    #[serde(default)]
+    pub diff_cut: Option<DiffCut>,
+}
+
+/// The part of a manifest diff the confirmation window does not get
+/// (#137): the user has to know they approve more than they see.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffCut {
+    pub shown_bytes: usize,
+    pub total_bytes: usize,
+    /// Lines of the diff after the cut.
+    pub hidden_lines: usize,
+    /// `Kind name` of the objects with changed lines after the cut, the
+    /// first [`MAX_CUT_OBJECTS`].
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// How many more such objects there are.
+    #[serde(default)]
+    pub more_objects: usize,
 }
 
 // ------------------------------------------------------------- arguments
@@ -641,8 +674,8 @@ pub(crate) fn mark_changed(old: &Value, new: &Value, old_masked: &Value, new_mas
 
 /// The diff of a release's values (#22), both sides masked as by
 /// [`mask_values`]; a masked value that changed is marked so. Empty when
-/// nothing changes. What the dialog shows and the agent gets: never the
-/// values themselves.
+/// nothing changes. What the dialog shows, whole (#137), and the agent gets
+/// bounded ([`MAX_AGENT_DIFF_BYTES`]): never the values themselves.
 pub(crate) fn masked_values_diff(
     old: &Value,
     new: &Value,
@@ -654,13 +687,12 @@ pub(crate) fn masked_values_diff(
     let mut new_masked = new.clone();
     mask_values(&mut new_masked);
     mark_changed(old, new, &old_masked, &mut new_masked);
-    let diff = unified_diff(
+    unified_diff(
         &kubach_core::helm::values_to_yaml(&old_masked),
         &kubach_core::helm::values_to_yaml(&new_masked),
         old_label,
         new_label,
-    );
-    truncate(&diff, 64 * 1024).into_owned()
+    )
 }
 
 /// Values YAML as shown and audited: masked, or an outline when it does
@@ -1320,19 +1352,170 @@ fn require_binary(env: &HelmEnv) -> Result<PathBuf, ToolError> {
 /// Manifests diffed with Secret values and sensitive env masked. Parsed
 /// on the blocking pool: the deep schemas of a chart's CRDs overflowed the
 /// async worker's stack on upgrade (#21), as in [`preview_from`].
-async fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
+async fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> WindowDiff {
     let (old, new) = (old.to_owned(), new.to_owned());
     let (old_label, new_label) = (old_label.to_owned(), new_label.to_owned());
     kubach_core::runtime::blocking(move || {
-        let diff = unified_diff(
-            &masked_manifest(&old),
-            &masked_manifest(&new),
-            &old_label,
-            &new_label,
-        );
-        truncate(&diff, 64 * 1024).into_owned()
+        window_diff(&old, &new, &old_label, &new_label, MAX_CONFIRM_DIFF_BYTES)
     })
     .await
+}
+
+/// The diff of two manifests for the confirmation window, both masked,
+/// within `max` bytes ([`cut_diff`]).
+pub(crate) fn window_diff(
+    old: &str,
+    new: &str,
+    old_label: &str,
+    new_label: &str,
+    max: usize,
+) -> WindowDiff {
+    let (old, new) = (masked_manifest(old), masked_manifest(new));
+    let diff = unified_diff(&old, &new, old_label, new_label);
+    cut_diff(diff, &old, &new, max)
+}
+
+/// A manifest diff for the confirmation window: whole, or with what it
+/// leaves out (#137).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowDiff {
+    pub text: String,
+    pub cut: Option<DiffCut>,
+}
+
+/// `diff` of the masked manifests `old` and `new` within `max` bytes: as it
+/// is when it fits, else cut after a whole line, with the size of the rest
+/// and the objects whose changes are in it.
+fn cut_diff(mut diff: String, old: &str, new: &str, max: usize) -> WindowDiff {
+    if diff.len() <= max {
+        return WindowDiff {
+            text: diff,
+            cut: None,
+        };
+    }
+    let mut end = max;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    // After a whole line; a single line longer than `max` is cut inside.
+    if let Some(line_end) = diff[..end].rfind('\n') {
+        end = line_end + 1;
+    }
+    let mut objects = hidden_objects(&diff, end, old, new);
+    let more_objects = objects.len().saturating_sub(MAX_CUT_OBJECTS);
+    objects.truncate(MAX_CUT_OBJECTS);
+    let cut = DiffCut {
+        shown_bytes: end,
+        total_bytes: diff.len(),
+        hidden_lines: diff[end..].lines().count(),
+        objects,
+        more_objects,
+    };
+    diff.truncate(end);
+    WindowDiff {
+        text: diff,
+        cut: Some(cut),
+    }
+}
+
+/// Where each side of a hunk starts: `@@ -12,7 +14,8 @@` is `(12, 14)`.
+fn hunk_start(header: &str) -> Option<(usize, usize)> {
+    let rest = header.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let new = rest.split([' ', ',']).next()?;
+    let old = old.split(',').next()?;
+    Some((old.parse().ok()?, new.parse().ok()?))
+}
+
+/// The documents of a manifest as [`masked_manifest`] writes it: the line
+/// each starts at (from 1) and its text.
+fn documents(manifest: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    let (mut start_line, mut start) = (1, 0);
+    let (mut line, mut offset) = (1, 0);
+    for text in manifest.split_inclusive('\n') {
+        if text.trim_end() == "---" {
+            found.push((start_line, &manifest[start..offset]));
+            start_line = line + 1;
+            start = offset + text.len();
+        }
+        line += 1;
+        offset += text.len();
+    }
+    found.push((start_line, &manifest[start..]));
+    found
+}
+
+/// `Kind name` of the objects of the masked manifests whose added or
+/// removed lines lie in `diff` from byte `from` on: those of `new` in its
+/// order, then those only `old` has.
+fn hidden_objects(diff: &str, from: usize, old: &str, new: &str) -> Vec<String> {
+    // Lines (from 1) of each side that change after the cut.
+    let (mut old_lines, mut new_lines) = (Vec::new(), Vec::new());
+    let (mut old_line, mut new_line) = (0usize, 0usize);
+    let mut in_hunk = false;
+    let mut offset = 0;
+    for text in diff.split_inclusive('\n') {
+        let hidden = offset >= from;
+        offset += text.len();
+        if let Some((old_start, new_start)) = hunk_start(text) {
+            (old_line, new_line) = (old_start, new_start);
+            in_hunk = true;
+        } else if !in_hunk {
+            // The `---` and `+++` header.
+        } else if text.starts_with('+') {
+            if hidden {
+                new_lines.push(new_line);
+            }
+            new_line += 1;
+        } else if text.starts_with('-') {
+            if hidden {
+                old_lines.push(old_line);
+            }
+            old_line += 1;
+        } else {
+            old_line += 1;
+            new_line += 1;
+        }
+    }
+    let mut labels: Vec<String> = Vec::new();
+    for (manifest, lines) in [(new, new_lines), (old, old_lines)] {
+        let documents = documents(manifest);
+        let mut last = None;
+        for line in lines {
+            let index = documents
+                .partition_point(|(start, _)| *start <= line)
+                .saturating_sub(1);
+            if last == Some(index) {
+                continue;
+            }
+            last = Some(index);
+            let label = document_label(documents[index].1, index);
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    labels
+}
+
+/// `Kind name` of one document, or its number when it has none.
+fn document_label(document: &str, index: usize) -> String {
+    let object = kubach_core::apply::yaml::parse(document)
+        .ok()
+        .and_then(|mut manifests| manifests.pop())
+        .map(|manifest| manifest.value);
+    let field = |pointer: &str| {
+        object
+            .as_ref()
+            .and_then(|object| object.pointer(pointer))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    match (field("/kind"), field("/metadata/name")) {
+        (Some(kind), Some(name)) => format!("{kind} {name}"),
+        _ => format!("document {}", index + 1),
+    }
 }
 
 /// What the agent is told after a change: status, revision, objects and
@@ -2306,6 +2489,7 @@ pub(crate) async fn install(
         user_objects: Vec::new(),
         namespaces: Vec::new(),
         values_diff: String::new(),
+        diff_cut: None,
     };
     // Under a temporary ServiceAccount, the chart's cluster-scoped objects
     // and RBAC are found on the client first (#18).
@@ -2516,6 +2700,7 @@ pub(crate) fn values_edit(values: Option<&str>, patch: Option<&str>) -> Result<V
 pub(crate) struct UpgradeValues {
     pub yaml: Sensitive<String>,
     pub masked: String,
+    /// Whole, for the confirmation window (#137).
     pub diff: String,
     /// [`changed_values`], for a preview's summary (#115).
     pub changes: Vec<Value>,
@@ -2645,6 +2830,7 @@ pub(crate) async fn upgrade(
         user_objects: Vec::new(),
         namespaces: Vec::new(),
         values_diff: values.diff.clone(),
+        diff_cut: None,
     };
     // Under a temporary ServiceAccount: what the new chart renders on the
     // client and what the current revision holds (an upgrade deletes what
@@ -2659,7 +2845,9 @@ pub(crate) async fn upgrade(
     let rendered = rendered(ctx, &binary, &template).await;
     let current_manifest = release_manifest(&current);
     let previous_label = format!("revision {}", current.revision);
-    let preview_values = Some((values.diff.as_str(), values.changes.as_slice()));
+    // The agent, a preview and the audit log get the values diff bounded.
+    let agent_values_diff = truncate(&values.diff, MAX_AGENT_DIFF_BYTES).into_owned();
+    let preview_values = Some((agent_values_diff.as_str(), values.changes.as_slice()));
     let scan = scan(
         ctx,
         &namespace,
@@ -2763,10 +2951,14 @@ pub(crate) async fn upgrade(
         "after the upgrade",
     )
     .await;
-    let details = if diff.trim().is_empty() {
+    let change = HelmChange {
+        diff_cut: diff.cut,
+        ..change
+    };
+    let details = if diff.text.trim().is_empty() {
         "The dry run changes no object.".to_owned()
     } else {
-        diff
+        diff.text
     };
     approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     // A fresh token: the user may have taken minutes to answer.
@@ -2799,12 +2991,12 @@ pub(crate) async fn upgrade(
             &preview,
             &phases,
             &output,
-            patched.then_some(values.diff.as_str()),
+            patched.then_some(agent_values_diff.as_str()),
         ),
         as_user,
         &scan.findings,
         touched(&namespace, &others),
-        patched.then_some(values.diff.as_str()),
+        patched.then_some(agent_values_diff.as_str()),
     ))
 }
 
@@ -2881,11 +3073,12 @@ pub(crate) async fn rollback(
         user_objects: Vec::new(),
         namespaces: others.clone(),
         values_diff: String::new(),
+        diff_cut: diff.cut,
     };
-    let details = if diff.trim().is_empty() {
+    let details = if diff.text.trim().is_empty() {
         "The rollback changes no object.".to_owned()
     } else {
-        diff
+        diff.text
     };
     // Nothing runs before this window: one question covers both the
     // user's credentials and the rollback.
@@ -2978,6 +3171,7 @@ pub(crate) async fn uninstall(
         user_objects: Vec::new(),
         namespaces: others.clone(),
         values_diff: String::new(),
+        diff_cut: None,
     };
     let mut details = String::from("Objects deleted with the release:\n");
     for object in &preview.objects {

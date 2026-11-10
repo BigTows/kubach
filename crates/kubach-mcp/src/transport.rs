@@ -502,6 +502,49 @@ mod token_tests {
         endpoint.shutdown().await;
     }
 
+    /// A Helm change's whole diff fits the bridge (#137): axum's own bound
+    /// of 2 MB would deny the call instead.
+    #[tokio::test]
+    async fn a_confirmation_with_a_large_diff_passes_the_bridge() {
+        let app = Arc::new(Counting::default());
+        let bridge_token = "b".repeat(64);
+        let endpoint = serve_shared_http(
+            SharedServer::new(),
+            HttpOptions {
+                port: 0,
+                token: "m".repeat(64),
+                bridge: Some(BridgeOptions {
+                    handler: app.clone(),
+                    token: bridge_token.clone(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let request = ConfirmationRequest {
+            kind: Default::default(),
+            session_id: "s".into(),
+            context: "minikube".into(),
+            client: "agent".into(),
+            tool: "helm_upgrade".into(),
+            namespace: "web".into(),
+            summary: "upgrade".into(),
+            details: "+  line: \"of a diff\"\n".repeat(crate::MAX_CONFIRM_DIFF_BYTES / 22),
+            dangerous: Vec::new(),
+            mode: SessionMode::ClientOnly,
+            allow_remember: false,
+        };
+        assert!(request.details.len() > 8_000_000);
+        let launcher = BridgeClient::new(endpoint.addr.port(), bridge_token);
+        assert_eq!(
+            launcher.confirm(&request).await.ok(),
+            Some(ConfirmationDecision::Denied { reason: None }),
+            "the app was asked and answered"
+        );
+        assert_eq!(app.calls.load(Ordering::SeqCst), 1);
+        endpoint.shutdown().await;
+    }
+
     #[tokio::test]
     async fn the_bridge_needs_its_own_token() {
         let token = "t".repeat(64);

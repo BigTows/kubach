@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -494,9 +494,18 @@ impl Confirmer for HandlerConfirmer {
 }
 
 /// Bridge routes, nested under [`BRIDGE_PATH`] by the transport.
+/// Largest confirmation request the bridge takes: the whole diff of a
+/// Helm change ([`crate::helm_tools::MAX_CONFIRM_DIFF_BYTES`], #137) as
+/// JSON, with the rest of the request. Above it the call is denied, never
+/// shown cut.
+pub(crate) const MAX_CONFIRM_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 pub(crate) fn router(handler: Handler) -> axum::Router {
     axum::Router::new()
-        .route("/confirm", post(confirm_route))
+        .route(
+            "/confirm",
+            post(confirm_route).layer(DefaultBodyLimit::max(MAX_CONFIRM_BODY_BYTES)),
+        )
         .route("/heartbeat", post(heartbeat_route))
         .route("/ended", post(ended_route))
         .route("/hosted/start", post(host_route))

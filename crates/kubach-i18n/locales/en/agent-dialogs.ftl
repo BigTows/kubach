@@ -97,6 +97,24 @@ agent-helm-values = Values (sensitive keys masked)
 agent-helm-values-show = Show all values
 agent-helm-values-diff = Values changes (sensitive values masked)
 agent-helm-objects = Objects
+agent-diff-size =
+    { $count ->
+        [one] { $count } line, { $size } · the whole diff, scroll to read it
+       *[other] { $count } lines, { $size } · the whole diff, scroll to read it
+    }
+# $shown and $total are sizes: 8.0 MB.
+agent-diff-cut-title = The diff below is cut: { $shown } of { $total } shown
+agent-diff-cut-hidden =
+    { $count ->
+        [one] { $count } more line ({ $size }) is not shown. Approving allows those changes too.
+       *[other] { $count } more lines ({ $size }) are not shown. Approving allows those changes too.
+    }
+agent-diff-cut-objects = Changes not shown in full: { $objects }
+agent-diff-cut-more-objects =
+    { $count ->
+        [one] …and { $count } more object
+       *[other] …and { $count } more objects
+    }
 agent-helm-as-user-title = Run this helm call with your credentials?
 agent-helm-as-user-warning = This helm call will run with your credentials from kubeconfig, not the session's temporary ServiceAccount. Only your own RBAC limits it, and only this one call.
 agent-helm-as-user-objects = The ServiceAccount cannot create or delete these cluster-scoped objects, RBAC and objects in other namespaces of the chart:
