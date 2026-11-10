@@ -4613,6 +4613,7 @@ dependencies = [
  "objc2 0.6.5",
  "resvg 0.49.0",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]
