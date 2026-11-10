@@ -608,11 +608,12 @@ impl<'a> Policy<'a> {
                 ),
             ));
         }
+        let asked = missing.asked();
         let (code, message) = if self.raises.is_refused(missing) {
             (
                 DenialCode::AccessRefused,
                 format!(
-                    "{what} needs {missing}; the user did not allow it on {context} in this \
+                    "{what} needs {asked}; the user did not allow it on {context} in this \
                      session and is not asked again"
                 ),
             )
@@ -620,7 +621,7 @@ impl<'a> Policy<'a> {
             (
                 DenialCode::NeedsAccess,
                 format!(
-                    "{what} needs {missing}, beyond this session's access ({have}); the user has \
+                    "{what} needs {asked}, beyond this session's access ({have}); the user has \
                      to allow it in Kubach"
                 ),
             )

@@ -126,13 +126,14 @@ impl McpServer {
                 let note = needed
                     .and_then(|needed| have.missing(needed))
                     .map(|missing| {
+                        let asked = missing.asked();
                         let each = if confirms_each_call(spec.name) {
                             " Allowing it approves no call: each one is still confirmed."
                         } else {
                             ""
                         };
                         format!(
-                            " Requires your approval in Kubach: this needs {missing}, beyond this \
+                            " Requires your approval in Kubach: this needs {asked}, beyond this \
                          session's access ({have}); the first call asks the user to allow it \
                          (for this session or by default on this cluster).{each}"
                         )
