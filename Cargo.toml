@@ -108,6 +108,9 @@ resvg = { version = "0.49.0", default-features = false }
 usvg = { version = "0.49.0", default-features = false }
 # Language tags of the Fluent bundles (ADR 0018).
 unic-langid = "0.9.6"
+# Width of log lines in cells, to find the widest one without shaping every
+# line (#143). Already in the tree through gpui-component.
+unicode-width = "0.2.2"
 uuid = { version = "1.28.0", features = ["v4"] }
 # Windows only: Windows Hello key credentials for biometric unlock (#80).
 # Same version as gpui on Windows.
