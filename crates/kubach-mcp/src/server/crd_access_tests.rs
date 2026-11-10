@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 
 use super::McpServer;
 use crate::access::Access;
-use crate::confirm::{RequestKind, ScriptedConfirmer};
+use crate::confirm::{Confirmer, DenyAll, RequestKind, ScriptedConfirmer};
 use crate::scope::SessionSpec;
 use crate::session::Session;
 use crate::settings::{ImpersonationTarget, Profile, SecurityPolicy};
@@ -245,11 +245,7 @@ async fn start_cluster(user_reads_volumes: bool) -> (String, Arc<Mutex<Cluster>>
 }
 
 /// The session of the report: reading without asking, no custom resources.
-async fn server_on(
-    url: &str,
-    policy: &SecurityPolicy,
-    confirmer: Arc<ScriptedConfirmer>,
-) -> McpServer {
+async fn server_on(url: &str, policy: &SecurityPolicy, confirmer: Arc<dyn Confirmer>) -> McpServer {
     assert_eq!(policy.minimum, Access::NONE);
     let spec = SessionSpec {
         context: "minikube".into(),
@@ -337,6 +333,77 @@ async fn refusing_custom_resources_gives_the_agent_the_reason() {
     assert!(outcome.text.contains("not asked again"), "{}", outcome.text);
     assert_eq!(access_questions(&confirmer), [CRDS]);
     assert_eq!(cluster.lock().unwrap().volume_reads, 0);
+}
+
+/// Only custom resources were asked for: built-in resources are within the
+/// session's access already, so neither the question nor the refusals name
+/// them as refused (#148).
+#[tokio::test]
+async fn a_refusal_of_custom_resources_names_only_them() {
+    let (url, _cluster) = start_cluster(true).await;
+    let confirmer = Arc::new(ScriptedConfirmer::denying());
+    let server = server_on(&url, &SecurityPolicy::default(), confirmer.clone()).await;
+
+    let outcome = server.call("agent", "list_resources", list_volumes()).await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .text
+            .contains("the user did not allow custom resources (CRDs) on minikube"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.contains("built-in resources"),
+        "{}",
+        outcome.text
+    );
+    let requests = confirmer.requests();
+    let question = requests
+        .iter()
+        .find(|request| matches!(request.kind, RequestKind::Access { .. }))
+        .expect("access was asked for");
+    assert_eq!(
+        question.summary,
+        format!("agent asks for custom resources (CRDs) on minikube (namespace {NS})")
+    );
+    // What the session has is still named in full.
+    assert!(
+        question
+            .details
+            .contains("access on minikube now: reading built-in resources."),
+        "{}",
+        question.details
+    );
+
+    // "Not asked again" names what was refused, nothing else.
+    let again = server.call("agent", "list_resources", list_volumes()).await;
+    assert!(again.is_error);
+    assert!(
+        again
+            .text
+            .contains("needs custom resources (CRDs); the user did not allow it on minikube"),
+        "{}",
+        again.text
+    );
+    assert!(!again.text.contains("built-in resources"), "{}", again.text);
+}
+
+/// No answer is not a refusal, and names the same request.
+#[tokio::test]
+async fn no_answer_about_custom_resources_names_only_them() {
+    let (url, _cluster) = start_cluster(true).await;
+    let server = server_on(&url, &SecurityPolicy::default(), Arc::new(DenyAll)).await;
+
+    let outcome = server.call("agent", "list_resources", list_volumes()).await;
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .text
+            .contains("no answer from the user about custom resources (CRDs)"),
+        "{}",
+        outcome.text
+    );
 }
 
 #[tokio::test]
