@@ -907,6 +907,7 @@ fn helm_changes_of_older_peers_run_as_the_session() {
         user_objects: vec!["ClusterRole demo".into()],
         namespaces: vec!["kube-system".into()],
         values_diff: "-a: 1\n+a: 2\n".into(),
+        diff_cut: None,
     };
     let mut json = serde_json::to_value(&change).unwrap();
     assert_eq!(json["credentials"], "ask-user");
@@ -1207,4 +1208,137 @@ fn a_session_keeps_only_its_last_previews() {
     assert!(ids[1..].iter().all(|id| store.has(id)));
     store.clear();
     assert!(!store.has(&ids[1]));
+}
+
+/// A chart of `count` ConfigMaps and a Secret, as helm keeps a manifest.
+fn large_manifest(count: usize, revision: u32, secret: &str) -> String {
+    let mut text = String::new();
+    for n in 0..count {
+        text.push_str(&format!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm-{n:04}\ndata:\n  \
+             revision: \"{revision}\"\n  note: \"settings of part {n} of the chart\"\n"
+        ));
+    }
+    text.push_str(&format!(
+        "---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: db\nstringData:\n  \
+         password: {secret}\n"
+    ));
+    text
+}
+
+/// The window gets a diff over the old 64 KB bound whole (#137), masked as
+/// a small one.
+#[test]
+fn a_diff_over_64_kb_reaches_the_window_whole() {
+    let old = large_manifest(1500, 1, "old-pass");
+    let new = large_manifest(1500, 2, "new-password-value");
+    let diff = window_diff(
+        &old,
+        &new,
+        "revision 1",
+        "after the upgrade",
+        MAX_CONFIRM_DIFF_BYTES,
+    );
+    assert!(diff.text.len() > 3 * 64 * 1024, "{} bytes", diff.text.len());
+    assert_eq!(diff.cut, None);
+    assert!(!diff.text.contains("truncated"));
+    // The last object's change is there, far past 64 KB.
+    let last = diff.text.rfind("name: cm-1499").unwrap();
+    assert!(last > 64 * 1024, "at {last}");
+    assert!(diff.text[last..].contains("+  revision: \"2\""));
+    for secret in ["old-pass", "new-password-value"] {
+        assert!(!diff.text.contains(secret), "a Secret value is not masked");
+    }
+    assert!(
+        diff.text.contains("*** (18 bytes)"),
+        "the Secret is in the diff, masked"
+    );
+}
+
+/// Past the bound the diff ends at a line and says what it leaves out:
+/// bytes, lines and the objects whose changes are not shown (#137).
+#[test]
+fn a_diff_over_the_bound_says_what_it_hides() {
+    let old = format!(
+        "{}---\napiVersion: v1\nkind: Service\nmetadata:\n  name: gone\nspec:\n  clusterIP: None\n",
+        large_manifest(80, 1, "old-password-value")
+    );
+    let new = large_manifest(80, 2, "new-password-value");
+    let whole = window_diff(&old, &new, "revision 1", "revision 2", usize::MAX);
+    assert_eq!(whole.cut, None);
+    let max = 4096;
+    let diff = window_diff(&old, &new, "revision 1", "revision 2", max);
+    assert!(diff.text.len() <= max && diff.text.len() > max - 200);
+    assert!(diff.text.ends_with('\n'), "cut inside a line");
+    assert!(whole.text.starts_with(&diff.text));
+    let cut = diff.cut.expect("the window is told of the cut");
+    assert_eq!(cut.shown_bytes, diff.text.len());
+    assert_eq!(cut.total_bytes, whole.text.len());
+    assert_eq!(
+        cut.hidden_lines,
+        whole.text.lines().count() - diff.text.lines().count()
+    );
+    // The first objects are shown, so they are not named; the rest are, in
+    // the manifest's order.
+    assert!(diff.text.contains("name: cm-0000"));
+    assert!(
+        !cut.objects.contains(&"ConfigMap cm-0000".to_owned()),
+        "{:?}",
+        cut.objects
+    );
+    assert_eq!(cut.objects.len(), MAX_CUT_OBJECTS);
+    let first_hidden: usize = cut.objects[0]
+        .strip_prefix("ConfigMap cm-")
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    assert!(first_hidden > 0);
+    assert!(
+        diff.text
+            .contains(&format!("name: cm-{:04}", first_hidden - 1)),
+        "an object between the shown and the named ones"
+    );
+    assert_eq!(
+        cut.objects[1],
+        format!("ConfigMap cm-{:04}", first_hidden + 1)
+    );
+    // The ConfigMaps from the first hidden one, the Secret and the Service.
+    assert_eq!(cut.objects.len() + cut.more_objects, 80 - first_hidden + 2);
+    // Every object is named when they fit, the removed one last.
+    let near_end = window_diff(&old, &new, "a", "b", whole.text.len() - 150);
+    let cut = near_end.cut.unwrap();
+    assert_eq!(cut.more_objects, 0);
+    assert_eq!(cut.objects.last().map(String::as_str), Some("Service gone"));
+    assert!(!near_end.text.contains("new-password-value"));
+}
+
+#[test]
+fn hunk_headers_give_the_first_line_of_each_side() {
+    assert_eq!(hunk_start("@@ -12,7 +14,8 @@\n"), Some((12, 14)));
+    assert_eq!(hunk_start("@@ -1 +1 @@\n"), Some((1, 1)));
+    assert_eq!(hunk_start("@@ -0,0 +1,3 @@\n"), Some((0, 1)));
+    assert_eq!(hunk_start("+@@ -1 +1 @@\n"), None);
+    assert_eq!(hunk_start(" context\n"), None);
+}
+
+/// The window gets the values diff whole too (#137).
+#[test]
+fn a_values_diff_over_64_kb_is_whole() {
+    let values = |revision: u32| {
+        let map: Map<String, Value> = (0..3000)
+            .map(|n| {
+                (
+                    format!("setting{n:04}"),
+                    json!(format!("value {n} of {revision}")),
+                )
+            })
+            .collect();
+        Value::Object(map)
+    };
+    let diff = masked_values_diff(&values(1), &values(2), "before", "after");
+    assert!(diff.len() > 2 * 64 * 1024, "{} bytes", diff.len());
+    assert!(!diff.contains("truncated"));
+    assert!(
+        diff.contains("+setting2999: value 2999 of 2"),
+        "the last change"
+    );
 }

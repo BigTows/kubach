@@ -94,6 +94,29 @@ agent-helm-values = Values (чувствительные ключи скрыты
 agent-helm-values-show = Показать все values
 agent-helm-values-diff = Изменения values (чувствительные значения скрыты)
 agent-helm-objects = Объекты
+agent-diff-size =
+    { $count ->
+        [one] { $count } строка, { $size } · diff целиком, прокрутите, чтобы прочитать
+        [few] { $count } строки, { $size } · diff целиком, прокрутите, чтобы прочитать
+        [many] { $count } строк, { $size } · diff целиком, прокрутите, чтобы прочитать
+       *[other] { $count } строки, { $size } · diff целиком, прокрутите, чтобы прочитать
+    }
+agent-diff-cut-title = Diff ниже обрезан: показано { $shown } из { $total }
+agent-diff-cut-hidden =
+    { $count ->
+        [one] Ещё { $count } строка ({ $size }) не показана. Одобрение разрешает и эти изменения.
+        [few] Ещё { $count } строки ({ $size }) не показаны. Одобрение разрешает и эти изменения.
+        [many] Ещё { $count } строк ({ $size }) не показано. Одобрение разрешает и эти изменения.
+       *[other] Ещё { $count } строки ({ $size }) не показаны. Одобрение разрешает и эти изменения.
+    }
+agent-diff-cut-objects = Изменения показаны не полностью: { $objects }
+agent-diff-cut-more-objects =
+    { $count ->
+        [one] …и ещё { $count } объект
+        [few] …и ещё { $count } объекта
+        [many] …и ещё { $count } объектов
+       *[other] …и ещё { $count } объекта
+    }
 agent-helm-as-user-title = Выполнить этот вызов helm от ваших учётных данных?
 agent-helm-as-user-warning = Этот вызов helm выполнится от ваших учётных данных из kubeconfig, а не от временного ServiceAccount сессии. Ограничивает его только ваш RBAC, и только этот один вызов.
 agent-helm-as-user-objects = ServiceAccount не может создать или удалить эти объекты уровня кластера, RBAC и объекты в других namespace чарта:

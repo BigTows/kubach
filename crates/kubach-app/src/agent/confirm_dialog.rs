@@ -8,15 +8,18 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_i18n::t;
 use kubach_mcp::{
-    BatchAction, BatchChange, ConfirmationDecision, ConfirmationRequest, Grant, HelmCredentials,
-    RequestKind,
+    BatchAction, BatchChange, ConfirmationDecision, ConfirmationRequest, DiffCut, Grant,
+    HelmCredentials, RequestKind,
 };
-use kubach_ui::measure;
+use kubach_ui::{format_bytes, measure};
+
+use std::rc::Rc;
 
 use super::{AgentState, Notice, countdown, global, secret_dialog};
 use crate::settings::{AppSettings, SettingsTarget, open_settings};
@@ -379,26 +382,197 @@ fn kind_counts(objects: &[String]) -> String {
         .join(", ")
 }
 
-/// Lines of a unified diff, colored as git does: added green, removed
-/// red, hunk headers muted. Long lines wrap: nothing hides past the edge.
-fn diff_lines(text: &str, cx: &App) -> Vec<Div> {
+/// What a row of a diff is, for its color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffKind {
+    /// `--- old` and `+++ new`.
+    Header,
+    Added,
+    Removed,
+    /// `@@ -1,3 +1,3 @@`.
+    Hunk,
+    Context,
+}
+
+/// One row of a diff in the dialog: a line, or a piece of a long one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiffRow {
+    kind: DiffKind,
+    text: SharedString,
+}
+
+/// A line longer than this many bytes is split into rows of its own: one
+/// text of a megabyte (a ConfigMap's value on one line) would be shaped
+/// whole whenever it is in view.
+const MAX_ROW_BYTES: usize = 2000;
+
+/// Rows of a diff above which only those in view are laid out (#137): a
+/// diff of megabytes is a hundred thousand lines.
+const VIRTUAL_DIFF_ROWS: usize = 300;
+
+/// Height a row of a diff is taken for until it is laid out.
+const DIFF_ROW_HINT: Pixels = px(19.);
+
+/// The rows of a unified diff, colored as git does: added green, removed
+/// red, hunk headers muted. Nothing is left out; a long line becomes
+/// several rows of its kind.
+fn diff_rows(text: &str) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let kind = if line.starts_with("+++") || line.starts_with("---") {
+            DiffKind::Header
+        } else if line.starts_with('+') {
+            DiffKind::Added
+        } else if line.starts_with('-') {
+            DiffKind::Removed
+        } else if line.starts_with("@@") {
+            DiffKind::Hunk
+        } else {
+            DiffKind::Context
+        };
+        let mut rest = line;
+        while rest.len() > MAX_ROW_BYTES {
+            let mut end = MAX_ROW_BYTES;
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (piece, tail) = rest.split_at(end);
+            rows.push(DiffRow {
+                kind,
+                text: SharedString::new(piece),
+            });
+            rest = tail;
+        }
+        rows.push(DiffRow {
+            kind,
+            // An empty text would have no height.
+            text: SharedString::new(if rest.is_empty() { " " } else { rest }),
+        });
+    }
+    rows
+}
+
+/// A row as drawn. Long lines wrap: nothing hides past the edge.
+fn diff_row(row: &DiffRow, cx: &App) -> Div {
     let theme = cx.theme();
-    text.lines()
-        .map(|line| {
-            let color = if line.starts_with("+++") || line.starts_with("---") {
-                theme.foreground
-            } else if line.starts_with('+') {
-                theme.success
-            } else if line.starts_with('-') {
-                theme.danger
-            } else if line.starts_with("@@") {
-                theme.muted_foreground
-            } else {
-                theme.foreground
-            };
-            div().text_color(color).child(line.to_owned())
-        })
-        .collect()
+    let color = match row.kind {
+        DiffKind::Added => theme.success,
+        DiffKind::Removed => theme.danger,
+        DiffKind::Hunk => theme.muted_foreground,
+        DiffKind::Header | DiffKind::Context => theme.foreground,
+    };
+    div().text_color(color).child(row.text.clone())
+}
+
+/// A diff of the dialog, split into rows once: the dialog is drawn again
+/// every second and on every scroll. A long one keeps the state of its
+/// virtual list (#137).
+struct DiffBlock {
+    rows: Rc<[DiffRow]>,
+    lines: usize,
+    bytes: usize,
+    list: Option<ListState>,
+}
+
+impl DiffBlock {
+    fn new(text: &str) -> Self {
+        let rows: Rc<[DiffRow]> = diff_rows(text).into();
+        let list = (rows.len() > VIRTUAL_DIFF_ROWS).then(|| {
+            ListState::new(rows.len(), ListAlignment::Top, px(400.))
+                .with_uniform_item_height(DIFF_ROW_HINT)
+        });
+        Self {
+            lines: text.lines().count(),
+            bytes: text.len(),
+            rows,
+            list,
+        }
+    }
+
+    /// The diff in a block of `max_height` at most, scrolling inside. A
+    /// long one says its size and takes the whole height.
+    fn render(&self, id: &'static str, max_height: Pixels, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let block = div()
+            .id(id)
+            .rounded_md()
+            .bg(theme.muted)
+            .font_family(theme.mono_font_family.clone())
+            .text_xs();
+        let Some(list_state) = &self.list else {
+            return block
+                .max_h(max_height)
+                .overflow_y_scroll()
+                .p_2()
+                .children(self.rows.iter().map(|row| diff_row(row, cx)))
+                .into_any_element();
+        };
+        let rows = self.rows.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_xs().text_color(theme.muted_foreground).child(t!(
+                "agent-diff-size",
+                count = self.lines,
+                size = format_bytes(self.bytes as u64)
+            )))
+            .child(
+                block
+                    .relative()
+                    .h(max_height)
+                    .child(
+                        list(list_state.clone(), move |ix, _, cx| match rows.get(ix) {
+                            Some(row) => diff_row(row, cx).into_any_element(),
+                            None => Empty.into_any_element(),
+                        })
+                        .size_full()
+                        .p_2(),
+                    )
+                    .child(Scrollbar::vertical(list_state)),
+            )
+            .into_any_element()
+    }
+}
+
+/// Whether `details` of `request` is shown as a diff: not a command, a
+/// batch or the meaning of a right.
+fn details_are_a_diff(request: &ConfirmationRequest) -> bool {
+    !matches!(
+        request.kind,
+        RequestKind::Exec { .. }
+            | RequestKind::Batch { .. }
+            | RequestKind::Grant { .. }
+            | RequestKind::Access { .. }
+            | RequestKind::ChartSource { .. }
+            | RequestKind::UseContext { .. }
+            | RequestKind::Namespaces { .. }
+    ) && !request.details.trim().is_empty()
+}
+
+/// What the warning about a diff cut by Kubach says (#137): how much is
+/// shown, how much is not and which objects' changes are not.
+fn cut_lines(cut: &DiffCut) -> (String, Vec<String>) {
+    let title = t!(
+        "agent-diff-cut-title",
+        shown = format_bytes(cut.shown_bytes as u64),
+        total = format_bytes(cut.total_bytes as u64)
+    );
+    let mut lines = vec![t!(
+        "agent-diff-cut-hidden",
+        count = cut.hidden_lines,
+        size = format_bytes(cut.total_bytes.saturating_sub(cut.shown_bytes) as u64)
+    )];
+    if !cut.objects.is_empty() {
+        lines.push(t!(
+            "agent-diff-cut-objects",
+            objects = cut.objects.join(", ")
+        ));
+    }
+    if cut.more_objects > 0 {
+        lines.push(t!("agent-diff-cut-more-objects", count = cut.more_objects));
+    }
+    (title, lines)
 }
 
 fn show_next(agent: Entity<AgentState>, window: &mut Window, cx: &mut App) {
@@ -458,13 +632,37 @@ struct ConfirmView {
     /// "Don't ask again until the session ends" for this kind of change in
     /// this namespace (#30); off until the user ticks it.
     remember: bool,
+    /// The request, as it came: a diff of megabytes is not copied on every
+    /// frame.
+    request: Option<Rc<ConfirmationRequest>>,
+    /// `details` when they are a diff ([`details_are_a_diff`]).
+    details: Option<DiffBlock>,
+    /// The values diff of a Helm change.
+    values_diff: Option<DiffBlock>,
     _observe: Subscription,
 }
 
 impl ConfirmView {
     fn new(agent: Entity<AgentState>, id: u64, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&agent, |_, _, cx| cx.notify());
+        let request = agent
+            .read(cx)
+            .pending_by_id(id)
+            .map(|pending| Rc::new(pending.request.clone()));
+        let details = request
+            .as_deref()
+            .filter(|request| details_are_a_diff(request))
+            .map(|request| DiffBlock::new(&request.details));
+        let values_diff = request.as_deref().and_then(|request| match &request.kind {
+            RequestKind::Helm { helm } if !helm.values_diff.trim().is_empty() => {
+                Some(DiffBlock::new(&helm.values_diff))
+            }
+            _ => None,
+        });
         Self {
+            request,
+            details,
+            values_diff,
             agent,
             id,
             acknowledged: false,
@@ -601,10 +799,10 @@ impl Render for ConfirmView {
         let label_width = label_width(window, cx);
         let theme = cx.theme().clone();
         let agent = self.agent.read(cx);
-        let Some(pending) = agent.pending_by_id(self.id) else {
+        let (Some(pending), Some(request)) = (agent.pending_by_id(self.id), self.request.clone())
+        else {
             return div().text_sm().child(t!("agent-no-longer-pending"));
         };
-        let request = pending.request.clone();
         let left = countdown(pending.deadline);
         let queued = agent.pending.len().saturating_sub(1);
         let client_only = !request.mode.server_enforced();
@@ -615,7 +813,7 @@ impl Render for ConfirmView {
         let secret = matches!(grant, Some(Grant::Secret { .. }));
         // A Helm change (#418).
         let helm = match &request.kind {
-            RequestKind::Helm { helm } => Some(helm.clone()),
+            RequestKind::Helm { helm } => Some(&**helm),
             _ => None,
         };
         let source = matches!(
@@ -649,24 +847,29 @@ impl Render for ConfirmView {
             // Exec is a command, not a diff: no colors, every argument apart.
             RequestKind::Exec { command } => Some(command_block(command, cx).into_any_element()),
             RequestKind::Batch { batch } => Some(batch_block(batch, cx).into_any_element()),
-            _ => (grant.is_none()
-                && access.is_none()
-                && !source
-                && !request.details.trim().is_empty())
-            .then(|| {
-                div()
-                    .id("confirm-details")
-                    .max_h(px(280.))
-                    .overflow_y_scroll()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.muted)
-                    .font_family(theme.mono_font_family.clone())
-                    .text_xs()
-                    .children(diff_lines(&request.details, cx))
-                    .into_any_element()
-            }),
+            _ => self
+                .details
+                .as_ref()
+                .map(|diff| diff.render("confirm-details", px(280.), cx)),
         };
+        // Kubach cut the diff (#137): said right above it, never silently.
+        let diff_cut = helm.and_then(|helm| helm.diff_cut.as_ref()).map(|cut| {
+            let (title, lines) = cut_lines(cut);
+            warning_block(title, lines, theme.danger, cx)
+        });
+        let values_diff = self.values_diff.as_ref().map(|diff| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("agent-helm-values-diff")),
+                )
+                .child(diff.render("confirm-helm-values-diff", px(160.), cx))
+        });
         let dangerous = (!request.dangerous.is_empty()).then(|| {
             warning_block(
                 t!("agent-dangerous-title"),
@@ -1001,45 +1204,37 @@ impl Render for ConfirmView {
                                 )
                         };
                         // How the release's values change (#22), masked.
-                        this.when(!helm.values_diff.trim().is_empty(), |this| {
-                            this.child(block(
-                                "confirm-helm-values-diff",
-                                t!("agent-helm-values-diff"),
-                                div()
-                                    .children(diff_lines(&helm.values_diff, cx))
-                                    .into_any_element(),
-                            ))
-                        })
-                        .when(!helm.values.trim().is_empty(), |this| {
-                            // With a values diff the whole values are folded.
-                            if helm.values_diff.trim().is_empty() || show_values {
+                        this.children(values_diff)
+                            .when(!helm.values.trim().is_empty(), |this| {
+                                // With a values diff the whole values are folded.
+                                if helm.values_diff.trim().is_empty() || show_values {
+                                    this.child(block(
+                                        "confirm-helm-values",
+                                        t!("agent-helm-values"),
+                                        helm.values.clone().into_any_element(),
+                                    ))
+                                } else {
+                                    this.child(
+                                        div().child(
+                                            Button::new("confirm-show-values")
+                                                .ghost()
+                                                .xsmall()
+                                                .label(t!("agent-helm-values-show"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_values = true;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                    )
+                                }
+                            })
+                            .when(!helm.objects.is_empty(), |this| {
                                 this.child(block(
-                                    "confirm-helm-values",
-                                    t!("agent-helm-values"),
-                                    helm.values.clone().into_any_element(),
+                                    "confirm-helm-objects",
+                                    t!("agent-helm-objects"),
+                                    helm.objects.join("\n").into_any_element(),
                                 ))
-                            } else {
-                                this.child(
-                                    div().child(
-                                        Button::new("confirm-show-values")
-                                            .ghost()
-                                            .xsmall()
-                                            .label(t!("agent-helm-values-show"))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_values = true;
-                                                cx.notify();
-                                            })),
-                                    ),
-                                )
-                            }
-                        })
-                        .when(!helm.objects.is_empty(), |this| {
-                            this.child(block(
-                                "confirm-helm-objects",
-                                t!("agent-helm-objects"),
-                                helm.objects.join("\n").into_any_element(),
-                            ))
-                        })
+                            })
                     })
                     .when(access.is_some(), |this| {
                         this.child(div().text_sm().text_color(theme.muted_foreground).child(t!(
@@ -1096,6 +1291,7 @@ impl Render for ConfirmView {
                     .children(as_user_tick)
                     .children(dangerous)
                     .children(acknowledge)
+                    .children(diff_cut)
                     .children(details),
             )
             // Next to the buttons, in sight without scrolling.
@@ -1163,7 +1359,11 @@ impl Render for ConfirmView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgPart, SystemNotice, VISIBLE_SPACE, arg_parts, arg_text};
+    use super::{
+        ArgPart, DiffKind, MAX_ROW_BYTES, SystemNotice, VISIBLE_SPACE, arg_parts, arg_text,
+        cut_lines, details_are_a_diff, diff_rows,
+    };
+    use kubach_mcp::{ConfirmationRequest, DiffCut, RequestKind};
 
     /// Only a new question with the window hidden or not focused posts
     /// (#102), and only what was posted is retracted.
@@ -1271,5 +1471,107 @@ mod tests {
             "CustomResourceDefinition × 2, ClusterRole × 1, Role × 1"
         );
         assert_eq!(super::kind_counts(&[]), "");
+    }
+
+    #[test]
+    fn diff_rows_take_the_colors_of_their_lines() {
+        let rows = diff_rows("--- a\n+++ b\n@@ -1,3 +1,3 @@\n same\n-old\n+new\n\n");
+        let kinds: Vec<DiffKind> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                DiffKind::Header,
+                DiffKind::Header,
+                DiffKind::Hunk,
+                DiffKind::Context,
+                DiffKind::Removed,
+                DiffKind::Added,
+                DiffKind::Context,
+            ]
+        );
+        assert_eq!(rows[5].text.as_ref(), "+new");
+        assert_eq!(rows[6].text.as_ref(), " ", "an empty line keeps its height");
+    }
+
+    /// A diff of megabytes loses nothing on its way to the rows (#137), and
+    /// a line of a megabyte does not become one text.
+    #[test]
+    fn a_large_diff_keeps_every_line_in_bounded_rows() {
+        let line = |n: usize| format!("+  key{n}: \"value {n} — значение\"");
+        let mut text: String = (0..100_000).map(|n| line(n) + "\n").collect();
+        let long = format!("-  blob: {}", "é".repeat(600_000));
+        text.push_str(&long);
+        text.push('\n');
+        assert!(text.len() > 5 * 1024 * 1024);
+        let rows = diff_rows(&text);
+        assert_eq!(rows[99_999].text.as_ref(), line(99_999));
+        assert!(rows.iter().all(|row| row.text.len() <= MAX_ROW_BYTES));
+        let pieces = &rows[100_000..];
+        assert!(pieces.len() > 600, "{}", pieces.len());
+        assert!(pieces.iter().all(|row| row.kind == DiffKind::Removed));
+        let joined: String = pieces.iter().map(|row| row.text.as_ref()).collect();
+        assert_eq!(joined, long);
+    }
+
+    #[test]
+    fn a_cut_diff_says_how_much_and_what_is_hidden() {
+        let (title, lines) = cut_lines(&DiffCut {
+            shown_bytes: 8 * 1024 * 1024,
+            total_bytes: 11 * 1024 * 1024,
+            hidden_lines: 70_000,
+            objects: vec!["Deployment web".into(), "ConfigMap web".into()],
+            more_objects: 12,
+        });
+        assert!(
+            title.contains("8.0 MB") && title.contains("11.0 MB"),
+            "{title}"
+        );
+        assert!(
+            lines[0].contains("70") && lines[0].contains("3.0 MB"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("Deployment web, ConfigMap web"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("12"), "{lines:?}");
+        // Nothing to name: no empty line about objects.
+        let (_, lines) = cut_lines(&DiffCut {
+            shown_bytes: 1,
+            total_bytes: 2,
+            hidden_lines: 1,
+            ..DiffCut::default()
+        });
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn only_a_change_shows_its_details_as_a_diff() {
+        let request = |kind: RequestKind, details: &str| ConfirmationRequest {
+            kind,
+            session_id: "s".into(),
+            context: "minikube".into(),
+            client: "agent".into(),
+            tool: "apply".into(),
+            namespace: "web".into(),
+            summary: String::new(),
+            details: details.into(),
+            dangerous: Vec::new(),
+            mode: kubach_mcp::SessionMode::ClientOnly,
+            allow_remember: false,
+        };
+        assert!(details_are_a_diff(&request(RequestKind::Call, "+a: 1\n")));
+        assert!(!details_are_a_diff(&request(RequestKind::Call, " \n")));
+        let exec = RequestKind::Exec {
+            command: vec!["ls".into()],
+        };
+        assert!(!details_are_a_diff(&request(exec, "ls")));
+        let source = RequestKind::ChartSource {
+            source: "oci://example".into(),
+        };
+        assert!(!details_are_a_diff(&request(
+            source,
+            "Until the session ends"
+        )));
     }
 }
