@@ -10,6 +10,11 @@
 //! Copy are unavailable and shown values are hidden at once; keys, sizes
 //! and the typed summary (never passwords or keys) stay.
 //!
+//! A docker config Secret (#139) lists its registries in the summary; the
+//! password and `auth` of a registry are values like any other: hidden,
+//! fetched by their own "Show", hidden again by the same timer and settings,
+//! copied through the same clipboard guard.
+//!
 //! Values live only in this entity (as [`SecretBytes`]) and in the text
 //! being rendered; they never go to the cache, a log or an error message.
 
@@ -24,8 +29,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_core::runtime;
 use kubach_core::secrets::{
-    self, Access, CLIPBOARD_TTL, CertificateInfo, Decoded, RegistryLogin, SecretBytes, Summary,
-    TypedKind, Validity, x509,
+    self, Access, CLIPBOARD_TTL, CertificateInfo, Decoded, DockerConfig, RegistryLogin,
+    RegistrySecret, SecretBytes, Summary, TypedKind, Validity, x509,
 };
 use kubach_core::settings::SecretAction;
 use kubach_i18n::t;
@@ -58,6 +63,61 @@ impl SecretId {
             namespace: object.metadata.namespace.clone()?,
             name: object.metadata.name.clone()?,
         })
+    }
+}
+
+/// A value that can be shown: a whole key, or a secret field of one
+/// registry inside a docker config key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Slot {
+    Key(String),
+    Registry {
+        kind: TypedKind,
+        server: String,
+        field: RegistrySecret,
+    },
+}
+
+impl Slot {
+    /// The slot's name among shown and loading values. Data keys hold no
+    /// line breaks, so a registry field never clashes with a key.
+    fn id(&self) -> String {
+        match self {
+            Self::Key(key) => key.clone(),
+            Self::Registry { server, field, .. } => format!("registry\n{server}\n{field:?}"),
+        }
+    }
+
+    /// The data key the value is fetched from.
+    fn source_key(&self) -> &str {
+        match self {
+            Self::Key(key) => key,
+            Self::Registry { kind, .. } => kind.source_keys()[0],
+        }
+    }
+
+    /// The slot's value out of the fetched value of its key.
+    fn pick(&self, value: SecretBytes) -> Option<SecretBytes> {
+        match self {
+            Self::Key(_) => Some(value),
+            Self::Registry {
+                kind,
+                server,
+                field,
+            } => DockerConfig::of_kind(*kind, value.expose())?
+                .ok()?
+                .secret(server, *field),
+        }
+    }
+
+    /// The value is not in the Secret any more.
+    fn gone(&self) -> String {
+        match self {
+            Self::Key(key) => t!("editor-secret-key-gone", key = key),
+            Self::Registry { server, .. } => {
+                t!("editor-secret-registry-gone", registry = server)
+            }
+        }
     }
 }
 
@@ -159,8 +219,9 @@ impl SecretValues {
             .allows_secret(&self.id.context, action)
     }
 
-    /// Fetches `key` now and shows it for [`REVEAL_TTL`].
-    fn reveal(&mut self, key: String, cx: &mut Context<Self>) {
+    /// Fetches the slot's value now and shows it for [`REVEAL_TTL`].
+    fn reveal(&mut self, slot: Slot, cx: &mut Context<Self>) {
+        let key = slot.id();
         if !self.may_reveal()
             || !self.allows(SecretAction::Show, cx)
             || !self.loading.insert(key.clone())
@@ -170,7 +231,7 @@ impl SecretValues {
         self.error = None;
         let client = self.client.clone();
         let (namespace, name) = (self.id.namespace.clone(), self.id.name.clone());
-        let wanted = key.clone();
+        let wanted = slot.source_key().to_owned();
         let fetch = runtime::spawn(async move {
             secrets::reveal(&client, &namespace, &name, &[wanted.as_str()]).await
         });
@@ -182,10 +243,13 @@ impl SecretValues {
                     return;
                 }
                 match result {
-                    Ok(Ok(mut revealed)) => match revealed.values.remove(&key) {
-                        Some(value) => this.show(key, value, cx),
-                        None => this.error = Some(t!("editor-secret-key-gone", key = &key)),
-                    },
+                    Ok(Ok(mut revealed)) => {
+                        let value = revealed.values.remove(slot.source_key());
+                        match value.and_then(|value| slot.pick(value)) {
+                            Some(value) => this.show(key, value, cx),
+                            None => this.error = Some(slot.gone()),
+                        }
+                    }
                     Ok(Err(error)) => this.error = Some(error.to_string()),
                     Err(error) => this.error = Some(error.to_string()),
                 }
@@ -354,7 +418,12 @@ impl SecretValues {
             );
         }
         for (ix, key) in keys.into_iter().enumerate() {
-            panel = panel.child(self.render_key(ix, key, cx));
+            let ids = ValueIds {
+                toggle: "secret-toggle",
+                copy: "secret-copy",
+                ix,
+            };
+            panel = panel.child(self.render_value(ids, key.clone(), Slot::Key(key), cx));
         }
         panel.child(
             div()
@@ -392,14 +461,25 @@ impl SecretValues {
             )
     }
 
-    fn render_key(&self, ix: usize, key: String, cx: &mut Context<Self>) -> AnyElement {
+    /// One hidden value with its Show and Copy: `label` names it, `slot`
+    /// says where it comes from. Keys and registry fields share this, and
+    /// with it every rule of showing and copying.
+    fn render_value(
+        &self,
+        ids: ValueIds,
+        label: String,
+        slot: Slot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
+        let key = slot.id();
+        let ix = ids.ix;
         let shown = self.shown.get(&key);
         let loading = self.loading.contains(&key);
         let hidden_by_policy = !self.allows(SecretAction::Show, cx);
         let allowed = self.may_reveal() && !hidden_by_policy;
         let toggle_key = key.clone();
-        let toggle = Button::new(("secret-toggle", ix))
+        let toggle = Button::new((ids.toggle, ix))
             .ghost()
             .xsmall()
             .icon(if shown.is_some() {
@@ -421,7 +501,7 @@ impl SecretValues {
                 if this.shown.contains_key(&toggle_key) {
                     this.hide(&toggle_key, cx);
                 } else {
-                    this.reveal(toggle_key.clone(), cx);
+                    this.reveal(slot.clone(), cx);
                 }
             }));
         let copy_allowed = self.allows(SecretAction::Copy, cx);
@@ -431,7 +511,7 @@ impl SecretValues {
             .map(|_| {
                 let copy_key = key.clone();
                 let copied = self.copied.as_deref() == Some(key.as_str());
-                Button::new(("secret-copy", ix))
+                Button::new((ids.copy, ix))
                     .ghost()
                     .xsmall()
                     .icon(if copied {
@@ -457,7 +537,7 @@ impl SecretValues {
                     .font_family(theme.mono_font_family.clone())
                     .text_sm()
                     .text_color(theme.foreground)
-                    .child(key.clone()),
+                    .child(label),
             )
             .when_some(shown, |row, shown| {
                 row.child(
@@ -560,7 +640,8 @@ impl SecretValues {
                     Summary::Registries(logins) => panel.children(
                         logins
                             .iter()
-                            .map(|login| registry_row(login, cx).into_any_element())
+                            .enumerate()
+                            .map(|(ix, login)| self.render_registry(ix, kind, login, cx))
                             .collect::<Vec<_>>(),
                     ),
                     Summary::Certificates(chain) => {
@@ -592,37 +673,83 @@ impl SecretValues {
         }
         panel
     }
+
+    /// One registry of a docker config: who logs in, and its password and
+    /// `auth` as hidden values.
+    fn render_registry(
+        &self,
+        ix: usize,
+        kind: TypedKind,
+        login: &RegistryLogin,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut list = KeyValueList::new().row(
+            t!("editor-field-user"),
+            login.username.clone().unwrap_or_else(|| "—".into()),
+        );
+        if let Some(email) = &login.email {
+            list = list.row(t!("editor-field-email"), email.clone());
+        }
+        if !login.password_readable {
+            // A token Kubach does not show, or no credentials at all.
+            list = list.row(
+                t!("editor-field-password"),
+                if login.has_password {
+                    t!("editor-secret-password-set")
+                } else {
+                    t!("editor-secret-password-none")
+                },
+            );
+        }
+        let fields = [
+            (
+                login.password_readable,
+                RegistrySecret::Password,
+                t!("editor-field-password"),
+            ),
+            (login.has_auth, RegistrySecret::Auth, "auth".to_owned()),
+        ];
+        let values: Vec<AnyElement> = fields
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (present, ..))| *present)
+            .map(|(field_ix, (_, field, label))| {
+                let ids = ValueIds {
+                    toggle: "registry-toggle",
+                    copy: "registry-copy",
+                    ix: ix * 2 + field_ix,
+                };
+                let slot = Slot::Registry {
+                    kind,
+                    server: login.registry.clone(),
+                    field,
+                };
+                self.render_value(ids, label, slot, cx)
+            })
+            .collect();
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(login.registry.clone()),
+            )
+            .child(list)
+            .children(values)
+            .into_any_element()
+    }
 }
 
-fn registry_row(login: &RegistryLogin, cx: &App) -> impl IntoElement + use<> {
-    let theme = cx.theme();
-    let mut list = KeyValueList::new().row(
-        t!("editor-field-user"),
-        login.username.clone().unwrap_or_else(|| "—".into()),
-    );
-    if let Some(email) = &login.email {
-        list = list.row(t!("editor-field-email"), email.clone());
-    }
-    list = list.row(
-        t!("editor-field-password"),
-        if login.has_password {
-            t!("editor-secret-password-set")
-        } else {
-            t!("editor-secret-password-none")
-        },
-    );
-    div()
-        .flex()
-        .flex_col()
-        .gap_1p5()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.foreground)
-                .child(login.registry.clone()),
-        )
-        .child(list)
+/// Element ids of one value's buttons.
+struct ValueIds {
+    toggle: &'static str,
+    copy: &'static str,
+    ix: usize,
 }
 
 fn certificate_rows(

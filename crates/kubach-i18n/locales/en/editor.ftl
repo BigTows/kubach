@@ -243,6 +243,18 @@ editor-secret-user-placeholder = user
 editor-secret-password-placeholder = password or token
 editor-secret-optional = optional
 editor-secret-edit-hint = Keys you don't touch are not sent. Load a value to edit it, or replace it without loading. Values are typed as plain text; Kubach encodes them.
+editor-registry-kind = Registries
+editor-registry-load = Load registries
+editor-registry-replace-tooltip = Enter the registries anew without loading the current ones
+editor-registry-as-json = Edit as JSON
+editor-registry-as-json-tooltip = Edit the whole docker config as text, including the fields the form does not show
+editor-registry-fallback = This value is not a docker config Kubach can read as registries; it is edited as an ordinary value.
+editor-registry-add = Add registry
+editor-registry-remove = Remove this registry
+editor-registry-none = No registries.
+editor-registry-server-placeholder = registry address, e.g. ghcr.io
+editor-registry-password-binary = not text; type a new password to replace it
+editor-registry-hint = Kubach writes auth (base64 of user:password) itself when the user or the password changes. Other fields of the docker config are kept as they are.
 
 ## Secret values (details panel)
 
@@ -266,12 +278,13 @@ editor-secret-summary-tls = TLS certificate
 editor-secret-summary-basic-auth = Basic authentication
 editor-secret-summary-what-tls = Reads tls.crt only; the private key is never fetched.
 editor-secret-summary-what-basic-auth = Reads the user name only, not the password.
-editor-secret-summary-what-registry = Shows registries and user names, never passwords.
+editor-secret-summary-what-registry = Shows registries, user names and emails. Passwords stay hidden until you show them, like any other value.
 editor-secret-show-summary = Show summary
 editor-secret-tls-key-hidden = tls.key — hidden
 editor-secret-value-hidden = hidden
 editor-secret-password-set = set (hidden)
 editor-secret-password-none = none
+editor-secret-registry-gone = Registry { $registry } no longer has this value in the Secret
 editor-cert-not-yet-valid = not yet valid
 editor-cert-expired =
     { $days ->

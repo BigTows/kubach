@@ -9,6 +9,7 @@ mod analysis;
 mod assist;
 mod configmap;
 mod presets;
+mod registries;
 mod review;
 mod secret;
 mod tabs;

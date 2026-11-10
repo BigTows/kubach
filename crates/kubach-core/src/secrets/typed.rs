@@ -71,8 +71,12 @@ pub struct RegistryLogin {
     pub registry: String,
     pub username: Option<String>,
     pub email: Option<String>,
-    /// A password or auth token is set (it is never shown).
+    /// A password or auth token is set (a summary never holds it).
     pub has_password: bool,
+    /// The password itself can be read: from `password`, or from `auth`.
+    pub password_readable: bool,
+    /// `auth` is set.
+    pub has_auth: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,10 +134,13 @@ pub fn docker_logins(bytes: &[u8], legacy: bool) -> Result<Vec<RegistryLogin>, V
                     .filter(|s| !s.is_empty())
             };
             // `auth` is base64 of `user:password`; only the user is kept.
+            let mut auth_password = false;
             let auth_user = text("auth")
                 .and_then(|auth| STANDARD.decode(auth).ok())
                 .and_then(|decoded| {
-                    let user = decoded.split(|&b| b == b':').next()?.to_vec();
+                    let mut parts = decoded.splitn(2, |&b| b == b':');
+                    let user = parts.next()?.to_vec();
+                    auth_password = parts.next().is_some_and(|password| !password.is_empty());
                     let mut decoded = decoded;
                     super::value::wipe(&mut decoded);
                     String::from_utf8(user).ok()
@@ -145,6 +152,8 @@ pub fn docker_logins(bytes: &[u8], legacy: bool) -> Result<Vec<RegistryLogin>, V
                 has_password: text("password").is_some()
                     || text("auth").is_some()
                     || text("identitytoken").is_some(),
+                password_readable: text("password").is_some() || auth_password,
+                has_auth: text("auth").is_some(),
             }
         })
         .collect())
@@ -211,8 +220,10 @@ mod tests {
         // Registries keep their order in the config.
         assert_eq!(logins[1].username.as_deref(), Some("alice"));
         assert!(logins[1].has_password);
+        assert!(logins[0].password_readable && !logins[0].has_auth);
+        assert!(logins[1].password_readable && logins[1].has_auth);
         assert_eq!(logins[2].username, None);
-        assert!(!logins[2].has_password);
+        assert!(!logins[2].has_password && !logins[2].password_readable);
         let printed = format!("{logins:?}");
         assert!(!printed.contains("s3cret") && !printed.contains("pa55"));
     }
