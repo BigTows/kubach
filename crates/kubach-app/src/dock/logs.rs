@@ -2,6 +2,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -31,7 +32,14 @@ use super::target::{ContainerMenu, LogTarget};
 use crate::cluster::Cluster;
 
 /// Events applied to the view per UI update.
-const BATCH_EVENTS: usize = 64;
+const BATCH_EVENTS: usize = 256;
+/// Pause between UI updates of a stream. Every update redraws the whole
+/// window, so applying each batch as it arrives redraws it at the rate of
+/// the stream: a pod printing a few hundred lines a second kept the window
+/// drawing over a hundred frames a second (#142). Lines that arrive during
+/// the pause wait in the stream (which merges them into fewer batches) and
+/// are shown together; a line after a quiet period is shown at once.
+const UPDATE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Where the stream is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +134,23 @@ pub fn log_entry(line: LogLine, tag: Option<(String, usize)>) -> LogEntry {
         entry = entry.tag(label, color);
     }
     entry
+}
+
+/// Applies the events of `stream` to `tab` until the stream ends, at most
+/// once per [`UPDATE_INTERVAL`]. False when the tab is gone.
+async fn pump(
+    stream: impl futures::Stream<Item = LogEvent> + Unpin,
+    tab: &WeakEntity<LogsTab>,
+    cx: &mut AsyncApp,
+) -> bool {
+    let mut batches = stream.ready_chunks(BATCH_EVENTS);
+    while let Some(batch) = batches.next().await {
+        if tab.update(cx, |tab, cx| tab.apply(batch, cx)).is_err() {
+            return false;
+        }
+        cx.background_executor().timer(UPDATE_INTERVAL).await;
+    }
+    true
 }
 
 /// `50000` as `50,000`.
@@ -345,11 +370,8 @@ impl LogsTab {
             if started.is_err() {
                 return;
             }
-            let mut batches = stream.ready_chunks(BATCH_EVENTS);
-            while let Some(batch) = batches.next().await {
-                if this.update(cx, |this, cx| this.apply(batch, cx)).is_err() {
-                    return;
-                }
+            if !pump(stream, &this, cx).await {
+                return;
             }
             this.update(cx, |this, cx| {
                 this.state = LogsState::Finished;
