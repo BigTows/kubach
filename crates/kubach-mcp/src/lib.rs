@@ -68,7 +68,8 @@ pub use confirm::{
 };
 pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
 pub use helm_tools::{
-    HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY, VaultKubeconfig,
+    DiffCut, HelmAction, HelmChange, HelmCredentials, HelmEnv, MAX_CONFIRM_DIFF_BYTES,
+    USER_IDENTITY, VaultKubeconfig,
 };
 pub use identity::{Identity, sweep_expired};
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};

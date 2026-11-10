@@ -41,6 +41,7 @@ fn helm_change(action: HelmAction) -> HelmChange {
         user_objects: Vec::new(),
         namespaces: Vec::new(),
         values_diff: String::new(),
+        diff_cut: None,
     }
 }
 
