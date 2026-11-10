@@ -13,6 +13,7 @@ jiff.workspace = true
 kubach-i18n.workspace = true
 resvg = { workspace = true, features = ["text", "system-fonts"] }
 serde_json.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

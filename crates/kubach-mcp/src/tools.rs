@@ -685,6 +685,8 @@ pub(crate) async fn ask_access_now(
 ) -> Result<(), ToolError> {
     let scope = ctx.session.scope();
     let current = ctx.session.access();
+    // Only what is asked for; `current` names what the session has.
+    let asked = raise.asked();
     let namespace = namespace
         .map(str::to_owned)
         .or_else(|| ctx.session.policy().namespace(None).ok())
@@ -706,7 +708,7 @@ pub(crate) async fn ask_access_now(
         tool: ctx.tool.to_owned(),
         namespace: namespace.clone(),
         summary: format!(
-            "{} asks for {raise} on {}{place}",
+            "{} asks for {asked} on {}{place}",
             ctx.client_name, scope.context
         ),
         details: format!(
@@ -747,7 +749,7 @@ pub(crate) async fn ask_access_now(
             let always = decision == ConfirmationDecision::ApprovedAlways;
             if let Err(error) = ctx.session.decide_access(raise, true, always).await {
                 let message = format!(
-                    "the user allowed {raise}, but Kubach could not raise the session's access: \
+                    "the user allowed {asked}, but Kubach could not raise the session's access: \
                      {error}"
                 );
                 record("error", Some(message.clone()));
@@ -760,7 +762,7 @@ pub(crate) async fn ask_access_now(
             let _ = ctx.session.decide_access(raise, false, false).await;
             record("refused", reason.clone());
             Err(ToolError::Rejected(Some(format!(
-                "the user did not allow {raise} on {} in this session{}; Kubach does not ask \
+                "the user did not allow {asked} on {} in this session{}; Kubach does not ask \
                  again in this session",
                 scope.context,
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
@@ -769,7 +771,7 @@ pub(crate) async fn ask_access_now(
         ConfirmationDecision::Denied { reason } => {
             record("no-answer", reason.clone());
             Err(ToolError::Rejected(Some(format!(
-                "no answer from the user about {raise}{}",
+                "no answer from the user about {asked}{}",
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
             ))))
         }

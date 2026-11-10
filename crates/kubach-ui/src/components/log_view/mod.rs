@@ -6,7 +6,7 @@ mod buffer;
 
 use std::ops::Range;
 
-use gpui_kit::component::scroll::Scrollbar;
+use gpui_kit::component::scroll::{ScrollableMask, Scrollbar};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,6 +22,12 @@ pub use buffer::{
 /// Lines kept by default before the oldest are dropped.
 pub const DEFAULT_LOG_CAPACITY: usize = 500_000;
 const LINE_HEIGHT: Pixels = px(18.);
+/// Font size of the lines (`text_xs`).
+const FONT_SIZE: Rems = rems(0.75);
+/// Horizontal padding of a row, on each side.
+const ROW_PADDING: Pixels = px(12.);
+/// Space kept between a revealed search match and the edge of the view.
+const REVEAL_MARGIN: Pixels = px(48.);
 
 /// Color of tag `index` (cycles through the theme's accent colors).
 pub fn tag_color(index: usize, theme: &Theme) -> Hsla {
@@ -82,6 +88,26 @@ pub struct LogView {
     top_notice: Option<LogTopNotice>,
     /// Lines were dropped from the front since the last clear.
     evicted: bool,
+    /// Sideways scroll of all rows together while lines are not wrapped.
+    horizontal: ScrollHandle,
+    /// The shaped width of the buffer's widest line, and what it was shaped
+    /// for.
+    widest: Option<(WidestKey, Pixels)>,
+    /// Width of the widest row painted so far. The widest line is picked by
+    /// its cell count, which glyphs of a fallback font do not follow, so a
+    /// row seen to be wider than that still gets room.
+    painted_width: Pixels,
+    /// A search match to bring into view sideways on the next frame.
+    reveal: Option<LogMatch>,
+}
+
+/// What the cached width of the widest line depends on.
+#[derive(Clone, PartialEq)]
+struct WidestKey {
+    line: u64,
+    timestamps: bool,
+    font_size: Pixels,
+    font_family: SharedString,
 }
 
 impl EventEmitter<LogViewEvent> for LogView {}
@@ -110,6 +136,10 @@ impl LogView {
             top_armed: true,
             top_notice: None,
             evicted: false,
+            horizontal: ScrollHandle::new(),
+            widest: None,
+            painted_width: px(0.),
+            reveal: None,
         }
     }
 
@@ -190,6 +220,8 @@ impl LogView {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.evicted = false;
         self.top_armed = true;
+        self.painted_width = px(0.);
+        self.reveal = None;
         self.selector.clear();
         self.resume_follow = false;
         self.buffer.clear();
@@ -221,6 +253,7 @@ impl LogView {
         if self.show_timestamps != show {
             self.show_timestamps = show;
             // Offsets index the displayed line, which just changed.
+            self.painted_width = px(0.);
             self.selector.clear();
             self.resume_follow = false;
             self.list.remeasure();
@@ -309,23 +342,110 @@ impl LogView {
     }
 
     pub fn next_match(&mut self, cx: &mut Context<Self>) {
-        let line = self.search.next_match().map(|m| m.line);
-        self.reveal(line, cx);
+        let found = self.search.next_match().cloned();
+        self.reveal(found, cx);
     }
 
     pub fn prev_match(&mut self, cx: &mut Context<Self>) {
-        let line = self.search.prev_match().map(|m| m.line);
-        self.reveal(line, cx);
+        let found = self.search.prev_match().cloned();
+        self.reveal(found, cx);
     }
 
-    fn reveal(&mut self, line: Option<u64>, cx: &mut Context<Self>) {
-        let Some(index) = line.and_then(|id| self.buffer.index_of(id)) else {
+    fn reveal(&mut self, found: Option<LogMatch>, cx: &mut Context<Self>) {
+        let Some(found) = found else {
+            return;
+        };
+        let Some(index) = self.buffer.index_of(found.line) else {
             return;
         };
         self.list.pause_following_tail();
         self.follow.sync(false);
         self.list.scroll_to_reveal_item(index);
+        // Sideways it takes the text system: done while rendering.
+        self.reveal = Some(found);
         cx.notify();
+    }
+
+    /// Shapes a displayed line the way rows draw it. Highlights only change
+    /// colors and the weight of a monospace font, so one run measures it.
+    fn shape(&self, line: String, window: &Window, cx: &App) -> ShapedLine {
+        let line = if line.contains('\n') {
+            line.replace('\n', " ")
+        } else {
+            line
+        };
+        let theme = cx.theme();
+        let run = TextRun {
+            len: line.len(),
+            font: font(theme.mono_font_family.clone()),
+            color: theme.foreground,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let font_size = FONT_SIZE.to_pixels(window.rem_size());
+        window
+            .text_system()
+            .shape_line(line.into(), font_size, &[run], None)
+    }
+
+    /// Width of the unwrapped list: room for the widest buffered line, so
+    /// the scroll range does not change while scrolling through the log.
+    fn content_width(&mut self, window: &Window, cx: &App) -> Pixels {
+        if let Some(width) = self.selector.painted_width() {
+            self.painted_width = self.painted_width.max(width);
+        }
+        let Some(line) = self.buffer.widest() else {
+            return px(0.);
+        };
+        let key = WidestKey {
+            line,
+            timestamps: self.show_timestamps,
+            font_size: FONT_SIZE.to_pixels(window.rem_size()),
+            font_family: cx.theme().mono_font_family.clone(),
+        };
+        let width = match &self.widest {
+            Some((cached, width)) if *cached == key => *width,
+            _ => {
+                let width = self
+                    .buffer
+                    .index_of(line)
+                    .and_then(|index| self.buffer.get(index))
+                    .map_or(px(0.), |entry| {
+                        self.shape(self.display_line(entry).0, window, cx).width()
+                    });
+                self.widest = Some((key, width));
+                width
+            }
+        };
+        (width.max(self.painted_width) + ROW_PADDING * 2.).ceil()
+    }
+
+    /// Scrolls sideways so the pending search match is in view.
+    fn reveal_sideways(&mut self, window: &Window, cx: &App) {
+        let Some(found) = self.reveal.take() else {
+            return;
+        };
+        let Some(entry) = self
+            .buffer
+            .index_of(found.line)
+            .and_then(|index| self.buffer.get(index))
+        else {
+            return;
+        };
+        let (line, offset) = self.display_line(entry);
+        let shaped = self.shape(line, window, cx);
+        let start = ROW_PADDING + shaped.x_for_index(offset + found.range.start);
+        let end = ROW_PADDING + shaped.x_for_index(offset + found.range.end);
+        let current = self.horizontal.offset();
+        let scrolled = reveal_scroll(
+            start..end,
+            -current.x,
+            self.horizontal.bounds().size.width,
+            REVEAL_MARGIN,
+        );
+        // Past the end is clamped when the list is laid out.
+        self.horizontal.set_offset(point(-scrolled, current.y));
     }
 
     /// All buffered lines as shown (with tags and timestamps when visible).
@@ -410,11 +530,9 @@ impl LogView {
         self.selector
             .row(id, text)
             .w_full()
-            .px_3()
+            .px(ROW_PADDING)
             .line_height(LINE_HEIGHT)
-            .when(!self.wrap, |line| {
-                line.whitespace_nowrap().overflow_hidden()
-            })
+            .when(!self.wrap, |line| line.whitespace_nowrap())
             .into_any_element()
     }
 
@@ -538,14 +656,21 @@ impl LogView {
 }
 
 impl Render for LogView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reads the rows of the previous frame, so before forgetting them.
+        let content_width = (!self.wrap).then(|| self.content_width(window, cx));
+        if self.wrap {
+            self.reveal = None;
+        } else {
+            self.reveal_sideways(window, cx);
+        }
         self.selector.begin_frame();
         let theme = cx.theme();
         let root = div()
             .relative()
             .size_full()
             .font_family(theme.mono_font_family.clone())
-            .text_xs()
+            .text_size(FONT_SIZE)
             .text_color(theme.foreground);
         if self.buffer.is_empty() {
             return root
@@ -563,16 +688,35 @@ impl Render for LogView {
         let render_line =
             cx.processor(|this: &mut Self, index: usize, _, cx| this.render_line(index, cx));
         let root = line_selection::selectable(root, &self.selector, cx);
-        root.child(
-            list(self.list.clone(), move |index, window, cx| {
-                render_line(index, window, cx)
+        let lines = list(self.list.clone(), move |index, window, cx| {
+            render_line(index, window, cx)
+        })
+        .h_full()
+        .py_1();
+        let root = match content_width {
+            // Wrapped lines fit the view.
+            None => root.child(lines.w_full()),
+            // The whole list is as wide as the widest line and slides under
+            // the view, so every row moves by the same offset. Clipping and
+            // the offset come from the tracked handle; the wheel goes
+            // through the mask, which leaves vertical scrolling to the list.
+            Some(width) => root
+                .child(
+                    div()
+                        .id("log-sideways")
+                        .size_full()
+                        .overflow_x_hidden()
+                        .track_scroll(&self.horizontal)
+                        .child(lines.min_w_full().w(width)),
+                )
+                .child(ScrollableMask::new(Axis::Horizontal, &self.horizontal).id("log-wheel")),
+        };
+        root.child(Scrollbar::vertical(&self.list))
+            .when(content_width.is_some(), |root| {
+                root.child(Scrollbar::horizontal(&self.horizontal))
             })
-            .size_full()
-            .py_1(),
-        )
-        .child(Scrollbar::vertical(&self.list))
-        .children(self.render_top_notice(cx))
-        .children(self.render_unseen(cx))
+            .children(self.render_top_notice(cx))
+            .children(self.render_unseen(cx))
     }
 }
 
@@ -599,6 +743,19 @@ impl SelectableLines for LogView {
         cx.notify();
     }
 
+    fn scroll_sideways_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        if self.wrap {
+            return;
+        }
+        let offset = self.horizontal.offset();
+        let max = self.horizontal.max_offset().x;
+        let x = (offset.x - delta).clamp(-max, px(0.));
+        if x != offset.x {
+            self.horizontal.set_offset(point(x, offset.y));
+            cx.notify();
+        }
+    }
+
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
         if self.selector.has_selection() {
             if self.follow.is_following() {
@@ -612,5 +769,66 @@ impl SelectableLines for LogView {
             self.follow = FollowState::Following;
         }
         cx.notify();
+    }
+}
+
+/// Where to scroll sideways (distance from the start of the content) so the
+/// span `target` is in a view `viewport` wide that is now at `scrolled`,
+/// keeping `margin` around it. A span that fits at the start of the line
+/// goes back to the start; one in view stays; otherwise the nearer edge.
+fn reveal_scroll(
+    target: Range<Pixels>,
+    scrolled: Pixels,
+    viewport: Pixels,
+    margin: Pixels,
+) -> Pixels {
+    if target.end + margin <= viewport {
+        return px(0.);
+    }
+    if target.start - margin >= scrolled && target.end + margin <= scrolled + viewport {
+        return scrolled;
+    }
+    if target.start - margin < scrolled || target.end - target.start + margin * 2. > viewport {
+        // To the left of the view, or too long to fit: show where it starts.
+        (target.start - margin).max(px(0.))
+    } else {
+        target.end + margin - viewport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::px;
+
+    use super::reveal_scroll;
+
+    fn scroll(start: f32, end: f32, scrolled: f32) -> f32 {
+        f32::from(reveal_scroll(
+            px(start)..px(end),
+            px(scrolled),
+            px(500.),
+            px(40.),
+        ))
+    }
+
+    #[test]
+    fn match_near_the_line_start_scrolls_back() {
+        assert_eq!(scroll(100., 150., 0.), 0.);
+        assert_eq!(scroll(100., 150., 900.), 0.);
+    }
+
+    #[test]
+    fn match_in_view_does_not_move() {
+        assert_eq!(scroll(1000., 1050., 800.), 800.);
+    }
+
+    #[test]
+    fn match_outside_moves_to_the_nearer_edge() {
+        // To the right: its end lands a margin before the right edge.
+        assert_eq!(scroll(1000., 1050., 0.), 590.);
+        // To the left: its start lands a margin after the left edge.
+        assert_eq!(scroll(1000., 1050., 2000.), 960.);
+        // Wider than the view: its start wins.
+        assert_eq!(scroll(1000., 1900., 0.), 960.);
     }
 }

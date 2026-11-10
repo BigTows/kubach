@@ -1862,7 +1862,10 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
     assert_eq!(*current, Access::ALL.capped(Profile::ReadOnly));
     assert_eq!(
         requests[0].summary,
-        format!("claude-code asks for {raise} on minikube (namespace {NS})")
+        format!(
+            "claude-code asks for {} on minikube (namespace {NS})",
+            raise.asked()
+        )
     );
     // Refused: the same request does not bother the user again.
     let again = f.server.call("claude-code", "scale", args(scale)).await;

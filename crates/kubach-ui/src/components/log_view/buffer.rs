@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use gpui_kit::SharedString;
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::StyledSpan;
 
@@ -54,6 +55,21 @@ impl LogEntry {
         self.timestamp = Some(timestamp.into());
         self
     }
+
+    /// Terminal cells the tag and the text take: an estimate of how wide the
+    /// line is drawn, to compare lines without shaping them.
+    fn cells(&self) -> usize {
+        let tag = self.tag.as_ref().map_or(0, |tag| cells(&tag.label) + 1);
+        tag + cells(&self.text)
+    }
+}
+
+fn cells(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.width()
+    }
 }
 
 /// Lines in arrival order, dropping the oldest beyond `capacity`.
@@ -67,6 +83,11 @@ pub struct LogBuffer {
     lines: VecDeque<LogEntry>,
     capacity: usize,
     first_id: u64,
+    /// `(id, cells)` of every line wider than all lines after it, in line
+    /// order: the front is the widest buffered line. A line that is not
+    /// here has a later line at least as wide, which outlives it, so both
+    /// appending and evicting keep the maximum in constant time.
+    widest: VecDeque<(u64, usize)>,
 }
 
 /// Id of the first line pushed into an empty buffer; prepended lines count
@@ -87,6 +108,7 @@ impl LogBuffer {
             lines: VecDeque::new(),
             capacity: capacity.max(1),
             first_id: FIRST_ID,
+            widest: VecDeque::new(),
         }
     }
 
@@ -126,16 +148,34 @@ impl LogBuffer {
         self.lines.iter()
     }
 
+    /// Id of the buffered line that takes the most cells (tag and text; the
+    /// latest of equally wide ones).
+    pub fn widest(&self) -> Option<u64> {
+        self.widest.front().map(|&(id, _)| id)
+    }
+
     /// Appends lines, evicting the oldest ones beyond capacity.
     pub fn push(&mut self, entries: impl IntoIterator<Item = LogEntry>) -> PushResult {
         let mut added = 0;
         for entry in entries {
+            let (id, cells) = (self.end_id(), entry.cells());
+            while self.widest.back().is_some_and(|&(_, back)| back <= cells) {
+                self.widest.pop_back();
+            }
+            self.widest.push_back((id, cells));
             self.lines.push_back(entry);
             added += 1;
         }
         let evicted = self.lines.len().saturating_sub(self.capacity);
         self.lines.drain(..evicted);
         self.first_id += evicted as u64;
+        while self
+            .widest
+            .front()
+            .is_some_and(|&(id, _)| id < self.first_id)
+        {
+            self.widest.pop_front();
+        }
         PushResult { added, evicted }
     }
 
@@ -149,9 +189,14 @@ impl LogBuffer {
         let skip = entries.len().saturating_sub(room);
         let added = entries.len() - skip;
         for entry in entries.into_iter().skip(skip).rev() {
+            self.first_id -= 1;
+            let cells = entry.cells();
+            // Only a line wider than everything after it matters.
+            if self.widest.front().is_none_or(|&(_, front)| front < cells) {
+                self.widest.push_front((self.first_id, cells));
+            }
             self.lines.push_front(entry);
         }
-        self.first_id -= added as u64;
         added
     }
 
@@ -159,6 +204,7 @@ impl LogBuffer {
     pub fn clear(&mut self) {
         self.first_id = self.end_id();
         self.lines.clear();
+        self.widest.clear();
     }
 }
 
@@ -439,6 +485,69 @@ mod tests {
             .map(|ix| buffer.first_id() + ix as u64)
             .collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The widest line by a full scan (the latest of equals).
+    fn widest_by_scan(buffer: &LogBuffer) -> Option<u64> {
+        let mut best: Option<(u64, usize)> = None;
+        for (index, entry) in buffer.iter().enumerate() {
+            let cells = entry.cells();
+            if best.is_none_or(|(_, widest)| widest <= cells) {
+                best = Some((buffer.first_id() + index as u64, cells));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    #[test]
+    fn widest_line_follows_pushes_evictions_and_prepends() {
+        let mut buffer = LogBuffer::new(4);
+        assert_eq!(buffer.widest(), None);
+        lines(&mut buffer, &["aaaa", "bb", "ccc"]);
+        assert_eq!(buffer.widest(), Some(FIRST_ID));
+        // Equal width: the later line, which lives longer.
+        lines(&mut buffer, &["dddd"]);
+        assert_eq!(buffer.widest(), Some(FIRST_ID + 3));
+        // Evicts "aaaa" and "bb".
+        lines(&mut buffer, &["e", "f"]);
+        assert_eq!(buffer.widest(), Some(FIRST_ID + 3));
+        // Evicts "ccc" and "dddd": the widest is now one of the short ones.
+        lines(&mut buffer, &["g", "hh"]);
+        assert_eq!(buffer.widest(), Some(FIRST_ID + 7));
+        assert_eq!(buffer.widest(), widest_by_scan(&buffer));
+
+        let mut buffer = LogBuffer::new(10);
+        lines(&mut buffer, &["bbb", "c"]);
+        buffer.prepend(entries(&["x", "aaaaa", "yy"]));
+        assert_eq!(buffer.widest(), Some(FIRST_ID - 2));
+        assert_eq!(buffer.widest(), widest_by_scan(&buffer));
+        buffer.prepend(entries(&["zzzzz"]));
+        assert_eq!(buffer.widest(), Some(FIRST_ID - 2));
+        buffer.clear();
+        assert_eq!(buffer.widest(), None);
+    }
+
+    #[test]
+    fn widest_line_matches_a_scan_on_mixed_input() {
+        let mut buffer = LogBuffer::new(7);
+        let mut seed = 17usize;
+        for round in 0..200 {
+            seed = seed * 31 % 1009;
+            let text = "x".repeat(seed % 9);
+            if round % 5 == 4 {
+                buffer.prepend(vec![LogEntry::new(text)]);
+            } else {
+                buffer.push([LogEntry::new(text)]);
+            }
+            assert_eq!(buffer.widest(), widest_by_scan(&buffer), "round {round}");
+        }
+    }
+
+    #[test]
+    fn cells_count_the_tag_and_wide_characters() {
+        assert_eq!(LogEntry::new("abc").cells(), 3);
+        assert_eq!(LogEntry::new("abc").tag("pod", 0).cells(), 7);
+        assert_eq!(LogEntry::new("日本").cells(), 4);
     }
 
     #[test]
