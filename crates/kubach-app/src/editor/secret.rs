@@ -14,6 +14,10 @@
 //! values are highlighted and checked, JSON can be formatted. A key whose
 //! value is in the form can be renamed: the patch removes the old key and
 //! sets the new one.
+//!
+//! The key of a docker config Secret (`.dockerconfigjson`, `.dockercfg`)
+//! loads as a list of registries instead of JSON text (#139, see
+//! [`super::registries`]); a value that is not a docker config stays text.
 
 use kubach_ui::ButtonLoading as _;
 use std::path::Path;
@@ -26,7 +30,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_core::data_keys::ContentKind;
 use kubach_core::secrets::{
-    self, Access, KeyChange, NewSecret, ReviewLine, SecretBytes, SecretInfo, SecretPatch, typed,
+    self, Access, DockerConfig, KeyChange, NewSecret, ReviewLine, SecretBytes, SecretInfo,
+    SecretPatch, TypedKind, typed,
 };
 use kubach_core::settings::SecretAction;
 use kubach_core::{Connection, ConnectionState, runtime};
@@ -34,6 +39,7 @@ use kubach_i18n::t;
 use kubach_ui::{DataKeyBlock, KeyValueList, Panel, Tone};
 use kube::Client;
 
+use super::registries::RegistryForm;
 use super::value::{ValueEditor, binary_text, content_label, size_text, unreadable};
 use super::{Banner, callout, context_notice};
 use crate::cluster::Cluster;
@@ -99,6 +105,8 @@ enum ValueState {
     Binary {
         len: usize,
     },
+    /// A docker config edited as a list of registries.
+    Registries(RegistryForm),
     Removed,
 }
 
@@ -112,6 +120,9 @@ struct KeyRow {
     rename: Option<Entity<InputState>>,
     value: ValueState,
     loading: bool,
+    /// The loaded value of a docker config key is not a docker config: it
+    /// is edited as an ordinary value.
+    fallback: bool,
 }
 
 /// What a row contributes to the change.
@@ -125,6 +136,8 @@ enum RowChange {
         to: String,
         value: SecretBytes,
     },
+    /// The row's form can't be saved as it is; the text says why.
+    Invalid(String),
 }
 
 impl KeyRow {
@@ -187,6 +200,11 @@ impl KeyRow {
                 RowChange::None
             }
             ValueState::File { value, .. } => RowChange::Set(key, value.clone()),
+            ValueState::Registries(form) => match form.value(cx) {
+                Ok(Some(value)) => RowChange::Set(key, value),
+                Ok(None) => RowChange::None,
+                Err(error) => RowChange::Invalid(error.to_string()),
+            },
             ValueState::Text { editor, baseline } => {
                 let text = editor.text(cx);
                 match baseline {
@@ -282,9 +300,18 @@ impl SecretEditor {
     ) -> Self {
         let create =
             matches!(target, SecretTarget::New { .. }).then(|| CreateForm::new(window, cx));
-        let mut subscriptions = vec![cx.observe(&cluster, |this, _, cx| {
+        let mut subscriptions = vec![cx.observe_in(&cluster, window, |this, _, window, cx| {
             if !this.allows(SecretAction::LoadValue, cx) {
                 this.unload_values(cx);
+                // Edited registries stay; their loaded passwords are
+                // masked again and can't be shown.
+                for row in &this.rows {
+                    if let ValueState::Registries(form) = &row.value
+                        && form.loaded()
+                    {
+                        form.mask(window, cx);
+                    }
+                }
             }
             cx.notify();
         })];
@@ -397,6 +424,9 @@ impl SecretEditor {
                 ValueState::Text {
                     baseline: Some(_), ..
                 } => row.existing.is_some() && matches!(row.change(cx), RowChange::None),
+                ValueState::Registries(form) => {
+                    form.loaded() && matches!(row.change(cx), RowChange::None)
+                }
                 _ => false,
             };
             if loaded {
@@ -476,6 +506,7 @@ impl SecretEditor {
                     rename: None,
                     value: ValueState::Untouched,
                     loading: false,
+                    fallback: false,
                 }
             })
             .collect();
@@ -510,6 +541,7 @@ impl SecretEditor {
                 baseline: None,
             },
             loading: false,
+            fallback: false,
         });
         cx.notify();
     }
@@ -620,13 +652,7 @@ impl SecretEditor {
                 row.loading = false;
                 match result {
                     Ok(Ok(mut revealed)) => match revealed.values.remove(&key) {
-                        Some(value) => {
-                            if value.text().is_some() {
-                                this.set_text_value(id, Some(value), window, cx);
-                            } else if let Some(row) = this.row_mut(id) {
-                                row.value = ValueState::Binary { len: value.len() };
-                            }
-                        }
+                        Some(value) => this.set_loaded_value(id, &key, value, window, cx),
                         None => {
                             this.banner = Some(Banner::new(
                                 Tone::Warning,
@@ -644,6 +670,138 @@ impl SecretEditor {
             .ok();
         });
         self._tasks.push(task);
+        cx.notify();
+    }
+
+    /// The kind of docker config `key` holds in this Secret, if it is the
+    /// key of a docker config Secret.
+    fn docker_kind(&self, key: &str) -> Option<TypedKind> {
+        self.info
+            .as_ref()
+            .and_then(SecretInfo::typed_kind)
+            .filter(|kind| {
+                matches!(kind, TypedKind::DockerConfigJson | TypedKind::DockerCfg)
+                    && kind.source_keys() == [key]
+            })
+    }
+
+    /// Puts the fetched `value` of `key` on row `id`: a docker config as
+    /// registries, other text as text. A docker config key whose value is
+    /// not a docker config is edited as an ordinary value, with a note.
+    fn set_loaded_value(
+        &mut self,
+        id: usize,
+        key: &str,
+        value: SecretBytes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(kind) = self.docker_kind(key) {
+            match DockerConfig::of_kind(kind, value.expose()) {
+                Some(Ok(config)) => {
+                    self.set_registries(id, config, Some(value), window, cx);
+                    return;
+                }
+                _ => {
+                    if let Some(row) = self.row_mut(id) {
+                        row.fallback = true;
+                    }
+                }
+            }
+        }
+        if value.text().is_some() {
+            self.set_text_value(id, Some(value), window, cx);
+        } else if let Some(row) = self.row_mut(id) {
+            row.value = ValueState::Binary { len: value.len() };
+        }
+    }
+
+    /// Puts a registry form on row `id`: over the loaded `baseline`, or an
+    /// empty one that replaces the value.
+    fn set_registries(
+        &mut self,
+        id: usize,
+        config: DockerConfig,
+        baseline: Option<SecretBytes>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (form, subscriptions) = RegistryForm::new(config, baseline, window, cx);
+        self._subscriptions.extend(subscriptions);
+        if let Some(row) = self.row_mut(id) {
+            row.value = ValueState::Registries(form);
+            row.fallback = false;
+        }
+        cx.notify();
+    }
+
+    /// Starts a new value on row `id` without loading the current one:
+    /// registries for a docker config key, text for any other.
+    fn replace_value(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self
+            .rows
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| self.docker_kind(&row.key(cx)));
+        match kind {
+            Some(kind) => {
+                let config = DockerConfig::empty(kind == TypedKind::DockerCfg);
+                self.set_registries(id, config, None, window, cx);
+            }
+            None => self.set_text_value(id, None, window, cx),
+        }
+    }
+
+    fn registries_mut(&mut self, id: usize) -> Option<&mut RegistryForm> {
+        match &mut self.row_mut(id)?.value {
+            ValueState::Registries(form) => Some(form),
+            _ => None,
+        }
+    }
+
+    pub(super) fn add_registry(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let subscriptions = self
+            .registries_mut(id)
+            .map(|form| form.add(window, cx))
+            .unwrap_or_default();
+        self._subscriptions.extend(subscriptions);
+        cx.notify();
+    }
+
+    pub(super) fn remove_registry(&mut self, id: usize, registry: usize, cx: &mut Context<Self>) {
+        if let Some(form) = self.registries_mut(id) {
+            form.remove(registry);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn restore_registry(&mut self, id: usize, registry: usize, cx: &mut Context<Self>) {
+        if let Some(form) = self.registries_mut(id) {
+            form.restore(registry);
+        }
+        cx.notify();
+    }
+
+    /// Turns the registries of row `id` into JSON text, to edit what the
+    /// form does not show. The text shows every loaded password, so a
+    /// loaded form needs what loading a value needs.
+    fn registries_as_json(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        let ValueState::Registries(form) = &row.value else {
+            return;
+        };
+        if form.loaded() && !self.allows(SecretAction::LoadValue, cx) {
+            return;
+        }
+        let (text, baseline) = form.json(cx);
+        let key = row.final_key(cx);
+        let editor = self.new_value_editor(id, &key, text, window, cx);
+        editor.state.update(cx, |state, cx| state.focus(window, cx));
+        if let Some(row) = self.row_mut(id) {
+            row.value = ValueState::Text { editor, baseline };
+        }
         cx.notify();
     }
 
@@ -754,6 +912,7 @@ impl SecretEditor {
         if let Some(row) = self.row_mut(id) {
             row.value = ValueState::Untouched;
             row.rename = None;
+            row.fallback = false;
         }
         cx.notify();
     }
@@ -782,6 +941,12 @@ impl SecretEditor {
 
     fn build(&self, cx: &App) -> Result<Pending, String> {
         let changes: Vec<RowChange> = self.rows.iter().map(|row| row.change(cx)).collect();
+        if let Some(RowChange::Invalid(message)) = changes
+            .iter()
+            .find(|change| matches!(change, RowChange::Invalid(_)))
+        {
+            return Err(message.clone());
+        }
         let Some(form) = &self.create else {
             if self.immutable() {
                 return Err(t!("editor-secret-immutable-error"));
@@ -820,7 +985,7 @@ impl SecretEditor {
                         secrets::validate_key(&key)?;
                         patch.set(key, value);
                     }
-                    RowChange::None | RowChange::Remove(_) => {}
+                    RowChange::None | RowChange::Remove(_) | RowChange::Invalid(_) => {}
                 }
             }
             if patch.is_empty() {
@@ -1176,7 +1341,9 @@ impl SecretEditor {
             (Some((key, _)), _, RowChange::Rename { .. }) => {
                 (t!("editor-key-renamed", key = key), Tone::Info)
             }
-            (_, _, RowChange::Set(..)) => (t!("editor-key-changed"), Tone::Info),
+            (_, _, RowChange::Set(..) | RowChange::Invalid(_)) => {
+                (t!("editor-key-changed"), Tone::Info)
+            }
             (Some((_, size)), ValueState::Untouched, _) => (size_text(*size), Tone::Neutral),
             _ => (t!("editor-key-unchanged"), Tone::Neutral),
         };
@@ -1200,9 +1367,15 @@ impl SecretEditor {
             (None, None, _) => DataKeyBlock::new(("secret-key", id), div()),
         }
         .status(status, tone);
-        if let ValueState::Text { editor, .. } = &row.value {
-            block = block.kind(content_label(editor.kind));
+        match &row.value {
+            ValueState::Text { editor, .. } => block = block.kind(content_label(editor.kind)),
+            ValueState::Registries(_) => block = block.kind(t!("editor-registry-kind")),
+            _ => {}
         }
+        let docker = row
+            .existing
+            .as_ref()
+            .is_some_and(|(key, _)| self.docker_kind(key).is_some());
         if editable {
             let existing = row.existing.is_some();
             match &row.value {
@@ -1214,7 +1387,11 @@ impl SecretEditor {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Eye)
-                                .label(t!("editor-secret-load-value"))
+                                .label(if docker {
+                                    t!("editor-registry-load")
+                                } else {
+                                    t!("editor-secret-load-value")
+                                })
                                 .tooltip(if load_allowed {
                                     t!("editor-secret-load-value-tooltip")
                                 } else {
@@ -1232,9 +1409,13 @@ impl SecretEditor {
                                 .xsmall()
                                 .icon(IconName::Replace)
                                 .label(t!("editor-secret-replace"))
-                                .tooltip(t!("editor-secret-replace-tooltip"))
+                                .tooltip(if docker {
+                                    t!("editor-registry-replace-tooltip")
+                                } else {
+                                    t!("editor-secret-replace-tooltip")
+                                })
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.set_text_value(id, None, window, cx)
+                                    this.replace_value(id, window, cx)
                                 })),
                         );
                 }
@@ -1249,6 +1430,25 @@ impl SecretEditor {
                             .disabled(!editor.can_format())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.format_value(id, window, cx)
+                            })),
+                    );
+                }
+                ValueState::Registries(form) => {
+                    let allowed = !form.loaded() || self.allows(SecretAction::LoadValue, cx);
+                    block = block.action(
+                        Button::new(("secret-registries-json", id))
+                            .ghost()
+                            .xsmall()
+                            .icon(Lucide::Braces)
+                            .label(t!("editor-registry-as-json"))
+                            .tooltip(if allowed {
+                                t!("editor-registry-as-json-tooltip")
+                            } else {
+                                t!("editor-secret-hidden")
+                            })
+                            .disabled(!allowed)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.registries_as_json(id, window, cx)
                             })),
                     );
                 }
@@ -1316,6 +1516,10 @@ impl SecretEditor {
         block = match &row.value {
             ValueState::Untouched | ValueState::Removed => block,
             ValueState::Text { editor, .. } => block.body(editor.element(!editable, cx)),
+            ValueState::Registries(form) => {
+                let reveal = !form.loaded() || self.allows(SecretAction::LoadValue, cx);
+                block.body(form.render(id, editable, reveal, cx))
+            }
             ValueState::File { name, value } => block.body(note(t!(
                 "editor-secret-from-file",
                 name = name,
@@ -1329,13 +1533,23 @@ impl SecretEditor {
         let name_problem = (!removed && (row.existing.is_none() || row.rename.is_some()))
             .then(|| secrets::validate_key(&key).err().map(|e| e.to_string()))
             .flatten()
-            .or_else(|| twice.then(|| t!("editor-key-twice", key = &key)));
-        match (&row.value, name_problem) {
-            (_, Some(problem)) => block.problem(Some(problem), Tone::Danger),
-            (ValueState::Text { editor, .. }, None) => {
-                block.problem(editor.warning(), Tone::Warning)
-            }
-            _ => block,
+            .or_else(|| twice.then(|| t!("editor-key-twice", key = &key)))
+            .or(match change {
+                RowChange::Invalid(message) => Some(message),
+                _ => None,
+            });
+        let fallback = row.fallback.then(|| t!("editor-registry-fallback"));
+        let warning = match &row.value {
+            ValueState::Text { editor, .. } => editor.warning(),
+            _ => None,
+        };
+        let warning = match (fallback, warning) {
+            (Some(note), Some(warning)) => Some(format!("{note} {warning}")),
+            (note, warning) => note.or(warning),
+        };
+        match name_problem {
+            Some(problem) => block.problem(Some(problem), Tone::Danger),
+            None => block.problem(warning, Tone::Warning),
         }
         .into_any_element()
     }
@@ -1487,7 +1701,10 @@ fn file_picker(
         )
 }
 
-fn watch_input(input: &Entity<InputState>, cx: &mut Context<SecretEditor>) -> Subscription {
+pub(super) fn watch_input(
+    input: &Entity<InputState>,
+    cx: &mut Context<SecretEditor>,
+) -> Subscription {
     cx.subscribe(input, |_, _, event: &InputEvent, cx| {
         if matches!(event, InputEvent::Change) {
             cx.notify();
