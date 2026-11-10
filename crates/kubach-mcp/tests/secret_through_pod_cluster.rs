@@ -1,26 +1,30 @@
 //! A Secret through a pod against a real cluster (#190, #192), in a
 //! client-only session: the manifest's Secret reads are dangerous fields of
 //! the confirmation, the logs of the agent's own pod are confirmed, and
-//! kinds beyond the allowlist are refused. Ignored by default; run with
+//! kinds beyond the allowlist wait for the user's answer about custom
+//! resources (#15) and are refused when the user says no. Ignored by default;
+//! run with
 //!
 //! ```sh
 //! KUBACH_TEST_CONTEXT=minikube KUBACH_TEST_NAMESPACE=kubach-test-190 \
 //!     cargo test -p kubach-mcp --test secret_through_pod_cluster -- --ignored
 //! ```
 //!
-//! The namespace must exist and the node must have `nginx:1.27-alpine`; the
-//! test's Secret and Job are deleted at the end. Values are fake.
+//! The node must have `nginx:1.27-alpine`. The test creates the namespace
+//! when it is missing and then deletes it at the end, passed or failed; in a
+//! namespace that exists only the test's Secret and Job are deleted. Values
+//! are fake.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
 use kubach_mcp::{
-    McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session, SessionMode,
-    SessionSpec,
+    Access, McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session,
+    SessionMode, SessionSpec,
 };
-use kube::api::{Api, DeleteParams, ListParams};
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config, ResourceExt};
 use serde_json::{Map, Value, json};
@@ -53,9 +57,46 @@ fn args(value: Value) -> Map<String, Value> {
 #[ignore = "needs a cluster (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
 async fn a_secret_through_a_pod_is_shown_and_confirmed() {
     let (base, context, namespace) = config().await;
+    let user = Client::try_from(base.clone()).unwrap();
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    let created = namespaces.get_opt(&namespace).await.unwrap().is_none();
+    if created {
+        let new: Namespace =
+            serde_json::from_value(json!({"metadata": {"name": namespace}})).unwrap();
+        namespaces
+            .create(&PostParams::default(), &new)
+            .await
+            .unwrap();
+    }
+
+    // In a task of its own, so a failed check still cleans up.
+    let result = tokio::spawn(check(base, context, namespace.clone())).await;
+
+    let _ = Api::<Job>::namespaced(user.clone(), &namespace)
+        .delete(JOB, &DeleteParams::background())
+        .await;
+    let _ = Api::<Secret>::namespaced(user.clone(), &namespace)
+        .delete(SECRET, &DeleteParams::default())
+        .await;
+    if created {
+        let _ = namespaces
+            .delete(&namespace, &DeleteParams::default())
+            .await;
+    }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error.into_panic());
+    }
+}
+
+async fn check(base: Config, context: String, namespace: String) {
+    // Everything but custom resources: a kind beyond the allowlist is asked
+    // for, as on a context where the user has not opened them.
     let policy = SecurityPolicy {
         temporary_objects: false,
-        ..SecurityPolicy::with_minimum(kubach_mcp::Access::ALL)
+        ..SecurityPolicy::with_minimum(Access {
+            crds: false,
+            ..Access::ALL
+        })
     };
     let spec = SessionSpec {
         context,
@@ -69,7 +110,6 @@ async fn a_secret_through_a_pod_is_shown_and_confirmed() {
     assert_eq!(session.mode_in(&namespace), SessionMode::ClientOnly);
     let user = Client::try_from(base.clone()).unwrap();
     let secrets: Api<Secret> = Api::namespaced(user.clone(), &namespace);
-    let jobs: Api<Job> = Api::namespaced(user.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(user.clone(), &namespace);
     let secret: Secret = serde_json::from_value(json!({
         "metadata": {"name": SECRET},
@@ -159,18 +199,50 @@ async fn a_secret_through_a_pod_is_shown_and_confirmed() {
     assert!(!read.is_error, "{}", read.text);
     assert!(read.text.contains("leaked"), "{}", read.text);
 
-    // Kinds beyond the allowlist are refused (Lease is served everywhere).
-    let lease = server
+    // Kinds beyond the allowlist need access to custom resources (Lease is
+    // served everywhere). Refused: the agent is told so, and nothing is read.
+    let lease = McpServer::new(session.clone(), denying.clone(), None)
         .call(
             "test-agent",
             "list_resources",
             args(json!({"kind": "Lease"})),
         )
         .await;
-    assert!(lease.is_error);
-    assert!(lease.text.contains("Allow other kinds"), "{}", lease.text);
+    assert!(lease.is_error, "{}", lease.text);
+    assert!(
+        lease.text.contains("did not allow") && lease.text.contains("custom resources"),
+        "{}",
+        lease.text
+    );
+    let asked = denying.requests();
+    let asked: Vec<_> = asked
+        .iter()
+        .filter(|r| matches!(&r.kind, RequestKind::Access { raise, .. } if raise.crds))
+        .collect();
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0].tool, "list_resources");
 
-    let _ = jobs.delete(JOB, &DeleteParams::background()).await;
-    let _ = secrets.delete(SECRET, &DeleteParams::default()).await;
+    // The refusal holds for the session: no second question, whoever answers.
+    let again = server
+        .call(
+            "test-agent",
+            "list_resources",
+            args(json!({"kind": "Lease"})),
+        )
+        .await;
+    assert!(again.is_error, "{}", again.text);
+    assert!(
+        again.text.contains("custom resources") && again.text.contains("not asked again"),
+        "{}",
+        again.text
+    );
+    assert!(
+        !approving
+            .requests()
+            .iter()
+            .any(|r| matches!(r.kind, RequestKind::Access { .. })),
+        "the approving confirmer was asked about access"
+    );
+
     session.close().await.unwrap();
 }
