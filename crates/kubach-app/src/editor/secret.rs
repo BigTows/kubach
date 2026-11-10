@@ -300,9 +300,18 @@ impl SecretEditor {
     ) -> Self {
         let create =
             matches!(target, SecretTarget::New { .. }).then(|| CreateForm::new(window, cx));
-        let mut subscriptions = vec![cx.observe(&cluster, |this, _, cx| {
+        let mut subscriptions = vec![cx.observe_in(&cluster, window, |this, _, window, cx| {
             if !this.allows(SecretAction::LoadValue, cx) {
                 this.unload_values(cx);
+                // Edited registries stay; their loaded passwords are
+                // masked again and can't be shown.
+                for row in &this.rows {
+                    if let ValueState::Registries(form) = &row.value
+                        && form.loaded()
+                    {
+                        form.mask(window, cx);
+                    }
+                }
             }
             cx.notify();
         })];
@@ -774,7 +783,8 @@ impl SecretEditor {
     }
 
     /// Turns the registries of row `id` into JSON text, to edit what the
-    /// form does not show.
+    /// form does not show. The text shows every loaded password, so a
+    /// loaded form needs what loading a value needs.
     fn registries_as_json(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.rows.iter().find(|row| row.id == id) else {
             return;
@@ -782,6 +792,9 @@ impl SecretEditor {
         let ValueState::Registries(form) = &row.value else {
             return;
         };
+        if form.loaded() && !self.allows(SecretAction::LoadValue, cx) {
+            return;
+        }
         let (text, baseline) = form.json(cx);
         let key = row.final_key(cx);
         let editor = self.new_value_editor(id, &key, text, window, cx);
@@ -1420,14 +1433,20 @@ impl SecretEditor {
                             })),
                     );
                 }
-                ValueState::Registries(_) => {
+                ValueState::Registries(form) => {
+                    let allowed = !form.loaded() || self.allows(SecretAction::LoadValue, cx);
                     block = block.action(
                         Button::new(("secret-registries-json", id))
                             .ghost()
                             .xsmall()
                             .icon(Lucide::Braces)
                             .label(t!("editor-registry-as-json"))
-                            .tooltip(t!("editor-registry-as-json-tooltip"))
+                            .tooltip(if allowed {
+                                t!("editor-registry-as-json-tooltip")
+                            } else {
+                                t!("editor-secret-hidden")
+                            })
+                            .disabled(!allowed)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.registries_as_json(id, window, cx)
                             })),
@@ -1497,7 +1516,10 @@ impl SecretEditor {
         block = match &row.value {
             ValueState::Untouched | ValueState::Removed => block,
             ValueState::Text { editor, .. } => block.body(editor.element(!editable, cx)),
-            ValueState::Registries(form) => block.body(form.render(id, editable, cx)),
+            ValueState::Registries(form) => {
+                let reveal = !form.loaded() || self.allows(SecretAction::LoadValue, cx);
+                block.body(form.render(id, editable, reveal, cx))
+            }
             ValueState::File { name, value } => block.body(note(t!(
                 "editor-secret-from-file",
                 name = name,

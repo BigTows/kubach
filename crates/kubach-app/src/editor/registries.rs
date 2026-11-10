@@ -10,6 +10,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kubach_core::secrets::{DockerConfig, Registry, RegistryEdit, SecretBytes};
 use kubach_core::validation::ValidationError;
@@ -156,6 +157,14 @@ impl RegistryForm {
         subscriptions
     }
 
+    /// Masks every password again.
+    pub fn mask(&self, window: &mut Window, cx: &mut App) {
+        for row in &self.rows {
+            row.password
+                .update(cx, |input, cx| input.set_masked(true, window, cx));
+        }
+    }
+
     /// Removes registry `id`: a loaded one is marked (and can be kept
     /// again), an added one is dropped.
     pub fn remove(&mut self, id: usize) {
@@ -211,11 +220,13 @@ impl RegistryForm {
         (text, self.baseline.clone())
     }
 
-    /// The registries of key row `key_id`.
+    /// The registries of key row `key_id`. Passwords can be unmasked only
+    /// with `reveal`.
     pub fn render(
         &self,
         key_id: usize,
         editable: bool,
+        reveal: bool,
         cx: &mut Context<SecretEditor>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -303,7 +314,7 @@ impl RegistryForm {
                             t!("editor-field-password"),
                             Input::new(&row.password)
                                 .small()
-                                .mask_toggle()
+                                .when(reveal, |input| input.mask_toggle())
                                 .disabled(!editable),
                         )
                         .row(
