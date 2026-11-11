@@ -5,12 +5,18 @@
 //! KUBACH_TEST_CONTEXT=minikube cargo test -p kubach-mcp --test nodes_cluster -- --ignored
 //! ```
 //!
+//! With `KUBACH_TEST_PROMETHEUS=namespace/service:port` (as in the settings)
+//! `top_nodes` may also answer from that Prometheus where the cluster has no
+//! metrics-server (#112).
+//!
 //! Read-only: nothing is created in the cluster.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Node;
+use kubach_core::metrics::prometheus::Endpoint;
+use kubach_core::metrics::prometheus::source::Plan;
 use kubach_mcp::{
     McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session, SessionSpec,
 };
@@ -58,6 +64,13 @@ async fn the_agent_reads_nodes_after_the_user_allows_them() {
     let session = Session::start(&base, &spec, &policy).await.unwrap();
     let confirmer = Arc::new(ScriptedConfirmer::approving());
     let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    let prometheus = std::env::var("KUBACH_TEST_PROMETHEUS")
+        .ok()
+        .filter(|address| !address.is_empty());
+    if let Some(address) = &prometheus {
+        let endpoint = Endpoint::parse(address).unwrap();
+        server.set_prometheus(Arc::new(move |_: &str| Plan::Use(endpoint.clone())));
+    }
     let node = Api::<Node>::all(Client::try_from(base.clone()).unwrap())
         .list(&ListParams::default())
         .await
@@ -108,11 +121,25 @@ async fn the_agent_reads_nodes_after_the_user_allows_them() {
     ] {
         assert!(described.text.contains(part), "{part}: {}", described.text);
     }
-    // metrics-server is an addon: either usage or a clear answer.
-    assert!(
-        (!top.is_error && top.text.contains(&node))
-            || top.text.contains("metrics-server is not installed"),
-        "{}",
-        top.text
-    );
+    println!("{}", top.text);
+    // metrics-server is an addon: either usage or a clear answer. With a
+    // Prometheus for the context there is always usage: from metrics-server,
+    // else from that Prometheus, which the answer names (#112).
+    match &prometheus {
+        Some(address) => {
+            assert!(!top.is_error && top.text.contains(&node), "{}", top.text);
+            assert!(
+                !top.text.contains("no metrics-server")
+                    || top.text.contains(&format!("from Prometheus {address}")),
+                "{}",
+                top.text
+            );
+        }
+        None => assert!(
+            (!top.is_error && top.text.contains(&node))
+                || top.text.contains("metrics-server is not installed"),
+            "{}",
+            top.text
+        ),
+    }
 }

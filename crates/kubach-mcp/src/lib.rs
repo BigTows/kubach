@@ -72,6 +72,7 @@ pub use helm_tools::{
     USER_IDENTITY, VaultKubeconfig,
 };
 pub use identity::{Identity, sweep_expired};
+pub use node_tools::PrometheusPlan;
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
 pub use remember::{Remembered, RememberedAction, rememberable};
 pub use scope::{NamespaceHint, NamespaceSource, SessionMode, SessionScope, SessionSpec};

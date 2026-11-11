@@ -166,6 +166,9 @@ pub(crate) struct Ctx<'a> {
     pub accesses: std::sync::Mutex<Vec<AccessDecision>>,
     /// The user's `helm`, for the Helm tools (#418).
     pub helm: Option<std::sync::Arc<crate::helm_tools::HelmEnv>>,
+    /// The context's Prometheus, for `top_nodes` without metrics-server
+    /// (#112).
+    pub prometheus: Option<crate::node_tools::PrometheusPlan>,
     /// Live phases of a long call (helm), for MCP progress notifications.
     pub progress: Option<Progress>,
     /// Fires when the agent cancels the call or goes away: waits stop then

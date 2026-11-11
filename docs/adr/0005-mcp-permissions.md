@@ -1520,7 +1520,7 @@ patch `spec.ephemeralContainers`), ждёт, пока он запустится,
 - **Инструменты:** `list_nodes` (таблица плагина нод и выключенные conditions), `describe_node`
   (conditions с reason и message, capacity/allocatable, запросы и лимиты подов ноды против
   allocatable, taints, события ноды, вытеснения с неё), `top_nodes` (CPU и память из
-  metrics-server и % от allocatable). Запрос политики — `Request::Nodes`, без namespace и без
+  metrics-server и % от allocatable; без metrics-server — из Prometheus контекста, ADR 0009). Запрос политики — `Request::Nodes`, без namespace и без
   прав на namespace.
 - **От учётных данных пользователя.** Временный ServiceAccount по-прежнему получает только Role
   в namespace, ClusterRole не создаётся: в кластере не остаётся кластерных объектов сессии, даже

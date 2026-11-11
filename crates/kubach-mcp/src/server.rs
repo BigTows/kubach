@@ -23,6 +23,7 @@ use crate::event_tools::MAX_SINCE_SECONDS;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
+use crate::node_tools::PrometheusPlan;
 use crate::rules::writes_secrets;
 use crate::session::Session;
 use crate::settings::Profile;
@@ -42,6 +43,9 @@ struct Inner {
     audit: Option<Arc<AuditLog>>,
     /// The user's `helm` (#418); without it the Helm tools are not offered.
     helm: std::sync::RwLock<Option<Arc<HelmEnv>>>,
+    /// The Prometheus the user chose for a context (#112); without it
+    /// `top_nodes` needs metrics-server.
+    prometheus: std::sync::RwLock<Option<PrometheusPlan>>,
 }
 
 /// Outcome of one call, as the agent sees it.
@@ -71,6 +75,7 @@ impl McpServer {
                 confirmer,
                 audit,
                 helm: std::sync::RwLock::new(None),
+                prometheus: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -78,6 +83,13 @@ impl McpServer {
     /// Offers the Helm tools with the user's `helm` (#418).
     pub fn set_helm(&self, env: HelmEnv) {
         *sync::write(&self.inner.helm) = Some(Arc::new(env));
+    }
+
+    /// Lets `top_nodes` answer from the context's Prometheus where there is
+    /// no metrics-server (#112): `plan` reads the user's choice for a
+    /// context (ADR 0009).
+    pub fn set_prometheus(&self, plan: PrometheusPlan) {
+        *sync::write(&self.inner.prometheus) = Some(plan);
     }
 
     /// Runs the session's port-forwards in `manager`: the app's, so they
@@ -193,6 +205,7 @@ impl McpServer {
             decisions: std::sync::Mutex::new(Vec::new()),
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
+            prometheus: sync::read(&self.inner.prometheus).clone(),
             progress: progress.clone(),
             cancel,
             namespace: std::sync::Mutex::new(None),
@@ -896,7 +909,8 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "top_nodes",
             description: "CPU and memory used per node, and as % of allocatable, like kubectl \
-                          top nodes (needs metrics-server).",
+                          top nodes. From metrics-server; without it, from the Prometheus set \
+                          for the context in Kubach.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,

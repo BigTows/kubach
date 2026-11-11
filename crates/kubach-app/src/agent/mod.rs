@@ -64,6 +64,22 @@ pub(crate) fn helm_env(settings: &settings::Settings, in_file: bool) -> kubach_m
     }
 }
 
+/// The Prometheus of `context` for the agent's `top_nodes` where there is no
+/// metrics-server (#112): the choice of Settings → Clusters → Prometheus
+/// and the remembered search (ADR 0009), read from the files on every call,
+/// so it works the same in `kubach mcp` and in the app.
+pub(crate) fn prometheus_plan(context: &str) -> kubach_core::metrics::prometheus::source::Plan {
+    let settings = settings::default_path()
+        .map(|path| settings::load(&path).settings)
+        .unwrap_or_default();
+    let state = kubach_core::state::default_path().map(|path| kubach_core::state::load(&path));
+    kubach_core::metrics::prometheus::source::Plan::of(
+        &settings.clusters.prometheus_source(context),
+        settings.clusters.prometheus(context),
+        state.as_ref().and_then(|state| state.prometheus(context)),
+    )
+}
+
 /// `context` of the vault for a helm call the user allows under their
 /// credentials (#113): that one context only, written to a file just for
 /// that call, in the folder of the local terminal's temporary kubeconfigs
@@ -1199,6 +1215,7 @@ impl AgentState {
                             this.audit.clone(),
                         );
                         server.set_helm(helm);
+                        server.set_prometheus(Arc::new(prometheus_plan));
                         // The agent's forwards show on the "Port
                         // forwards" screen (#17).
                         if let Some(forwards) = crate::dock::forwards(cx) {
@@ -1310,6 +1327,7 @@ impl AgentState {
                     .await
                     .map_err(|error| error.to_string())?;
                 let server = McpServer::new(session.clone(), confirmer.clone(), audit);
+                server.set_prometheus(Arc::new(prometheus_plan));
                 if let Some(helm) = helm {
                     server.set_helm(helm);
                 }
