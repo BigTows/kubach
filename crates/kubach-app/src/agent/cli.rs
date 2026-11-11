@@ -532,6 +532,7 @@ async fn serve(options: Options) -> Result<(), String> {
         BridgeConfirmer::new(Box::new(move || locate_dir.as_deref().and_then(locate_app)));
     let server = McpServer::new(session.clone(), Arc::new(confirmer), audit);
     server.set_helm(super::helm_env(&settings, true));
+    server.set_prometheus(Arc::new(super::prometheus_plan));
     if plan.grant_read {
         if let Err(error) = server.grant_read_at_launch().await {
             let _ = session.close().await;
@@ -703,6 +704,7 @@ impl StdioChooser {
             self.audit.clone(),
         );
         server.set_helm(super::helm_env(&self.settings, true));
+        server.set_prometheus(Arc::new(super::prometheus_plan));
         eprintln!(
             "kubach mcp: session {} on {name} (access: {}), chosen by the agent and \
              approved in Kubach",
