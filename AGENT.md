@@ -12,7 +12,7 @@ Rust workspace, edition 2024, крейты лежат в `crates/*`.
 | `kubach-core` | Доменная логика k8s (будет на `kube-rs`) | **Без UI-зависимостей**: никакого GPUI и `gpui-kit` |
 | `kubach-ui` | Дизайн-система: тема `themes/kubach.json` (Kubach Dark / Light), компоненты, галерея | Зависит от `gpui-kit` и `kubach-i18n` (встроенные тексты компонентов); не знает про k8s и `kubach-core` |
 | `kubach-mcp` | MCP-сервер для ИИ-агентов (`rmcp`, `axum`): policy, сессии, идентичность, аудит ([ADR 0005](docs/adr/0005-mcp-permissions.md)) | Зависит только от `kubach-core`; без GPUI и `gpui-kit`; в API ходит своим клиентом сессии |
-| `kubach-app` | Бинарь `kubach` на GPUI (`gpui-kit 0.8`) | Склеивает `core`, `ui` и `mcp`; здесь экраны и wiring |
+| `kubach-app` | Бинарь `kubach` на GPUI (`gpui-kit 0.9`) | Склеивает `core`, `ui` и `mcp`; здесь экраны и wiring |
 
 Зависимости: `app → mcp → core`, `app → core`, `app → ui`; `core` и `ui` не зависят
 друг от друга, `mcp` не зависит от `ui`.
