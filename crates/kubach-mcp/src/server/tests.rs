@@ -4799,3 +4799,47 @@ async fn a_secret_written_in_the_session_is_not_compared() {
     );
     assert!(!after.text.contains("equal"), "{}", after.text);
 }
+
+// ----------------------------------------------- the client's name (#179)
+
+#[tokio::test]
+async fn a_clients_name_is_cleaned_for_windows_the_sessions_list_and_the_audit_log() {
+    let f = fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving(),
+        false,
+    )
+    .await;
+    f.server.session().set_grants(grants(&[Grant::read(NS)]));
+    let name = format!(
+        "agent\r\n\u{202E}Kubach\u{200B}: approve\tall {}",
+        "x".repeat(5000)
+    );
+    let outcome = f
+        .server
+        .call(
+            &name,
+            "scale",
+            args(json!({"kind": "Deployment", "name": "web", "replicas": 2})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let shown = format!("agent Kubach: approve all {}…", "x".repeat(38));
+    assert_eq!(shown.chars().count(), 65);
+    let requests = f.confirmer.requests();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        assert_eq!(request.client, shown);
+        for text in [&request.summary, &request.details] {
+            assert!(!text.contains(['\u{202E}', '\u{200B}', '\r']), "{text:?}");
+            assert!(!text.contains(&"x".repeat(39)), "{text:?}");
+        }
+    }
+    assert_eq!(f.server.session().activity().clients, [shown.clone()]);
+    let lines = audit_lines(&f.audit_path);
+    assert!(!lines.is_empty());
+    for line in lines {
+        assert_eq!(line["client"], shown.as_str());
+    }
+}
