@@ -169,6 +169,9 @@ pub(crate) struct Ctx<'a> {
     /// The context's Prometheus, for `top_nodes` without metrics-server
     /// (#112).
     pub prometheus: Option<crate::node_tools::PrometheusPlan>,
+    /// Where node shell pods go and what they run, for `node_host_read`
+    /// (#106).
+    pub node_shell: Option<crate::node_host::NodeShellPrefs>,
     /// Live phases of a long call (helm), for MCP progress notifications.
     pub progress: Option<Progress>,
     /// Fires when the agent cancels the call or goes away: waits stop then
@@ -1021,6 +1024,7 @@ pub(crate) async fn run(
         "cordon_node" => crate::node_maintenance::cordon_node(ctx, args, true).await,
         "uncordon_node" => crate::node_maintenance::cordon_node(ctx, args, false).await,
         "drain_node" => crate::node_maintenance::drain_node(ctx, args).await,
+        "node_host_read" => crate::node_host::node_host_read(ctx, args).await,
         "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
         "wait_for_condition" => crate::wait_tools::wait_for_condition(ctx, args).await,
         "helm_search_charts" => helm_tools::search(ctx, args).await,
@@ -2723,8 +2727,21 @@ pub(crate) async fn run_command(
     timeout: u64,
 ) -> Result<String, ToolError> {
     let client = ctx.session.client_in(namespace)?;
+    run_command_as(&client, namespace, pod, container, command, timeout).await
+}
+
+/// [`run_command`] with `client`: the session's identity, or the user's
+/// for a command on a node's host (#106).
+pub(crate) async fn run_command_as(
+    client: &Client,
+    namespace: &str,
+    pod: &str,
+    container: Option<&str>,
+    command: &[String],
+    timeout: u64,
+) -> Result<String, ToolError> {
     let run = exec_capture(
-        &client,
+        client,
         namespace,
         pod,
         container,

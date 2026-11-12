@@ -80,6 +80,8 @@ settings-session-no-grants = 尚未授予权限。
 settings-session-remembered = 无需询问：{ $list }
 # $action：agent-action-*，$namespace：位置。
 settings-session-remembered-item = { $namespace } 中的{ $action }
+# $command：确切的命令行，$node：节点。
+settings-session-remembered-command = 节点 { $node } 上的 { $command }
 settings-ask-again = 重新询问
 settings-boundary-client-only = 仅在 Kubach 中限制
 settings-boundary-impersonation = 在 Kubach 和 API 服务器中限制（impersonation）

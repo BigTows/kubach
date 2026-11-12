@@ -160,6 +160,7 @@ fn title(request: &ConfirmationRequest) -> String {
             grant: Grant::Modify { .. },
         } => t!("agent-title-modify"),
         RequestKind::Exec { .. } => t!("agent-title-exec"),
+        RequestKind::NodeCommand { .. } => t!("agent-title-node-command"),
         RequestKind::PortForward { .. } => t!("agent-title-port-forward"),
         RequestKind::Access { .. } => t!("agent-title-access"),
         RequestKind::Helm { helm } => match helm.action {
@@ -541,6 +542,7 @@ fn details_are_a_diff(request: &ConfirmationRequest) -> bool {
     !matches!(
         request.kind,
         RequestKind::Exec { .. }
+            | RequestKind::NodeCommand { .. }
             | RequestKind::Batch { .. }
             | RequestKind::Grant { .. }
             | RequestKind::Access { .. }
@@ -845,13 +847,29 @@ impl Render for ConfirmView {
 
         let details = match &request.kind {
             // Exec is a command, not a diff: no colors, every argument apart.
-            RequestKind::Exec { command } => Some(command_block(command, cx).into_any_element()),
+            RequestKind::Exec { command } | RequestKind::NodeCommand { command, .. } => {
+                Some(command_block(command, cx).into_any_element())
+            }
             RequestKind::Batch { batch } => Some(batch_block(batch, cx).into_any_element()),
             _ => self
                 .details
                 .as_ref()
                 .map(|diff| diff.render("confirm-details", px(280.), cx)),
         };
+        // A command on a node's host (#106): the node instead of a
+        // namespace, and what running it means.
+        let node = match &request.kind {
+            RequestKind::NodeCommand { node, .. } => Some(node.clone()),
+            _ => None,
+        };
+        let on_host = node.is_some().then(|| {
+            warning_block(
+                t!("agent-node-command-title"),
+                vec![t!("agent-node-command-warning")],
+                theme.warning,
+                cx,
+            )
+        });
         // Kubach cut the diff (#137): said right above it, never silently.
         let diff_cut = helm.and_then(|helm| helm.diff_cut.as_ref()).map(|cut| {
             let (title, lines) = cut_lines(cut);
@@ -993,11 +1011,15 @@ impl Render for ConfirmView {
         let remember = remember_offer.is_some() && self.remember;
         let remember_tick = remember_offer.map(|offer| {
             Checkbox::new("confirm-remember")
-                .label(t!(
-                    "agent-remember",
-                    action = super::remembered_action_label(offer.action),
-                    namespace = offer.namespace.as_str()
-                ))
+                .label(match &offer.exact {
+                    // Only this exact command on this node (#106).
+                    Some(exact) => t!("agent-remember-node-command", node = exact.node.as_str()),
+                    None => t!(
+                        "agent-remember",
+                        action = super::remembered_action_label(offer.action),
+                        namespace = offer.namespace.as_str()
+                    ),
+                })
                 .checked(remember)
                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
                     this.remember = *checked;
@@ -1089,12 +1111,17 @@ impl Render for ConfirmView {
                                     cx,
                                 ))
                             })
-                            .child(field(
-                                t!("agent-field-namespace"),
-                                namespace,
-                                label_width,
-                                cx,
-                            ))
+                            .when(node.is_none(), |this| {
+                                this.child(field(
+                                    t!("agent-field-namespace"),
+                                    namespace,
+                                    label_width,
+                                    cx,
+                                ))
+                            })
+                            .when_some(node, |this, node| {
+                                this.child(field(t!("agent-field-node"), node, label_width, cx))
+                            })
                             .when_some(grant.as_ref(), |this, grant| {
                                 this.child(field(
                                     t!("agent-field-right"),
@@ -1291,6 +1318,7 @@ impl Render for ConfirmView {
                     .children(as_user_tick)
                     .children(dangerous)
                     .children(acknowledge)
+                    .children(on_host)
                     .children(diff_cut)
                     .children(details),
             )

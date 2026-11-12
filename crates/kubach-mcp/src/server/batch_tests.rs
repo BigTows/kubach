@@ -1054,6 +1054,7 @@ fn remembered(action: RememberedAction, namespace: &str) -> Remembered {
     Remembered {
         action,
         namespace: namespace.to_owned(),
+        exact: None,
     }
 }
 

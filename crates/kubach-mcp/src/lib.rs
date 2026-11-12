@@ -48,6 +48,7 @@ mod event_tools;
 mod fields;
 mod helm_preview;
 mod log_level;
+mod node_host;
 mod node_maintenance;
 mod node_tools;
 mod rollout_tools;
@@ -72,9 +73,10 @@ pub use helm_tools::{
     USER_IDENTITY, VaultKubeconfig,
 };
 pub use identity::{Identity, sweep_expired};
+pub use node_host::{NodeShellPod, NodeShellPrefs};
 pub use node_tools::PrometheusPlan;
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
-pub use remember::{Remembered, RememberedAction, rememberable};
+pub use remember::{ExactCommand, Remembered, RememberedAction, rememberable};
 pub use scope::{NamespaceHint, NamespaceSource, SessionMode, SessionScope, SessionSpec};
 pub use secret_write::{
     KeySize, SecretInput, SecretOp, SecretRequest, SecretSource, SecretUser, check_input,

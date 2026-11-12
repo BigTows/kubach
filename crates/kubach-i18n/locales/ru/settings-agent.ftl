@@ -85,6 +85,8 @@ settings-session-no-grants = Права пока не выданы.
 settings-session-remembered = Без вопросов: { $list }
 # $action: agent-action-*, $namespace: где.
 settings-session-remembered-item = { $action } в { $namespace }
+# $command: точная команда, $node: нода.
+settings-session-remembered-command = { $command } на ноде { $node }
 settings-ask-again = Снова спрашивать
 settings-boundary-client-only = ограничения только в Kubach
 settings-boundary-impersonation = ограничения в Kubach и API-сервере (impersonation)

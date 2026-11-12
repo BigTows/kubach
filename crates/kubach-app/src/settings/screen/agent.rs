@@ -856,12 +856,18 @@ fn session_row(
         let list = row
             .remembered
             .iter()
-            .map(|r| {
-                t!(
+            .map(|r| match &r.exact {
+                // One exact command on a node's host (#106).
+                Some(exact) => t!(
+                    "settings-session-remembered-command",
+                    command = exact.line(),
+                    node = exact.node.as_str()
+                ),
+                None => t!(
                     "settings-session-remembered-item",
                     action = agent::remembered_action_label(r.action),
                     namespace = r.namespace.as_str()
-                )
+                ),
             })
             .collect::<Vec<_>>()
             .join(", ");
