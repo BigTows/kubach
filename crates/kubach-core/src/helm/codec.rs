@@ -18,11 +18,28 @@ use super::{ChartInfo, HelmError, Hook, HookRun, Release, ReleaseStatus, Sensiti
 
 const GZIP_MAGIC: [u8; 3] = [0x1f, 0x8b, 0x08];
 
+/// Largest release JSON a payload may unpack to; more is
+/// [`HelmError::TooLarge`]. Helm keeps a release in one Secret or ConfigMap,
+/// which Kubernetes caps at 1 MiB, and that holds `base64(gzip(json))`: at
+/// most ~768 KiB of gzip. Release JSON (manifests, values, chart files)
+/// compresses 5–20 times, so real releases unpack to a few MiB, rarely over
+/// ten; 64 MiB leaves several times that and keeps one payload (and the
+/// eight a listing decodes at once) from taking the memory gzip allows:
+/// about 1000 times its input.
+pub const MAX_RELEASE_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Decodes the `release` payload (the bytes after Kubernetes' own base64 of
 /// the Secret data, or the ConfigMap string). Like Helm, accepts payloads that
 /// are not gzipped.
 pub fn decode_release(payload: &[u8]) -> Result<Release, HelmError> {
-    release_from_json(&payload_json(payload)?)
+    decode_release_sized(payload).map(|(release, _)| release)
+}
+
+/// [`decode_release`] with the size of the unpacked JSON, for callers that
+/// keep many revisions in memory.
+pub(super) fn decode_release_sized(payload: &[u8]) -> Result<(Release, u64), HelmError> {
+    let json = payload_json(payload)?;
+    Ok((release_from_json(&json)?, json.len() as u64))
 }
 
 /// Parses release JSON as `helm upgrade --output json` prints it.
@@ -42,16 +59,26 @@ pub fn decode_chart(payload: &[u8]) -> Result<StoredChart, HelmError> {
     StoredChart::from_json(release.chart.unwrap_or_default())
 }
 
-/// The JSON inside a payload: un-base64 and, when gzipped, gunzip.
+/// The JSON inside a payload: un-base64 and, when gzipped, gunzip, up to
+/// [`MAX_RELEASE_JSON_BYTES`].
 fn payload_json(payload: &[u8]) -> Result<Vec<u8>, HelmError> {
+    payload_json_within(payload, MAX_RELEASE_JSON_BYTES)
+}
+
+fn payload_json_within(payload: &[u8], limit: u64) -> Result<Vec<u8>, HelmError> {
     let compressed = STANDARD.decode(payload.trim_ascii())?;
     if !compressed.starts_with(&GZIP_MAGIC) {
         return Ok(compressed);
     }
     let mut json = Vec::new();
+    // One byte past the limit tells "exactly the limit" from "more".
     GzDecoder::new(compressed.as_slice())
+        .take(limit.saturating_add(1))
         .read_to_end(&mut json)
         .map_err(HelmError::Gzip)?;
+    if json.len() as u64 > limit {
+        return Err(HelmError::TooLarge { limit });
+    }
     Ok(json)
 }
 
@@ -378,6 +405,47 @@ pub(crate) mod tests {
         assert!(matches!(
             decode_release(STANDARD.encode("{").as_bytes()),
             Err(HelmError::Json(_))
+        ));
+    }
+
+    fn gzipped(bytes: &[u8]) -> String {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        STANDARD.encode(encoder.finish().unwrap())
+    }
+
+    #[test]
+    fn unpacks_up_to_the_limit_and_no_further() {
+        let json = serde_json::to_vec(&release_json(1, "deployed", 1)).unwrap();
+        let payload = gzipped(&json);
+        let limit = json.len() as u64;
+        assert_eq!(
+            payload_json_within(payload.as_bytes(), limit).unwrap(),
+            json
+        );
+        assert!(matches!(
+            payload_json_within(payload.as_bytes(), limit - 1),
+            Err(HelmError::TooLarge { limit: l }) if l == limit - 1
+        ));
+    }
+
+    /// A small payload that unpacks past the limit is refused instead of
+    /// being read to the end.
+    #[test]
+    fn refuses_a_payload_that_unpacks_past_the_limit() {
+        let zeros = vec![0u8; (MAX_RELEASE_JSON_BYTES + 1) as usize];
+        let payload = gzipped(&zeros);
+        drop(zeros);
+        assert!(payload.len() < 256 * 1024, "{}", payload.len());
+        assert!(matches!(
+            decode_release(payload.as_bytes()),
+            Err(HelmError::TooLarge {
+                limit: MAX_RELEASE_JSON_BYTES
+            })
+        ));
+        assert!(matches!(
+            decode_chart(payload.as_bytes()),
+            Err(HelmError::TooLarge { .. })
         ));
     }
 

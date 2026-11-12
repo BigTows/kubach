@@ -58,6 +58,8 @@ pub enum HelmError {
     Base64(#[from] base64::DecodeError),
     #[error("release payload is not valid gzip: {0}")]
     Gzip(#[source] std::io::Error),
+    #[error("release payload unpacks to more than {limit} bytes")]
+    TooLarge { limit: u64 },
     #[error("release payload is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// Storage objects could not be watched or read (the watch retries).
