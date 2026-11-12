@@ -98,10 +98,13 @@ fn pod_plugin() -> Arc<dyn ResourcePlugin> {
     PluginRegistry::with_builtins().plugin_for("", "Pod")
 }
 
-fn build_rows(plugin: &dyn ResourcePlugin, objects: &[Arc<DynamicObject>]) -> Vec<ResourceRow> {
+fn build_rows(
+    plugin: &dyn ResourcePlugin,
+    objects: &[Arc<DynamicObject>],
+) -> Vec<Arc<ResourceRow>> {
     objects
         .iter()
-        .map(|object| rows::row(plugin, object))
+        .map(|object| Arc::new(rows::row(plugin, object)))
         .collect()
 }
 
@@ -148,7 +151,7 @@ fn perf_stand_rows_of_a_pod_list() {
     let rows = build_rows(plugin.as_ref(), &pods);
     let mut last_changed = rows.clone();
     if let Some(row) = last_changed.last_mut() {
-        row.key = "changed".into();
+        Arc::make_mut(row).key = "changed".into();
     }
     let mut probe = RowsProbe::new(rows::columns(plugin.as_ref()));
     probe.replace_rows(rows.clone());

@@ -42,7 +42,7 @@ use super::namespaces::NamespaceScope;
 use super::panel_width;
 use super::plugin_text;
 use super::prometheus_link::{PrometheusRegistry, PrometheusStatus};
-use super::rows;
+use super::rows::{self, RowBuilder, RowCache, RowInputs};
 use super::table_sort;
 use super::usage::{self, MetricsState, UsageFeed, UsageKind};
 use crate::cluster::{CatalogState, Cluster};
@@ -58,7 +58,8 @@ mod workload_pods;
 pub(super) use actions::{ObjectActions, Subject, Where};
 pub(super) use details::{DetailsEvent, DetailsTarget, OpenObject, ResourceDetails};
 
-/// How often ages in the table are recomputed when nothing else changes.
+/// How often the list looks at the clock when nothing else changes: for
+/// rows that turn at a moment, and the age of a list shown from disk.
 const AGE_REFRESH: Duration = Duration::from_secs(10);
 
 /// Where objects of a kind are listed.
@@ -137,6 +138,8 @@ struct KindView {
     bulk_actions: Vec<Action>,
     /// CPU / Memory columns, for Pods and Nodes.
     usage: Option<UsageFeed>,
+    /// The table rows, kept per object (#165).
+    row_cache: RowCache,
     /// Where the list is cached on disk (one key per namespace, or one for
     /// all); `None` for Secrets.
     list_keys: Option<Vec<ListKey>>,
@@ -171,7 +174,9 @@ impl KindView {
         hidden_column: Option<usize>,
         usage: Option<UsageFeed>,
     ) -> Self {
+        let builder = RowBuilder::new(plugin.clone(), hidden_column);
         Self {
+            row_cache: RowCache::new(builder, usage.is_some()),
             entry,
             scope,
             plugin,
@@ -200,19 +205,13 @@ impl KindView {
         })
     }
 
-    fn rows(&self, query: &str) -> Vec<ResourceRow> {
-        self.matching(query)
-            .map(|object| {
-                let mut row = rows::row(self.plugin.as_ref(), object);
-                if let Some(ix) = self.hidden_column.filter(|&ix| ix < row.cells.len()) {
-                    row.cells.remove(ix);
-                }
-                if let Some(feed) = &self.usage {
-                    row.cells.extend(usage::cells(&feed.state, object));
-                }
-                row
-            })
-            .collect()
+    /// What the rows are built from besides the objects, as of now.
+    /// The rows of the objects matching the search `query`: built for the
+    /// objects that changed since the last call, kept for the rest.
+    fn rows(&mut self, query: &str) -> Vec<Arc<ResourceRow>> {
+        let inputs = RowInputs::current(self.usage.as_ref().map(UsageFeed::view));
+        self.row_cache.update(&self.snapshot.objects, &inputs);
+        self.row_cache.rows(query)
     }
 
     /// Checked objects still in the cache, in table order.
@@ -357,7 +356,16 @@ impl ResourceBrowser {
             loop {
                 cx.background_executor().timer(AGE_REFRESH).await;
                 let refreshed = this.update(cx, |this, cx| {
-                    this.update_rows(cx);
+                    // Ages are drawn from their moment by the table; rows
+                    // are built again only for cells that turn with the
+                    // clock (a pod past its deletion deadline).
+                    let due = this
+                        .view
+                        .as_ref()
+                        .is_some_and(|view| view.row_cache.due(kubach_ui::unix_now()));
+                    if due {
+                        this.update_rows(cx);
+                    }
                     // "cached 5m ago" beside the count of a list from disk.
                     if this.view.as_ref().is_some_and(|view| view.cached.is_some()) {
                         cx.notify();
@@ -658,7 +666,7 @@ impl ResourceBrowser {
                 let updated = this.update(cx, |this, cx| {
                     if let Some(feed) = this.view.as_mut().and_then(|v| v.usage.as_mut()) {
                         let note = feed.note();
-                        feed.state = state;
+                        feed.set_state(state);
                         // The note beside the count ("metrics unavailable").
                         if feed.note() != note {
                             cx.notify();
@@ -721,18 +729,19 @@ impl ResourceBrowser {
         cx.notify();
     }
 
-    /// Rebuilds the table rows; redraws only if they changed, so the age
-    /// refresh and usage polls cost nothing while nothing visible changes
-    /// (#355). Callers that change more than the rows notify themselves.
+    /// Brings the table rows up to date; redraws only if they changed, so
+    /// usage polls cost nothing while nothing visible changes (#355).
+    /// Rows are built only for objects that changed (#165). Callers that
+    /// change more than the rows notify themselves.
     fn update_rows(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = &self.view else {
+        let query = self.query(cx);
+        let Some(view) = &mut self.view else {
             return;
         };
-        let query = self.query(cx);
-        let changed = match &view.table {
+        let changed = match view.table.clone() {
             Some(table) => {
                 let rows = view.rows(&query);
-                table.update(cx, |table, cx| table.set_rows(rows, cx))
+                table.update(cx, |table, cx| table.set_shared_rows(rows, cx))
             }
             None => false,
         };
@@ -820,7 +829,7 @@ impl ResourceBrowser {
                         .update(cx, |browser, cx| browser.select(Some(key), cx))
                         .ok();
                 });
-            table.set_rows(rows, cx);
+            table.set_shared_rows(rows, cx);
             table
         });
         let api = &view.entry.kind.api;

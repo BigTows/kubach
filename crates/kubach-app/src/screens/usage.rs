@@ -10,13 +10,22 @@ use kubach_core::ResourceKind;
 use kubach_core::metrics::prometheus::{Endpoint, Prometheus};
 use kubach_core::metrics::shared::{PollResult, PollScope, PollSubscription};
 use kubach_core::metrics::{
-    self, DEFAULT_POLL_INTERVAL, MetricsError, MetricsIndex, Polling, format_cpu, format_memory,
+    self, DEFAULT_POLL_INTERVAL, MetricsError, MetricsIndex, Polling, Usage, format_cpu,
+    format_memory,
 };
 use kubach_i18n::t;
 use kubach_ui::{ResourceCell, ResourceColumn};
 use kube::api::DynamicObject;
 
 use super::prometheus_link::{PrometheusStatus, doesnt_answer};
+
+/// The usage of a feed as rows are built from it.
+#[derive(Clone, Copy)]
+pub struct UsageView<'a> {
+    pub state: &'a MetricsState,
+    /// [`UsageFeed::revision`] of `state`.
+    pub revision: u64,
+}
 
 /// Kinds that get usage columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +103,10 @@ pub struct UsageFeed {
     pub kind: UsageKind,
     /// `None` while looking for Prometheus, or when there is no source.
     pub source: Option<UsageSource>,
-    pub state: MetricsState,
+    state: MetricsState,
+    /// Counts the changes of `state`: rows built from one revision need
+    /// their usage cells looked at again only for another.
+    revision: u64,
     /// Prometheus feeds: the server being polled.
     polling: Option<Endpoint>,
     /// Prometheus feeds: why there is no server to poll (it doesn't answer,
@@ -110,6 +122,7 @@ impl UsageFeed {
             kind,
             source: Some(UsageSource::MetricsServer),
             state: MetricsState::Loading,
+            revision: 0,
             polling: None,
             problem: None,
             _task: Some(task),
@@ -122,9 +135,32 @@ impl UsageFeed {
             kind,
             source: None,
             state: MetricsState::Loading,
+            revision: 0,
             polling: None,
             problem: None,
             _task: None,
+        }
+    }
+
+    pub fn state(&self) -> &MetricsState {
+        &self.state
+    }
+
+    /// The usage as of a new poll.
+    pub fn set_state(&mut self, state: MetricsState) {
+        self.state = state;
+        self.revision += 1;
+    }
+
+    /// Changes whenever the [`state`](Self::state) does.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn view(&self) -> UsageView<'_> {
+        UsageView {
+            state: &self.state,
+            revision: self.revision,
         }
     }
 
@@ -167,7 +203,7 @@ impl UsageFeed {
             Some(endpoint) => {
                 self.polling = Some(endpoint.clone());
                 self.source = Some(UsageSource::Prometheus);
-                self.state = MetricsState::Loading;
+                self.set_state(MetricsState::Loading);
                 self._task = None;
                 true
             }
@@ -175,11 +211,11 @@ impl UsageFeed {
                 self.polling = None;
                 self.source = None;
                 self._task = None;
-                self.state = if pending {
+                self.set_state(if pending {
                     MetricsState::Loading
                 } else {
                     MetricsState::Unavailable
-                };
+                });
                 false
             }
         }
@@ -254,10 +290,19 @@ pub fn columns() -> [ResourceColumn; 2] {
 }
 
 pub fn cells(state: &MetricsState, object: &DynamicObject) -> [ResourceCell; 2] {
-    let usage = match state {
+    usage_cells(usage_of(state, object))
+}
+
+/// The usage `state` has for `object`; `None` without a sample.
+pub fn usage_of(state: &MetricsState, object: &DynamicObject) -> Option<Usage> {
+    match state {
         MetricsState::Ready(index) => index.usage_of(object),
         _ => None,
-    };
+    }
+}
+
+/// The CPU and Memory cells of an object with `usage`.
+pub fn usage_cells(usage: Option<Usage>) -> [ResourceCell; 2] {
     match usage {
         Some(usage) => [
             ResourceCell::mono(format_cpu(usage.cpu)).sort_by(saturate(usage.cpu)),
@@ -307,7 +352,7 @@ mod tests {
         assert_eq!(feed.source, Some(UsageSource::MetricsServer));
         assert!(!matches!(feed.state, MetricsState::Unavailable));
         assert_eq!(feed.note().as_deref(), Some("metrics-server"));
-        feed.state = MetricsState::Unavailable;
+        feed.set_state(MetricsState::Unavailable);
         assert_eq!(feed.note().as_deref(), Some("metrics unavailable"));
     }
 
@@ -364,13 +409,13 @@ mod tests {
         // A server that answered the probe stops answering polls.
         assert!(feed.retarget(Some(&service("p")), false, None));
         let failed = Err(MetricsError::Unavailable("timeout".into()));
-        feed.state = MetricsState::from_result(failed);
+        feed.set_state(MetricsState::from_result(failed));
         assert_eq!(
             feed.note().as_deref(),
             Some("Prometheus at monitoring/p:web doesn't answer")
         );
         // It answers again.
-        feed.state = MetricsState::Ready(MetricsIndex::default());
+        feed.set_state(MetricsState::Ready(MetricsIndex::default()));
         assert_eq!(feed.note().as_deref(), Some("Prometheus"));
     }
 

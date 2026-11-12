@@ -1,15 +1,22 @@
 //! Converts plugin data (columns, cells, health) into `kubach-ui` table rows.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use gpui_kit::px;
+use kubach_core::metrics::Usage;
 use kubach_core::plugin::{
     Cell, Column, ColumnKind, ContainerBrief, ContainerHealth, ContainerRole, Health, HealthStatus,
     ResourcePlugin, not_ready_count,
 };
+use kubach_i18n::Locale;
 use kubach_ui::{
     ContainerCubeState, ResourceCell, ResourceColumn, ResourceRow, StatusCube, Tone,
-    container_tooltip,
+    container_tooltip, name_matches, unix_now,
 };
 use kube::api::DynamicObject;
+
+use super::usage::{self, UsageView};
 
 /// Longest health message shown in a table cell; longer ones (condition
 /// messages) are only shown in the details panel.
@@ -69,6 +76,323 @@ pub fn row(plugin: &dyn ResourcePlugin, object: &DynamicObject) -> ResourceRow {
         }
     });
     ResourceRow::new(object_key(object), cells)
+}
+
+/// What the rows of a list are built with besides its objects.
+#[derive(Clone)]
+pub struct RowBuilder {
+    plugin: Arc<dyn ResourcePlugin>,
+    /// Plugin column left out of the rows (Namespace for one namespace).
+    hidden_column: Option<usize>,
+}
+
+/// The row of one object without its usage cells, and what it was built
+/// from: enough to tell later whether it still stands.
+pub struct BuiltRow {
+    object: Arc<DynamicObject>,
+    row: ResourceRow,
+    /// The language of the texts in the cells.
+    locale: Locale,
+    /// When the cells were built (Unix seconds).
+    built_at: i64,
+    /// [`ResourcePlugin::cells_turn_at`] of the object (Unix seconds).
+    turns_at: Option<i64>,
+}
+
+impl RowBuilder {
+    pub fn new(plugin: Arc<dyn ResourcePlugin>, hidden_column: Option<usize>) -> Self {
+        Self {
+            plugin,
+            hidden_column,
+        }
+    }
+
+    /// Builds the row of `object` at `now`, in the language `locale` (the
+    /// one of the process: it is recorded, not applied).
+    pub fn build(&self, object: &Arc<DynamicObject>, now: i64, locale: Locale) -> BuiltRow {
+        let plugin = self.plugin.as_ref();
+        let mut row = row(plugin, object);
+        if let Some(ix) = self.hidden_column.filter(|&ix| ix < row.cells.len()) {
+            row.cells.remove(ix);
+        }
+        let turns_at = plugin.cells_turn_at(object).map(|at| at.as_second());
+        BuiltRow {
+            object: object.clone(),
+            row,
+            locale,
+            built_at: now,
+            turns_at,
+        }
+    }
+
+    /// [`build`](Self::build) now, off the UI thread; `None` if the
+    /// language was switched meanwhile (the row could mix two).
+    pub fn build_detached(&self, object: &Arc<DynamicObject>) -> Option<BuiltRow> {
+        let locale = kubach_i18n::locale();
+        let built = self.build(object, unix_now(), locale);
+        (kubach_i18n::locale() == locale).then_some(built)
+    }
+}
+
+/// What rows depend on besides their objects and the [`RowBuilder`].
+#[derive(Clone, Copy)]
+pub struct RowInputs<'a> {
+    /// What the usage cells show; `None` shows dashes.
+    pub usage: Option<UsageView<'a>>,
+    /// Unix seconds.
+    pub now: i64,
+    pub locale: Locale,
+}
+
+impl<'a> RowInputs<'a> {
+    /// The clock and the language of the process.
+    pub fn current(usage: Option<UsageView<'a>>) -> Self {
+        Self {
+            usage,
+            now: unix_now(),
+            locale: kubach_i18n::locale(),
+        }
+    }
+}
+
+struct Entry {
+    object: Arc<DynamicObject>,
+    row: Arc<ResourceRow>,
+    /// What the usage cells of `row` show; `None` is dashes.
+    usage: Option<Usage>,
+    built_at: i64,
+    turns_at: Option<i64>,
+}
+
+impl Entry {
+    /// The moment the row has to be built again, if it was built before it.
+    fn pending_turn(&self) -> Option<i64> {
+        self.turns_at.filter(|&at| self.built_at < at)
+    }
+
+    /// Replaces the two usage cells, the last of the row.
+    fn set_usage(&mut self, usage: Option<Usage>) {
+        let mut cells = self.row.cells.clone();
+        cells.truncate(cells.len().saturating_sub(2));
+        cells.extend(usage::usage_cells(usage));
+        self.row = Arc::new(ResourceRow {
+            key: self.row.key.clone(),
+            cells,
+        });
+        self.usage = usage;
+    }
+}
+
+/// The table rows of a list, kept per object (#165): [`update`] builds
+/// rows only for objects that are new or changed, and for the few whose
+/// row no longer stands for another reason.
+///
+/// A row is built from
+/// - its object: the cache keeps an unchanged object in the same `Arc`,
+///   across updates and relists, so another `Arc` is a changed object;
+/// - the plugin and the hidden column: fixed for the life of the cache;
+/// - usage: only the two usage cells are replaced, and only when the
+///   object's usage differs in a new revision of the feed;
+/// - the clock, for cells that turn at a known moment
+///   ([`ResourcePlugin::cells_turn_at`]). Ages are not among them: the
+///   table formats those from their moment when it draws;
+/// - the language of translated texts (statuses, container tooltips): a
+///   switch builds every row again.
+///
+/// Rows do not depend on the search: [`rows`] filters the built ones.
+///
+/// [`update`]: Self::update
+/// [`rows`]: Self::rows
+pub struct RowCache {
+    builder: RowBuilder,
+    /// Rows end with the CPU and Memory cells.
+    usage_columns: bool,
+    locale: Locale,
+    usage_revision: Option<u64>,
+    /// In the order of the objects of the last update.
+    entries: Vec<Entry>,
+    /// Rows built off the UI thread for the next update, by the address
+    /// of their object (alive as long as the row holds it).
+    prebuilt: HashMap<usize, BuiltRow>,
+    /// The earliest moment a row has to be built again.
+    next_turn: Option<i64>,
+}
+
+fn address(object: &Arc<DynamicObject>) -> usize {
+    Arc::as_ptr(object) as usize
+}
+
+fn same_name(a: &DynamicObject, b: &DynamicObject) -> bool {
+    a.metadata.name == b.metadata.name && a.metadata.namespace == b.metadata.namespace
+}
+
+impl RowCache {
+    pub fn new(builder: RowBuilder, usage_columns: bool) -> Self {
+        Self {
+            builder,
+            usage_columns,
+            locale: kubach_i18n::locale(),
+            usage_revision: None,
+            entries: Vec::new(),
+            prebuilt: HashMap::new(),
+            next_turn: None,
+        }
+    }
+
+    pub fn builder(&self) -> &RowBuilder {
+        &self.builder
+    }
+
+    /// Whether the clock reached a moment some row turns at: an
+    /// [`update`](Self::update) is due though nothing else changed.
+    pub fn due(&self, now: i64) -> bool {
+        self.next_turn.is_some_and(|at| at <= now)
+    }
+
+    /// For each of `objects`, the entry that holds its row as it stands
+    /// with `inputs`.
+    ///
+    /// Lists keep their order, so the entries are walked along with the
+    /// objects: an object changed in place or removed is stepped over, and
+    /// only an insertion or a reordering looks entries up by address.
+    fn standing(&self, objects: &[Arc<DynamicObject>], inputs: &RowInputs) -> Vec<Option<usize>> {
+        if inputs.locale != self.locale {
+            return vec![None; objects.len()];
+        }
+        let entries = &self.entries;
+        let is = |ix: usize, object: &Arc<DynamicObject>| {
+            entries
+                .get(ix)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.object, object))
+        };
+        let mut by_address: Option<HashMap<usize, usize>> = None;
+        let mut cursor = 0;
+        objects
+            .iter()
+            .map(|object| {
+                let ix = if is(cursor, object) {
+                    cursor
+                } else if entries
+                    .get(cursor)
+                    .is_some_and(|entry| same_name(&entry.object, object))
+                {
+                    // A new version of the object in its place.
+                    cursor += 1;
+                    return None;
+                } else if is(cursor + 1, object) {
+                    cursor + 1
+                } else {
+                    let by_address = by_address.get_or_insert_with(|| {
+                        let addresses = entries.iter().map(|entry| address(&entry.object));
+                        addresses.zip(0..).collect()
+                    });
+                    *by_address.get(&address(object))?
+                };
+                cursor = ix + 1;
+                let turned = entries[ix]
+                    .pending_turn()
+                    .is_some_and(|at| at <= inputs.now);
+                (!turned).then_some(ix)
+            })
+            .collect()
+    }
+
+    /// The `objects` whose rows [`update`](Self::update) would have to
+    /// build: to build them off the UI thread first when they are many
+    /// ([`adopt`](Self::adopt)).
+    pub fn missing(
+        &self,
+        objects: &[Arc<DynamicObject>],
+        inputs: &RowInputs,
+    ) -> Vec<Arc<DynamicObject>> {
+        let standing = self.standing(objects, inputs);
+        let missing = objects.iter().zip(standing).filter(|(object, entry)| {
+            entry.is_none()
+                && !self
+                    .prebuilt
+                    .get(&address(object))
+                    .is_some_and(|built| built.locale == inputs.locale)
+        });
+        missing.map(|(object, _)| object.clone()).collect()
+    }
+
+    /// Takes rows built off the UI thread: the next
+    /// [`update`](Self::update) uses those whose object is still listed
+    /// and drops the rest.
+    pub fn adopt(&mut self, rows: impl IntoIterator<Item = BuiltRow>) {
+        let rows = rows.into_iter().map(|row| (address(&row.object), row));
+        self.prebuilt.extend(rows);
+    }
+
+    /// Brings the rows to `objects` with `inputs`; returns how many rows
+    /// were built.
+    pub fn update(&mut self, objects: &[Arc<DynamicObject>], inputs: &RowInputs) -> usize {
+        let standing = self.standing(objects, inputs);
+        let revision = inputs.usage.map(|usage| usage.revision);
+        let usage_changed = self.usage_revision != revision;
+        self.usage_revision = revision;
+        self.locale = inputs.locale;
+        let usage_columns = self.usage_columns;
+        let usage_of = |object: &DynamicObject| {
+            let usage = inputs.usage.filter(|_| usage_columns)?;
+            usage::usage_of(usage.state, object)
+        };
+        let mut previous: Vec<Option<Entry>> = std::mem::take(&mut self.entries)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut prebuilt = std::mem::take(&mut self.prebuilt);
+        let mut built = 0;
+        let entries = objects.iter().zip(standing).map(|(object, ix)| {
+            // `None` again for an object listed twice: its entry is taken.
+            if let Some(mut entry) = ix.and_then(|ix| previous[ix].take()) {
+                if usage_changed && usage_columns {
+                    let usage = usage_of(object);
+                    if usage != entry.usage {
+                        entry.set_usage(usage);
+                    }
+                }
+                return entry;
+            }
+            built += 1;
+            let ready = prebuilt
+                .remove(&address(object))
+                .filter(|row| row.locale == inputs.locale);
+            let BuiltRow {
+                object,
+                mut row,
+                built_at,
+                turns_at,
+                ..
+            } = ready.unwrap_or_else(|| self.builder.build(object, inputs.now, inputs.locale));
+            let usage = usage_of(&object);
+            if usage_columns {
+                row.cells.extend(usage::usage_cells(usage));
+            }
+            Entry {
+                object,
+                row: Arc::new(row),
+                usage,
+                built_at,
+                turns_at,
+            }
+        });
+        self.entries = entries.collect();
+        self.next_turn = self.entries.iter().filter_map(Entry::pending_turn).min();
+        built
+    }
+
+    /// The rows of the objects whose name matches the search `query`, in
+    /// the order of the objects.
+    pub fn rows(&self, query: &str) -> Vec<Arc<ResourceRow>> {
+        let matching = self.entries.iter().filter(|entry| {
+            name_matches(
+                entry.object.metadata.name.as_deref().unwrap_or_default(),
+                query,
+            )
+        });
+        matching.map(|entry| entry.row.clone()).collect()
+    }
 }
 
 /// Times stay absolute: the table formats them when it draws and keeps
