@@ -437,3 +437,177 @@ async fn a_silent_agents_forward_closes_and_stays_listed_with_why() {
             .await;
     }
 }
+
+const NODE_NETWORK: &str = "kubach-test-node-network";
+const NODE_NETWORK_PORT: u16 = 18179;
+
+/// A pod behind Service [`NODE_NETWORK`] that answers on
+/// [`NODE_NETWORK_PORT`], in its own network or in its node's.
+fn network_pod(name: &str, host_network: bool) -> Pod {
+    let start = format!(
+        "printf 'server {{ listen {NODE_NETWORK_PORT}; location / {{ return 200 ok; }} }}' \
+         > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+    );
+    serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "labels": {"app": NODE_NETWORK}},
+        "spec": {"hostNetwork": host_network,
+                 "containers": [{"name": "web", "image": "nginx:alpine",
+                                 "command": ["sh", "-c", start],
+                                 "ports": [{"name": "http",
+                                            "containerPort": NODE_NETWORK_PORT}]}]},
+    }))
+    .unwrap()
+}
+
+/// #179: a forward approved for a pod with its own network does not move
+/// to a pod in the node's network; a new forward to that pod shows the
+/// user what it reaches, and works once approved.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_pod_in_the_nodes_network_is_shown_and_not_reached_unasked() {
+    let (base, context, namespace) = config().await;
+    let user = Client::try_from(base.clone()).unwrap();
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    let created_namespace = namespaces.get_opt(&namespace).await.unwrap().is_none();
+    if created_namespace {
+        let object: Namespace =
+            serde_json::from_value(json!({"metadata": {"name": namespace}})).unwrap();
+        namespaces
+            .create(&PostParams::default(), &object)
+            .await
+            .unwrap();
+    }
+    let pods: Api<Pod> = Api::namespaced(user.clone(), &namespace);
+    let services: Api<Service> = Api::namespaced(user.clone(), &namespace);
+    let own = format!("{NODE_NETWORK}-own");
+    let node = format!("{NODE_NETWORK}-node");
+    for name in [&own, &node] {
+        let _ = pods
+            .delete(name, &DeleteParams::default().grace_period(0))
+            .await;
+        let _ = eventually(async || pods.get_opt(name).await.unwrap().is_none()).await;
+    }
+    let _ = services
+        .delete(NODE_NETWORK, &DeleteParams::default())
+        .await;
+    let service: Service = serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": NODE_NETWORK},
+        "spec": {"selector": {"app": NODE_NETWORK},
+                 "ports": [{"port": 80, "targetPort": NODE_NETWORK_PORT}]},
+    }))
+    .unwrap();
+    services
+        .create(&PostParams::default(), &service)
+        .await
+        .unwrap();
+    pods.create(&PostParams::default(), &network_pod(&own, false))
+        .await
+        .unwrap();
+    wait_ready(&pods, &own).await;
+
+    let policy = SecurityPolicy::with_minimum(Access::profile(Profile::Debug));
+    let spec = SessionSpec {
+        context,
+        server_url: base.cluster_url.to_string(),
+        namespaces: Vec::new(),
+        profile: Profile::Debug,
+        ttl: Some(Duration::from_secs(600)),
+        hints: Vec::new(),
+    };
+    let session = Session::start(&base, &spec, &policy).await.unwrap();
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    let start = async || {
+        let outcome = server
+            .call(
+                "test",
+                "port_forward_start",
+                args(
+                    json!({"target": format!("service/{NODE_NETWORK}"), "port": 80,
+                            "namespace": namespace}),
+                ),
+            )
+            .await;
+        assert!(!outcome.is_error, "{}", outcome.text);
+        let json_start = outcome.text.find('{').unwrap();
+        let result: Value = serde_json::from_str(&outcome.text[json_start..]).unwrap();
+        (
+            result["id"].as_u64().unwrap(),
+            result["address"].as_str().unwrap().to_owned(),
+            result["hostNetwork"].as_bool().unwrap(),
+        )
+    };
+    let questions = || -> Vec<_> {
+        confirmer
+            .requests()
+            .into_iter()
+            .filter(|request| matches!(request.kind, RequestKind::PortForward { .. }))
+            .collect()
+    };
+    let answers = async |address: &str| {
+        eventually(async || {
+            http_get(address)
+                .await
+                .is_some_and(|reply| reply.starts_with("HTTP/1.") && reply.ends_with("ok"))
+        })
+        .await
+    };
+
+    // A pod with its own network: nothing to tick, and it answers.
+    let (first, first_address, host_network) = start().await;
+    assert!(!host_network);
+    assert!(questions()[0].dangerous.is_empty());
+    assert!(answers(&first_address).await, "the pod did not answer");
+
+    // The Service's only pod is now one in the node's network.
+    pods.delete(&own, &DeleteParams::default().grace_period(0))
+        .await
+        .unwrap();
+    let _ = eventually(async || pods.get_opt(&own).await.unwrap().is_none()).await;
+    pods.create(&PostParams::default(), &network_pod(&node, true))
+        .await
+        .unwrap();
+    wait_ready(&pods, &node).await;
+    let refused = eventually(async || {
+        let _ = http_get(&first_address).await;
+        entry(&server, first).await["lastError"]
+            .as_str()
+            .is_some_and(|error| error.contains("hostNetwork"))
+    })
+    .await;
+    let last = entry(&server, first).await;
+    assert!(refused, "{last}");
+    assert_eq!(last["pod"], own.as_str(), "{last}");
+    let reply = http_get(&first_address).await.unwrap_or_default();
+    assert!(!reply.contains("200"), "{reply}");
+
+    // A new forward shows what it reaches and works once approved.
+    let (_, second_address, host_network) = start().await;
+    assert!(host_network);
+    let asked = questions();
+    let finding = &asked[1].dangerous;
+    assert_eq!(finding.len(), 1, "{finding:?}");
+    assert_eq!(finding[0].path, format!("pod/{node} .spec.hostNetwork"));
+    assert!(!asked[1].allow_remember);
+    assert!(
+        answers(&second_address).await,
+        "the node's pod did not answer"
+    );
+
+    session.close().await.unwrap();
+    for name in [&own, &node] {
+        let _ = pods
+            .delete(name, &DeleteParams::default().grace_period(0))
+            .await;
+    }
+    let _ = services
+        .delete(NODE_NETWORK, &DeleteParams::default())
+        .await;
+    if created_namespace {
+        let _ = namespaces
+            .delete(&namespace, &DeleteParams::default())
+            .await;
+    }
+}

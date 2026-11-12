@@ -28,7 +28,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use super::StreamError;
-use super::forward_target::{ForwardSource, ResolvedTarget, resolve_in};
+use super::forward_target::{ForwardSource, ResolvedTarget, resolve_in, uses_host_network};
 use crate::runtime::{self, BackgroundTask};
 use crate::sync::lock;
 
@@ -128,6 +128,25 @@ pub struct ForwardAgent {
     pub session: String,
 }
 
+/// Whether an agent's forward may go to a pod that runs in its node's
+/// network namespace (`spec.hostNetwork`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostNetwork {
+    /// The user saw that the pod uses the node's network and approved it.
+    Allowed,
+    /// The forward was approved for a pod with its own network: it does
+    /// not start to, and never moves to, a pod that uses the node's.
+    Refused,
+}
+
+/// Why a forward does not go to `pod`, see [`HostNetwork::Refused`].
+fn host_network_refusal(pod: &str) -> String {
+    format!(
+        "pod {pod} uses the node's network (hostNetwork), and this forward was approved for a \
+         pod with its own network; start the forward again to have the user approve it"
+    )
+}
+
 /// Health of a forward, derived from its most recent connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForwardState {
@@ -164,12 +183,16 @@ impl PortForwardManager {
         port: u16,
         local_port: impl Into<LocalPort>,
     ) -> Result<ForwardInfo, StreamError> {
-        self.start_source(client, source, port, local_port.into(), false, None)
+        self.start_source(client, source, port, local_port.into(), false)
             .await
     }
 
     /// Like [`start`](Self::start), for an AI agent's session (#17): the
     /// forward is marked as the agent's. Same listener, same `127.0.0.1`.
+    /// With [`HostNetwork::Refused`] the pod is read before every
+    /// connection, and one that uses the node's network is not connected
+    /// to: not at the start, not after the forward moves to another pod of
+    /// a Service or workload, not when a pod of the same name replaces it.
     pub async fn start_for_agent(
         &self,
         client: &Client,
@@ -177,9 +200,16 @@ impl PortForwardManager {
         port: u16,
         local_port: impl Into<LocalPort>,
         agent: ForwardAgent,
+        host_network: HostNetwork,
     ) -> Result<ForwardInfo, StreamError> {
-        self.start_source(client, source, port, local_port.into(), false, Some(agent))
-            .await
+        let api: Api<Pod> = Api::namespaced(client.clone(), &source.namespace);
+        let target = resolve_in(&api, source, port).await?;
+        if host_network == HostNetwork::Refused && target.host_network {
+            return Err(StreamError::Target(host_network_refusal(&target.pod)));
+        }
+        let route = Route::new(source, port, &target, Some(agent));
+        let connector = source_connector(api, source.clone(), port, target, host_network);
+        self.start_with(route, local_port, connector, false)
     }
 
     /// Like [`start`](Self::start), but paused from the first moment: the
@@ -192,7 +222,7 @@ impl PortForwardManager {
         port: u16,
         local_port: impl Into<LocalPort>,
     ) -> Result<ForwardInfo, StreamError> {
-        self.start_source(client, source, port, local_port.into(), true, None)
+        self.start_source(client, source, port, local_port.into(), true)
             .await
     }
 
@@ -203,19 +233,12 @@ impl PortForwardManager {
         port: u16,
         local_port: LocalPort,
         paused: bool,
-        agent: Option<ForwardAgent>,
     ) -> Result<ForwardInfo, StreamError> {
         let api: Api<Pod> = Api::namespaced(client.clone(), &source.namespace);
         let target = resolve_in(&api, source, port).await?;
-        let route = Route {
-            namespace: source.namespace.clone(),
-            source: source.label(),
-            source_port: port,
-            pod: target.pod.clone(),
-            remote_port: target.port,
-            agent,
-        };
-        let connector = source_connector(api, source.clone(), port, target);
+        let route = Route::new(source, port, &target, None);
+        // The user's own forward: they chose the target themselves.
+        let connector = source_connector(api, source.clone(), port, target, HostNetwork::Allowed);
         self.start_with(route, local_port, connector, paused)
     }
 
@@ -319,6 +342,24 @@ struct Route {
     pod: String,
     remote_port: u16,
     agent: Option<ForwardAgent>,
+}
+
+impl Route {
+    fn new(
+        source: &ForwardSource,
+        port: u16,
+        target: &ResolvedTarget,
+        agent: Option<ForwardAgent>,
+    ) -> Self {
+        Self {
+            namespace: source.namespace.clone(),
+            source: source.label(),
+            source_port: port,
+            pod: target.pod.clone(),
+            remote_port: target.port,
+            agent,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -484,6 +525,34 @@ async fn connect_pod(api: &Api<Pod>, target: ResolvedTarget) -> Result<Upstream,
     })
 }
 
+/// [`connect_pod`], after reading the pod when `host_network` refuses
+/// pods in the node's network: the pod under this name may be another one
+/// by now.
+async fn connect_checked(
+    api: &Api<Pod>,
+    target: ResolvedTarget,
+    host_network: HostNetwork,
+) -> Result<Upstream, Refused> {
+    if host_network == HostNetwork::Refused {
+        let pod = api
+            .get(&target.pod)
+            .await
+            .map_err(|error| Refused::Failed(error.to_string()))?;
+        if uses_host_network(&pod) {
+            return Err(Refused::HostNetwork(host_network_refusal(&target.pod)));
+        }
+    }
+    connect_pod(api, target).await.map_err(Refused::Failed)
+}
+
+/// Why [`connect_checked`] did not connect.
+enum Refused {
+    /// The connection failed; another pod may take it.
+    Failed(String),
+    /// The pod uses the node's network; nothing is tried in its place.
+    HostNetwork(String),
+}
+
 /// Connects to the current pod of `source`. For a Service or workload, a
 /// failed connection looks for another ready pod and retries there once.
 fn source_connector(
@@ -491,6 +560,7 @@ fn source_connector(
     source: ForwardSource,
     port: u16,
     initial: ResolvedTarget,
+    host_network: HostNetwork,
 ) -> Connector {
     let source = Arc::new(source);
     let current = Arc::new(Mutex::new(initial));
@@ -500,14 +570,18 @@ fn source_connector(
         let current = current.clone();
         Box::pin(async move {
             let target = lock(&current).clone();
-            let error = match connect_pod(&api, target.clone()).await {
+            let error = match connect_checked(&api, target.clone(), host_network).await {
                 Ok(upstream) => return Ok(upstream),
-                Err(error) => error,
+                Err(Refused::HostNetwork(refusal)) => return Err(refusal),
+                Err(Refused::Failed(error)) => error,
             };
             if source.selector.is_none() {
                 return Err(error);
             }
             match resolve_in(&api, &source, port).await {
+                Ok(next) if host_network == HostNetwork::Refused && next.host_network => {
+                    Err(host_network_refusal(&next.pod))
+                }
                 Ok(next) if next != target => {
                     *lock(&current) = next.clone();
                     connect_pod(&api, next).await
@@ -680,6 +754,7 @@ mod tests {
         let target = ResolvedTarget {
             pod: "web-2".into(),
             port: 80,
+            host_network: false,
         };
         registry.connected(id, &target);
         let info = registry.info(id).unwrap();
@@ -730,6 +805,7 @@ mod tests {
         let target = ResolvedTarget {
             pod: "db-2".into(),
             port: 5433,
+            host_network: false,
         };
         registry.connected(b, &target);
         registry.connected(b, &target);
