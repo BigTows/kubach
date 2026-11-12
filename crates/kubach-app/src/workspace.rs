@@ -195,10 +195,10 @@ impl Workspace {
             nav.set_state(default_nav_state(), cx);
             nav
         });
-        let forwards = cx.new(Forwards::new);
+        let forwards = cx.new(|cx| Forwards::new(&cluster, cx));
         // Forwards of the last run restart as their contexts connect (#474).
-        forwards.update(cx, |forwards, cx| forwards.restore(&cluster, cx));
-        let dock = cx.new(|_| Dock::new(cluster.clone(), forwards.clone()));
+        forwards.update(cx, |forwards, cx| forwards.restore(cx));
+        let dock = cx.new(|cx| Dock::new(cluster.clone(), forwards.clone(), cx));
         Dock::install(&dock, cx);
         let forwards_screen = cx.new(|cx| ForwardsScreen::new(forwards.clone(), cx));
         let access = cx.new(|cx| AccessScreen::new(cluster.clone(), namespaces.clone(), cx));
