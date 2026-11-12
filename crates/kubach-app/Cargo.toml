@@ -44,6 +44,10 @@ windows-sys.workspace = true
 embed-resource.workspace = true
 
 [dev-dependencies]
+# Synthetic clusters and the windowless table rows for the stand of
+# `docs/perf.md` (`screens/perf_stand.rs`).
+kubach-core = { workspace = true, features = ["perf"] }
+kubach-ui = { workspace = true, features = ["perf"] }
 resvg.workspace = true
 tempfile.workspace = true
 

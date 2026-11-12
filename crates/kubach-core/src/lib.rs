@@ -26,6 +26,8 @@ pub mod list_cache;
 pub mod metrics;
 pub mod names;
 pub mod namespace;
+#[cfg(feature = "perf")]
+pub mod perf;
 pub mod plugin;
 pub mod probe;
 pub mod process;

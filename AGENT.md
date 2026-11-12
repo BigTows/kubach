@@ -48,6 +48,7 @@ cargo run                                    # приложение
 cargo run -p kubach-ui --example gallery     # галерея дизайн-системы
 cargo test -p kubach-ui -p kubach-app --test a11y_ids --test a11y_check -- --ignored
                                              # дерево a11y галереи и окна без дублей id (macOS, откроет окна)
+cargo bench -p kubach-core --bench core      # бенчмарки ядра; стенды и исходные цифры — docs/perf.md
 ```
 
 Dev-профиль оптимизирует зависимости (`opt-level = 3`), иначе GPUI тормозит.

@@ -21,6 +21,8 @@ mod namespaces;
 mod oci_versions;
 mod overview;
 mod panel_width;
+#[cfg(test)]
+mod perf_stand;
 pub(crate) mod plugin_text;
 mod prometheus_link;
 mod rbac;
