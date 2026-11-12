@@ -1,10 +1,11 @@
 //! Stand for the row pipeline of the resource browser (`docs/perf.md`): a
 //! pod list from the cache becomes table rows and replaces the rows of a
-//! table, as `ResourceBrowser::update_rows` does on every cache update.
+//! table, as `ResourceBrowser::update_rows` does on every cache update,
+//! metrics poll and search keystroke.
 //!
-//! No window: the table is a [`RowsProbe`], the data side of
-//! `ResourceTable::set_rows`. Search filtering, usage cells, the selection
-//! in the table state and the redraw are not measured.
+//! The rows are the browser's own [`RowCache`]. No window: the table is a
+//! [`RowsProbe`], the data side of `ResourceTable::set_shared_rows`. The
+//! selection in the table state and the redraw are not measured.
 //!
 //! Ignored tests that print their figures; run them optimized:
 //!
@@ -20,12 +21,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kubach_core::cache::{DEBOUNCE, ResourceCache, WatchFilter, WatchStatus};
+use kubach_core::metrics::{ContainerMetrics, MetricsIndex, PodMetrics, Usage};
 use kubach_core::perf::{self, Churn, PodShape};
 use kubach_core::plugin::{PluginRegistry, ResourcePlugin};
 use kubach_ui::{ResourceRow, RowsProbe, SortDirection};
 use kube::api::DynamicObject;
 
-use super::rows;
+use super::rows::{self, RowBuilder, RowCache, RowInputs};
+use super::usage::{MetricsState, UsageView};
 
 const NAMESPACES: usize = 50;
 /// Pods changed by every burst of the live part (a rollout in progress).
@@ -98,18 +101,44 @@ fn pod_plugin() -> Arc<dyn ResourcePlugin> {
     PluginRegistry::with_builtins().plugin_for("", "Pod")
 }
 
-fn build_rows(
-    plugin: &dyn ResourcePlugin,
-    objects: &[Arc<DynamicObject>],
-) -> Vec<Arc<ResourceRow>> {
-    objects
-        .iter()
-        .map(|object| Arc::new(rows::row(plugin, object)))
-        .collect()
+/// The rows of a pod list as the browser keeps them; `usage` adds the CPU
+/// and Memory cells.
+fn row_cache(plugin: &Arc<dyn ResourcePlugin>, usage: bool) -> RowCache {
+    RowCache::new(RowBuilder::new(plugin.clone(), None), usage)
 }
 
-/// One pass of the pipeline over a list that does not change between
-/// passes, step by step.
+/// What `KindView::rows` does: brings the rows to `objects`, then takes
+/// those matching the search `query`.
+fn rows_of(
+    cache: &mut RowCache,
+    objects: &[Arc<DynamicObject>],
+    usage: Option<UsageView>,
+    query: &str,
+) -> Vec<Arc<ResourceRow>> {
+    cache.update(objects, &RowInputs::current(usage));
+    cache.rows(query)
+}
+
+/// Every pod uses `step` more than in the last sample.
+fn usage_of_all(pods: &[Arc<DynamicObject>], step: u64) -> MetricsState {
+    let samples = pods.iter().zip(0u64..).map(|(pod, ix)| PodMetrics {
+        name: pod.metadata.name.clone().unwrap_or_default(),
+        namespace: pod.metadata.namespace.clone().unwrap_or_default(),
+        timestamp: None,
+        window: None,
+        containers: vec![ContainerMetrics {
+            name: "app".into(),
+            usage: Usage {
+                cpu: (ix % 900 + step * 37) * 1_000_000,
+                memory: (ix % 700 + step * 11) * 1_048_576,
+            },
+        }],
+    });
+    MetricsState::Ready(MetricsIndex::from_pods(samples))
+}
+
+/// One pass of the pipeline over a list, step by step: the first build of
+/// the rows, then the updates the browser runs while the list is shown.
 #[test]
 #[ignore = "performance stand: prints timings, see docs/perf.md"]
 fn perf_stand_rows_of_a_pod_list() {
@@ -119,9 +148,12 @@ fn perf_stand_rows_of_a_pod_list() {
     for (name, shape) in SHAPES {
         let pods = perf::shared(perf::pods(count, NAMESPACES, shape));
         let bytes: usize = pods.iter().take(200).map(|pod| perf::json_len(pod)).sum();
-        let build = median(|| (), |()| build_rows(plugin.as_ref(), &pods));
+        let build = median(
+            || row_cache(&plugin, false),
+            |mut cache| rows_of(&mut cache, &pods, None, ""),
+        );
         println!(
-            "{name:8} {:5} B/pod  build rows {:8.1} ms  ({:.2} us/row)",
+            "{name:8} {:5} B/pod  first build {:8.1} ms  ({:.2} us/row)",
             bytes / pods.len().min(200),
             ms(build),
             ms(build) * 1000. / count as f64,
@@ -148,17 +180,109 @@ fn perf_stand_rows_of_a_pod_list() {
     println!("plugin.columns() x {count}: {:.1} ms", ms(columns));
     println!("object_key x {count}:       {:.1} ms", ms(keys));
 
-    let rows = build_rows(plugin.as_ref(), &pods);
+    // The updates of a list that is shown: rows and table together, as
+    // `ResourceBrowser::update_rows` runs them.
+    println!("-- update of {count} rows: rows + table.set_rows --");
+    let mut cache = row_cache(&plugin, true);
+    let mut probe = RowsProbe::new(rows::columns(plugin.as_ref()));
+    probe.set_rows(rows_of(&mut cache, &pods, None, ""));
+    let mut update = |cache: &mut RowCache,
+                      objects: &[Arc<DynamicObject>],
+                      usage: Option<UsageView>,
+                      query: &str| {
+        let rows = rows_of(cache, objects, usage, query);
+        probe.set_rows(rows)
+    };
+    let unchanged = median(|| (), |()| update(&mut cache, &pods, None, ""));
+    println!("nothing changed:                {:8.2} ms", ms(unchanged));
+
+    // Two lists that differ in `CHANGED` pods, shown in turn.
+    let mut other = pods.clone();
+    let step = (count / CHANGED).max(1);
+    for (revision, pod) in other.iter_mut().step_by(step).take(CHANGED).enumerate() {
+        perf::touch(Arc::make_mut(pod), 20_000_000 + revision as u64);
+    }
+    let mut turn = 0;
+    let changed = median(
+        || {
+            turn += 1;
+            if turn % 2 == 1 { &other } else { &pods }
+        },
+        |objects| update(&mut cache, objects, None, ""),
+    );
+    println!(
+        "{CHANGED} pods changed:                {:8.2} ms",
+        ms(changed)
+    );
+
+    let mut removed = pods.clone();
+    removed.truncate(count - count / 10);
+    let mut turn = 0;
+    let relisted = median(
+        || {
+            turn += 1;
+            if turn % 2 == 1 { &removed } else { &pods }
+        },
+        |objects| update(&mut cache, objects, None, ""),
+    );
+    println!("a tenth removed / added back:   {:8.2} ms", ms(relisted));
+
+    let samples = [usage_of_all(&pods, 1), usage_of_all(&pods, 2)];
+    let mut revision = 0;
+    let polled = median(
+        || {
+            revision += 1;
+            UsageView {
+                state: &samples[revision as usize % 2],
+                revision,
+            }
+        },
+        |usage| update(&mut cache, &pods, Some(usage), ""),
+    );
+    println!("metrics poll, all usage changed:{:8.2} ms", ms(polled));
+    let usage = UsageView {
+        state: &samples[revision as usize % 2],
+        revision,
+    };
+    let same_poll = median(
+        || {
+            revision += 1;
+            UsageView { revision, ..usage }
+        },
+        |usage| update(&mut cache, &pods, Some(usage), ""),
+    );
+    println!("metrics poll, same usage:       {:8.2} ms", ms(same_poll));
+
+    // A search narrows the rows and widens them again, keystroke by
+    // keystroke: every update replaces the rows of the table.
+    let queries = ["app-0", "app-00", "app-001", "app-00", "app-0", ""];
+    let mut key = 0;
+    let typed = median(
+        || {
+            key += 1;
+            queries[key % queries.len()]
+        },
+        |query| update(&mut cache, &pods, Some(usage), query),
+    );
+    println!("search keystroke:               {:8.2} ms", ms(typed));
+    let tick = median(|| (), |()| cache.due(kubach_ui::unix_now()));
+    println!("clock tick (nothing turns):     {:8.4} ms", ms(tick));
+
+    let rows = rows_of(&mut row_cache(&plugin, false), &pods, None, "");
     let mut last_changed = rows.clone();
     if let Some(row) = last_changed.last_mut() {
         Arc::make_mut(row).key = "changed".into();
     }
+    // Rows built again for the same objects: equal, in other allocations.
+    let rebuilt = rows_of(&mut row_cache(&plugin, false), &pods, None, "");
     let mut probe = RowsProbe::new(rows::columns(plugin.as_ref()));
     probe.replace_rows(rows.clone());
     println!("-- table.set_rows on {count} rows --");
     let same = median(|| (), |()| probe.same_rows(&rows));
+    let equal = median(|| (), |()| probe.same_rows(&rebuilt));
     let differs = median(|| (), |()| probe.same_rows(&last_changed));
-    println!("compare, rows equal:            {:8.1} ms", ms(same));
+    println!("compare, the same rows:         {:8.1} ms", ms(same));
+    println!("compare, rows built again:      {:8.1} ms", ms(equal));
     println!("compare, last row differs:      {:8.1} ms", ms(differs));
     println!("clone of the rows:              {:8.1} ms", {
         ms(median(|| (), |()| rows.clone()))
@@ -225,6 +349,7 @@ fn live(shape: PodShape, namespaces: Option<&[String]>, sorted: bool) -> (Durati
     let plugin = pod_plugin();
     let watches = cache.subscribe_many(&perf::pod_kind(), namespaces, WatchFilter::default());
     let mut changes = watches.changes();
+    let mut cache = row_cache(&plugin, false);
     let mut probe = RowsProbe::new(rows::columns(plugin.as_ref()));
     if sorted {
         probe.sort_by("age", SortDirection::Ascending);
@@ -242,7 +367,7 @@ fn live(shape: PodShape, namespaces: Option<&[String]>, sorted: bool) -> (Durati
         if snapshot.status != WatchStatus::Ready || snapshot.objects.len() < count {
             continue;
         }
-        let rows = build_rows(plugin.as_ref(), &snapshot.objects);
+        let rows = rows_of(&mut cache, &snapshot.objects, None, "");
         let built = started.elapsed();
         probe.set_rows(rows);
         let done = started.elapsed();

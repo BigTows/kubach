@@ -99,6 +99,17 @@ pub struct BuiltRow {
     turns_at: Option<i64>,
 }
 
+impl BuiltRow {
+    /// Whether the row is what would be built with `inputs`: in the same
+    /// language, and not from before a moment its cells turned at.
+    fn stands(&self, inputs: &RowInputs) -> bool {
+        let turned = self
+            .turns_at
+            .is_some_and(|at| self.built_at < at && at <= inputs.now);
+        self.locale == inputs.locale && !turned
+    }
+}
+
 impl RowBuilder {
     pub fn new(plugin: Arc<dyn ResourcePlugin>, hidden_column: Option<usize>) -> Self {
         Self {
@@ -311,7 +322,7 @@ impl RowCache {
                 && !self
                     .prebuilt
                     .get(&address(object))
-                    .is_some_and(|built| built.locale == inputs.locale)
+                    .is_some_and(|built| built.stands(inputs))
         });
         missing.map(|(object, _)| object.clone()).collect()
     }
@@ -325,7 +336,7 @@ impl RowCache {
     }
 
     /// Brings the rows to `objects` with `inputs`; returns how many rows
-    /// were built.
+    /// it had to build ([adopted](Self::adopt) ones are not counted).
     pub fn update(&mut self, objects: &[Arc<DynamicObject>], inputs: &RowInputs) -> usize {
         let standing = self.standing(objects, inputs);
         let revision = inputs.usage.map(|usage| usage.revision);
@@ -354,17 +365,19 @@ impl RowCache {
                 }
                 return entry;
             }
-            built += 1;
             let ready = prebuilt
                 .remove(&address(object))
-                .filter(|row| row.locale == inputs.locale);
+                .filter(|row| row.stands(inputs));
             let BuiltRow {
                 object,
                 mut row,
                 built_at,
                 turns_at,
                 ..
-            } = ready.unwrap_or_else(|| self.builder.build(object, inputs.now, inputs.locale));
+            } = ready.unwrap_or_else(|| {
+                built += 1;
+                self.builder.build(object, inputs.now, inputs.locale)
+            });
             let usage = usage_of(&object);
             if usage_columns {
                 row.cells.extend(usage::usage_cells(usage));
@@ -552,5 +565,728 @@ mod tests {
         assert_eq!(status_label(&short), "Running");
         assert_eq!(status_label(&long), "Degraded");
         assert_eq!(status_label(&Health::unknown()), "Unknown");
+    }
+
+    // The rows kept per object (#165).
+
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+    use k8s_openapi::jiff::Timestamp;
+    use kubach_core::metrics::{ContainerMetrics, MetricsIndex, NodeMetrics, PodMetrics};
+    use kubach_core::plugin::{DetailSection, Relation};
+    use kube::api::GroupVersionKind;
+
+    use super::super::usage::MetricsState;
+
+    /// What the cells of the [`Stub`] plugin read besides the object: the
+    /// clock and the language, as real plugins read those of the process.
+    #[derive(Default)]
+    struct World {
+        now: AtomicI64,
+        language: AtomicUsize,
+        /// How many times the plugin built cells.
+        built: AtomicUsize,
+    }
+
+    impl World {
+        fn now(&self) -> i64 {
+            self.now.load(Ordering::Relaxed)
+        }
+
+        fn locale(&self) -> Locale {
+            Locale::ALL[self.language.load(Ordering::Relaxed) % Locale::ALL.len()]
+        }
+
+        fn built(&self) -> usize {
+            self.built.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Cells that show the object's version, whether its moment (the
+    /// `turn` annotation) has come, and the language.
+    struct Stub(Arc<World>);
+
+    fn turn_of(object: &DynamicObject) -> Option<i64> {
+        let annotations = object.metadata.annotations.as_ref()?;
+        annotations.get("turn")?.parse().ok()
+    }
+
+    impl ResourcePlugin for Stub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn supported(&self) -> Vec<GroupVersionKind> {
+            Vec::new()
+        }
+
+        fn columns(&self) -> Vec<Column> {
+            let column = |id, kind| Column {
+                id,
+                title: id,
+                kind,
+            };
+            vec![
+                column("name", ColumnKind::Text),
+                column("namespace", ColumnKind::Text),
+                column("state", ColumnKind::Text),
+                column("age", ColumnKind::Age),
+            ]
+        }
+
+        fn cells(&self, object: &DynamicObject) -> Vec<Cell> {
+            self.0.built.fetch_add(1, Ordering::Relaxed);
+            let meta = &object.metadata;
+            let turned = turn_of(object).is_some_and(|at| at <= self.0.now());
+            let version = meta.resource_version.as_deref().unwrap_or_default();
+            vec![
+                Cell::Text(meta.name.clone().unwrap_or_default()),
+                Cell::Text(meta.namespace.clone().unwrap_or_default()),
+                Cell::Text(format!("v{version} {turned} {:?}", self.0.locale())),
+                Cell::Age(meta.creation_timestamp.as_ref().map(|time| time.0)),
+            ]
+        }
+
+        fn cells_turn_at(&self, object: &DynamicObject) -> Option<Timestamp> {
+            Timestamp::from_second(turn_of(object)?).ok()
+        }
+
+        fn details(&self, _: &DynamicObject) -> Vec<DetailSection> {
+            Vec::new()
+        }
+
+        fn relations(&self, _: &DynamicObject) -> Vec<Relation> {
+            Vec::new()
+        }
+
+        fn health(&self, _: &DynamicObject) -> Health {
+            Health::unknown()
+        }
+    }
+
+    fn thing(
+        name: &str,
+        namespace: Option<&str>,
+        version: u64,
+        turn: Option<i64>,
+    ) -> Arc<DynamicObject> {
+        let mut value = json!({
+            "apiVersion": "v1",
+            "kind": "Thing",
+            "metadata": {
+                "name": name,
+                "resourceVersion": version.to_string(),
+                "creationTimestamp": "2026-10-01T00:00:00Z"
+            }
+        });
+        if let Some(namespace) = namespace {
+            value["metadata"]["namespace"] = json!(namespace);
+        }
+        if let Some(turn) = turn {
+            value["metadata"]["annotations"] = json!({ "turn": turn.to_string() });
+        }
+        Arc::new(serde_json::from_value(value).unwrap())
+    }
+
+    fn usage(cpu: u64, memory: u64) -> Usage {
+        Usage { cpu, memory }
+    }
+
+    fn pod_usage(samples: &[(&str, &str, Usage)]) -> MetricsState {
+        let samples = samples.iter().map(|(namespace, name, usage)| PodMetrics {
+            name: (*name).into(),
+            namespace: (*namespace).into(),
+            timestamp: None,
+            window: None,
+            containers: vec![ContainerMetrics {
+                name: "app".into(),
+                usage: *usage,
+            }],
+        });
+        MetricsState::Ready(MetricsIndex::from_pods(samples))
+    }
+
+    /// A list as the browser shows it: its objects, usage and search, and
+    /// the cache of its rows.
+    struct List {
+        world: Arc<World>,
+        plugin: Arc<dyn ResourcePlugin>,
+        hidden: Option<usize>,
+        /// `None` for a kind without usage columns.
+        usage: Option<MetricsState>,
+        revision: u64,
+        objects: Vec<Arc<DynamicObject>>,
+        query: String,
+        cache: RowCache,
+    }
+
+    impl List {
+        fn new(hidden: Option<usize>, usage: Option<MetricsState>) -> Self {
+            let world = Arc::new(World::default());
+            world.now.store(1_000, Ordering::Relaxed);
+            let plugin: Arc<dyn ResourcePlugin> = Arc::new(Stub(world.clone()));
+            Self::of(world, plugin, hidden, usage)
+        }
+
+        fn of(
+            world: Arc<World>,
+            plugin: Arc<dyn ResourcePlugin>,
+            hidden: Option<usize>,
+            usage: Option<MetricsState>,
+        ) -> Self {
+            let builder = RowBuilder::new(plugin.clone(), hidden);
+            Self {
+                cache: RowCache::new(builder, usage.is_some()),
+                world,
+                plugin,
+                hidden,
+                usage,
+                revision: 0,
+                objects: Vec::new(),
+                query: String::new(),
+            }
+        }
+
+        fn set_usage(&mut self, usage: MetricsState) {
+            self.usage = Some(usage);
+            self.revision += 1;
+        }
+
+        fn advance(&self, seconds: i64) {
+            self.world.now.fetch_add(seconds, Ordering::Relaxed);
+        }
+
+        fn inputs(&self) -> RowInputs<'_> {
+            RowInputs {
+                usage: self.usage.as_ref().map(|state| UsageView {
+                    state,
+                    revision: self.revision,
+                }),
+                now: self.world.now(),
+                locale: self.world.locale(),
+            }
+        }
+
+        /// Brings the cache up to date; returns how many times the plugin
+        /// built cells for it.
+        fn update(&mut self) -> usize {
+            let before = self.world.built();
+            let built = self.update_at(self.world.now(), self.world.locale());
+            assert_eq!(built, self.world.built() - before);
+            built
+        }
+
+        fn update_at(&mut self, now: i64, locale: Locale) -> usize {
+            let inputs = RowInputs {
+                usage: self.usage.as_ref().map(|state| UsageView {
+                    state,
+                    revision: self.revision,
+                }),
+                now,
+                locale,
+            };
+            self.cache.update(&self.objects, &inputs)
+        }
+
+        fn shared(&self) -> Vec<Arc<ResourceRow>> {
+            self.cache.rows(&self.query)
+        }
+
+        fn shown(&self) -> Vec<ResourceRow> {
+            self.shared().iter().map(|row| (**row).clone()).collect()
+        }
+
+        /// Every row built from scratch, as the browser did before rows
+        /// were kept.
+        fn rebuilt(&self) -> Vec<ResourceRow> {
+            let matching = self.objects.iter().filter(|object| {
+                name_matches(
+                    object.metadata.name.as_deref().unwrap_or_default(),
+                    &self.query,
+                )
+            });
+            matching
+                .map(|object| {
+                    let mut row = row(self.plugin.as_ref(), object);
+                    if let Some(ix) = self.hidden.filter(|&ix| ix < row.cells.len()) {
+                        row.cells.remove(ix);
+                    }
+                    if let Some(state) = &self.usage {
+                        row.cells
+                            .extend(usage::usage_cells(usage::usage_of(state, object)));
+                    }
+                    row
+                })
+                .collect()
+        }
+
+        fn check(&mut self) {
+            self.update();
+            assert_eq!(self.shown(), self.rebuilt());
+            let inputs = self.inputs();
+            assert!(self.cache.missing(&self.objects, &inputs).is_empty());
+            assert!(!self.cache.due(inputs.now));
+        }
+    }
+
+    fn same_allocations(a: &[Arc<ResourceRow>], b: &[Arc<ResourceRow>]) -> Vec<bool> {
+        a.iter().zip(b).map(|(a, b)| Arc::ptr_eq(a, b)).collect()
+    }
+
+    #[test]
+    fn only_rows_of_changed_objects_are_built() {
+        let mut list = List::new(None, None);
+        list.objects = vec![
+            thing("a", Some("web"), 1, None),
+            thing("b", Some("web"), 1, None),
+            thing("c", Some("web"), 1, None),
+        ];
+        assert_eq!(list.update(), 3);
+        let first = list.shared();
+        assert_eq!(list.shown(), list.rebuilt());
+        // The same list again, also as another vector of the same objects.
+        assert_eq!(list.update(), 0);
+        list.objects = list.objects.clone();
+        assert_eq!(list.update(), 0);
+        assert_eq!(same_allocations(&first, &list.shared()), [true; 3]);
+
+        // A new version of one object.
+        list.objects[1] = thing("b", Some("web"), 2, None);
+        assert_eq!(list.update(), 1);
+        assert_eq!(
+            same_allocations(&first, &list.shared()),
+            [true, false, true]
+        );
+        list.check();
+
+        // An equal object in another allocation is another object.
+        list.objects[0] = Arc::new((*list.objects[0]).clone());
+        assert_eq!(list.update(), 1);
+        assert_eq!(list.shown(), list.rebuilt());
+    }
+
+    #[test]
+    fn added_removed_and_moved_objects_keep_the_other_rows() {
+        let mut list = List::new(None, None);
+        list.objects = (0..6)
+            .map(|ix| thing(&format!("t{ix}"), Some("web"), 1, None))
+            .collect();
+        assert_eq!(list.update(), 6);
+        // Removed from the middle and from the end.
+        list.objects.remove(2);
+        list.objects.pop();
+        assert_eq!(list.update(), 0);
+        list.check();
+        // Added at the start, in the middle and at the end.
+        list.objects.insert(0, thing("first", Some("web"), 1, None));
+        list.objects
+            .insert(3, thing("middle", Some("web"), 1, None));
+        list.objects.push(thing("last", Some("web"), 1, None));
+        assert_eq!(list.update(), 3);
+        list.check();
+        // Another order (a merge of namespaces that came in another one).
+        list.objects.reverse();
+        assert_eq!(list.update(), 0);
+        list.check();
+        // Listed twice: one row is kept, the other built.
+        list.objects.push(list.objects[0].clone());
+        assert_eq!(list.update(), 1);
+        list.check();
+        // Nothing left, then everything again.
+        let objects = std::mem::take(&mut list.objects);
+        assert_eq!(list.update(), 0);
+        assert!(list.shown().is_empty());
+        list.objects = objects;
+        assert_eq!(list.update(), list.objects.len());
+        list.check();
+    }
+
+    #[test]
+    fn a_metrics_poll_replaces_only_usage_cells_that_changed() {
+        let mut list = List::new(None, Some(MetricsState::Loading));
+        list.objects = vec![
+            thing("a", Some("web"), 1, None),
+            thing("b", Some("web"), 1, None),
+            thing("c", Some("web"), 1, None),
+        ];
+        assert_eq!(list.update(), 3);
+        // Dashes while loading.
+        assert_eq!(list.shown(), list.rebuilt());
+        let loading = list.shared();
+
+        list.set_usage(pod_usage(&[
+            ("web", "a", usage(100_000_000, 1 << 20)),
+            ("web", "b", usage(200_000_000, 2 << 20)),
+        ]));
+        assert_eq!(list.update(), 0);
+        assert_eq!(list.shown(), list.rebuilt());
+        let polled = list.shared();
+        // `c` has no sample: still dashes, the same row.
+        assert_eq!(same_allocations(&loading, &polled), [false, false, true]);
+        let plugin_cells = |row: &ResourceRow| row.cells[..4].to_vec();
+        for (before, after) in loading.iter().zip(&polled) {
+            assert_eq!(plugin_cells(before), plugin_cells(after));
+        }
+
+        // Another poll: `a` uses the same, `b` more, `c` got a sample.
+        list.set_usage(pod_usage(&[
+            ("web", "a", usage(100_000_000, 1 << 20)),
+            ("web", "b", usage(250_000_000, 2 << 20)),
+            ("web", "c", usage(1, 1)),
+        ]));
+        assert_eq!(list.update(), 0);
+        assert_eq!(list.shown(), list.rebuilt());
+        assert_eq!(
+            same_allocations(&polled, &list.shared()),
+            [true, false, false]
+        );
+        // The same state again is not looked at.
+        let shown = list.shared();
+        assert_eq!(list.update(), 0);
+        assert_eq!(same_allocations(&shown, &list.shared()), [true; 3]);
+
+        // Metrics went away: dashes again.
+        list.set_usage(MetricsState::Unavailable);
+        assert_eq!(list.update(), 0);
+        assert_eq!(list.shown(), list.rebuilt());
+        // A changed object gets the usage of the current poll.
+        list.set_usage(pod_usage(&[("web", "b", usage(5, 5))]));
+        list.objects[1] = thing("b", Some("web"), 2, None);
+        assert_eq!(list.update(), 1);
+        assert_eq!(list.shown(), list.rebuilt());
+    }
+
+    #[test]
+    fn nodes_get_usage_by_name_and_a_hidden_column_stays_hidden() {
+        let nodes = MetricsIndex::from_nodes([NodeMetrics {
+            name: "n1".into(),
+            timestamp: None,
+            window: None,
+            usage: usage(3_000_000_000, 8 << 30),
+        }]);
+        let mut list = List::new(Some(1), Some(MetricsState::Ready(nodes)));
+        list.objects = vec![thing("n1", None, 1, None), thing("n2", None, 1, None)];
+        list.check();
+        let rows = list.shown();
+        // Name, state, age, CPU, Memory.
+        assert_eq!(rows[0].cells.len(), 5);
+        assert_eq!(rows[0].cells[3].label().as_ref(), "3.000");
+        assert_eq!(rows[1].cells[3].label().as_ref(), "—");
+        list.set_usage(MetricsState::Loading);
+        list.check();
+        assert_eq!(list.shown()[0].cells.len(), 5);
+    }
+
+    #[test]
+    fn a_row_is_built_again_when_its_moment_comes() {
+        let mut list = List::new(None, None);
+        let now = list.world.now();
+        list.objects = vec![
+            thing("steady", Some("web"), 1, None),
+            thing("soon", Some("web"), 1, Some(now + 30)),
+            thing("later", Some("web"), 1, Some(now + 60)),
+            thing("past", Some("web"), 1, Some(now - 5)),
+        ];
+        assert_eq!(list.update(), 4);
+        // The clock alone builds nothing before a moment.
+        assert!(!list.cache.due(list.world.now()));
+        list.advance(29);
+        assert!(!list.cache.due(list.world.now()));
+        assert_eq!(list.update(), 0);
+        assert_eq!(list.shown(), list.rebuilt());
+
+        list.advance(1);
+        assert!(list.cache.due(list.world.now()));
+        let before = list.shared();
+        assert_eq!(list.update(), 1);
+        assert_eq!(
+            same_allocations(&before, &list.shared()),
+            [true, false, true, true]
+        );
+        list.check();
+
+        // Far past both moments: the one left turns, the turned one stays.
+        list.advance(1_000);
+        assert!(list.cache.due(list.world.now()));
+        assert_eq!(list.update(), 1);
+        list.check();
+        list.advance(1_000);
+        assert_eq!(list.update(), 0);
+
+        // A new version with a new moment is waited for again.
+        let now = list.world.now();
+        list.objects[0] = thing("steady", Some("web"), 2, Some(now + 10));
+        assert_eq!(list.update(), 1);
+        assert!(!list.cache.due(now + 9));
+        assert!(list.cache.due(now + 10));
+    }
+
+    #[test]
+    fn another_language_builds_every_row() {
+        let mut list = List::new(None, Some(MetricsState::Loading));
+        list.objects = vec![
+            thing("a", Some("web"), 1, None),
+            thing("b", Some("web"), 1, None),
+        ];
+        assert_eq!(list.update(), 2);
+        list.world.language.store(1, Ordering::Relaxed);
+        assert_eq!(list.update(), 2);
+        assert_eq!(list.shown(), list.rebuilt());
+        assert_eq!(list.update(), 0);
+        list.world.language.store(0, Ordering::Relaxed);
+        assert_eq!(list.update(), 2);
+        list.check();
+    }
+
+    #[test]
+    fn the_search_filters_built_rows() {
+        let mut list = List::new(None, None);
+        list.objects = vec![
+            thing("api-1", Some("web"), 1, None),
+            thing("worker", Some("web"), 1, None),
+            thing("API-2", Some("jobs"), 1, None),
+        ];
+        assert_eq!(list.update(), 3);
+        let all = list.shared();
+        for query in ["api", " Api ", "worker", "web", "", "-"] {
+            list.query = query.into();
+            assert_eq!(list.update(), 0, "{query}");
+            assert_eq!(list.shown(), list.rebuilt(), "{query}");
+        }
+        list.query = "api".into();
+        let found = list.shared();
+        assert_eq!(found.len(), 2);
+        assert!(Arc::ptr_eq(&found[0], &all[0]) && Arc::ptr_eq(&found[1], &all[2]));
+    }
+
+    #[test]
+    fn rows_built_ahead_are_used_while_they_stand() {
+        let mut list = List::new(None, None);
+        let now = list.world.now();
+        list.objects = vec![
+            thing("a", Some("web"), 1, None),
+            thing("b", Some("web"), 1, Some(now + 10)),
+            thing("c", Some("web"), 1, None),
+        ];
+        let missing = list.cache.missing(&list.objects, &list.inputs());
+        assert_eq!(missing.len(), 3);
+        let build = |list: &List, objects: &[Arc<DynamicObject>]| -> Vec<BuiltRow> {
+            let builder = list.cache.builder();
+            let (now, locale) = (list.world.now(), list.world.locale());
+            objects
+                .iter()
+                .map(|object| builder.build(object, now, locale))
+                .collect()
+        };
+        let ahead = build(&list, &missing);
+        assert_eq!(list.world.built(), 3);
+        list.cache.adopt(ahead);
+        assert!(list.cache.missing(&list.objects, &list.inputs()).is_empty());
+        // Meanwhile one object changed and one was removed.
+        list.objects[0] = thing("a", Some("web"), 2, None);
+        list.objects.pop();
+        let missing = list.cache.missing(&list.objects, &list.inputs());
+        assert_eq!(missing.len(), 1);
+        assert!(Arc::ptr_eq(&missing[0], &list.objects[0]));
+        assert_eq!(list.update(), 1);
+        assert_eq!(list.shown(), list.rebuilt());
+        assert_eq!(list.world.built(), 4 + 2);
+
+        // Built ahead before the moment of `b`, used after it: built again.
+        let fresh = thing("b", Some("web"), 2, Some(now + 10));
+        list.objects[1] = fresh.clone();
+        let ahead = build(&list, &[fresh]);
+        list.cache.adopt(ahead);
+        list.advance(10);
+        assert_eq!(list.cache.missing(&list.objects, &list.inputs()).len(), 1);
+        assert_eq!(list.update(), 1);
+        list.check();
+
+        // Built ahead in another language: built again.
+        let fresh = thing("c", Some("web"), 1, None);
+        list.objects.push(fresh.clone());
+        let ahead = build(&list, &[fresh]);
+        list.cache.adopt(ahead);
+        list.world.language.store(2, Ordering::Relaxed);
+        assert_eq!(list.update(), 3);
+        list.check();
+    }
+
+    #[test]
+    fn the_rows_of_pods_are_those_built_from_scratch() {
+        use kubach_core::perf::{self, PodShape};
+
+        let plugin = PluginRegistry::with_builtins().plugin_for("", "Pod");
+        let pods = perf::shared(perf::pods(60, 3, PodShape::SLIM));
+        let sample = |pod: &Arc<DynamicObject>, cpu| PodMetrics {
+            name: pod.metadata.name.clone().unwrap(),
+            namespace: pod.metadata.namespace.clone().unwrap(),
+            timestamp: None,
+            window: None,
+            containers: vec![ContainerMetrics {
+                name: "app".into(),
+                usage: usage(cpu, 64 << 20),
+            }],
+        };
+        let namespace = namespace_column(plugin.as_ref());
+        for hidden in [None, namespace] {
+            let world = Arc::new(World::default());
+            world.now.store(unix_now(), Ordering::Relaxed);
+            let mut list = List::of(world, plugin.clone(), hidden, Some(MetricsState::Loading));
+            list.objects = pods.clone();
+            list.update_at(unix_now(), kubach_i18n::locale());
+            assert_eq!(list.shown(), list.rebuilt());
+            let samples = pods.iter().step_by(2).map(|pod| sample(pod, 250_000_000));
+            list.set_usage(MetricsState::Ready(MetricsIndex::from_pods(samples)));
+            let mut changed = (*pods[7]).clone();
+            perf::touch(&mut changed, 77);
+            list.objects[7] = Arc::new(changed);
+            list.objects.remove(20);
+            list.query = "app-000".into();
+            assert_eq!(list.update_at(unix_now(), kubach_i18n::locale()), 1);
+            assert_eq!(list.shown(), list.rebuilt());
+            assert!(!list.shown().is_empty());
+        }
+    }
+
+    /// A small generator of repeatable "random" numbers.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self, sides: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % sides.max(1) as u64) as usize
+        }
+
+        fn chance(&mut self, percent: usize) -> bool {
+            self.roll(100) < percent
+        }
+    }
+
+    /// Whatever happens to a list, in whatever order, the kept rows are
+    /// those a build from scratch gives.
+    #[test]
+    fn kept_rows_equal_rebuilt_rows_after_random_changes() {
+        const NAMES: [&str; 8] = ["api", "API-b", "worker", "db", "cache", "b1", "web", "job"];
+        const QUERIES: [&str; 7] = ["", "a", "b1", "API", " w ", "zz", "-"];
+        for seed in 1..=60u64 {
+            let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let namespaced = dice.chance(70);
+            let hidden = [None, Some(1), Some(0), Some(9)][dice.roll(4)];
+            let usage_columns = dice.chance(60).then_some(MetricsState::Loading);
+            let mut list = List::new(hidden, usage_columns);
+            let mut next_version = 1;
+            let mut new_thing = |dice: &mut Dice, now: i64, name: Option<String>| {
+                next_version += 1;
+                let name = name.unwrap_or_else(|| {
+                    format!("{}-{}", NAMES[dice.roll(NAMES.len())], dice.roll(6))
+                });
+                let namespace = namespaced.then(|| ["web", "jobs"][dice.roll(2)]);
+                let turn = dice.chance(40).then(|| now + dice.roll(12) as i64 - 3);
+                thing(&name, namespace, next_version, turn)
+            };
+            let mut ahead: Vec<BuiltRow> = Vec::new();
+            for step in 0..400 {
+                let now = list.world.now();
+                let count = list.objects.len();
+                let at = dice.roll(count);
+                match dice.roll(14) {
+                    0 | 1 if count < 24 => {
+                        let object = new_thing(&mut dice, now, None);
+                        list.objects.insert(dice.roll(count + 1), object);
+                    }
+                    2 | 3 if count > 0 => {
+                        let name = list.objects[at].metadata.name.clone();
+                        list.objects[at] = new_thing(&mut dice, now, name);
+                    }
+                    4 if count > 0 => {
+                        list.objects.remove(at);
+                    }
+                    5 if count > 1 => list.objects.swap(at, dice.roll(count)),
+                    // An equal object in another allocation.
+                    6 if count > 0 => list.objects[at] = Arc::new((*list.objects[at]).clone()),
+                    7 if count > 0 && dice.chance(20) => {
+                        let again = list.objects[at].clone();
+                        list.objects.push(again);
+                    }
+                    8 if list.usage.is_some() => {
+                        let state = match dice.roll(6) {
+                            0 => MetricsState::Loading,
+                            1 => MetricsState::Unavailable,
+                            _ => {
+                                let mut sampled = Vec::new();
+                                for object in &list.objects {
+                                    if dice.chance(70) {
+                                        let usage = usage(
+                                            dice.roll(3) as u64 * 100_000_000,
+                                            dice.roll(3) as u64 * (64 << 20),
+                                        );
+                                        let meta = &object.metadata;
+                                        sampled.push((
+                                            meta.namespace.clone(),
+                                            meta.name.clone().unwrap(),
+                                            usage,
+                                        ));
+                                    }
+                                }
+                                let pods = sampled.iter().filter_map(|(namespace, name, usage)| {
+                                    Some(PodMetrics {
+                                        name: name.clone(),
+                                        namespace: namespace.clone()?,
+                                        timestamp: None,
+                                        window: None,
+                                        containers: vec![ContainerMetrics {
+                                            name: "app".into(),
+                                            usage: *usage,
+                                        }],
+                                    })
+                                });
+                                let mut index = MetricsIndex::from_pods(pods);
+                                if !namespaced {
+                                    let nodes =
+                                        sampled.iter().map(|(_, name, usage)| NodeMetrics {
+                                            name: name.clone(),
+                                            timestamp: None,
+                                            window: None,
+                                            usage: *usage,
+                                        });
+                                    index = MetricsIndex::from_nodes(nodes);
+                                }
+                                MetricsState::Ready(index)
+                            }
+                        };
+                        list.set_usage(state);
+                    }
+                    9 => list.advance(dice.roll(5) as i64),
+                    10 if dice.chance(15) => {
+                        list.world.language.store(dice.roll(3), Ordering::Relaxed);
+                    }
+                    11 => list.query = QUERIES[dice.roll(QUERIES.len())].into(),
+                    // Rows built ahead for some of the missing objects,
+                    // taken now or after more changes.
+                    12 => {
+                        let inputs = list.inputs();
+                        let missing = list.cache.missing(&list.objects, &inputs);
+                        let builder = list.cache.builder();
+                        for object in &missing {
+                            if dice.chance(70) {
+                                ahead.push(builder.build(object, inputs.now, inputs.locale));
+                            }
+                        }
+                    }
+                    13 => list.cache.adopt(ahead.drain(..)),
+                    _ => {}
+                }
+                if dice.chance(60) {
+                    list.update();
+                    assert_eq!(list.shown(), list.rebuilt(), "seed {seed}, step {step}");
+                    let inputs = list.inputs();
+                    assert!(list.cache.missing(&list.objects, &inputs).is_empty());
+                    assert!(!list.cache.due(inputs.now), "seed {seed}, step {step}");
+                }
+            }
+        }
     }
 }

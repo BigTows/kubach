@@ -16,6 +16,7 @@ use kubach_core::metrics::{
 use kubach_i18n::t;
 use kubach_ui::{ResourceCell, ResourceColumn};
 use kube::api::DynamicObject;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::prometheus_link::{PrometheusStatus, doesnt_answer};
 
@@ -23,8 +24,15 @@ use super::prometheus_link::{PrometheusStatus, doesnt_answer};
 #[derive(Clone, Copy)]
 pub struct UsageView<'a> {
     pub state: &'a MetricsState,
-    /// [`UsageFeed::revision`] of `state`.
+    /// Another one for another `state`, also of another feed.
     pub revision: u64,
+}
+
+/// A revision no state had before: a view that gets another feed (a cached
+/// list going live) never takes its usage for the one already shown.
+fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Kinds that get usage columns.
@@ -104,8 +112,8 @@ pub struct UsageFeed {
     /// `None` while looking for Prometheus, or when there is no source.
     pub source: Option<UsageSource>,
     state: MetricsState,
-    /// Counts the changes of `state`: rows built from one revision need
-    /// their usage cells looked at again only for another.
+    /// Names this `state` among the states of all feeds: rows whose usage
+    /// cells show one revision need them looked at again only for another.
     revision: u64,
     /// Prometheus feeds: the server being polled.
     polling: Option<Endpoint>,
@@ -122,7 +130,7 @@ impl UsageFeed {
             kind,
             source: Some(UsageSource::MetricsServer),
             state: MetricsState::Loading,
-            revision: 0,
+            revision: next_revision(),
             polling: None,
             problem: None,
             _task: Some(task),
@@ -135,26 +143,17 @@ impl UsageFeed {
             kind,
             source: None,
             state: MetricsState::Loading,
-            revision: 0,
+            revision: next_revision(),
             polling: None,
             problem: None,
             _task: None,
         }
     }
 
-    pub fn state(&self) -> &MetricsState {
-        &self.state
-    }
-
     /// The usage as of a new poll.
     pub fn set_state(&mut self, state: MetricsState) {
         self.state = state;
-        self.revision += 1;
-    }
-
-    /// Changes whenever the [`state`](Self::state) does.
-    pub fn revision(&self) -> u64 {
-        self.revision
+        self.revision = next_revision();
     }
 
     pub fn view(&self) -> UsageView<'_> {
@@ -289,10 +288,6 @@ pub fn columns() -> [ResourceColumn; 2] {
     ]
 }
 
-pub fn cells(state: &MetricsState, object: &DynamicObject) -> [ResourceCell; 2] {
-    usage_cells(usage_of(state, object))
-}
-
 /// The usage `state` has for `object`; `None` without a sample.
 pub fn usage_of(state: &MetricsState, object: &DynamicObject) -> Option<Usage> {
     match state {
@@ -330,7 +325,9 @@ mod tests {
 
     use kubach_core::metrics::shared::{PollScope, Polled};
 
-    use super::{MetricsState, UsageFeed, UsageKind, UsageSource, cells, poll_scope};
+    use super::{
+        MetricsState, UsageFeed, UsageKind, UsageSource, poll_scope, usage_cells, usage_of,
+    };
     use crate::screens::prometheus_link::PrometheusStatus;
 
     fn service(name: &str) -> Endpoint {
@@ -458,10 +455,11 @@ mod tests {
                 memory: 512 << 20,
             },
         }]);
-        let [cpu, memory] = cells(&MetricsState::Ready(index), &node);
+        let cells = |state: &MetricsState| usage_cells(usage_of(state, &node));
+        let [cpu, memory] = cells(&MetricsState::Ready(index));
         assert_eq!(cpu.label().as_ref(), "0.250");
         assert_eq!(memory.label().as_ref(), "512.0 MiB");
-        let [cpu, _] = cells(&MetricsState::Unavailable, &node);
+        let [cpu, _] = cells(&MetricsState::Unavailable);
         assert_eq!(cpu.label().as_ref(), "—");
     }
 }
