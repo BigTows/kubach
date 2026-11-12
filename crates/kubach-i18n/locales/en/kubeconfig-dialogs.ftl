@@ -73,6 +73,9 @@ kubeconfig-review-file-cluster = cluster { $owner }, { $key }
 kubeconfig-review-file-user = user { $owner }, { $key }
 kubeconfig-review-file-cluster-outside = cluster { $owner }, { $key } (outside the kubeconfig's folder)
 kubeconfig-review-file-user-outside = user { $owner }, { $key } (outside the kubeconfig's folder)
+kubeconfig-review-connection = This config changes how Kubach connects to these clusters: without checking the server's certificate, through a proxy, or checking the certificate against another name. Continue only if you expect that.
+# $cluster is a cluster name, $key the kubeconfig field (insecure-skip-tls-verify, proxy-url, tls-server-name).
+kubeconfig-review-connection-setting = cluster { $cluster }, { $key }
 
 ## "Test connection" failures
 

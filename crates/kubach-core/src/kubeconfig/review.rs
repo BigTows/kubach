@@ -1,9 +1,11 @@
 //! What a kubeconfig does on this computer besides talking to its API
 //! servers: programs it runs to get credentials (exec plugins and the `gcp`
 //! auth provider's `cmd-path`, with their environment) and local files whose
-//! contents it sends (certificates, keys, token files). Shown before a
-//! foreign kubeconfig is imported or linked, so nothing runs or leaves the
-//! computer unnoticed.
+//! contents it sends (certificates, keys, token files), and cluster
+//! settings that change how the connection itself is made (no certificate
+//! check, a proxy, another name to check the certificate against). Shown
+//! before a foreign kubeconfig is imported or linked, so nothing runs,
+//! leaves the computer or takes another route unnoticed.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -14,6 +16,8 @@ use kube::config::Kubeconfig;
 pub struct ConfigReview {
     pub programs: Vec<Program>,
     pub files: Vec<LocalFile>,
+    /// Cluster settings that change how the connection is made.
+    pub connection: Vec<ConnectionSetting>,
 }
 
 impl ConfigReview {
@@ -29,6 +33,21 @@ impl ConfigReview {
                 && let Some(path) = &cluster.certificate_authority
             {
                 review.add_file(&named.name, FileField::CertificateAuthority, path, folder);
+            }
+            let mut setting = |kind| {
+                review.connection.push(ConnectionSetting {
+                    cluster: named.name.clone(),
+                    kind,
+                });
+            };
+            if cluster.insecure_skip_tls_verify == Some(true) {
+                setting(ConnectionSettingKind::InsecureSkipTlsVerify);
+            }
+            if let Some(url) = nonempty(&cluster.proxy_url) {
+                setting(ConnectionSettingKind::ProxyUrl(url));
+            }
+            if let Some(name) = nonempty(&cluster.tls_server_name) {
+                setting(ConnectionSettingKind::TlsServerName(name));
             }
         }
         for named in &config.auth_infos {
@@ -111,7 +130,7 @@ impl ConfigReview {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.programs.is_empty() && self.files.is_empty()
+        self.programs.is_empty() && self.files.is_empty() && self.connection.is_empty()
     }
 
     /// Whether some program gets an environment variable that changes how
@@ -123,6 +142,77 @@ impl ConfigReview {
     /// Whether some file lies outside the kubeconfig's folder.
     pub fn has_outside_files(&self) -> bool {
         self.files.iter().any(|file| file.outside)
+    }
+}
+
+fn nonempty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// A cluster setting that changes how Kubach connects to the API server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionSetting {
+    /// The kubeconfig cluster it belongs to.
+    pub cluster: String,
+    pub kind: ConnectionSettingKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionSettingKind {
+    /// `insecure-skip-tls-verify: true`: the server's certificate is not
+    /// checked.
+    InsecureSkipTlsVerify,
+    /// `proxy-url`: every request to the cluster goes through this proxy.
+    ProxyUrl(String),
+    /// `tls-server-name`: the certificate is checked against this name
+    /// instead of the server's host.
+    TlsServerName(String),
+}
+
+impl ConnectionSetting {
+    /// The key as written in kubeconfig.
+    pub fn key(&self) -> &'static str {
+        match self.kind {
+            ConnectionSettingKind::InsecureSkipTlsVerify => "insecure-skip-tls-verify",
+            ConnectionSettingKind::ProxyUrl(_) => "proxy-url",
+            ConnectionSettingKind::TlsServerName(_) => "tls-server-name",
+        }
+    }
+
+    /// The value as shown to the user, with a password in the proxy URL
+    /// masked.
+    pub fn value(&self) -> String {
+        match &self.kind {
+            ConnectionSettingKind::InsecureSkipTlsVerify => "true".to_owned(),
+            ConnectionSettingKind::ProxyUrl(url) => mask_url_password(url),
+            ConnectionSettingKind::TlsServerName(name) => name.clone(),
+        }
+    }
+
+    /// Whether the connection is no longer authenticated by a certificate
+    /// check at all.
+    pub fn disables_verification(&self) -> bool {
+        self.kind == ConnectionSettingKind::InsecureSkipTlsVerify
+    }
+}
+
+/// `scheme://user:password@host` with the password replaced by `•••`.
+fn mask_url_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:•••@{host}{tail}"),
+        None => url.to_owned(),
     }
 }
 
@@ -394,6 +484,78 @@ contexts:
             ]
         );
         assert!(review.has_outside_files());
+    }
+
+    #[test]
+    fn connection_settings_are_listed() {
+        let config = Kubeconfig::from_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: open
+    cluster:
+      server: "https://open.invalid"
+      insecure-skip-tls-verify: true
+      proxy-url: "http://me:hunter2@proxy.invalid:3128/path"
+      tls-server-name: other.invalid
+  - name: plain
+    cluster:
+      server: "https://plain.invalid"
+      insecure-skip-tls-verify: false
+      proxy-url: ""
+  - name: socks
+    cluster: { server: "https://socks.invalid", proxy-url: "socks5://127.0.0.1:1080" }
+"#,
+        )
+        .unwrap();
+        let review = ConfigReview::of(&config, None);
+        assert!(review.programs.is_empty() && review.files.is_empty());
+        assert!(!review.is_empty());
+        let settings: Vec<_> = review
+            .connection
+            .iter()
+            .map(|s| {
+                (
+                    s.cluster.as_str(),
+                    s.key(),
+                    s.value(),
+                    s.disables_verification(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                ("open", "insecure-skip-tls-verify", "true".to_owned(), true),
+                (
+                    "open",
+                    "proxy-url",
+                    "http://me:•••@proxy.invalid:3128/path".to_owned(),
+                    false
+                ),
+                ("open", "tls-server-name", "other.invalid".to_owned(), false),
+                (
+                    "socks",
+                    "proxy-url",
+                    "socks5://127.0.0.1:1080".to_owned(),
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_passwords_are_masked() {
+        for (url, shown) in [
+            ("http://proxy:3128", "http://proxy:3128"),
+            ("http://user@proxy:3128", "http://user@proxy:3128"),
+            ("http://user:p@ss@proxy:3128", "http://user:•••@proxy:3128"),
+            ("http://proxy/a:b@c", "http://proxy/a:b@c"),
+            ("proxy:3128", "proxy:3128"),
+        ] {
+            assert_eq!(mask_url_password(url), shown);
+        }
     }
 
     #[test]

@@ -72,6 +72,8 @@ kubeconfig-review-file-cluster = кластер { $owner }, { $key }
 kubeconfig-review-file-user = пользователь { $owner }, { $key }
 kubeconfig-review-file-cluster-outside = кластер { $owner }, { $key } (вне папки kubeconfig)
 kubeconfig-review-file-user-outside = пользователь { $owner }, { $key } (вне папки kubeconfig)
+kubeconfig-review-connection = Этот конфиг меняет то, как Kubach подключается к этим кластерам: без проверки сертификата сервера, через прокси или с проверкой сертификата по другому имени. Продолжайте, только если ожидаете этого.
+kubeconfig-review-connection-setting = кластер { $cluster }, { $key }
 
 ## Ошибки «Проверить подключение»
 
