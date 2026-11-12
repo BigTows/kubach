@@ -4836,7 +4836,7 @@ async fn a_clients_name_is_cleaned_for_windows_the_sessions_list_and_the_audit_l
             assert!(!text.contains(&"x".repeat(39)), "{text:?}");
         }
     }
-    assert_eq!(f.server.session().activity().clients, [shown.clone()]);
+    assert_eq!(f.server.session().activity().clients, vec![shown.clone()]);
     let lines = audit_lines(&f.audit_path);
     assert!(!lines.is_empty());
     for line in lines {
