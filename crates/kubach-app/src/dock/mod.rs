@@ -146,10 +146,23 @@ pub struct Dock {
     active: usize,
     expanded: bool,
     next_id: u64,
+    /// Ends the tabs of the vault's contexts when it locks.
+    _vault: Option<Subscription>,
 }
 
 impl Dock {
-    pub fn new(cluster: Entity<Cluster>, forwards: Entity<Forwards>) -> Self {
+    pub fn new(
+        cluster: Entity<Cluster>,
+        forwards: Entity<Forwards>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let vault = crate::vault::global(cx).map(|vault| {
+            cx.observe(&vault, |dock, vault, cx| {
+                if !vault.read(cx).is_unlocked() {
+                    dock.vault_locked(cx);
+                }
+            })
+        });
         Self {
             cluster,
             forwards,
@@ -157,6 +170,24 @@ impl Dock {
             active: 0,
             expanded: true,
             next_id: 0,
+            _vault: vault,
+        }
+    }
+
+    /// The vault locked (by hand, idle timer, screen lock): every tab on
+    /// one of its contexts ends its stream or session and stays, saying
+    /// why (ADR 0008). Each tab knows whether it is on such a context. A
+    /// new kind of tab has to be named here to compile.
+    fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match &tab.view {
+                TabView::Logs(tab) => tab.update(cx, |tab, cx| tab.vault_locked(cx)),
+                TabView::Terminal(tab) => tab.update(cx, |tab, cx| tab.vault_locked(cx)),
+                TabView::Node(tab) => tab.update(cx, |tab, cx| tab.vault_locked(cx)),
+                // The local shell keeps running with its own kubeconfig
+                // file (ADR 0015).
+                TabView::Local(_) => {}
+            }
         }
     }
 
@@ -311,6 +342,7 @@ impl Dock {
                         LogsState::Starting => (t!("dock-connecting"), true),
                         LogsState::Streaming => (t!("dock-logs-streaming", lines = lines), true),
                         LogsState::Finished => (t!("dock-logs-ended", lines = lines), false),
+                        LogsState::Locked => (t!("dock-vault-locked"), false),
                         LogsState::Failed(error) => (error.clone(), false),
                     };
                     SessionSummary {

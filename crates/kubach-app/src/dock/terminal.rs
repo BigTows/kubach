@@ -196,6 +196,8 @@ pub struct TerminalTab {
     /// Bumped by every (re)connect; a session's task stops touching the tab
     /// once a newer one started (e.g. after switching containers).
     generation: u64,
+    /// The session runs on a context of the vault and ends when it locks.
+    vault: bool,
     _session: Option<Task<()>>,
     _subscription: Subscription,
     /// Follows the OSC 52 clipboard setting.
@@ -237,6 +239,7 @@ impl TerminalTab {
             state: SessionState::Connecting(msg!("dock-connecting")),
             no_shell: false,
             generation: 0,
+            vault: false,
             _session: None,
             _subscription: subscription,
             _settings: settings,
@@ -325,6 +328,23 @@ impl TerminalTab {
         }
     }
 
+    /// The vault locked: a session on one of its contexts ends like a
+    /// closed tab's, and the tab stays to say why (ADR 0008).
+    pub fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.vault) {
+            return;
+        }
+        let live = self.state.is_live();
+        // The session's task no longer touches the tab.
+        self.generation += 1;
+        self.shutdown(cx);
+        if live {
+            let closed = msg!("dock-vault-locked");
+            self.note(&format!("[{closed}]"), cx);
+            self.set_state(SessionState::Exited(closed), cx);
+        }
+    }
+
     /// The containers the tab can switch to, when there is a choice.
     fn container_menu(&self) -> Option<ContainerMenu> {
         (self.pod.containers.len() > 1)
@@ -352,15 +372,19 @@ impl TerminalTab {
         self.no_shell = false;
         self.generation += 1;
         let generation = self.generation;
-        let client =
-            match action_context::tab_connection(self.cluster.read(cx), self.context.as_deref()) {
-                Ok(connection) => connection.client.clone(),
-                Err(error) => {
-                    self.note(&error, cx);
-                    self.set_state(SessionState::Failed(error), cx);
-                    return;
-                }
-            };
+        let tab_client =
+            action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx);
+        let client = match tab_client {
+            Ok(tab) => {
+                self.vault = tab.vault;
+                tab.client
+            }
+            Err(error) => {
+                self.note(&error, cx);
+                self.set_state(SessionState::Failed(error), cx);
+                return;
+            }
+        };
         let namespace = self.pod.namespace.clone();
         let pod = self.pod.name.clone();
         let container = self.container.clone();
