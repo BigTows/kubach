@@ -157,6 +157,12 @@ pub struct Session {
     /// session, as `(namespace, kind, name)`: reading the logs of their pods
     /// is confirmed (#190).
     changed: Mutex<HashSet<ChangedObject>>,
+    /// How many times each Secret key was compared in this session, see
+    /// [`MAX_COMPARISONS_PER_KEY`].
+    compared: Mutex<HashMap<SecretKey, u32>>,
+    /// Secrets written through this session (entered by the user, copied),
+    /// as `(namespace, name)`: they are not compared (#179).
+    written_secrets: Mutex<HashSet<(String, String)>>,
     /// The agent's port-forwards (#17); they end with the session.
     forwards: SessionForwards,
     /// Kinds of change per namespace the user said not to ask about again
@@ -187,6 +193,16 @@ const ROLE_SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 
 /// `(namespace, kind, name)` of an object the agent applied.
 pub type ChangedObject = (String, String, String);
+
+/// `(namespace, name, key)` of a Secret key.
+pub type SecretKey = (String, String, String);
+
+/// Most times one Secret key takes part in `compare_secret_values` in a
+/// session (#179). A comparison answers one yes-or-no question about the
+/// value, so the number of answers about one value is kept small: ten
+/// covers finding which of a handful of Secrets hold the same value, and
+/// is in the range of attempts a login form allows before it locks.
+pub const MAX_COMPARISONS_PER_KEY: u32 = 10;
 
 /// Who used a session and how much, for the sessions screen.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -239,6 +255,8 @@ impl Session {
             waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
             helm_previews: Mutex::default(),
@@ -276,6 +294,8 @@ impl Session {
             waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
             helm_previews: Mutex::default(),
@@ -554,6 +574,39 @@ impl Session {
             kind.to_owned(),
             name.to_owned(),
         ))
+    }
+
+    /// Records that Secret `name` in `namespace` is written through this
+    /// session.
+    pub(crate) fn note_secret_written(&self, namespace: &str, name: &str) {
+        sync::lock(&self.written_secrets).insert((namespace.to_owned(), name.to_owned()));
+    }
+
+    /// Whether Secret `name` in `namespace` was written through this
+    /// session.
+    pub(crate) fn secret_written(&self, namespace: &str, name: &str) -> bool {
+        sync::lock(&self.written_secrets).contains(&(namespace.to_owned(), name.to_owned()))
+    }
+
+    /// Counts one comparison of `first` with `second`, unless either was
+    /// compared [`MAX_COMPARISONS_PER_KEY`] times already: then nothing is
+    /// counted and that key is returned.
+    pub(crate) fn count_comparison(
+        &self,
+        first: &SecretKey,
+        second: &SecretKey,
+    ) -> Result<(), SecretKey> {
+        let mut compared = sync::lock(&self.compared);
+        let full =
+            |key: &SecretKey| compared.get(key).copied().unwrap_or(0) >= MAX_COMPARISONS_PER_KEY;
+        if let Some(key) = [first, second].into_iter().find(|key| full(key)) {
+            return Err(key.clone());
+        }
+        *compared.entry(first.clone()).or_default() += 1;
+        if second != first {
+            *compared.entry(second.clone()).or_default() += 1;
+        }
+        Ok(())
     }
 
     /// Helm previews kept for paging (#115).
@@ -1295,6 +1348,8 @@ mod tests {
             waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
             helm_previews: Mutex::default(),

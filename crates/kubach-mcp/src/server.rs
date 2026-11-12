@@ -23,6 +23,7 @@ use crate::event_tools::MAX_SINCE_SECONDS;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
+use crate::names::{UNKNOWN_CLIENT, clean_client_name};
 use crate::node_host::NodeShellPrefs;
 use crate::node_tools::PrometheusPlan;
 use crate::rules::writes_secrets;
@@ -196,6 +197,9 @@ impl McpServer {
         cancel: CancellationToken,
     ) -> CallOutcome {
         let started = Instant::now();
+        // A name that did not come through `client_name` (a relayed call)
+        // is cleaned as well.
+        let client = &clean_client_name(client);
         self.inner.session.note_call(client);
         let confirmer = AnnouncingConfirmer {
             confirmer: self.inner.confirmer.as_ref(),
@@ -560,11 +564,13 @@ pub(crate) fn progress_of(context: &RequestContext<RoleServer>) -> Option<tools:
     }))
 }
 
-/// The MCP client's self-reported name (for the audit log only; it is not
-/// authenticated).
+/// The MCP client's self-reported name, for showing only: it is not
+/// authenticated. The client writes it, so it is cleaned here, once, for
+/// everything that shows or records it: windows, notifications, the
+/// sessions list, the audit log ([`clean_client_name`]).
 pub(crate) fn client_name(context: &RequestContext<RoleServer>) -> String {
     if let Some(info) = context.peer.peer_info() {
-        return info.client_info.name.clone();
+        return clean_client_name(&info.client_info.name);
     }
     serde_json::to_value(&context.meta)
         .ok()
@@ -572,9 +578,9 @@ pub(crate) fn client_name(context: &RequestContext<RoleServer>) -> String {
             meta.get("io.modelcontextprotocol/clientInfo")?
                 .get("name")?
                 .as_str()
-                .map(str::to_owned)
+                .map(clean_client_name)
         })
-        .unwrap_or_else(|| "unknown".into())
+        .unwrap_or_else(|| UNKNOWN_CLIENT.into())
 }
 
 // ------------------------------------------------------------- tool catalog
