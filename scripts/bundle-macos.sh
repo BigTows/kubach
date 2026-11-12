@@ -3,9 +3,11 @@
 # the data protection keychain needs a signed app whose entitlements the
 # provisioning profile allows (ADR 0008).
 #
-#   scripts/bundle-macos.sh [--debug] [--profile FILE] [--identity NAME] [--unsigned] [--dmg]
+#   scripts/bundle-macos.sh [--debug] [--no-build] [--profile FILE] [--identity NAME] [--unsigned] [--dmg]
 #
 #   --debug      the dev build (fast) instead of release
+#   --no-build   don't run cargo: bundle the binary already in
+#                target/<release|debug>/kubach (CI builds it in another job)
 #   --profile    provisioning profile, default $KUBACH_PROVISIONING_PROFILE
 #   --identity   signing identity, default $KUBACH_SIGN_IDENTITY or the
 #                first "Apple Development" / "Developer ID Application" one
@@ -22,14 +24,16 @@ profile="${KUBACH_PROVISIONING_PROFILE:-}"
 identity="${KUBACH_SIGN_IDENTITY:-}"
 unsigned=
 dmg=
+no_build=
 while [ $# -gt 0 ]; do
     case "$1" in
         --debug) build=debug ;;
+        --no-build) no_build=1 ;;
         --profile) profile="$2"; shift ;;
         --identity) identity="$2"; shift ;;
         --unsigned) unsigned=1 ;;
         --dmg) dmg=1 ;;
-        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -76,17 +80,20 @@ fi
 echo "build      $build, version $version"
 
 cd "$root"
-if [ "$build" = release ]; then
+target="${CARGO_TARGET_DIR:-$root/target}"
+if [ -n "$no_build" ]; then
+    [ -f "$target/$build/kubach" ] || { echo "no build at $target/$build/kubach" >&2; exit 2; }
+elif [ "$build" = release ]; then
     cargo build --release -p kubach-app
 else
     cargo build -p kubach-app
 fi
 
-target="${CARGO_TARGET_DIR:-$root/target}"
 app="$target/$build/bundle/Kubach.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$target/$build/kubach" "$app/Contents/MacOS/kubach"
+chmod 755 "$app/Contents/MacOS/kubach"
 cp crates/kubach-app/assets/icon/kubach.icns "$app/Contents/Resources/kubach.icns"
 [ -n "$unsigned" ] || cp "$profile" "$app/Contents/embedded.provisionprofile"
 
