@@ -1240,6 +1240,11 @@ impl ResourceTable {
         true
     }
 
+    /// Whether the table has no rows.
+    pub fn is_empty(&self, cx: &App) -> bool {
+        self.state.read(cx).delegate().rows.is_empty()
+    }
+
     /// Keys of the checked rows, in display order.
     pub fn checked(&self, cx: &App) -> Vec<SharedString> {
         self.state.read(cx).delegate().checked_keys()

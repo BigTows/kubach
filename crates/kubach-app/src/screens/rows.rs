@@ -138,7 +138,7 @@ impl RowBuilder {
 
     /// [`build`](Self::build) now, off the UI thread; `None` if the
     /// language was switched meanwhile (the row could mix two).
-    pub fn build_detached(&self, object: &Arc<DynamicObject>) -> Option<BuiltRow> {
+    fn build_detached(&self, object: &Arc<DynamicObject>) -> Option<BuiltRow> {
         let locale = kubach_i18n::locale();
         let built = self.build(object, unix_now(), locale);
         (kubach_i18n::locale() == locale).then_some(built)
@@ -163,6 +163,33 @@ impl<'a> RowInputs<'a> {
             now: unix_now(),
             locale: kubach_i18n::locale(),
         }
+    }
+}
+
+/// An update builds at most this many rows where it runs, the UI thread:
+/// about a frame of work for pods (`docs/perf.md`). More (a long list
+/// shown for the first time, another language) are built on other threads.
+pub const OFF_THREAD_ROWS: usize = 300;
+
+/// Rows a [`RowCache`] is missing for a list, to build off the UI thread.
+pub struct RowJob {
+    builder: RowBuilder,
+    /// The list the rows are for.
+    list: Vec<Arc<DynamicObject>>,
+    missing: Vec<Arc<DynamicObject>>,
+}
+
+impl RowJob {
+    /// The work in parts of at most `size` rows, each for any thread.
+    pub fn parts(&self, size: usize) -> Vec<impl FnOnce() -> Vec<BuiltRow> + Send + 'static> {
+        let parts = self.missing.chunks(size.max(1)).map(|objects| {
+            let (builder, objects) = (self.builder.clone(), objects.to_vec());
+            move || {
+                let rows = objects.iter().map(|object| builder.build_detached(object));
+                rows.flatten().collect()
+            }
+        });
+        parts.collect()
     }
 }
 
@@ -212,6 +239,9 @@ impl Entry {
 ///
 /// Rows do not depend on the search: [`rows`] filters the built ones.
 ///
+/// Many rows to build at once (a long list shown for the first time) are
+/// built off the UI thread: see [`update_or_job`](Self::update_or_job).
+///
 /// [`update`]: Self::update
 /// [`rows`]: Self::rows
 pub struct RowCache {
@@ -250,6 +280,7 @@ impl RowCache {
         }
     }
 
+    #[cfg(test)]
     pub fn builder(&self) -> &RowBuilder {
         &self.builder
     }
@@ -309,14 +340,22 @@ impl RowCache {
     }
 
     /// The `objects` whose rows [`update`](Self::update) would have to
-    /// build: to build them off the UI thread first when they are many
-    /// ([`adopt`](Self::adopt)).
+    /// build.
+    #[cfg(test)]
     pub fn missing(
         &self,
         objects: &[Arc<DynamicObject>],
         inputs: &RowInputs,
     ) -> Vec<Arc<DynamicObject>> {
-        let standing = self.standing(objects, inputs);
+        self.missing_of(objects, inputs, &self.standing(objects, inputs))
+    }
+
+    fn missing_of(
+        &self,
+        objects: &[Arc<DynamicObject>],
+        inputs: &RowInputs,
+        standing: &[Option<usize>],
+    ) -> Vec<Arc<DynamicObject>> {
         let missing = objects.iter().zip(standing).filter(|(object, entry)| {
             entry.is_none()
                 && !self
@@ -327,9 +366,8 @@ impl RowCache {
         missing.map(|(object, _)| object.clone()).collect()
     }
 
-    /// Takes rows built off the UI thread: the next
-    /// [`update`](Self::update) uses those whose object is still listed
-    /// and drops the rest.
+    /// Takes rows built ahead: the next [`update`](Self::update) uses
+    /// those whose object is still listed and drops the rest.
     pub fn adopt(&mut self, rows: impl IntoIterator<Item = BuiltRow>) {
         let rows = rows.into_iter().map(|row| (address(&row.object), row));
         self.prebuilt.extend(rows);
@@ -339,6 +377,51 @@ impl RowCache {
     /// it had to build ([adopted](Self::adopt) ones are not counted).
     pub fn update(&mut self, objects: &[Arc<DynamicObject>], inputs: &RowInputs) -> usize {
         let standing = self.standing(objects, inputs);
+        self.apply(objects, inputs, standing)
+    }
+
+    /// [`update`](Self::update), unless it would build more than
+    /// [`OFF_THREAD_ROWS`] rows: then the rows stay as they are, and the
+    /// job returned builds the missing ones on other threads
+    /// ([`finish`](Self::finish) takes them).
+    pub fn update_or_job(
+        &mut self,
+        objects: &[Arc<DynamicObject>],
+        inputs: &RowInputs,
+    ) -> Option<RowJob> {
+        let standing = self.standing(objects, inputs);
+        let missing = self.missing_of(objects, inputs, &standing);
+        if missing.len() <= OFF_THREAD_ROWS {
+            self.apply(objects, inputs, standing);
+            return None;
+        }
+        Some(RowJob {
+            builder: self.builder.clone(),
+            list: objects.to_vec(),
+            missing,
+        })
+    }
+
+    /// Takes the `rows` built for `job` and brings the rows to the list
+    /// the job was made for. The list may have changed since: the next
+    /// update is for the caller to run, and has little left to build
+    /// unless most of the list changed meanwhile.
+    pub fn finish(&mut self, job: RowJob, rows: Vec<BuiltRow>, inputs: &RowInputs) -> usize {
+        self.adopt(rows);
+        self.update(&job.list, inputs)
+    }
+
+    /// No rows yet: nothing was listed, or the first rows are being built.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn apply(
+        &mut self,
+        objects: &[Arc<DynamicObject>],
+        inputs: &RowInputs,
+        standing: Vec<Option<usize>>,
+    ) -> usize {
         let revision = inputs.usage.map(|usage| usage.revision);
         let usage_changed = self.usage_revision != revision;
         self.usage_revision = revision;
@@ -1110,6 +1193,76 @@ mod tests {
         list.world.language.store(2, Ordering::Relaxed);
         assert_eq!(list.update(), 3);
         list.check();
+    }
+
+    #[test]
+    fn many_rows_are_left_to_a_job_and_few_built_at_once() {
+        let mut list = List::new(None, Some(MetricsState::Loading));
+        let many = OFF_THREAD_ROWS + 40;
+        list.objects = (0..many)
+            .map(|ix| thing(&format!("t{ix}"), Some("web"), 1, None))
+            .collect();
+        // The process speaks the language the job builds in.
+        let inputs = |list: &List| RowInputs {
+            usage: None,
+            now: list.world.now(),
+            locale: kubach_i18n::locale(),
+        };
+        let job = list
+            .cache
+            .update_or_job(&list.objects, &inputs(&list))
+            .expect("too many rows for one update");
+        // Nothing was built or shown yet.
+        assert_eq!(list.world.built(), 0);
+        assert!(list.cache.is_empty() && list.cache.rows("").is_empty());
+
+        // Built in parts, on whatever threads.
+        let parts = job.parts(100);
+        assert_eq!(parts.len(), many.div_ceil(100));
+        let threads: Vec<_> = parts.into_iter().map(std::thread::spawn).collect();
+        let rows: Vec<BuiltRow> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(rows.len(), many);
+        assert_eq!(list.world.built(), many);
+
+        // Meanwhile the list changed a little.
+        let listed = std::mem::take(&mut list.objects);
+        let mut now = listed.clone();
+        now[3] = thing("t3", Some("web"), 2, None);
+        now.remove(10);
+        now.push(thing("new", Some("web"), 1, None));
+        // The job's rows are shown for its list, without building any.
+        assert_eq!(list.cache.finish(job, rows, &inputs(&list)), 0);
+        assert_eq!(list.world.built(), many);
+        list.objects = listed;
+        list.world
+            .language
+            .store(kubach_i18n::locale() as usize, Ordering::Relaxed);
+        assert_eq!(list.shown(), list.rebuilt());
+        // The rest is little: built at once.
+        list.objects = now;
+        let before = list.world.built();
+        assert!(
+            list.cache
+                .update_or_job(&list.objects, &inputs(&list))
+                .is_none()
+        );
+        assert_eq!(list.world.built() - before, 2);
+        assert_eq!(list.shown(), list.rebuilt());
+
+        // Exactly the limit is still built at once.
+        let mut list = List::new(None, None);
+        list.objects = (0..OFF_THREAD_ROWS)
+            .map(|ix| thing(&format!("t{ix}"), None, 1, None))
+            .collect();
+        assert!(
+            list.cache
+                .update_or_job(&list.objects, &inputs(&list))
+                .is_none()
+        );
+        assert_eq!(list.world.built(), OFF_THREAD_ROWS);
     }
 
     #[test]

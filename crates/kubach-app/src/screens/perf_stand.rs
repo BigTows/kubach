@@ -27,6 +27,7 @@ use kubach_core::plugin::{PluginRegistry, ResourcePlugin};
 use kubach_ui::{ResourceRow, RowsProbe, SortDirection};
 use kube::api::DynamicObject;
 
+use super::browser::ROWS_PER_TASK;
 use super::rows::{self, RowBuilder, RowCache, RowInputs};
 use super::usage::{MetricsState, UsageView};
 
@@ -107,16 +108,80 @@ fn row_cache(plugin: &Arc<dyn ResourcePlugin>, usage: bool) -> RowCache {
     RowCache::new(RowBuilder::new(plugin.clone(), None), usage)
 }
 
-/// What `KindView::rows` does: brings the rows to `objects`, then takes
-/// those matching the search `query`.
+/// What `ResourceBrowser::sync_rows` does, on one thread: brings the rows
+/// to `objects` (many missing rows are a job, run here at once), then
+/// takes those matching the search `query`.
 fn rows_of(
     cache: &mut RowCache,
     objects: &[Arc<DynamicObject>],
     usage: Option<UsageView>,
     query: &str,
 ) -> Vec<Arc<ResourceRow>> {
-    cache.update(objects, &RowInputs::current(usage));
+    let inputs = RowInputs::current(usage);
+    if let Some(job) = cache.update_or_job(objects, &inputs) {
+        let rows = job.parts(usize::MAX).into_iter().flat_map(|part| part());
+        let rows = rows.collect();
+        cache.finish(job, rows, &inputs);
+    }
     cache.rows(query)
+}
+
+/// The first build of the rows of a long list, as the browser runs it.
+struct FirstBuild {
+    /// On the UI thread: finding out there is a job, then taking its rows.
+    ui: Duration,
+    /// The job on one thread.
+    one_thread: Duration,
+    /// The job in parts of [`ROWS_PER_TASK`] on [`BUILD_THREADS`] threads.
+    threads: Duration,
+}
+
+/// Threads the parts of a job run on here; the app runs them on the
+/// background executor.
+const BUILD_THREADS: usize = 4;
+
+fn first_build(plugin: &Arc<dyn ResourcePlugin>, pods: &[Arc<DynamicObject>]) -> FirstBuild {
+    let inputs = RowInputs::current(None);
+    let mut cache = row_cache(plugin, false);
+    let started = Instant::now();
+    let job = cache
+        .update_or_job(pods, &inputs)
+        .expect("a list long enough for a job");
+    let planned = started.elapsed();
+    let started = Instant::now();
+    let rows: Vec<_> = job
+        .parts(usize::MAX)
+        .into_iter()
+        .flat_map(|part| part())
+        .collect();
+    let one_thread = started.elapsed();
+    let started = Instant::now();
+    cache.finish(job, rows, &inputs);
+    black_box(cache.rows(""));
+    let ui = planned + started.elapsed();
+
+    let job = row_cache(plugin, false)
+        .update_or_job(pods, &inputs)
+        .expect("a list long enough for a job");
+    let parts = std::sync::Mutex::new(job.parts(ROWS_PER_TASK));
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..BUILD_THREADS {
+            scope.spawn(|| {
+                loop {
+                    let Some(part) = parts.lock().unwrap().pop() else {
+                        break;
+                    };
+                    black_box(part());
+                }
+            });
+        }
+    });
+    FirstBuild {
+        ui,
+        one_thread,
+        threads: started.elapsed(),
+    }
 }
 
 /// Every pod uses `step` more than in the last sample.
@@ -148,15 +213,20 @@ fn perf_stand_rows_of_a_pod_list() {
     for (name, shape) in SHAPES {
         let pods = perf::shared(perf::pods(count, NAMESPACES, shape));
         let bytes: usize = pods.iter().take(200).map(|pod| perf::json_len(pod)).sum();
-        let build = median(
-            || row_cache(&plugin, false),
-            |mut cache| rows_of(&mut cache, &pods, None, ""),
-        );
+        let mut builds: Vec<FirstBuild> = (0..RUNS).map(|_| first_build(&plugin, &pods)).collect();
+        let mut middle = |by: fn(&FirstBuild) -> Duration| {
+            builds.sort_by_key(by);
+            by(&builds[builds.len() / 2])
+        };
+        let one_thread = middle(|build| build.one_thread);
         println!(
-            "{name:8} {:5} B/pod  first build {:8.1} ms  ({:.2} us/row)",
+            "{name:8} {:5} B/pod  first build: {:7.1} ms off the UI thread ({:.2} us/row), \
+             {:6.1} ms on {BUILD_THREADS} threads; {:5.2} ms on the UI thread",
             bytes / pods.len().min(200),
-            ms(build),
-            ms(build) * 1000. / count as f64,
+            ms(one_thread),
+            ms(one_thread) * 1000. / count as f64,
+            ms(middle(|build| build.threads)),
+            ms(middle(|build| build.ui)),
         );
     }
 

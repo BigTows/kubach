@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -28,7 +29,7 @@ use kubach_core::secrets::mask::is_core_secret;
 use kubach_core::state::kind_key;
 use kubach_i18n::t;
 use kubach_ui::{
-    EmptyState, FilterBar, MultiSelection, ResourceRow, ResourceTable, ResourceTableEvent,
+    EmptyState, FilterBar, MultiSelection, ResourceTable, ResourceTableEvent,
     SIDE_PANEL_CONTENT_MIN, SidePanel, SidePanelState, name_matches,
 };
 use kube::api::DynamicObject;
@@ -42,7 +43,7 @@ use super::namespaces::NamespaceScope;
 use super::panel_width;
 use super::plugin_text;
 use super::prometheus_link::{PrometheusRegistry, PrometheusStatus};
-use super::rows::{self, RowBuilder, RowCache, RowInputs};
+use super::rows::{self, BuiltRow, RowBuilder, RowCache, RowInputs, RowJob};
 use super::table_sort;
 use super::usage::{self, MetricsState, UsageFeed, UsageKind};
 use crate::cluster::{CatalogState, Cluster};
@@ -61,6 +62,10 @@ pub(super) use details::{DetailsEvent, DetailsTarget, OpenObject, ResourceDetail
 /// How often the list looks at the clock when nothing else changes: for
 /// rows that turn at a moment, and the age of a list shown from disk.
 const AGE_REFRESH: Duration = Duration::from_secs(10);
+
+/// Rows built by one background task when many are built off the UI
+/// thread: a long list is spread over the threads of the executor.
+pub(super) const ROWS_PER_TASK: usize = 2_000;
 
 /// Where objects of a kind are listed.
 #[derive(Clone, Debug, PartialEq)]
@@ -140,6 +145,9 @@ struct KindView {
     usage: Option<UsageFeed>,
     /// The table rows, kept per object (#165).
     row_cache: RowCache,
+    /// Many rows being built off the UI thread, with the number of the
+    /// build; the table shows the rows it had until they are ready.
+    row_build: Option<(u64, Task<()>)>,
     /// Where the list is cached on disk (one key per namespace, or one for
     /// all); `None` for Secrets.
     list_keys: Option<Vec<ListKey>>,
@@ -177,6 +185,7 @@ impl KindView {
         let builder = RowBuilder::new(plugin.clone(), hidden_column);
         Self {
             row_cache: RowCache::new(builder, usage.is_some()),
+            row_build: None,
             entry,
             scope,
             plugin,
@@ -205,13 +214,29 @@ impl KindView {
         })
     }
 
-    /// What the rows are built from besides the objects, as of now.
-    /// The rows of the objects matching the search `query`: built for the
-    /// objects that changed since the last call, kept for the rest.
-    fn rows(&mut self, query: &str) -> Vec<Arc<ResourceRow>> {
+    /// Brings the rows up to date with the objects: builds those of
+    /// objects that changed, keeps the rest. `Some` when there are too
+    /// many to build here: the rows stay as they were until the job is
+    /// done ([`finish_rows`](Self::finish_rows)). While one is running,
+    /// nothing is done.
+    fn update_rows(&mut self) -> Option<RowJob> {
+        if self.row_build.is_some() {
+            return None;
+        }
         let inputs = RowInputs::current(self.usage.as_ref().map(UsageFeed::view));
-        self.row_cache.update(&self.snapshot.objects, &inputs);
-        self.row_cache.rows(query)
+        self.row_cache
+            .update_or_job(&self.snapshot.objects, &inputs)
+    }
+
+    /// Takes the rows built off the UI thread.
+    fn finish_rows(&mut self, job: RowJob, rows: Vec<BuiltRow>) {
+        let inputs = RowInputs::current(self.usage.as_ref().map(UsageFeed::view));
+        self.row_cache.finish(job, rows, &inputs);
+    }
+
+    /// The first rows of the list are being built off the UI thread.
+    fn building_first_rows(&self) -> bool {
+        self.row_build.is_some() && self.row_cache.is_empty()
     }
 
     /// Checked objects still in the cache, in table order.
@@ -734,20 +759,73 @@ impl ResourceBrowser {
     /// Rows are built only for objects that changed (#165). Callers that
     /// change more than the rows notify themselves.
     fn update_rows(&mut self, cx: &mut Context<Self>) {
-        let query = self.query(cx);
-        let Some(view) = &mut self.view else {
-            return;
-        };
-        let changed = match view.table.clone() {
-            Some(table) => {
-                let rows = view.rows(&query);
-                table.update(cx, |table, cx| table.set_shared_rows(rows, cx))
-            }
-            None => false,
-        };
-        if changed {
+        if self.sync_rows(cx) {
             cx.notify();
         }
+    }
+
+    /// Gives the table the rows of the objects matching the search;
+    /// returns whether the table changed.
+    ///
+    /// Many rows to build (a long list shown for the first time) are built
+    /// off the UI thread: the table keeps the rows it has, filtered by the
+    /// search as it is now, and gets the new ones when they are ready.
+    fn sync_rows(&mut self, cx: &mut Context<Self>) -> bool {
+        let query = self.query(cx);
+        let Some(view) = &mut self.view else {
+            return false;
+        };
+        let Some(table) = view.table.clone() else {
+            return false;
+        };
+        if let Some(job) = view.update_rows() {
+            view.row_build = Some(Self::build_rows(job, cx));
+        }
+        // Nothing to show yet: a table taken over from a cached view of
+        // the list keeps its rows, selection and scroll meanwhile.
+        if view.building_first_rows() {
+            return false;
+        }
+        let rows = view.row_cache.rows(&query);
+        table.update(cx, |table, cx| table.set_shared_rows(rows, cx))
+    }
+
+    /// Builds the rows of `job` on background threads, then shows them.
+    fn build_rows(job: RowJob, cx: &mut Context<Self>) -> (u64, Task<()>) {
+        static BUILDS: AtomicU64 = AtomicU64::new(0);
+        let build = BUILDS.fetch_add(1, Ordering::Relaxed);
+        let parts: Vec<Task<Vec<BuiltRow>>> = job
+            .parts(ROWS_PER_TASK)
+            .into_iter()
+            .map(|part| cx.background_spawn(async move { part() }))
+            .collect();
+        let task = cx.spawn(async move |this, cx| {
+            let mut rows = Vec::new();
+            for part in parts {
+                rows.extend(part.await);
+            }
+            this.update(cx, |this, cx| {
+                // Not the rows of a view shown since.
+                let Some(view) = this.view.as_mut().filter(|view| {
+                    view.row_build
+                        .as_ref()
+                        .is_some_and(|(running, _)| *running == build)
+                }) else {
+                    return;
+                };
+                let running = view.row_build.take();
+                view.finish_rows(job, rows);
+                // The list as it is now: what changed meanwhile.
+                this.update_rows(cx);
+                cx.notify();
+                // This very task: let it end by itself.
+                if let Some((_, task)) = running {
+                    task.detach();
+                }
+            })
+            .ok();
+        });
+        (build, task)
     }
 
     fn query(&self, cx: &App) -> String {
@@ -791,7 +869,6 @@ impl ResourceBrowser {
     }
 
     fn ensure_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.query(cx);
         let browser = cx.entity().downgrade();
         let Some(view) = &mut self.view else {
             return;
@@ -818,9 +895,8 @@ impl ResourceBrowser {
         if let Some(ix) = view.hidden_column.filter(|&ix| ix < columns.len()) {
             columns.remove(ix);
         }
-        let rows = view.rows(&query);
         let table = cx.new(|cx| {
-            let mut table = ResourceTable::new(columns, window, cx)
+            ResourceTable::new(columns, window, cx)
                 .checkable(cx)
                 .movable_columns(cx)
                 .on_select(move |row, _, cx| {
@@ -828,9 +904,7 @@ impl ResourceBrowser {
                     browser
                         .update(cx, |browser, cx| browser.select(Some(key), cx))
                         .ok();
-                });
-            table.set_shared_rows(rows, cx);
-            table
+                })
         });
         let api = &view.entry.kind.api;
         let kind = kind_key(&api.group, &api.kind);
@@ -848,6 +922,8 @@ impl ResourceBrowser {
             },
         ));
         view.table = Some(table);
+        // In a render: the rows are drawn by it.
+        self.sync_rows(cx);
     }
 
     fn clear_checked(&mut self, cx: &mut Context<Self>) {
@@ -1050,6 +1126,8 @@ impl ResourceBrowser {
         let title = view.entry.title.as_str();
         let (scope, namespace, namespaces) = view.scope.message_args();
         let empty = view.snapshot.objects.is_empty();
+        let no_rows = |table: &Entity<ResourceTable>| table.read(cx).is_empty(cx);
+        let building = view.building_first_rows() && view.table.as_ref().is_none_or(no_rows);
         let placeholder =
             match &view.snapshot.status {
                 WatchStatus::Loading if empty => Some(EmptyState::new(
@@ -1078,6 +1156,11 @@ impl ResourceBrowser {
                             t!("browser-error-retrying", error = error.message.as_str())
                         }),
                 ),
+                // A long list whose first rows are still being built.
+                _ if !empty && building => Some(EmptyState::new(
+                    IconName::LoaderCircle,
+                    t!("browser-loading", title = title),
+                )),
                 WatchStatus::Ready if empty && view.snapshot.errors.is_empty() => Some(
                     EmptyState::new(IconName::Inbox, t!("browser-empty", title = title))
                         .description(t!(
