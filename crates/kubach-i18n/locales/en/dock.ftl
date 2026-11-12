@@ -113,6 +113,7 @@ dock-exit-code = Exited with code { $code }
 dock-exit-failed = Failed
 dock-exit-failed-message = Failed: { $message }
 dock-exit-disconnected = Disconnected
+dock-vault-locked = Closed: the vault is locked
 
 ## Local terminal
 

@@ -617,7 +617,7 @@ impl SecretEditor {
         let Some((key, _)) = row.existing.clone() else {
             return;
         };
-        if row.loading {
+        if row.loading || self.session_closed(cx) {
             return;
         }
         if !self

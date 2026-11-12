@@ -17,7 +17,9 @@ use k8s_openapi::jiff::Timestamp;
 use kubach_core::apply::{self as core_apply, ApplyOptions, yaml_diff};
 use kubach_core::discovery::{self, ApiCatalog, ResourceKind};
 use kubach_core::plugin::builtin::action;
-use kubach_core::plugin::{ActionId, ActionKind, ActionParams, Cell, PluginRegistry, format_age};
+use kubach_core::plugin::{
+    ActionId, ActionKind, ActionParams, Cell, PluginRegistry, ResourcePlugin, format_age,
+};
 use kubach_core::rbac::ResourceAccess;
 use kubach_core::secrets::mask::is_core_secret;
 use kubach_core::streams::exec_capture;
@@ -38,7 +40,7 @@ use crate::fields::Fields;
 use crate::grants::{CustomRight, Grant};
 use crate::helm_tools;
 use crate::log_level::{Level, LevelCounts};
-use crate::masking::{Masked, mask_object, mask_text, truncate};
+use crate::masking::{Masked, mask_object, mask_text, plugin_view, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
     service_account_changes, walk_fields,
@@ -1583,6 +1585,22 @@ pub(crate) fn table_heading(ctx: &Ctx<'_>, kind: &ResourceKind) -> String {
         .join("\t")
 }
 
+/// One table line of `obj`: the cells of its plugin, from the masked object
+/// ([`plugin_view`]), so a cell holds nothing `get_resource` would hide.
+pub(crate) fn table_row(
+    plugin: &dyn ResourcePlugin,
+    obj: &DynamicObject,
+    api: &ApiResource,
+    now: Timestamp,
+) -> String {
+    plugin
+        .cells(&plugin_view(obj, api))
+        .iter()
+        .map(|c| render_cell(c, now))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
 /// Reads one namespace under its identity: the one way `list_resources`
 /// reaches the API, whether for one namespace or many.
 pub(crate) async fn read_rows(
@@ -1611,12 +1629,7 @@ pub(crate) async fn read_rows(
         .filter(|obj| ensure_namespace(obj, &allowed.namespace).is_ok())
         .map(|obj| match fields {
             Some(fields) => fields.row(&Masked::object(obj, &kind.api)),
-            None => plugin
-                .cells(obj)
-                .iter()
-                .map(|c| render_cell(c, now))
-                .collect::<Vec<_>>()
-                .join("\t"),
+            None => table_row(plugin.as_ref(), obj, &kind.api, now),
         })
         .collect();
     Ok(Rows {
@@ -1700,16 +1713,22 @@ async fn get_resource(
     Ok(ToolOutput::read(finish(&text)))
 }
 
-async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
-    let client = ctx.session.client_in(&allowed.namespace)?;
-    let obj = fetch(&client, allowed).await?;
-    let kind = kind_of(allowed);
-    let plugin = ctx.registry.plugin_for_resource(&kind.api);
-    let health = plugin.health(&obj);
+/// What `describe_resource` says about `obj` before its events: health,
+/// the details of its plugin and its relations. Everything is built from
+/// the masked object ([`plugin_view`]), the one `get_resource` shows.
+pub(crate) fn describe_text(
+    registry: &PluginRegistry,
+    api: &ApiResource,
+    namespace: &str,
+    obj: &DynamicObject,
+) -> String {
+    let plugin = registry.plugin_for_resource(api);
+    let obj = &plugin_view(obj, api);
+    let health = plugin.health(obj);
     let mut out = format!(
         "{} {}/{}\nHealth: {:?}{}\n",
-        kind.api.kind,
-        allowed.namespace,
+        api.kind,
+        namespace,
         obj.name_any(),
         health.status,
         if health.message.is_empty() {
@@ -1718,13 +1737,13 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             format!(" ({})", health.message)
         }
     );
-    for section in plugin.details(&obj) {
+    for section in plugin.details(obj) {
         let _ = writeln!(out, "\n{}:", section.title);
         for line in section.text_lines() {
             let _ = writeln!(out, "  {line}");
         }
     }
-    let relations = plugin.relations(&obj);
+    let relations = plugin.relations(obj);
     if !relations.is_empty() {
         out.push_str("\nRelations:\n");
         for relation in relations {
@@ -1735,13 +1754,25 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             );
         }
     }
-    for relation in plugin.selector_relations(&obj) {
+    for relation in plugin.selector_relations(obj) {
         let _ = writeln!(
             out,
             "  {:?} {} with {}",
             relation.kind, relation.target_kind, relation.label_selector
         );
     }
+    out
+}
+
+async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
+    let client = ctx.session.client_in(&allowed.namespace)?;
+    let obj = fetch(&client, allowed).await?;
+    let mut out = describe_text(
+        ctx.registry,
+        &kind_of(allowed).api,
+        &allowed.namespace,
+        &obj,
+    );
     let events = list_events(ctx, allowed, &EventFilter::default(), 20)
         .await
         .unwrap_or_else(|e| e.message());
@@ -2785,6 +2816,203 @@ pub(crate) async fn run_command_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
+
+    /// Objects of several kinds with values that masking hides, each value
+    /// a distinct `canary-…` word, and what the rendered text must keep.
+    fn masked_fixtures() -> Vec<(ApiResource, Value, Vec<&'static str>)> {
+        let api = |group: &str, kind: &str| {
+            ApiResource::from_gvk(&kube::api::GroupVersionKind::gvk(group, "v1", kind))
+        };
+        let last_applied = |canary: &str| {
+            json!({
+                "data": {"DSN": canary, "plain": format!("{canary}-plain")},
+                "spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                    {"name": "DB_PASSWORD", "value": canary},
+                    {"name": "SIGNING_KEY", "value": format!("{canary}-signing")},
+                ]}]}}},
+            })
+            .to_string()
+        };
+        let metadata = |name: &str, canary: &str| {
+            json!({
+                "name": name, "namespace": "dev",
+                "labels": {"app": name},
+                "annotations": {
+                    LAST_APPLIED: last_applied(&format!("{canary}-applied")),
+                    "example.com/api-token": format!("{canary}-annotation"),
+                    "example.com/owner": "team-web",
+                },
+            })
+        };
+        let pod_spec = |canary: &str| {
+            json!({"containers": [{"name": "app", "image": "nginx:1.27", "env": [
+                {"name": "DB_PASS", "value": format!("{canary}-env")},
+                {"name": "AUTH", "value": format!("{canary}-auth")},
+                {"name": "LOG_LEVEL", "value": "debug"},
+            ]}]})
+        };
+        vec![
+            (
+                api("apps", "Deployment"),
+                json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": metadata("web", "canary-deploy"),
+                    "spec": {
+                        "replicas": 2,
+                        "selector": {"matchLabels": {"app": "web"}},
+                        "template": {
+                            "metadata": {"labels": {"app": "web"}, "annotations": {
+                                "example.com/db-password": "canary-deploy-template",
+                            }},
+                            "spec": pod_spec("canary-deploy"),
+                        },
+                    },
+                }),
+                vec![
+                    "Deployment dev/web",
+                    "example.com/owner: team-web",
+                    "nginx:1.27",
+                ],
+            ),
+            (
+                api("", "Pod"),
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": metadata("web-0", "canary-pod"),
+                    "spec": pod_spec("canary-pod"),
+                    "status": {"phase": "Running"},
+                }),
+                vec!["Pod dev/web-0", "nginx:1.27", "example.com/owner: team-web"],
+            ),
+            (
+                api("", "ConfigMap"),
+                json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": metadata("app", "canary-config"),
+                    "data": {"DSN": "canary-config-dsn", "DB_HOST": "db.local"},
+                    "binaryData": {"tls.key": "Y2FuYXJ5LWNvbmZpZy1iaW5hcnk="},
+                }),
+                // Sizes are those of the values, not of what replaced them.
+                vec!["DSN: 17 bytes", "DB_HOST: 8 bytes", "tls.key: 20 bytes"],
+            ),
+            (
+                api("", "Secret"),
+                json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": metadata("db", "canary-secret"),
+                    "type": "Opaque",
+                    "data": {"pw": "Y2FuYXJ5LXNlY3JldC1kYXRh"},
+                    "stringData": {"plain": "canary-secret-string"},
+                }),
+                vec!["Type: Opaque", "pw: 18 bytes", "plain: 20 bytes"],
+            ),
+            (
+                api("example.com", "Widget"),
+                json!({
+                    "apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": metadata("w1", "canary-widget"),
+                    "spec": {"env": [{"name": "API_TOKEN", "value": "canary-widget-env"}]},
+                    "status": {"conditions": [{"type": "Ready", "status": "True", "reason": "Ok"}]},
+                }),
+                vec![
+                    "Widget dev/w1",
+                    "Ready = True Ok",
+                    "example.com/owner: team-web",
+                ],
+            ),
+            (
+                api("", "Node"),
+                json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": metadata("n1", "canary-node"),
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }),
+                vec!["example.com/owner: team-web"],
+            ),
+        ]
+    }
+
+    /// Every `canary-…` word and base64 value of a fixture.
+    fn canaries(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                if let Ok(inner) = serde_json::from_str::<Value>(text)
+                    && !inner.is_string()
+                {
+                    canaries(&inner, out);
+                } else if text.starts_with("canary-") || text.starts_with("Y2FuYXJ5") {
+                    out.push(text.clone());
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| canaries(item, out)),
+            Value::Object(map) => map.values().for_each(|item| canaries(item, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn describe_and_table_show_no_more_than_get() {
+        let registry = PluginRegistry::with_builtins();
+        for (api, value, kept) in masked_fixtures() {
+            let obj: DynamicObject = serde_json::from_value(value.clone()).unwrap();
+            let get = finish(&core_apply::to_yaml(&masked_value(&obj)));
+            let describe = finish(&describe_text(&registry, &api, "dev", &obj));
+            let row = finish(&table_row(
+                registry.plugin_for_resource(&api).as_ref(),
+                &obj,
+                &api,
+                Timestamp::now(),
+            ));
+            let mut words = Vec::new();
+            canaries(&value, &mut words);
+            assert!(words.len() >= 5, "{}: {words:?}", api.kind);
+            let mut hidden = 0;
+            for word in &words {
+                if get.contains(word.as_str()) {
+                    continue;
+                }
+                hidden += 1;
+                assert!(!describe.contains(word.as_str()), "{word} in {describe}");
+                assert!(!row.contains(word.as_str()), "{word} in {row}");
+            }
+            assert!(hidden >= 4, "{}: get hides {hidden} of {words:?}", api.kind);
+            assert!(!describe.contains(LAST_APPLIED), "{describe}");
+            assert!(!describe.contains("managedFields"), "{describe}");
+            for text in kept {
+                assert!(describe.contains(text), "{text} not in {describe}");
+            }
+            assert!(row.starts_with(&obj.name_any()), "{row}");
+        }
+    }
+
+    #[test]
+    fn table_cells_survive_masking() {
+        let registry = PluginRegistry::with_builtins();
+        let row = |kind: &str| {
+            let (api, value, _) = masked_fixtures()
+                .into_iter()
+                .find(|(api, ..)| api.kind == kind)
+                .unwrap();
+            let obj: DynamicObject = serde_json::from_value(value).unwrap();
+            let plugin = registry.plugin_for_resource(&api);
+            let raw: Vec<String> = plugin
+                .cells(&obj)
+                .iter()
+                .map(|c| render_cell(c, Timestamp::UNIX_EPOCH))
+                .collect();
+            let row = table_row(plugin.as_ref(), &obj, &api, Timestamp::UNIX_EPOCH);
+            (raw.join("\t"), row)
+        };
+        // Masking changes no cell: counts, types and states stay.
+        for kind in ["Deployment", "Pod", "ConfigMap", "Secret", "Widget", "Node"] {
+            let (raw, masked) = row(kind);
+            assert_eq!(raw, masked, "{kind}");
+        }
+        assert!(row("Secret").1.contains("Opaque\t2"));
+        assert!(row("ConfigMap").1.contains("\t3\t"));
+    }
 
     #[test]
     fn cut_lists_are_noticed() {

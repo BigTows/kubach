@@ -34,7 +34,8 @@
 //! namespace itself.
 //!
 //! `a_preview_reads_lookup_under_the_service_account` (#114) previews a chart
-//! with `lookup` and a ClusterRole; run it with
+//! with `lookup` and a ClusterRole, before and after the session is given
+//! the namespace's Secrets (#173); run it with
 //! `KUBACH_TEST_NAMESPACE=kubach-test-114`. It creates and deletes the
 //! namespace and needs no registry.
 
@@ -140,8 +141,9 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     )
     .await;
 
-    // A preview: the dry run's objects and diff for the agent, no change
-    // confirmed and nothing installed (#68).
+    // A preview: the chart's objects and diff for the agent, rendered
+    // without the cluster, no change confirmed and nothing installed (#68,
+    // #173).
     let preview = call(
         &server,
         "helm_install",
@@ -966,8 +968,8 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     );
     assert_eq!(confirmer.requests().len(), before);
 
-    // Its preview, from the server-side dry run: a summary with the changed
-    // values and objects, the full diff by object (#115).
+    // Its preview: a summary with the changed values and objects, the full
+    // diff by object (#115).
     let preview = call(
         &server,
         "helm_upgrade",
@@ -1184,6 +1186,7 @@ async fn lookup_flow(base: Config, context: String, namespace: String) {
         namespace: namespace.clone(),
         driver: Driver::Secret,
         secret_env: SecretEnv::default(),
+        working_dir: None,
     };
     helm_cli::install(
         binary.as_deref(),
@@ -1227,8 +1230,37 @@ async fn lookup_flow(base: Config, context: String, namespace: String) {
     let roles: Api<Role> = Api::namespaced(user.clone(), &namespace);
     let role = format!("kubach-mcp-{}", session.id());
 
-    // What the release has is read: the generated id and key stay, so the
-    // diff has no false change.
+    let secret_rules = |rules: &[k8s_openapi::api::rbac::v1::PolicyRule]| {
+        rules.iter().any(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource == "secrets")
+        })
+    };
+    // The chart's lookup reads a Secret, which this session was not given:
+    // the render under the ServiceAccount fails, its objects are marked,
+    // and the Role gets no Secrets for it (#173).
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert!(
+        preview["lookup"]["objects"]
+            .to_string()
+            .contains("Secret keeper-tls"),
+        "{preview}"
+    );
+    let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
+    assert!(!secret_rules(&rules), "{rules:?}");
+
+    // The user gives the session the namespace's Secrets (as list_secrets
+    // asks): now what the release has is read, the generated id and key
+    // stay, and the diff has no false change.
+    call(&server, "list_secrets", json!({"namespace": namespace})).await;
     let preview = call(
         &server,
         "helm_upgrade",
@@ -1258,17 +1290,9 @@ async fn lookup_flow(base: Config, context: String, namespace: String) {
         "{preview}"
     );
 
-    // Back to the granted rights: the Secrets it read were for the render.
+    // The Secrets it read are the ones the session was given.
     let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
-    assert!(
-        !rules.iter().any(|rule| {
-            rule.resources
-                .iter()
-                .flatten()
-                .any(|resource| resource == "secrets")
-        }),
-        "{rules:?}"
-    );
+    assert!(secret_rules(&rules), "{rules:?}");
 
     // A lookup the ServiceAccount cannot do: the render without the cluster,
     // with its marks.

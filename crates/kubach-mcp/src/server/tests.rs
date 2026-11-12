@@ -3836,6 +3836,12 @@ struct VaultHelm {
 impl VaultHelm {
     /// `on_change`: shell run for a real (not dry) change.
     async fn start(allow_user: bool, on_change: &str) -> Self {
+        Self::start_in(false, allow_user, on_change).await
+    }
+
+    /// `client_only`: the session has the user's own kubeconfig and no
+    /// ServiceAccount, in a file as a kubeconfig context is.
+    async fn start_in(client_only: bool, allow_user: bool, on_change: &str) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::tempdir().unwrap();
         let kubeconfigs = root.path().join("run").join("kubeconfig");
@@ -3850,6 +3856,14 @@ impl VaultHelm {
             format!(
                 r#"#!/bin/sh
 kubeconfig=; context=; dry=; previous=; destination=
+# Where helm runs (#174): the mode of the directory above, what is in this
+# one, and for a chart archive its checksum.
+for last; do :; done
+{{
+  printf '%s ' "$1"
+  [ -f "$last" ] && printf 'chart=%s ' "$(cksum < "$last" | tr -d ' ')"
+  printf 'above=%s files=%s\n' "$(ls -ld .. | cut -c1-10)" "$(ls -A . | wc -l | tr -d ' ')"
+}} >> '{places}'
 for argument in "$@"; do
   [ "$previous" = --kubeconfig ] && kubeconfig="$argument"
   [ "$previous" = --kube-context ] && context="$argument"
@@ -3858,7 +3872,10 @@ for argument in "$@"; do
   previous="$argument"
 done
 if [ "$1" = pull ]; then
-  [ -d '{chart}' ] || {{ echo 'Error: no such chart' >&2; exit 1; }}
+  echo pull >> '{pulls}'
+  [ -f '{no_chart}' ] && {{ echo 'Error: chart "password=hunter2" not found' >&2; exit 1; }}
+  # No chart of the test: an archive whose templates cannot be read.
+  [ -d '{chart}' ] || {{ echo junk > "$destination/infra-1.0.0.tgz"; exit 0; }}
   tar -czf "$destination/infra-1.0.0.tgz" -C '{chart}' infra
   exit 0
 fi
@@ -3881,6 +3898,7 @@ if [ "$1" = template ]; then cat '{manifest}'; exit 0; fi
   printf 'credentials=%s\n' "$(grep -c '{VAULT_TOKEN}' "$kubeconfig")"
 }} >> '{log}'
 case "$1" in install|upgrade) cat > /dev/null ;; esac
+if [ -n "$dry" ] && [ -f '{dry_fails}' ]; then cat '{dry_fails}' >&2; exit 1; fi
 if [ -n "$dry" ]; then cat '{dry_run}'; exit 0; fi
 {on_change}
 echo 'STATUS: deployed'
@@ -3889,6 +3907,10 @@ echo 'STATUS: deployed'
                 log = log.display(),
                 dry_run = dry_run.display(),
                 chart = root.path().join("chart").display(),
+                pulls = root.path().join("pulls.log").display(),
+                places = root.path().join("places.log").display(),
+                dry_fails = root.path().join("dry-run-fails").display(),
+                no_chart = root.path().join("no-chart").display(),
                 live = root.path().join("live.yaml").display(),
                 renders = root.path().join("renders.log").display(),
                 kubeconfigs = kubeconfigs.display(),
@@ -3901,9 +3923,13 @@ echo 'STATUS: deployed'
         let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
         let scope = scope_with(Profile::Deploy, &permissive(), &[NS]);
         let context = scope.context.clone();
-        let identity = Identity::TemporaryServiceAccount(
-            crate::identity::TemporaryServiceAccount::fake(client, NS),
-        );
+        let identity = if client_only {
+            Identity::ClientOnly { client }
+        } else {
+            Identity::TemporaryServiceAccount(crate::identity::TemporaryServiceAccount::fake(
+                client, NS,
+            ))
+        };
         let capabilities: HashSet<Capability> = Capability::ALL.into_iter().collect();
         let session = Session::from_parts(scope, identity, catalog(), capabilities);
         session.set_grants(grants(&[Grant::read(NS)]));
@@ -3923,13 +3949,13 @@ echo 'STATUS: deployed'
              contexts: [{{name: {context}, context: {{cluster: c, user: u}}}}]\n"
         ))
         .unwrap();
+        let file = root.path().join("user-kubeconfig");
+        std::fs::write(&file, "apiVersion: v1\nkind: Config\n").unwrap();
         server.set_helm(crate::helm_tools::HelmEnv {
             binary: Some(helm),
-            kubeconfig: None,
-            vault: Some(crate::helm_tools::VaultKubeconfig::new(
-                config,
-                kubeconfigs.clone(),
-            )),
+            kubeconfig: client_only.then(|| vec![file]),
+            vault: (!client_only)
+                .then(|| crate::helm_tools::VaultKubeconfig::new(config, kubeconfigs.clone())),
             paths: None,
         });
         Self {
@@ -4842,4 +4868,277 @@ async fn a_clients_name_is_cleaned_for_windows_the_sessions_list_and_the_audit_l
     for line in lines {
         assert_eq!(line["client"], shown.as_str());
     }
+}
+
+// ------------------------------------------- before the user's yes (#173)
+
+/// A chart with nothing a temporary ServiceAccount cannot create.
+#[cfg(unix)]
+const PLAIN_MANIFEST: &str = "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: infra\n";
+
+/// What a chart's template can make helm say: the cluster's data.
+#[cfg(unix)]
+const HELM_SAYS: &str = "Error: INSTALLATION FAILED: execution error at \
+     (infra/templates/x.yaml:1:3): {\"data\":{\"password\":\"aHVudGVyMi1vZi0xNzM=\"}}\n";
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// `(command, the rest)` of every helm call: where it ran and with
+    /// which archive.
+    fn places(&self) -> Vec<(String, String)> {
+        std::fs::read_to_string(self.root.path().join("places.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(command, rest)| (command.to_owned(), rest.to_owned()))
+            .collect()
+    }
+
+    fn plain_chart(&self) {
+        std::fs::write(self.root.path().join("manifest.yaml"), PLAIN_MANIFEST).unwrap();
+        let mut release = infra_release(3);
+        release["manifest"] = json!(PLAIN_MANIFEST);
+        std::fs::write(self.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    }
+
+    async fn install(&self, preview: bool) -> crate::server::CallOutcome {
+        self.server
+            .call(
+                "agent",
+                "helm_install",
+                args(
+                    json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                            "namespace": NS, "preview": preview}),
+                ),
+            )
+            .await
+    }
+}
+
+/// A dry run that fails tells the agent that it failed, and nothing helm
+/// said: under the ServiceAccount before any window, and under the user's
+/// credentials after the first one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_dry_run_passes_on_nothing_helm_said() {
+    for plain in [true, false] {
+        let f = VaultHelm::start(true, "").await;
+        if plain {
+            f.plain_chart();
+        }
+        std::fs::write(f.root.path().join("dry-run-fails"), HELM_SAYS).unwrap();
+        let failed = f.install(false).await;
+        assert!(failed.is_error);
+        assert!(
+            failed.text.contains("server-side dry run failed"),
+            "{}",
+            failed.text
+        );
+        for hidden in [
+            "aHVudGVyMi1vZi0xNzM",
+            "password",
+            "execution error",
+            "x.yaml",
+        ] {
+            assert!(!failed.text.contains(hidden), "{}", failed.text);
+        }
+        assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
+        assert_eq!(f.windows().len(), usize::from(!plain));
+        f.assert_clean(&failed.text);
+    }
+}
+
+/// The one failure told apart is helm's whole message about a taken name.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_says_when_the_release_name_is_taken() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    std::fs::write(
+        f.root.path().join("dry-run-fails"),
+        "Error: INSTALLATION FAILED: cannot re-use a name that is still in use\n",
+    )
+    .unwrap();
+    let failed = f.install(false).await;
+    assert!(failed.text.contains("exists in the namespace already"));
+    // The same words inside a longer message are the chart's.
+    std::fs::write(
+        f.root.path().join("dry-run-fails"),
+        "Error: INSTALLATION FAILED: execution error at (x.yaml:1:3): Error: INSTALLATION \
+         FAILED: cannot re-use a name that is still in use\n",
+    )
+    .unwrap();
+    let failed = f.install(false).await;
+    assert!(
+        failed.text.contains("server-side dry run failed"),
+        "{}",
+        failed.text
+    );
+}
+
+/// A preview of a chart the ServiceAccount could install is `helm
+/// template` too: no dry run, nothing with the release storage's rights.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_is_a_render_and_never_a_dry_run() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n");
+    f.plain_chart();
+    let preview = f.install(true).await;
+    assert!(!preview.is_error, "{}", preview.text);
+    let answer: Value = serde_json::from_str(&preview.text).unwrap();
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap()
+            .contains("without the cluster"),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["summary"]["added"],
+        json!([{"object": "ConfigMap infra"}]),
+        "{answer}"
+    );
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(f.renders().is_empty());
+    assert!(f.windows().is_empty());
+    let commands: Vec<String> = f.places().into_iter().map(|(command, _)| command).collect();
+    assert_eq!(commands, ["pull", "template"]);
+}
+
+/// In a client-only namespace helm has only the user's credentials: the
+/// dry run waits for the first window, and a no runs nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_client_only_dry_run_waits_for_the_user() {
+    use crate::helm_tools::HelmCredentials;
+    let refused = VaultHelm::start_in(true, false, "").await;
+    let outcome = refused.install(false).await;
+    assert!(outcome.is_error);
+    assert!(refused.calls().is_empty(), "{:?}", refused.calls());
+    assert_eq!(refused.windows().len(), 1);
+    assert_eq!(refused.windows()[0].0, HelmCredentials::AskUser);
+
+    let f = VaultHelm::start_in(true, true, "").await;
+    let preview = f.install(true).await;
+    assert!(!preview.is_error, "{}", preview.text);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(f.windows().is_empty());
+
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let credentials: Vec<HelmCredentials> = f.windows().iter().map(|window| window.0).collect();
+    assert_eq!(
+        credentials,
+        [HelmCredentials::AskUser, HelmCredentials::User]
+    );
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (asked, details, _) = &windows[0];
+        assert!(asked.identity.contains("user"), "{}", asked.identity);
+        assert!(asked.user_objects.is_empty());
+        assert!(details.contains("helm template"), "{details}");
+        assert!(details.contains("dry run"), "{details}");
+    }
+    assert_eq!(f.calls().len(), 2, "{:?}", f.calls());
+    assert!(f.calls()[0].starts_with("install dry "), "{:?}", f.calls());
+}
+
+// ------------------------------------------- one archive for a call (#174)
+
+/// The chart is fetched once; the render, the dry run and the install read
+/// that archive by its path, and helm runs in an empty directory of a
+/// private one. The answer and the audit log say how the release compares
+/// with the dry run.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_step_of_a_call_reads_the_chart_fetched_once() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n");
+    f.plain_chart();
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let places = f.places();
+    let commands: Vec<&str> = places.iter().map(|(command, _)| command.as_str()).collect();
+    assert_eq!(commands, ["pull", "template", "install", "install"]);
+    assert!(
+        places
+            .iter()
+            .all(|(_, place)| place.ends_with("above=drwx------ files=0")),
+        "{places:?}"
+    );
+    let archives: Vec<&str> = places[1..]
+        .iter()
+        .map(|(_, place)| place.split(' ').next().unwrap())
+        .collect();
+    assert!(archives[0].starts_with("chart="), "{places:?}");
+    assert!(archives.iter().all(|archive| *archive == archives[0]));
+
+    let answer: Value = serde_json::from_str(&installed.text).unwrap();
+    assert_eq!(
+        answer["chartArchive"]["sha256"].as_str().map(str::len),
+        Some(64),
+        "{answer}"
+    );
+    // The release in the fake storage has a ClusterRole the dry run of this
+    // test did not: the answer and the audit log name it.
+    let compared = &answer["comparedWithDryRun"];
+    assert_eq!(compared["sameObjects"], false, "{answer}");
+    assert_eq!(
+        compared["notInDryRun"],
+        json!(["ClusterRole infra-reader"]),
+        "{answer}"
+    );
+    assert_eq!(compared["missing"], json!([]), "{answer}");
+    let audit = audit_lines(&f.audit_path);
+    let line = audit.last().unwrap();
+    assert_eq!(
+        line["change"]["chartSha256"], answer["chartArchive"]["sha256"],
+        "{line}"
+    );
+    assert_eq!(
+        line["change"]["comparedWithDryRun"]["notInDryRun"],
+        json!(["ClusterRole infra-reader"]),
+        "{line}"
+    );
+    f.assert_clean(&installed.text);
+}
+
+/// The release helm wrote has what the dry run showed: the answer says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_release_like_its_dry_run_is_reported_as_such() {
+    let f = VaultHelm::start(true, "").await;
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let answer: Value = serde_json::from_str(&installed.text).unwrap();
+    assert_eq!(
+        answer["comparedWithDryRun"]["sameObjects"], true,
+        "{answer}"
+    );
+    assert_eq!(answer["comparedWithDryRun"]["changed"], json!([]));
+    let audit = audit_lines(&f.audit_path);
+    assert_eq!(
+        audit.last().unwrap()["change"]["comparedWithDryRun"]["sameObjects"],
+        true
+    );
+}
+
+/// A chart that cannot be fetched ends the call before anything renders.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chart_that_cannot_be_fetched_ends_the_call() {
+    let f = VaultHelm::start(true, "").await;
+    std::fs::write(f.root.path().join("no-chart"), "").unwrap();
+    let failed = f.install(false).await;
+    assert!(failed.is_error);
+    assert!(
+        failed.text.contains("could not be fetched"),
+        "{}",
+        failed.text
+    );
+    assert!(!failed.text.contains("hunter2"), "{}", failed.text);
+    let commands: Vec<String> = f.places().into_iter().map(|(command, _)| command).collect();
+    assert_eq!(commands, ["pull"]);
+    assert!(f.windows().is_empty());
 }

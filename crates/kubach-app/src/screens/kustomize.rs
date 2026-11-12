@@ -245,10 +245,19 @@ impl KustomizeScreen {
 
     /// Re-runs the comparison when the connection changed under a ready build.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        let cache = self.cluster.read(cx).cache().cloned();
         if !self.active {
+            // A hidden screen does not keep the cache of a connection
+            // that is gone; the comparison reruns when it is shown.
+            let kept = match (&self.compared_with, &cache) {
+                (Some(old), Some(new)) => old.same_as(new),
+                _ => false,
+            };
+            if !kept {
+                self.compared_with = None;
+            }
             return;
         }
-        let cache = self.cluster.read(cx).cache().cloned();
         let same = match (&self.compared_with, &cache) {
             (Some(old), Some(new)) => old.same_as(new),
             (None, None) => true,

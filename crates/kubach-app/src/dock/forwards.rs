@@ -5,6 +5,9 @@
 //! their context is connected. A forward leaves the state only when the user
 //! stops or removes it.
 //!
+//! Forwards in a context of the vault stop when it locks (ADR 0008) and
+//! wait, like forwards of the last run, until it is unlocked.
+//!
 //! A paused forward (#476) keeps its local port and forwards nothing; it
 //! stays remembered as paused and comes back paused on the next run.
 //!
@@ -119,7 +122,8 @@ fn restore_step(known: bool, state: &ConnectionState, connected: bool, requested
 }
 
 /// Owns the [`PortForwardManager`]; forwards live until stopped or the app
-/// quits, across context switches.
+/// quits, across context switches. Those in a context of the vault also
+/// stop when it locks.
 pub struct Forwards {
     manager: PortForwardManager,
     list: Vec<ForwardInfo>,
@@ -131,15 +135,18 @@ pub struct Forwards {
     /// Forwards of the last run not running yet, in saved order.
     restoring: Vec<Restore>,
     next_restore: u64,
-    cluster: Option<WeakEntity<Cluster>>,
+    cluster: WeakEntity<Cluster>,
     /// Contexts connected in the background for restores.
     requested: HashSet<String>,
+    /// Forwards running in a context of the vault.
+    vault: HashSet<ForwardId>,
     _cluster: Option<Subscription>,
+    _vault: Option<Subscription>,
     _watch: Task<()>,
 }
 
 impl Forwards {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cluster: &Entity<Cluster>, cx: &mut Context<Self>) -> Self {
         let manager = PortForwardManager::new();
         let mut changes = manager.subscribe();
         let watch = cx.spawn(async move |this, cx| {
@@ -157,11 +164,68 @@ impl Forwards {
             saved: Vec::new(),
             restoring: Vec::new(),
             next_restore: 0,
-            cluster: None,
+            cluster: cluster.downgrade(),
             requested: HashSet::new(),
-            _cluster: None,
+            vault: HashSet::new(),
+            // Restores (and forwards a lock put on hold) move on as their
+            // contexts load and connect.
+            _cluster: Some(cx.observe(cluster, |this, cluster, cx| this.drive(&cluster, cx))),
+            _vault: crate::vault::global(cx).map(|vault| {
+                cx.observe(&vault, |this, vault, cx| {
+                    if !vault.read(cx).is_unlocked() {
+                        this.vault_locked(cx);
+                    }
+                })
+            }),
             _watch: watch,
         }
+    }
+
+    /// The vault locked (by hand, idle timer, screen lock): forwards in
+    /// its contexts stop and wait for it to be unlocked (ADR 0008).
+    fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        // A context connected for a restore is connected again after the
+        // unlock.
+        if let Some(cluster) = self.cluster.upgrade() {
+            let cluster = cluster.read(cx);
+            self.requested
+                .retain(|context| !cluster.is_imported(context));
+        }
+        if self.hold_vault_forwards() {
+            self.refresh(cx);
+        }
+    }
+
+    /// Stops the forwards in contexts of the vault. The remembered ones
+    /// stay remembered and wait, as forwards of the last run do, for their
+    /// context to be loaded and connected again. True if any stopped.
+    fn hold_vault_forwards(&mut self) -> bool {
+        let ids = std::mem::take(&mut self.vault);
+        for id in &ids {
+            self.manager.stop(*id);
+        }
+        let (held, kept) = std::mem::take(&mut self.saved)
+            .into_iter()
+            .partition(|(id, _)| ids.contains(id));
+        self.saved = kept;
+        self.names.retain(|(id, _)| !ids.contains(id));
+        for (_, saved) in held {
+            self.next_restore += 1;
+            self.restoring.push(Restore {
+                id: self.next_restore,
+                saved,
+                status: RestoreStatus::Waiting { known: false },
+                _task: None,
+            });
+        }
+        !ids.is_empty()
+    }
+
+    /// Whether `context` is in the vault of imported kubeconfigs.
+    fn in_vault(&self, context: &str, cx: &App) -> bool {
+        self.cluster
+            .upgrade()
+            .is_some_and(|cluster| cluster.read(cx).is_imported(context))
     }
 
     pub fn list(&self) -> &[ForwardInfo] {
@@ -209,6 +273,7 @@ impl Forwards {
         let ids: Vec<ForwardId> = self.list.iter().map(|info| info.id).collect();
         self.names.retain(|(id, _)| ids.contains(id));
         self.saved.retain(|(id, _)| ids.contains(id));
+        self.vault.retain(|id| ids.contains(id));
         cx.notify();
     }
 
@@ -228,6 +293,9 @@ impl Forwards {
             port_name,
         } = request;
         let (kind, name) = (source.kind.clone(), source.name.clone());
+        let vault = context
+            .as_deref()
+            .is_some_and(|context| self.in_vault(context, cx));
         let task =
             runtime::spawn(async move { manager.start(&client, &source, port, local_port).await });
         cx.spawn(async move |this, cx| {
@@ -236,7 +304,15 @@ impl Forwards {
                 Ok(Err(error)) => return Err(start_error(&error)),
                 Err(error) => return Err(error.to_string()),
             };
-            this.update(cx, |this, cx| {
+            let kept = this.update(cx, |this, cx| {
+                // The vault locked while the forward was starting.
+                if crate::vault::lock_ends(vault, crate::vault::is_unlocked(cx)) {
+                    this.manager.stop(info.id);
+                    return false;
+                }
+                if vault {
+                    this.vault.insert(info.id);
+                }
                 if let Some(context) = context.filter(|_| remembered(&info)) {
                     let saved = SavedForward {
                         context,
@@ -253,8 +329,11 @@ impl Forwards {
                     this.names.push((info.id, port_name));
                 }
                 this.refresh(cx);
-            })
-            .ok();
+                true
+            });
+            if matches!(kept, Ok(false)) {
+                return Err(t!("dock-vault-locked"));
+            }
             Ok(info)
         })
     }
@@ -312,7 +391,7 @@ impl Forwards {
     /// Restarts the forwards remembered from the last run (#474) as their
     /// contexts connect: the startup context as usual, any other one in the
     /// background once the kubeconfig (or the unlocked vault) lists it.
-    pub fn restore(&mut self, cluster: &Entity<Cluster>, cx: &mut Context<Self>) {
+    pub fn restore(&mut self, cx: &mut Context<Self>) {
         let saved: Vec<SavedForward> = StateStore::try_global(cx)
             .map(|store| store.read(cx).get().saved_forwards().to_vec())
             .unwrap_or_default();
@@ -325,12 +404,9 @@ impl Forwards {
                 _task: None,
             });
         }
-        if self.restoring.is_empty() {
-            return;
+        if let Some(cluster) = self.cluster.upgrade() {
+            self.drive(&cluster, cx);
         }
-        self.cluster = Some(cluster.downgrade());
-        self._cluster = Some(cx.observe(cluster, |this, cluster, cx| this.drive(&cluster, cx)));
-        self.drive(cluster, cx);
     }
 
     /// Moves waiting restores on as their contexts load and connect.
@@ -354,11 +430,11 @@ impl Forwards {
         for context in waiting {
             let (step, client) = {
                 let cluster = cluster.read(cx);
-                let known = cluster
-                    .contexts()
-                    .is_ok_and(|contexts| contexts.get(&context).is_some());
+                // A context of the vault is not known while it is locked.
+                let known = cluster.is_available(&context, cx);
                 let client = cluster
                     .connection_of(&context)
+                    .filter(|_| known)
                     .map(|connection| connection.client.clone());
                 let step = restore_step(
                     known,
@@ -437,6 +513,10 @@ impl Forwards {
         };
         let manager = self.manager.clone();
         let saved = restore.saved.clone();
+        let vault = self
+            .cluster
+            .upgrade()
+            .is_some_and(|cluster| cluster.read(cx).is_imported(&saved.context));
         let task = runtime::spawn(async move {
             let source = fetch_source(&client, &saved.kind, &saved.namespace, &saved.name).await?;
             let local_port = LocalPort::Exact(saved.local_port);
@@ -458,12 +538,19 @@ impl Forwards {
                 Ok(Err(error)) => Err(restore_error(&error)),
                 Err(error) => Err(error.to_string()),
             };
-            this.update(cx, |this, cx| this.restored(id, result, cx))
+            this.update(cx, |this, cx| this.restored(id, vault, result, cx))
                 .ok();
         }));
     }
 
-    fn restored(&mut self, id: u64, result: Result<ForwardInfo, String>, cx: &mut Context<Self>) {
+    /// A restore finished starting; `vault`: in a context of the vault.
+    fn restored(
+        &mut self,
+        id: u64,
+        vault: bool,
+        result: Result<ForwardInfo, String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(ix) = self.restoring.iter().position(|r| r.id == id) else {
             // Removed while starting.
             if let Ok(info) = result {
@@ -472,7 +559,17 @@ impl Forwards {
             return;
         };
         match result {
+            // The vault locked while the forward was starting: it waits.
+            Ok(info) if crate::vault::lock_ends(vault, crate::vault::is_unlocked(cx)) => {
+                self.manager.stop(info.id);
+                self.restoring[ix].status = RestoreStatus::Waiting { known: false };
+                self.restoring[ix]._task = None;
+                cx.notify();
+            }
             Ok(info) => {
+                if vault {
+                    self.vault.insert(info.id);
+                }
                 let restore = self.restoring.remove(ix);
                 let saved = restore.saved;
                 self.names.push((info.id, saved.port_name.clone()));
@@ -496,7 +593,7 @@ impl Forwards {
         restore._task = None;
         let context = restore.saved.context.clone();
         self.requested.remove(&context);
-        if let Some(cluster) = self.cluster.as_ref().and_then(WeakEntity::upgrade) {
+        if let Some(cluster) = self.cluster.upgrade() {
             self.drive(&cluster, cx);
         }
         cx.notify();
@@ -546,7 +643,67 @@ mod tests {
     use kubach_core::ConnectionState;
     use kubach_core::streams::{ForwardAgent, ForwardInfo, ForwardState, StreamError};
 
-    use super::{Step, remembered, restore_error, restore_step};
+    use std::collections::HashSet;
+
+    use gpui_kit::{Task, WeakEntity};
+    use kubach_core::state::SavedForward;
+    use kubach_core::streams::PortForwardManager;
+
+    use super::{Forwards, RestoreStatus, Step, remembered, restore_error, restore_step};
+
+    fn saved(context: &str, local_port: u16, paused: bool) -> SavedForward {
+        SavedForward {
+            context: context.into(),
+            namespace: "web".into(),
+            kind: "Service".into(),
+            name: "web".into(),
+            port: 80,
+            local_port,
+            port_name: Some("http".into()),
+            paused,
+        }
+    }
+
+    #[test]
+    fn a_lock_puts_the_forwards_of_vault_contexts_on_hold() {
+        let mut forwards = Forwards {
+            manager: PortForwardManager::new(),
+            list: Vec::new(),
+            names: vec![(1, Some("http".into())), (2, None), (3, None)],
+            // 1 and 3 run in a context of the vault, 2 in a kubeconfig
+            // file's; 3 was started without a context to remember it in.
+            saved: vec![
+                (1, saved("from-vault", 18080, true)),
+                (2, saved("from-file", 18081, false)),
+            ],
+            restoring: Vec::new(),
+            next_restore: 4,
+            cluster: WeakEntity::new_invalid(),
+            requested: HashSet::new(),
+            vault: HashSet::from([1, 3]),
+            _cluster: None,
+            _vault: None,
+            _watch: Task::ready(()),
+        };
+
+        assert!(forwards.hold_vault_forwards());
+        // The kubeconfig file's forward is untouched.
+        assert_eq!(forwards.saved, vec![(2, saved("from-file", 18081, false))]);
+        assert_eq!(forwards.names, vec![(2, None)]);
+        assert!(forwards.vault.is_empty());
+        // The vault's forward waits for the unlock with its port and its
+        // pause, and stays remembered.
+        let [held] = forwards.restoring() else {
+            panic!("one forward on hold");
+        };
+        assert_eq!(held.id, 5);
+        assert_eq!(held.saved, saved("from-vault", 18080, true));
+        assert_eq!(held.status, RestoreStatus::Waiting { known: false });
+
+        // Nothing more to stop on the next notification of a locked vault.
+        assert!(!forwards.hold_vault_forwards());
+        assert_eq!(forwards.restoring().len(), 1);
+    }
 
     #[test]
     fn an_agents_forward_is_never_remembered() {

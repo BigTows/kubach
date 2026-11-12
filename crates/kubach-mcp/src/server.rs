@@ -759,10 +759,11 @@ fn batch_props(object: Value, extra: Value) -> Value {
 }
 
 /// How helm_install and helm_upgrade describe `preview` (#68).
-const PREVIEW_HELP: &str = "Only show what would change, as a short summary of the server-side \
-     dry run: objects added, changed and removed, image changes, changed ConfigMap and Secret \
-     keys and changed values, secrets masked, without asking the user or changing anything. \
-     helm_preview_diff gives the full diff by previewId. Call again without preview to do it";
+const PREVIEW_HELP: &str = "Only show what would change, as a short summary of a helm template \
+     render (no server-side dry run: that runs when you call without preview): objects added, \
+     changed and removed, image changes, changed ConfigMap and Secret keys and changed values, \
+     secrets masked, without asking the user or changing anything. helm_preview_diff gives the \
+     full diff by previewId. Call again without preview to do it";
 
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
