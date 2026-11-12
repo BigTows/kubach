@@ -740,6 +740,8 @@ impl Cluster {
     }
 
     /// Reruns discovery for `name` whenever CRDs are added, changed or removed.
+    /// The watch ends for good when the user may not list CRDs; the next
+    /// connection of the context tries again.
     fn watch_crds(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get_mut(name) else {
             return;
