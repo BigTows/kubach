@@ -23,6 +23,7 @@ use crate::event_tools::MAX_SINCE_SECONDS;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
+use crate::node_host::NodeShellPrefs;
 use crate::node_tools::PrometheusPlan;
 use crate::rules::writes_secrets;
 use crate::session::Session;
@@ -46,6 +47,9 @@ struct Inner {
     /// The Prometheus the user chose for a context (#112); without it
     /// `top_nodes` needs metrics-server.
     prometheus: std::sync::RwLock<Option<PrometheusPlan>>,
+    /// Namespace and image of node shell pods from the user's settings,
+    /// for `node_host_read` (#106); the defaults without it.
+    node_shell: std::sync::RwLock<Option<NodeShellPrefs>>,
 }
 
 /// Outcome of one call, as the agent sees it.
@@ -76,6 +80,7 @@ impl McpServer {
                 audit,
                 helm: std::sync::RwLock::new(None),
                 prometheus: std::sync::RwLock::new(None),
+                node_shell: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -90,6 +95,12 @@ impl McpServer {
     /// context (ADR 0009).
     pub fn set_prometheus(&self, plan: PrometheusPlan) {
         *sync::write(&self.inner.prometheus) = Some(plan);
+    }
+
+    /// Puts the pods of `node_host_read` where the user's node shells go
+    /// (#106): `prefs` reads Settings → General → Terminal.
+    pub fn set_node_shell(&self, prefs: NodeShellPrefs) {
+        *sync::write(&self.inner.node_shell) = Some(prefs);
     }
 
     /// Runs the session's port-forwards in `manager`: the app's, so they
@@ -128,7 +139,7 @@ impl McpServer {
                         .is_some(),
                     "get_secret_value" => scope.policy.reveal_allowed(),
                     // Refused in a pinned session; drain_node still previews.
-                    "cordon_node" | "uncordon_node" => !scope.pinned(),
+                    "cordon_node" | "uncordon_node" | "node_host_read" => !scope.pinned(),
                     _ => true,
                 };
                 let needed = tool_access(spec.name);
@@ -206,6 +217,7 @@ impl McpServer {
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
             prometheus: sync::read(&self.inner.prometheus).clone(),
+            node_shell: sync::read(&self.inner.node_shell).clone(),
             progress: progress.clone(),
             cancel,
             namespace: std::sync::Mutex::new(None),
@@ -585,8 +597,8 @@ const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, 
      command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
      machine) is previewed and confirmed by the user one by one, even within your access. The \
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
-     (not for deletions, Secrets or nodes); the result of such a call then says it was approved that \
-     way. For many objects use scale_batch and rollout_restart_batch: one window lists them all.";
+     (not for deletions, Secrets or changes to nodes), or for one exact node_host_read command \
+     on one node; the result of such a call then says it was approved that way. For many objects use scale_batch and rollout_restart_batch: one window lists them all.";
 
 /// Whether a call of `tool` ends when it is cancelled. A relayed call of
 /// any other tool runs on as before, a change above all.
@@ -604,8 +616,10 @@ pub(crate) const WAITS: &str = "A call that needs the user's answer waits for it
 /// Whether every real call of tool `name` is confirmed by the user (a dry
 /// run of `apply_manifest` is not).
 fn confirms_each_call(name: &str) -> bool {
-    matches!(name, "exec" | "debug_container" | "port_forward_start")
-        || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
+    matches!(
+        name,
+        "exec" | "debug_container" | "port_forward_start" | "node_host_read"
+    ) || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
 }
 
 /// What a tool needs of the access, where the user may raise it (#15).
@@ -648,6 +662,11 @@ fn tool_access(name: &str) -> Option<Access> {
         }),
         "cordon_node" | "uncordon_node" | "drain_node" => Some(Access {
             profile: Profile::Deploy,
+            nodes: true,
+            ..Access::NONE
+        }),
+        "node_host_read" => Some(Access {
+            profile: Profile::Debug,
             nodes: true,
             ..Access::NONE
         }),
@@ -913,6 +932,37 @@ fn catalog() -> Vec<ToolSpec> {
                           for the context in Kubach.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "node_host_read",
+            description: "Read-only diagnostics of a node's host, which the Kubernetes API does \
+                          not show: the kernel log (AppArmor and seccomp denials, OOM kills), \
+                          the journal of kubelet and the container runtime, files such as \
+                          /proc/<pid>/stack, /proc/<pid>/attr/current or a config under /etc. \
+                          Runs one program — dmesg, journalctl, cat, head, tail, ls or ps — \
+                          with your args, without a shell: no pipes, redirects or globs, and \
+                          only reading options (nothing that follows, pages or writes); files \
+                          by absolute path. journalctl gets --no-pager and -n 500 unless you \
+                          pass -n. Output is cut after 64 KiB from the start and masked, so \
+                          narrow it (journalctl -k -n 200 --since ..., tail -n). Runs with the \
+                          user's credentials through a temporary privileged pod, after they \
+                          confirm the exact command; they may allow that exact command on that \
+                          node for the rest of the session. Not in a session pinned to \
+                          namespaces.",
+            schema: object_schema(
+                json!({
+                    "node": {"type": "string"},
+                    "command": {
+                        "type": "string",
+                        "enum": ["dmesg", "journalctl", "cat", "head", "tail", "ls", "ps"],
+                    },
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 120},
+                }),
+                &["node", "command"],
+            ),
+            read_only: false,
             destructive: false,
         },
         ToolSpec {

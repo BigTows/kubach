@@ -8,6 +8,10 @@
 //! remembered in that namespace; the user can forget everything of a
 //! session in Settings → Agent.
 //!
+//! A command on a node's host (#106) is remembered differently: not as a
+//! kind of change but as that exact command on that node ([`ExactCommand`]),
+//! so any other argument, file or node asks again.
+//!
 //! Some questions are always asked, without the tick and past anything
 //! remembered: [`rememberable`] lists what may be remembered, everything
 //! else is not.
@@ -33,10 +37,12 @@ pub enum RememberedAction {
     HelmInstall,
     HelmUpgrade,
     HelmRollback,
+    /// `node_host_read`: only ever one exact command on one node (#106).
+    NodeHostRead,
 }
 
 impl RememberedAction {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Scale,
         Self::RolloutRestart,
         Self::ApplyManifest,
@@ -45,6 +51,7 @@ impl RememberedAction {
         Self::HelmInstall,
         Self::HelmUpgrade,
         Self::HelmRollback,
+        Self::NodeHostRead,
     ];
 
     /// The tool that makes this kind of change.
@@ -58,6 +65,7 @@ impl RememberedAction {
             Self::HelmInstall => "helm_install",
             Self::HelmUpgrade => "helm_upgrade",
             Self::HelmRollback => "helm_rollback",
+            Self::NodeHostRead => "node_host_read",
         }
     }
 }
@@ -68,16 +76,50 @@ impl fmt::Display for RememberedAction {
     }
 }
 
-/// One remembered "don't ask again": a kind of change in a namespace.
+/// The exact command a "don't ask again" covers on a node's host (#106):
+/// the whole argv, compared as it is.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExactCommand {
+    pub node: String,
+    pub command: Vec<String>,
+}
+
+impl ExactCommand {
+    /// The command as one shell line, for the user and the agent.
+    pub fn line(&self) -> String {
+        crate::tools::shell_words(&self.command)
+    }
+}
+
+/// One remembered "don't ask again": a kind of change in a namespace, or
+/// one exact command on a node.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Remembered {
     pub action: RememberedAction,
+    /// Empty for a command on a node.
     pub namespace: String,
+    /// Set for [`RememberedAction::NodeHostRead`] and only for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<ExactCommand>,
+}
+
+impl Remembered {
+    /// A kind of change in a namespace.
+    pub fn in_namespace(action: RememberedAction, namespace: impl Into<String>) -> Self {
+        Self {
+            action,
+            namespace: namespace.into(),
+            exact: None,
+        }
+    }
 }
 
 impl fmt::Display for Remembered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} in {}", self.action, self.namespace)
+        match &self.exact {
+            Some(exact) => write!(f, "exactly `{}` on node {}", exact.line(), exact.node),
+            None => write!(f, "{} in namespace {}", self.action, self.namespace),
+        }
     }
 }
 
@@ -93,7 +135,23 @@ impl fmt::Display for Remembered {
 ///   objects, in other namespaces (#21) or creating its namespace;
 /// - a namespace where only Kubach holds the boundary (ADR 0005: client
 ///   only confirms every change without "remember").
+///
+/// A command on a node's host (#106) may be remembered whatever the mode,
+/// since it never runs as a session identity; only as that exact command
+/// on that node, and never when it reads a file that needs its own tick.
 pub fn rememberable(request: &ConfirmationRequest) -> Option<Remembered> {
+    if let RequestKind::NodeCommand { node, command } = &request.kind {
+        return (request.tool == "node_host_read" && request.dangerous.is_empty()).then(|| {
+            Remembered {
+                action: RememberedAction::NodeHostRead,
+                namespace: String::new(),
+                exact: Some(ExactCommand {
+                    node: node.clone(),
+                    command: command.clone(),
+                }),
+            }
+        });
+    }
     if request.namespace.is_empty()
         || !request.dangerous.is_empty()
         || !request.mode.server_enforced()
@@ -126,10 +184,7 @@ pub fn rememberable(request: &ConfirmationRequest) -> Option<Remembered> {
         }
         _ => return None,
     };
-    Some(Remembered {
-        action,
-        namespace: request.namespace.clone(),
-    })
+    Some(Remembered::in_namespace(action, request.namespace.clone()))
 }
 
 /// What a session remembers. `epoch` changes whenever something is
@@ -198,14 +253,12 @@ impl RememberNote {
     pub(crate) fn agent_text(&self) -> String {
         match self {
             Self::Used(r) => format!(
-                "Approved by the user's earlier choice: no confirmation for {} in namespace {} \
-                 until this session ends.",
-                r.action, r.namespace
+                "Approved by the user's earlier choice: no confirmation for {r} until this \
+                 session ends."
             ),
             Self::Saved(r) => format!(
-                "The user approved this and chose not to be asked again about {} in namespace {} \
-                 until this session ends.",
-                r.action, r.namespace
+                "The user approved this and chose not to be asked again about {r} until this \
+                 session ends."
             ),
         }
     }
