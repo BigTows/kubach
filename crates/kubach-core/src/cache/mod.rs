@@ -1154,6 +1154,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_set_merges_again_only_after_a_change() {
+        let (cache, senders) = scripted();
+        let pods = kind("Pod", "pods", Scope::Namespaced);
+        let set = SubscriptionSet::new(vec![
+            cache.subscribe(&pods, Some("web")),
+            cache.subscribe(&pods, Some("api")),
+        ]);
+        let in_namespace = |namespace: &str, name: &str| {
+            let mut object = pod(name);
+            object.metadata.namespace = Some(namespace.into());
+            object
+        };
+        for (ix, namespace) in ["web", "api"].into_iter().enumerate() {
+            let tx = lock(&senders)[ix].1.clone();
+            tx.unbounded_send(Ok(Event::Init)).unwrap();
+            for name in ["a", "b"] {
+                tx.unbounded_send(Ok(Event::InitApply(in_namespace(namespace, name))))
+                    .unwrap();
+            }
+            tx.unbounded_send(Ok(Event::InitDone)).unwrap();
+        }
+        eventually(|| set.snapshot().objects.len() == 4).await;
+
+        let first = set.snapshot().objects;
+        let keys = |objects: &Objects| -> Vec<String> {
+            objects
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{}/{}",
+                        o.metadata.namespace.as_deref().unwrap_or(""),
+                        o.metadata.name.as_deref().unwrap_or("")
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(keys(&first), ["api/a", "api/b", "web/a", "web/b"]);
+        // Nothing changed: the same list, also for a clone of the set.
+        assert!(Arc::ptr_eq(&first, &set.snapshot().objects));
+        assert!(Arc::ptr_eq(&first, &set.clone().snapshot().objects));
+
+        let tx = lock(&senders)[1].1.clone();
+        tx.unbounded_send(Ok(Event::Apply(in_namespace("api", "c"))))
+            .unwrap();
+        eventually(|| set.snapshot().objects.len() == 5).await;
+        let second = set.snapshot().objects;
+        assert_eq!(keys(&second), ["api/a", "api/b", "api/c", "web/a", "web/b"]);
+        assert!(Arc::ptr_eq(&second, &set.snapshot().objects));
+        // The earlier list is not touched.
+        assert_eq!(first.len(), 4);
+    }
+
+    #[tokio::test]
     async fn subscribe_many_watches_each_namespace_or_all() {
         let (cache, senders) = scripted();
         let pods = kind("Pod", "pods", Scope::Namespaced);
