@@ -1221,11 +1221,7 @@ impl ResourceTable {
     /// updates (a long list where a few rows change at a time): a row
     /// passed again is recognized by its allocation instead of being
     /// compared cell by cell, and none is copied.
-    pub fn set_shared_rows(
-        &mut self,
-        rows: Vec<Arc<ResourceRow>>,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn set_shared_rows(&mut self, rows: Vec<Arc<ResourceRow>>, cx: &mut Context<Self>) -> bool {
         if same_rows(&self.state.read(cx).delegate().rows, &rows) {
             return false;
         }
