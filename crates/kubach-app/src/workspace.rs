@@ -210,7 +210,9 @@ impl Workspace {
         // The first screen shown.
         set_active(&overview, true, cx);
         let mut subscriptions = vec![
-            cx.observe(&dock, |_, _, cx| cx.notify()),
+            // The dock draws its own tab strip and tabs; the workspace
+            // only places it (#166).
+            crate::dock::observe_shape(&dock, cx),
             cx.observe(&forwards, |_, _, cx| cx.notify()),
             cx.observe(&cluster, |this, _, cx| this.on_cluster_change(cx)),
             // After on_cluster_change: the context switch is taken in.
@@ -761,11 +763,11 @@ impl Workspace {
     /// `content` with the bottom dock under it once a log or terminal tab
     /// is open.
     fn with_dock(&self, content: AnyElement, cx: &App) -> AnyElement {
-        let dock = self.dock.read(cx);
-        if !dock.has_tabs() {
+        let dock = self.dock.read(cx).shape();
+        if !dock.has_tabs {
             return content;
         }
-        if !dock.is_expanded() {
+        if !dock.expanded {
             return div()
                 .flex_1()
                 .min_w_0()

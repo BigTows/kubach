@@ -33,10 +33,11 @@ use crate::cluster::Cluster;
 
 /// Events applied to the view per UI update.
 const BATCH_EVENTS: usize = 256;
-/// Pause between UI updates of a stream. Every update redraws the whole
-/// window, so applying each batch as it arrives redraws it at the rate of
-/// the stream: a pod printing a few hundred lines a second kept the window
-/// drawing over a hundred frames a second (#142). Lines that arrive during
+/// Pause between UI updates of a stream. Every update of the tab on screen
+/// redraws the window (the views the tab is in; cached ones beside them
+/// are reused), so applying each batch as it arrives redraws it at the rate
+/// of the stream: a pod printing a few hundred lines a second kept the
+/// window drawing over a hundred frames a second (#142). Lines that arrive during
 /// the pause wait in the stream (which merges them into fewer batches) and
 /// are shown together; a line after a quiet period is shown at once.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(50);
@@ -168,6 +169,8 @@ fn group_thousands(n: usize) -> String {
     out
 }
 
+impl EventEmitter<super::TabChanged> for LogsTab {}
+
 pub struct LogsTab {
     cluster: Entity<Cluster>,
     /// Context the tab was opened in: restarts and earlier lines come from
@@ -281,8 +284,12 @@ impl LogsTab {
         &self.state
     }
 
-    pub fn line_count(&self, cx: &App) -> usize {
-        self.view.read(cx).len()
+    /// Moves the stream on; the dock's tab strip shows the state (and the
+    /// title, which a restart with another container changed).
+    fn set_state(&mut self, state: LogsState, cx: &mut Context<Self>) {
+        self.state = state;
+        cx.emit(super::TabChanged);
+        cx.notify();
     }
 
     /// (Re)starts the stream with the current container and previous-logs
@@ -294,13 +301,12 @@ impl LogsTab {
         self.history_error = None;
         self.sources.clear();
         self.status = LogsStatus::default();
-        self.state = LogsState::Starting;
         self.view.update(cx, |view, cx| {
             view.clear(cx);
             view.set_top_notice(None, cx);
             view.set_placeholder(t!("dock-connecting"), cx);
         });
-        cx.notify();
+        self.set_state(LogsState::Starting, cx);
 
         let tab_client =
             crate::action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx);
@@ -368,11 +374,10 @@ impl LogsTab {
             let started = this.update(cx, |this, cx| {
                 this.sources = sources.into_iter().map(Arc::new).collect();
                 this.history = Some(LogHistory::new(&this.sources, INITIAL_TAIL_LINES));
-                this.state = LogsState::Streaming;
                 this.view.update(cx, |view, cx| {
                     view.set_placeholder(t!("dock-logs-waiting"), cx)
                 });
-                cx.notify();
+                this.set_state(LogsState::Streaming, cx);
             });
             if started.is_err() {
                 return;
@@ -381,11 +386,10 @@ impl LogsTab {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.state = LogsState::Finished;
                 this.view.update(cx, |view, cx| {
                     view.set_placeholder(t!("dock-logs-no-lines"), cx)
                 });
-                cx.notify();
+                this.set_state(LogsState::Finished, cx);
             })
             .ok();
         }));
@@ -400,10 +404,10 @@ impl LogsTab {
         self._stream = None;
         self._history_load = None;
         if matches!(self.state, LogsState::Starting | LogsState::Streaming) {
-            self.state = LogsState::Locked;
             self.view.update(cx, |view, cx| {
                 view.set_placeholder(t!("dock-vault-locked"), cx)
             });
+            self.set_state(LogsState::Locked, cx);
         }
         self.update_top_notice(cx);
         cx.notify();
@@ -412,8 +416,7 @@ impl LogsTab {
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.view
             .update(cx, |view, cx| view.set_placeholder(error.clone(), cx));
-        self.state = LogsState::Failed(error);
-        cx.notify();
+        self.set_state(LogsState::Failed(error), cx);
     }
 
     /// Source label and color shown before lines of `source` when several
@@ -429,7 +432,12 @@ impl LogsTab {
         })
     }
 
+    /// Shows a batch of the stream. The lines redraw the view, which
+    /// notifies for them itself (and only reaches a window while the tab
+    /// is shown); the tab redraws its toolbar when the health of the
+    /// stream changed, not with every batch (#166).
     fn apply(&mut self, batch: Vec<LogEvent>, cx: &mut Context<Self>) {
+        let status = self.status.clone();
         let mut entries = Vec::new();
         for event in batch {
             self.status.apply(&event);
@@ -454,7 +462,9 @@ impl LogsTab {
             history.turn_off();
         }
         self.update_top_notice(cx);
-        cx.notify();
+        if self.status != status {
+            cx.notify();
+        }
     }
 
     /// Fetches lines older than the shown ones (the view reached its top).
