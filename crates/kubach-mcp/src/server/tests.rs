@@ -4728,3 +4728,74 @@ async fn a_preview_without_lookup_is_not_marked() {
     assert!(preview.get("lookup").is_none(), "{preview}");
     assert!(f.renders().is_empty());
 }
+
+// ------------------------------------------------ comparing Secrets (#179)
+
+async fn compare_db(f: &Fixture, key: &str, other_key: &str) -> CallOutcome {
+    f.server
+        .call(
+            "agent",
+            "compare_secret_values",
+            args(json!({"name": "db", "key": key, "otherName": "db", "otherKey": other_key})),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn one_secret_key_is_compared_a_bounded_number_of_times() {
+    let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
+    for n in 0..crate::session::MAX_COMPARISONS_PER_KEY {
+        let compared = compare_db(&f, "password", "copy").await;
+        assert!(!compared.is_error, "{n}: {}", compared.text);
+    }
+    let refused = compare_db(&f, "password", "copy").await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused.text.contains("db[password] was compared 10 times"),
+        "{}",
+        refused.text
+    );
+    assert!(!refused.text.contains("equal"), "{}", refused.text);
+    // The limit is the key's, whatever it is compared with; a key that
+    // was not compared yet still is.
+    let other = compare_db(&f, "url", "password").await;
+    assert!(other.is_error, "{}", other.text);
+    let fresh = compare_db(&f, "url", "url").await;
+    assert!(!fresh.is_error, "{}", fresh.text);
+    let last = audit_lines(&f.audit_path)
+        .into_iter()
+        .rfind(|line| line["result"] == "denied")
+        .unwrap();
+    assert_eq!(last["tool"], "compare_secret_values");
+    assert_eq!(last["decided_by"], "policy");
+}
+
+#[tokio::test]
+async fn a_secret_written_in_the_session_is_not_compared() {
+    let f = writing_fixture(ScriptedConfirmer::providing(provided(
+        &[("password", TYPED)],
+        &[],
+    )))
+    .await;
+    let before = compare_db(&f, "password", "copy").await;
+    assert!(!before.is_error, "{}", before.text);
+    let written = f
+        .server
+        .call(
+            "agent",
+            "request_secret_input",
+            args(json!({"name": "db", "mode": "update", "keys": ["password"]})),
+        )
+        .await;
+    assert!(!written.is_error, "{}", written.text);
+    let after = compare_db(&f, "password", "copy").await;
+    assert!(after.is_error, "{}", after.text);
+    assert!(
+        after
+            .text
+            .contains("created or changed during this session"),
+        "{}",
+        after.text
+    );
+    assert!(!after.text.contains("equal"), "{}", after.text);
+}
