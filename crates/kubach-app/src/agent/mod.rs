@@ -80,6 +80,20 @@ pub(crate) fn prometheus_plan(context: &str) -> kubach_core::metrics::prometheus
     )
 }
 
+/// Where the pods of the agent's `node_host_read` go and what they run
+/// (#106): the node shell namespace and image of Settings → General →
+/// Terminal, read from the file on every call.
+pub(crate) fn node_shell_pod() -> kubach_mcp::NodeShellPod {
+    let general = settings::default_path()
+        .map(|path| settings::load(&path).settings)
+        .unwrap_or_default()
+        .general;
+    kubach_mcp::NodeShellPod {
+        namespace: general.node_shell_namespace().to_owned(),
+        image: general.node_shell_image().to_owned(),
+    }
+}
+
 /// `context` of the vault for a helm call the user allows under their
 /// credentials (#113): that one context only, written to a file just for
 /// that call, in the folder of the local terminal's temporary kubeconfigs
@@ -1216,6 +1230,7 @@ impl AgentState {
                         );
                         server.set_helm(helm);
                         server.set_prometheus(Arc::new(prometheus_plan));
+                        server.set_node_shell(Arc::new(node_shell_pod));
                         // The agent's forwards show on the "Port
                         // forwards" screen (#17).
                         if let Some(forwards) = crate::dock::forwards(cx) {
@@ -1328,6 +1343,7 @@ impl AgentState {
                     .map_err(|error| error.to_string())?;
                 let server = McpServer::new(session.clone(), confirmer.clone(), audit);
                 server.set_prometheus(Arc::new(prometheus_plan));
+                server.set_node_shell(Arc::new(node_shell_pod));
                 if let Some(helm) = helm {
                     server.set_helm(helm);
                 }
@@ -1784,6 +1800,7 @@ pub fn remembered_action_label(action: kubach_mcp::RememberedAction) -> String {
         RememberedAction::HelmInstall => t!("agent-action-helm-install"),
         RememberedAction::HelmUpgrade => t!("agent-action-helm-upgrade"),
         RememberedAction::HelmRollback => t!("agent-action-helm-rollback"),
+        RememberedAction::NodeHostRead => t!("agent-action-node-host-read"),
     }
 }
 
@@ -1894,6 +1911,7 @@ mod tests {
         session.remembered = vec![kubach_mcp::Remembered {
             action: kubach_mcp::RememberedAction::Scale,
             namespace: "web".into(),
+            exact: None,
         }];
         let reply = app.heartbeat(session.clone(), "mine").unwrap();
         assert!(!reply.forget_remembered);

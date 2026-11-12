@@ -3041,6 +3041,7 @@ fn remembered(action: crate::RememberedAction) -> crate::Remembered {
     crate::Remembered {
         action,
         namespace: NS.into(),
+        exact: None,
     }
 }
 

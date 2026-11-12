@@ -89,6 +89,8 @@ settings-session-no-grants = No rights granted yet.
 settings-session-remembered = Without asking: { $list }
 # $action: agent-action-*, $namespace: where.
 settings-session-remembered-item = { $action } in { $namespace }
+# $command: the exact command line, $node: the node.
+settings-session-remembered-command = { $command } on node { $node }
 settings-ask-again = Ask again
 settings-boundary-client-only = limits only in Kubach
 settings-boundary-impersonation = limits in Kubach and the API server (impersonation)

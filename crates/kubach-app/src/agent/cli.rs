@@ -533,6 +533,7 @@ async fn serve(options: Options) -> Result<(), String> {
     let server = McpServer::new(session.clone(), Arc::new(confirmer), audit);
     server.set_helm(super::helm_env(&settings, true));
     server.set_prometheus(Arc::new(super::prometheus_plan));
+    server.set_node_shell(Arc::new(super::node_shell_pod));
     if plan.grant_read {
         if let Err(error) = server.grant_read_at_launch().await {
             let _ = session.close().await;
@@ -705,6 +706,7 @@ impl StdioChooser {
         );
         server.set_helm(super::helm_env(&self.settings, true));
         server.set_prometheus(Arc::new(super::prometheus_plan));
+        server.set_node_shell(Arc::new(super::node_shell_pod));
         eprintln!(
             "kubach mcp: session {} on {name} (access: {}), chosen by the agent and \
              approved in Kubach",

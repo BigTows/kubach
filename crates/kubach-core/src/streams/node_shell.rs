@@ -64,6 +64,16 @@ pub fn shell_command() -> Vec<String> {
     .collect()
 }
 
+/// `argv` run in the host's namespaces from the shell pod, without a shell
+/// in between: the arguments reach the program exactly as given (#106).
+pub fn host_command(argv: &[String]) -> Vec<String> {
+    ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(argv.iter().cloned())
+        .collect()
+}
+
 /// `node` as a label value: at most 63 characters, starting and ending
 /// with an alphanumeric one.
 fn label_value(node: &str) -> String {

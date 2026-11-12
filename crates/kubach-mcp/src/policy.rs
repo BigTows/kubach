@@ -272,6 +272,14 @@ pub enum Request {
         timeout_seconds: Option<u64>,
         preview: bool,
     },
+    /// `node_host_read` (#106): one read-only program of a fixed list, with
+    /// checked arguments, run on the node's host through a temporary
+    /// privileged pod. The user's credentials for this one call, confirmed
+    /// with the exact command, and never in a session pinned to namespaces.
+    NodeHost {
+        name: String,
+        command: Vec<String>,
+    },
     /// Helm releases of a namespace: list, history and values. Needs
     /// access to Secrets, where Helm stores them (#53).
     HelmRead {
@@ -298,6 +306,7 @@ impl Request {
             | Self::SecretCopy { .. }
             | Self::SecretDelete { .. }
             | Self::NodeCordon { .. }
+            | Self::NodeHost { .. }
             | Self::HelmChange { .. } => true,
             Self::NodeDrain { preview, .. } => !preview,
             _ => false,
@@ -585,6 +594,12 @@ impl<'a> Policy<'a> {
                 nodes: true,
                 ..Access::NONE
             }),
+            // Runs a program, like exec, but on a node.
+            Request::NodeHost { .. } => Some(Access {
+                profile: Profile::Debug,
+                nodes: true,
+                ..Access::NONE
+            }),
             _ => None,
         }
     }
@@ -668,6 +683,7 @@ impl<'a> Policy<'a> {
             | Request::HelmCharts
             | Request::Nodes { .. }
             | Request::NodeCordon { .. }
+            | Request::NodeHost { .. }
             | Request::NodeDrain { .. } => Vec::new(),
             Request::HelmRead { .. } => vec![read],
             Request::List { .. }
@@ -817,6 +833,13 @@ impl<'a> Policy<'a> {
             }
             Request::NodeCordon { name, .. } => {
                 let mut allowed = self.node_write()?;
+                allowed.name = Some(object_name(name)?);
+                Ok(allowed)
+            }
+            Request::NodeHost { name, .. } => {
+                let mut allowed = self.node_call(
+                    "a command on a node's host reads what every namespace on it left there",
+                )?;
                 allowed.name = Some(object_name(name)?);
                 Ok(allowed)
             }
@@ -1204,12 +1227,18 @@ impl<'a> Policy<'a> {
     /// none applies, and confirmed each time. It reaches beyond any
     /// namespace, so a session pinned to some never makes it.
     fn node_write(&self) -> Result<Allowed, Denial> {
+        self.node_call("a change to a node reaches every namespace on it")
+    }
+
+    /// A call on a node with the user's credentials, confirmed each time;
+    /// `why` says what keeps it out of a session pinned to namespaces.
+    fn node_call(&self, why: &str) -> Result<Allowed, Denial> {
         if self.scope.pinned() {
             return Err(Denial::new(
                 DenialCode::ClusterScoped,
                 format!(
-                    "this session is limited to namespace(s) {}, and a change to a node reaches \
-                     every namespace on it. Start kubach mcp without --namespace to do this",
+                    "this session is limited to namespace(s) {}, and {why}. Start kubach mcp \
+                     without --namespace to do this",
                     self.scope.namespaces.join(", ")
                 ),
             ));
@@ -1284,6 +1313,9 @@ impl<'a> Policy<'a> {
             Request::NodeDrain { preview: true, .. } => "a drain preview (reads nodes and pods)",
             Request::NodeCordon { .. } | Request::NodeDrain { .. } => {
                 "changing a node (cluster-scoped, with the user's credentials)"
+            }
+            Request::NodeHost { .. } => {
+                "running a read-only command on a node's host (with the user's credentials)"
             }
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",

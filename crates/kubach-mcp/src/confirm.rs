@@ -40,6 +40,11 @@ pub enum RequestKind {
     /// spelled out, and not as a diff (#194). `details` holds the same
     /// command as one shell line.
     Exec { command: Vec<String> },
+    /// One read-only command on the host of `node` (#106): `command` is
+    /// the exact argv, shown like an exec. "Don't ask again" is offered for
+    /// this exact command on this node only, and not at all when a file it
+    /// reads comes as a `dangerous` finding.
+    NodeCommand { node: String, command: Vec<String> },
     /// One port-forward of the agent (#17), confirmed every time:
     /// `127.0.0.1:<local_port>` (any free port when `None`) to `port`
     /// (number or name) of `target` (`pod/web-0`, `service/web`). TCP only.

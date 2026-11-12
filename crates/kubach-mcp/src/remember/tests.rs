@@ -3,7 +3,9 @@ use crate::confirm::{ConfirmationRequest, RequestKind};
 use crate::grants::Grant;
 use crate::helm_tools::{HelmAction, HelmChange, HelmCredentials};
 use crate::policy::Finding;
-use crate::remember::{RememberNote, Remembered, RememberedAction, RememberedSet, rememberable};
+use crate::remember::{
+    ExactCommand, RememberNote, Remembered, RememberedAction, RememberedSet, rememberable,
+};
 use crate::scope::SessionMode;
 use crate::secret_write::{SecretOp, SecretRequest};
 
@@ -77,6 +79,7 @@ fn remembered(action: RememberedAction) -> Option<Remembered> {
     Some(Remembered {
         action,
         namespace: NS.into(),
+        exact: None,
     })
 }
 
@@ -320,10 +323,12 @@ fn forgetting_wins_over_a_late_tick() {
     let scale = Remembered {
         action: RememberedAction::Scale,
         namespace: NS.into(),
+        exact: None,
     };
     let exec = Remembered {
         action: RememberedAction::Exec,
         namespace: "web".into(),
+        exact: None,
     };
     let mut set = RememberedSet::default();
     let epoch = set.epoch();
@@ -344,6 +349,7 @@ fn the_agent_is_told() {
     let r = Remembered {
         action: RememberedAction::HelmUpgrade,
         namespace: NS.into(),
+        exact: None,
     };
     let used = RememberNote::Used(r.clone());
     assert_eq!(used.audit(), "used");
@@ -352,5 +358,85 @@ fn the_agent_is_told() {
             .contains("helm_upgrade in namespace cert-manager")
     );
     assert_eq!(RememberNote::Saved(r).audit(), "saved");
-    assert_eq!(RememberedAction::ALL.len(), 8);
+    assert_eq!(RememberedAction::ALL.len(), 9);
+}
+
+fn node_command(node: &str, command: &[&str]) -> ConfirmationRequest {
+    ConfirmationRequest {
+        kind: RequestKind::NodeCommand {
+            node: node.into(),
+            command: command.iter().map(|arg| (*arg).to_owned()).collect(),
+        },
+        // No namespace and no session identity: the user's credentials.
+        namespace: String::new(),
+        mode: SessionMode::ClientOnly,
+        ..call("node_host_read")
+    }
+}
+
+#[test]
+fn a_host_command_is_remembered_only_as_that_exact_command_on_that_node() {
+    let cat = node_command("n1", &["cat", "/etc/nginx/nginx.conf"]);
+    let offer = rememberable(&cat).expect("offered");
+    assert_eq!(offer.action, RememberedAction::NodeHostRead);
+    assert_eq!(
+        offer.exact,
+        Some(ExactCommand {
+            node: "n1".into(),
+            command: vec!["cat".into(), "/etc/nginx/nginx.conf".into()],
+        })
+    );
+    assert_eq!(
+        offer.to_string(),
+        "exactly `cat /etc/nginx/nginx.conf` on node n1"
+    );
+
+    let mut set = RememberedSet::default();
+    let epoch = set.epoch();
+    assert!(set.insert(offer.clone(), epoch));
+    // The same command again: no window.
+    assert!(set.contains(&rememberable(&cat).unwrap()));
+    // Another file, another argument, another program, another node: asked.
+    for other in [
+        node_command("n1", &["cat", "/etc/nginx/conf.d/default.conf"]),
+        node_command("n1", &["cat", "/etc/nginx/nginx.conf", "/etc/hosts"]),
+        node_command("n1", &["head", "/etc/nginx/nginx.conf"]),
+        node_command("n2", &["cat", "/etc/nginx/nginx.conf"]),
+    ] {
+        assert!(!set.contains(&rememberable(&other).unwrap()), "{other:?}");
+    }
+    // Revoking a namespace's rights does not touch it; "ask again" does.
+    set.forget_in(NS);
+    assert!(set.contains(&offer));
+    set.clear();
+    assert!(!set.contains(&offer));
+}
+
+#[test]
+fn a_host_command_reading_a_sensitive_file_is_never_remembered() {
+    let key = ConfirmationRequest {
+        dangerous: vec![finding()],
+        ..node_command("n1", &["cat", "/etc/kubernetes/pki/ca.key"])
+    };
+    assert_eq!(rememberable(&key), None);
+    // The kind belongs to its tool alone.
+    let other_tool = ConfirmationRequest {
+        tool: "exec".into(),
+        ..node_command("n1", &["dmesg"])
+    };
+    assert_eq!(rememberable(&other_tool), None);
+}
+
+#[test]
+fn an_exact_command_survives_the_bridge() {
+    let offer = rememberable(&node_command("n1", &["journalctl", "-k", "-n", "50"])).unwrap();
+    let json = serde_json::to_string(&offer).unwrap();
+    assert_eq!(serde_json::from_str::<Remembered>(&json).unwrap(), offer);
+    // An older peer's item has no `exact`.
+    let old: Remembered = serde_json::from_str(r#"{"action":"scale","namespace":"web"}"#).unwrap();
+    assert_eq!(
+        old,
+        Remembered::in_namespace(RememberedAction::Scale, "web")
+    );
+    assert!(!serde_json::to_string(&old).unwrap().contains("exact"));
 }
