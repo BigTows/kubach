@@ -17,6 +17,11 @@
 //! or when the user stops them; each start and stop is in the audit log.
 //! They are never remembered for the app's next run.
 //!
+//! A pod that runs in its node's network (`spec.hostNetwork`) is shown to
+//! the user as a finding to tick, every time (#179). A forward approved
+//! without it never goes to such a pod: the manager reads the pod before
+//! every connection ([`HostNetwork::Refused`]).
+//!
 //! Nothing else closes one: a pod that restarts, a dropped or idle
 //! connection end that connection only, the local port stays and the next
 //! connection reaches for the pod again (`state`, `lastError`). A forward
@@ -33,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use k8s_openapi::jiff::Timestamp;
 use kubach_core::runtime::BackgroundTask;
 use kubach_core::streams::{
-    ForwardAgent, ForwardId, ForwardInfo, ForwardSource, ForwardState, LocalPort,
+    ForwardAgent, ForwardId, ForwardInfo, ForwardSource, ForwardState, HostNetwork, LocalPort,
     PortForwardManager, StreamError, fetch_source,
 };
 use kubach_core::sync;
@@ -463,7 +468,19 @@ pub(crate) async fn start(
         .await
         .map_err(stream_error)?;
     let port = port_number(&source, &a.port)?;
-    check::check_target(&client, &source, port).await?;
+    let reached = check::check_target(&client, &source, port).await?;
+    let (host_network, node_network) = if reached.host_network {
+        (
+            HostNetwork::Allowed,
+            format!(
+                "\nPod {} uses the node's network (hostNetwork): the forward reaches the node's \
+                 own ports.",
+                reached.pod
+            ),
+        )
+    } else {
+        (HostNetwork::Refused, String::new())
+    };
     let local = a
         .local_port
         .map_or_else(|| "any free port".to_owned(), |port| port.to_string());
@@ -482,7 +499,8 @@ pub(crate) async fn start(
             a.port
         ),
         format!(
-            "Namespace: {namespace}\nTarget: {target}\nRemote port: {}\nLocal: 127.0.0.1, {local}\n\
+            "Namespace: {namespace}\nTarget: {target}\nRemote port: {}\nLocal: 127.0.0.1, {local}\
+             {node_network}\n\
              Session: {} ({}, context {})\nOnly this machine can connect. The forward ends with \
              the session or when the agent disconnects, and is not restored after Kubach \
              restarts; you can stop it any time under Port forwards.",
@@ -491,11 +509,11 @@ pub(crate) async fn start(
             ctx.client_name,
             scope.context,
         ),
-        Vec::new(),
+        reached.findings(),
     )
     .await?;
     ctx.session.begin_forward(&namespace).await?;
-    let started = open(ctx, &client, &source, port, a.local_port).await;
+    let started = open(ctx, &client, &source, port, a.local_port, host_network).await;
     let info = match started {
         Ok(info) => info,
         Err(error) => {
@@ -541,6 +559,7 @@ pub(crate) async fn start(
         "port": info.source_port,
         "pod": info.pod,
         "podPort": info.remote_port,
+        "hostNetwork": host_network == HostNetwork::Allowed,
     });
     Ok(ToolOutput {
         text: format!(
@@ -549,7 +568,13 @@ pub(crate) async fn start(
             info.namespace, info.source, info.source_port, info.pod, info.remote_port, info.id
         ),
         confirmed: true,
-        audit: Some(json!({"forward": info.id, "address": address, "target": info.source})),
+        audit: Some(json!({
+            "forward": info.id,
+            "address": address,
+            "target": info.source,
+            "pod": info.pod,
+            "hostNetwork": host_network == HostNetwork::Allowed,
+        })),
     })
 }
 
@@ -560,6 +585,7 @@ async fn open(
     source: &ForwardSource,
     port: u16,
     local_port: Option<u16>,
+    host_network: HostNetwork,
 ) -> Result<ForwardInfo, ToolError> {
     let local = LocalPort::Exact(local_port.unwrap_or(0));
     let agent = ForwardAgent {
@@ -570,7 +596,7 @@ async fn open(
     ctx.session
         .forwards()
         .manager()
-        .start_for_agent(client, source, port, local, agent)
+        .start_for_agent(client, source, port, local, agent, host_network)
         .await
         .map_err(|error| match error {
             StreamError::PortInUse(port) => ToolError::Failed(format!(

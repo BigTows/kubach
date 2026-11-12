@@ -6,13 +6,17 @@
 //! A pod that is Running but not Ready is refused too: a Service would
 //! not send it traffic either, and a forward picked from a Service or
 //! workload goes to a ready pod only.
+//!
+//! The check also tells whether that pod runs in its node's network
+//! (`spec.hostNetwork`), for the user to see before approving (#179).
 
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kubach_core::plugin::builtin::summarize_pod;
-use kubach_core::streams::{ForwardSource, is_pod_ready, pick_ready_pod};
+use kubach_core::streams::{ForwardSource, is_pod_ready, pick_ready_pod, uses_host_network};
 use kube::Client;
 use kube::api::{Api, ListParams};
 
+use crate::policy::Finding;
 use crate::tools::ToolError;
 
 /// Pods described in the error about a Service or workload, at most.
@@ -22,13 +26,40 @@ const DESCRIBED_PODS: usize = 3;
 const NOT_ASKED: &str = "The forward cannot work now, so the user was not asked; \
      try again when the pod is ready.";
 
+/// The pod a forward would go to now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Reached {
+    pub pod: String,
+    /// The pod runs in its node's network namespace.
+    pub host_network: bool,
+}
+
+impl Reached {
+    /// What the user has to tick before approving: through a pod in the
+    /// node's network the forward reaches the node's own ports. Such a
+    /// forward is asked about every time, "don't ask again" does not cover
+    /// it ([`rememberable`](crate::remember::rememberable)).
+    pub fn findings(&self) -> Vec<Finding> {
+        if !self.host_network {
+            return Vec::new();
+        }
+        vec![Finding {
+            document: None,
+            path: format!("pod/{} .spec.hostNetwork", self.pod),
+            message: "the pod uses the node's network: the forward reaches ports of the node \
+                      itself, also those open only on the node's 127.0.0.1"
+                .into(),
+        }]
+    }
+}
+
 /// Reads the pod `source` would forward to and checks it is ready and
 /// reaches `requested` (a pod port, or a Service port).
 pub(super) async fn check_target(
     client: &Client,
     source: &ForwardSource,
     requested: u16,
-) -> Result<(), ToolError> {
+) -> Result<Reached, ToolError> {
     let api: Api<Pod> = Api::namespaced(client.clone(), &source.namespace);
     let pod = match &source.selector {
         None => {
@@ -60,7 +91,10 @@ pub(super) async fn check_target(
             ports_text(source)
         ))
     })?;
-    Ok(())
+    Ok(Reached {
+        pod: pod.metadata.name.clone().unwrap_or_default(),
+        host_network: uses_host_network(&pod),
+    })
 }
 
 /// The TCP ports `source` declares, for an error naming a wrong one.
