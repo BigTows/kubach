@@ -48,6 +48,8 @@ pub enum LogsState {
     Streaming,
     /// Every source ended (previous logs, deleted pods, stopped containers).
     Finished,
+    /// Closed with the vault its context is in (ADR 0008).
+    Locked,
     Failed(String),
 }
 
@@ -183,6 +185,8 @@ pub struct LogsTab {
     /// Earlier lines loaded on scrolling to the top.
     history: Option<LogHistory>,
     history_error: Option<String>,
+    /// The stream runs on a context of the vault and ends when it locks.
+    vault: bool,
     _history_load: Option<Task<()>>,
     _stream: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -249,6 +253,7 @@ impl LogsTab {
             status: LogsStatus::default(),
             history: None,
             history_error: None,
+            vault: false,
             _history_load: None,
             _stream: None,
             _subscriptions: subscriptions,
@@ -297,11 +302,13 @@ impl LogsTab {
         });
         cx.notify();
 
-        let client = match crate::action_context::tab_connection(
-            self.cluster.read(cx),
-            self.context.as_deref(),
-        ) {
-            Ok(connection) => connection.client.clone(),
+        let tab_client =
+            crate::action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx);
+        let client = match tab_client {
+            Ok(tab) => {
+                self.vault = tab.vault;
+                tab.client
+            }
             Err(error) => {
                 self.fail(error, cx);
                 return;
@@ -384,6 +391,24 @@ impl LogsTab {
         }));
     }
 
+    /// The vault locked: a stream on one of its contexts closes, the lines
+    /// read so far stay, and the tab says why (ADR 0008).
+    pub fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.vault) {
+            return;
+        }
+        self._stream = None;
+        self._history_load = None;
+        if matches!(self.state, LogsState::Starting | LogsState::Streaming) {
+            self.state = LogsState::Locked;
+            self.view.update(cx, |view, cx| {
+                view.set_placeholder(t!("dock-vault-locked"), cx)
+            });
+        }
+        self.update_top_notice(cx);
+        cx.notify();
+    }
+
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.view
             .update(cx, |view, cx| view.set_placeholder(error.clone(), cx));
@@ -446,8 +471,8 @@ impl LogsTab {
             return;
         }
         let Ok(client) =
-            crate::action_context::tab_connection(self.cluster.read(cx), self.context.as_deref())
-                .map(|connection| connection.client.clone())
+            crate::action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx)
+                .map(|tab| tab.client)
         else {
             return;
         };
@@ -640,6 +665,13 @@ impl LogsTab {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(t!("dock-logs-ended-indicator"))
+                    .into_any_element(),
+            ),
+            LogsState::Locked => indicators.push(
+                div()
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(t!("dock-vault-locked"))
                     .into_any_element(),
             ),
             LogsState::Failed(error) => indicators.push(

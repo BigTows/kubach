@@ -129,18 +129,32 @@ pub fn title_in_context(title: &str, context: Option<&str>) -> String {
     }
 }
 
-/// The connection of `context` for a tab that belongs to it, never the
-/// active context's: a tab opened in staging stays in staging.
-pub fn tab_connection<'a>(
-    cluster: &'a Cluster,
-    context: Option<&str>,
-) -> Result<&'a Connection, String> {
+/// What a dock tab talks to its context with.
+pub struct TabClient {
+    pub client: kube::Client,
+    /// The context is in the vault of imported kubeconfigs: whatever uses
+    /// `client` ends when the vault locks (ADR 0008).
+    pub vault: bool,
+}
+
+/// The client of `context` for a tab that belongs to it, never the active
+/// context's: a tab opened in staging stays in staging. A context of the
+/// vault gives none once the vault is locked.
+pub fn tab_client(cluster: &Cluster, context: Option<&str>, cx: &App) -> Result<TabClient, String> {
     let Some(context) = context else {
         return Err(kubach_i18n::t!("dock-not-connected"));
     };
-    cluster
+    let vault = cluster.is_imported(context);
+    if crate::vault::lock_ends(vault, crate::vault::is_unlocked(cx)) {
+        return Err(not_connected(context));
+    }
+    let connection = cluster
         .connection_of(context)
-        .ok_or_else(|| not_connected(context))
+        .ok_or_else(|| not_connected(context))?;
+    Ok(TabClient {
+        client: connection.client.clone(),
+        vault,
+    })
 }
 
 /// Why a tab of `context` can't (re)connect.

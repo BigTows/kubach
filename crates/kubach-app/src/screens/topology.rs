@@ -389,6 +389,11 @@ impl TopologyScreen {
             self.selected = None;
             self.set_graph(GraphData::default(), cx);
         }
+        // The opened details watch their object through the connection:
+        // they close with it, even while the context stays selected.
+        if cache.is_none() {
+            self.opened = None;
+        }
         let (Some(cache), Some(catalog), Some(scope), true) = (cache, catalog, scope, self.active)
         else {
             self.live = None;

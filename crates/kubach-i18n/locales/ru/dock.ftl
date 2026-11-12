@@ -110,6 +110,7 @@ dock-exit-code = Завершён с кодом { $code }
 dock-exit-failed = Ошибка
 dock-exit-failed-message = Ошибка: { $message }
 dock-exit-disconnected = Отключён
+dock-vault-locked = Закрыто: хранилище заблокировано
 
 ## Локальный терминал
 

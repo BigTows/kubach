@@ -19,6 +19,12 @@
 //!   and name.
 //! - **No secret values**: Secrets are [redacted](crate::secrets::mask::redact) on the way in,
 //!   so nothing reading the cache can display them.
+//! - **Trimmed objects**: `managedFields` and the last-applied annotation
+//!   are dropped on the way in; whoever needs them reads the object from the
+//!   cluster (as the editor does).
+//! - **Stable objects**: an object a relist returns unchanged (same uid and
+//!   resource version) stays the same `Arc`, so it is not copied and
+//!   `Arc::ptr_eq` tells readers it did not change.
 //! - **Narrowed watches**: a [`WatchFilter`] adds label/field selectors and
 //!   can ask for metadata only (e.g. Helm release objects, whose payload is
 //!   not needed to notice a change).
@@ -1151,6 +1157,59 @@ mod tests {
         eventually(|| cache.loaded_count_in(&pods, "db") == Some(0)).await;
         assert_eq!(cache.loaded_count(&pods, None), Some(1));
         drop(all);
+    }
+
+    #[tokio::test]
+    async fn a_set_merges_again_only_after_a_change() {
+        let (cache, senders) = scripted();
+        let pods = kind("Pod", "pods", Scope::Namespaced);
+        let set = SubscriptionSet::new(vec![
+            cache.subscribe(&pods, Some("web")),
+            cache.subscribe(&pods, Some("api")),
+        ]);
+        let in_namespace = |namespace: &str, name: &str| {
+            let mut object = pod(name);
+            object.metadata.namespace = Some(namespace.into());
+            object
+        };
+        for (ix, namespace) in ["web", "api"].into_iter().enumerate() {
+            let tx = lock(&senders)[ix].1.clone();
+            tx.unbounded_send(Ok(Event::Init)).unwrap();
+            for name in ["a", "b"] {
+                tx.unbounded_send(Ok(Event::InitApply(in_namespace(namespace, name))))
+                    .unwrap();
+            }
+            tx.unbounded_send(Ok(Event::InitDone)).unwrap();
+        }
+        eventually(|| set.snapshot().objects.len() == 4).await;
+
+        let first = set.snapshot().objects;
+        let keys = |objects: &Objects| -> Vec<String> {
+            objects
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{}/{}",
+                        o.metadata.namespace.as_deref().unwrap_or(""),
+                        o.metadata.name.as_deref().unwrap_or("")
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(keys(&first), ["api/a", "api/b", "web/a", "web/b"]);
+        // Nothing changed: the same list, also for a clone of the set.
+        assert!(Arc::ptr_eq(&first, &set.snapshot().objects));
+        assert!(Arc::ptr_eq(&first, &set.clone().snapshot().objects));
+
+        let tx = lock(&senders)[1].1.clone();
+        tx.unbounded_send(Ok(Event::Apply(in_namespace("api", "c"))))
+            .unwrap();
+        eventually(|| set.snapshot().objects.len() == 5).await;
+        let second = set.snapshot().objects;
+        assert_eq!(keys(&second), ["api/a", "api/b", "api/c", "web/a", "web/b"]);
+        assert!(Arc::ptr_eq(&second, &set.snapshot().objects));
+        // The earlier list is not touched.
+        assert_eq!(first.len(), 4);
     }
 
     #[tokio::test]
