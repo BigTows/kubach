@@ -292,7 +292,9 @@ impl ListCache {
             .flat_map(|list| list.objects.iter().cloned())
             .collect();
         objects.sort_by(|a, b| {
-            let key = |o: &DynamicObject| (o.metadata.namespace.clone(), o.metadata.name.clone());
+            fn key(o: &DynamicObject) -> (Option<&str>, Option<&str>) {
+                (o.metadata.namespace.as_deref(), o.metadata.name.as_deref())
+            }
             key(a).cmp(&key(b))
         });
         Some(CachedList {
