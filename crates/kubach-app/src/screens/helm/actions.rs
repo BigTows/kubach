@@ -158,6 +158,7 @@ impl HelmScreen {
             namespace: namespace.to_owned(),
             driver: self.releases.read(cx).driver().driver,
             secret_env: Default::default(),
+            working_dir: None,
         })
     }
 

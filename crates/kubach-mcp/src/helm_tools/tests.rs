@@ -398,7 +398,9 @@ fn objects_in_other_namespaces_need_a_tick_and_are_named_with_their_namespace() 
     )
     .unwrap_err();
     assert_eq!(denial.code, DenialCode::Namespace);
-    assert!(denial.message.contains(OTHER_NS), "{}", denial.message);
+    // It is about a dry run nobody approved: no name of the chart's (#173).
+    assert!(!denial.message.contains(OTHER_NS), "{}", denial.message);
+    assert!(!denial.message.contains("ConfigMap"), "{}", denial.message);
     // A name that is no namespace is refused without asking.
     for bad in ["*", "../kube-system", "Kube-System", "a b"] {
         let objects = [resource("v1", "ConfigMap", "c", Some(bad))];
@@ -1577,4 +1579,143 @@ fn the_window_says_that_unparsed_manifests_differ() {
     assert!(diff.lines().any(|line| line.starts_with('+')), "{diff}");
     assert!(!diff.contains("ZmFrZS"), "{diff}");
     assert_eq!(window_text(old, old), "");
+}
+
+// ------------------------------------------ before the user's yes (#173)
+
+/// A render nobody approved reads no Secret the session was not given.
+#[test]
+fn the_rules_for_lookup_leave_secrets_out() {
+    let named = |rules: &[PolicyRule], resource: &str| {
+        rules
+            .iter()
+            .flat_map(|rule| rule.resources.iter().flatten())
+            .any(|known| known == resource)
+    };
+    assert!(named(&helm_rules(&[]), "secrets"));
+    let read = helm_read_rules();
+    assert!(!named(&read, "secrets"), "{read:?}");
+    assert!(named(&read, "configmaps"), "{read:?}");
+}
+
+fn failed(stderr: &str) -> HelmCliError {
+    HelmCliError::Failed {
+        code: Some(1),
+        stderr: stderr.to_owned(),
+    }
+}
+
+#[test]
+fn a_failed_render_is_told_by_its_kind() {
+    for (stderr, kind) in [
+        (
+            "Error: execution error at (web/templates/a.yaml:3:5): boom",
+            RenderFailure::Template,
+        ),
+        (
+            "Error: parse error at (web/templates/a.yaml:3): unclosed action",
+            RenderFailure::Template,
+        ),
+        (
+            "Error: template: web/templates/a.yaml:3:5: executing \"x\" at <.Values.a.b>: nil \
+             pointer evaluating interface {}.b",
+            RenderFailure::Template,
+        ),
+        (
+            "Error: YAML parse error on web/templates/a.yaml: error converting YAML to JSON",
+            RenderFailure::Template,
+        ),
+        (
+            "Error: values don't meet the specifications of the schema(s) in the following \
+             chart(s):\nweb:\n- replicaCount: Invalid type",
+            RenderFailure::Schema,
+        ),
+        (
+            "Error: chart requires kubeVersion: >=1.99.0 which is incompatible with Kubernetes \
+             v1.33.0",
+            RenderFailure::KubeVersion,
+        ),
+        ("Error: something else", RenderFailure::Other),
+    ] {
+        assert_eq!(RenderFailure::of(&failed(stderr)), kind, "{stderr}");
+    }
+    assert_eq!(
+        RenderFailure::of(&HelmCliError::NotInstalled),
+        RenderFailure::Other
+    );
+}
+
+/// Every failure of a dry run reads the same to the agent, whatever the
+/// chart made helm say; the render without the cluster adds its kind.
+#[test]
+fn a_failed_dry_run_has_one_message() {
+    let text = |stderr: &str, rendered| dry_run_error(failed(stderr), rendered).message();
+    let secret = "Error: INSTALLATION FAILED: execution error at (a.yaml:1:3): hunter2";
+    let refused = "Error: INSTALLATION FAILED: ConfigMap \"hunter2\" is invalid";
+    assert_eq!(text(secret, None), text(refused, None));
+    assert!(!text(secret, None).contains("hunter2"));
+    let with_render = text(secret, Some(RenderFailure::Schema));
+    assert!(with_render.contains("values schema"), "{with_render}");
+    assert!(!with_render.contains("hunter2"), "{with_render}");
+    // A change the user approved keeps helm's message, but not a template's.
+    assert!(run_error(failed(refused)).message().contains("is invalid"));
+    assert!(!run_error(failed(secret)).message().contains("hunter2"));
+}
+
+// ------------------------------------------ one archive for a call (#174)
+
+#[cfg(unix)]
+#[test]
+fn the_directory_of_a_call_is_private_and_goes_with_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let work = Workspace::new().unwrap();
+    let root = work.dir.path().to_owned();
+    let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert_eq!(std::fs::read_dir(work.cwd()).unwrap().count(), 0);
+    assert!(work.cwd().is_absolute());
+    std::fs::write(work.chart_dir().join("web-1.0.0.tgz"), "x").unwrap();
+    drop(work);
+    assert!(!root.exists());
+}
+
+#[test]
+fn a_release_is_compared_with_its_dry_run_by_object() {
+    let object = |kind: &str, name: &str, extra: &str| {
+        format!("---\napiVersion: v1\nkind: {kind}\nmetadata:\n  name: {name}\n{extra}")
+    };
+    let dry_run = [
+        object("ConfigMap", "web", "data:\n  a: '1'\n"),
+        object("Secret", "web-tls", "data:\n  key: YQ==\n"),
+        object("Service", "web", ""),
+    ]
+    .concat();
+    // The same objects; a generated value differs, a namespace is spelled out.
+    let same = [
+        object("ConfigMap", "web", "data:\n  a: '1'\n"),
+        object("Secret", "web-tls", "data:\n  key: Yg==\n"),
+        format!("---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: {NS}\n"),
+    ]
+    .concat();
+    let compared = compare_manifests(&dry_run, &same, NS).unwrap();
+    assert!(compared.same_objects(), "{compared:?}");
+    assert_eq!(compared.changed, ["Secret web-tls", "Service web"]);
+
+    let other = [
+        object("ConfigMap", "web", "data:\n  a: '1'\n"),
+        object("Secret", "web-tls", "data:\n  key: YQ==\n"),
+        "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: extra\n  \
+         namespace: kube-system\n"
+            .to_owned(),
+    ]
+    .concat();
+    let compared = compare_manifests(&dry_run, &other, NS).unwrap();
+    assert!(!compared.same_objects());
+    assert_eq!(
+        compared.not_in_dry_run,
+        ["Role extra (namespace kube-system)"]
+    );
+    assert_eq!(compared.missing, ["Service web"]);
+    assert!(compared.changed.is_empty());
+    assert_eq!(compared.json()["sameObjects"], false);
 }

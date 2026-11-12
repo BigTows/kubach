@@ -120,6 +120,7 @@ agent-diff-cut-more-objects =
 agent-helm-as-user-title = Run this helm call with your credentials?
 agent-helm-as-user-warning = This helm call will run with your credentials from kubeconfig, not the session's temporary ServiceAccount. Only your own RBAC limits it, and only this one call.
 agent-helm-as-user-objects = The ServiceAccount cannot create or delete these cluster-scoped objects, RBAC and objects in other namespaces of the chart:
+agent-helm-dry-run-own-warning = In this namespace the session has no identity of its own: helm runs with your credentials from kubeconfig. The server-side dry run executes the chart's templates with them and its result is shown in the next window. Nothing changes until you approve that one.
 agent-helm-as-user-show-all = Show all objects
 agent-helm-as-user-tick = Run this helm call with my kubeconfig credentials
 agent-helm-dry-run-as-user = Dry run with my credentials

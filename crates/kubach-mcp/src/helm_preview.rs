@@ -643,7 +643,7 @@ pub(crate) async fn preview_diff(
         },
     )
     .await?;
-    authorize_elsewhere(ctx, &allowed, &kept.release, &kept.elsewhere).await?;
+    authorize_elsewhere(ctx, &allowed, &kept.release, &kept.elsewhere, true).await?;
     let matched: Vec<&DiffEntry> = kept.entries.iter().filter(|e| a.matches(e)).collect();
     let text: String = matched.iter().map(|entry| entry.text.as_str()).collect();
     let all = pages(&text);

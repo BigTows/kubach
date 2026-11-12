@@ -43,6 +43,9 @@ pub struct HelmTarget {
     /// an agent session's ServiceAccount, #418): set on the process only,
     /// never in the arguments or `Debug` output. Empty for the UI.
     pub secret_env: SecretEnv,
+    /// The directory helm runs in ([`HelmCommand::working_dir`]); `None`
+    /// leaves the one of the application.
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Environment variables for helm that may hold credentials; `None`
@@ -64,6 +67,11 @@ pub struct HelmCommand {
     pub stdin: Option<Sensitive<String>>,
     /// Set after `env`; see [`HelmTarget::secret_env`].
     pub secret_env: SecretEnv,
+    /// The directory helm runs in. Helm takes a chart reference such as
+    /// `repo/chart` for a path when a directory of that name is where it
+    /// runs, so a call made for an agent runs in an empty private directory
+    /// ([`private_dir`]). `None` leaves the one of the application.
+    pub working_dir: Option<PathBuf>,
     /// Why the call must not run (an invalid release name, credentials for
     /// a plain `http://` repository); [`run`] refuses it before helm starts.
     refusal: Option<ValidationError>,
@@ -90,6 +98,9 @@ pub enum UpgradeChart {
         chart: String,
         version: Option<String>,
     },
+    /// A chart archive on disk, by absolute path ([`pull_chart`]): every
+    /// call that names it reads the same bytes.
+    Archive(PathBuf),
 }
 
 /// `helm upgrade` of a release with new values.
@@ -140,6 +151,8 @@ pub struct TemplateRequest {
     /// `crds/` directory, which `helm upgrade` leaves alone. An install
     /// renders those CRDs too (`--include-crds`).
     pub is_upgrade: bool,
+    /// The directory helm runs in ([`HelmCommand::working_dir`]).
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Basic auth of a chart repository for `helm repo add`.
@@ -195,6 +208,7 @@ impl HelmCommand {
         let chart: OsString = match (&request.chart, chart_dir) {
             (UpgradeChart::Stored(_), Some(dir)) => dir.into(),
             (UpgradeChart::Stored(chart), None) => format!("<stored {}>", chart.reference()).into(),
+            (UpgradeChart::Archive(path), _) => path.into(),
             (UpgradeChart::Reference { chart, version }, _) => {
                 if let Some(version) = non_empty(version.as_deref()) {
                     flags.extend(["--version".into(), version.into()]);
@@ -258,6 +272,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: Some(request.values.clone()),
             secret_env: SecretEnv::default(),
+            working_dir: request.working_dir.clone(),
             refusal: None,
         }
         .for_release(request.release.trim())
@@ -289,6 +304,7 @@ impl HelmCommand {
         let chart: OsString = match (&request.chart, chart_dir) {
             (UpgradeChart::Stored(_), Some(dir)) => dir.into(),
             (UpgradeChart::Stored(chart), None) => format!("<stored {}>", chart.reference()).into(),
+            (UpgradeChart::Archive(path), _) => path.into(),
             (UpgradeChart::Reference { chart, version }, _) => {
                 if let Some(version) = non_empty(version.as_deref()) {
                     flags.extend(["--version".into(), version.into()]);
@@ -323,6 +339,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: None,
             secret_env: SecretEnv::default(),
+            working_dir: None,
             refusal: None,
         }
     }
@@ -393,6 +410,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: None,
             secret_env: SecretEnv::default(),
+            working_dir: None,
             refusal: None,
         }
     }
@@ -442,8 +460,15 @@ impl HelmCommand {
             env,
             stdin: None,
             secret_env: target.secret_env.clone(),
+            working_dir: target.working_dir.clone(),
             refusal: None,
         }
+    }
+
+    /// Runs helm in `dir` ([`Self::working_dir`]).
+    pub fn in_dir(mut self, dir: Option<&Path>) -> Self {
+        self.working_dir = dir.map(Path::to_owned);
+        self
     }
 
     /// Why [`run`] refuses this call, if it does.
@@ -633,6 +658,9 @@ pub async fn run_watched(
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     let mut process = Command::new(helm);
     process.args(&command.args);
+    if let Some(dir) = &command.working_dir {
+        process.current_dir(dir);
+    }
     for (name, value) in command.env.iter().chain(command.secret_env.expose()) {
         match value {
             Some(value) => process.env(name, value),
@@ -786,6 +814,14 @@ pub async fn chart_templates(
                 })
                 .collect());
         }
+        UpgradeChart::Archive(path) => {
+            let path = path.clone();
+            return crate::runtime::blocking(move || {
+                super::lookup::archive_templates(&std::fs::read(path)?)
+            })
+            .await
+            .map_err(|error| HelmCliError::Output(error.to_string()));
+        }
         UpgradeChart::Reference { chart, version } => (chart, version),
     };
     let failed = |error: std::io::Error| HelmCliError::Output(error.to_string());
@@ -807,6 +843,84 @@ pub async fn chart_templates(
     })
     .await
     .map_err(failed)
+}
+
+/// A new directory only its owner can enter (`0700`), removed with what it
+/// holds when dropped: on an error, a cancelled call or a panic too. For a
+/// chart fetched once ([`pull_chart`]) and for helm to run in
+/// ([`HelmCommand::working_dir`]).
+pub fn private_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("kubach-helm-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+/// A chart archive fetched once ([`pull_chart`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PulledChart {
+    /// Absolute path of the archive.
+    pub archive: PathBuf,
+    /// SHA-256 of the archive, in hex.
+    pub sha256: String,
+}
+
+impl PulledChart {
+    /// The archive for `helm upgrade` and `helm template`.
+    pub fn chart(&self) -> UpgradeChart {
+        UpgradeChart::Archive(self.archive.clone())
+    }
+
+    /// Whether the archive still is what was fetched.
+    pub async fn unchanged(&self) -> bool {
+        let path = self.archive.clone();
+        let digest = crate::runtime::blocking(move || archive_digest(&path)).await;
+        digest.is_ok_and(|digest| digest == self.sha256)
+    }
+}
+
+fn archive_digest(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(std::fs::read(path)?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Fetches `chart` once with `helm pull` into `destination`, which must be
+/// an empty directory of the caller ([`private_dir`]). The calls that
+/// render and install it then name the archive by its absolute path, so
+/// they all work on what was fetched here, whatever the registry or the
+/// repository serves later. helm runs in `working_dir`.
+pub async fn pull_chart(
+    helm: Option<&Path>,
+    chart: &str,
+    version: Option<&str>,
+    destination: &Path,
+    working_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<PulledChart, HelmCliError> {
+    let failed = |error: std::io::Error| HelmCliError::Output(error.to_string());
+    let destination = std::path::absolute(destination).map_err(failed)?;
+    let command = HelmCommand::pull(chart, version, &destination).in_dir(working_dir);
+    run(helm, &command, timeout).await?;
+    let mut archives = std::fs::read_dir(&destination)
+        .map_err(failed)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "tgz"));
+    let (Some(archive), None) = (archives.next(), archives.next()) else {
+        return Err(HelmCliError::Output(
+            "helm pull did not save one chart archive".into(),
+        ));
+    };
+    let path = archive.clone();
+    let sha256 = crate::runtime::blocking(move || archive_digest(&path))
+        .await
+        .map_err(failed)?;
+    Ok(PulledChart { archive, sha256 })
 }
 
 /// Runs `command`, with `--debug` and its phases when watched.
@@ -871,6 +985,7 @@ mod tests {
             namespace: "apps".into(),
             driver: Driver::Secret,
             secret_env: SecretEnv::default(),
+            working_dir: None,
         }
     }
 
@@ -1099,6 +1214,33 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_is_named_by_its_path_and_helm_runs_where_told() {
+        let mut target = target(&[]);
+        target.working_dir = Some("/work/cwd".into());
+        let request = UpgradeRequest {
+            release: "web".into(),
+            chart: UpgradeChart::Archive("/work/chart/web-1.2.0.tgz".into()),
+            values: Sensitive::new(String::new()),
+        };
+        let command = HelmCommand::upgrade(&target, &request, None, true);
+        assert_eq!(args(&command).last().unwrap(), "/work/chart/web-1.2.0.tgz");
+        assert!(!args(&command).iter().any(|arg| arg == "--version"));
+        assert_eq!(command.working_dir.as_deref(), Some(Path::new("/work/cwd")));
+        let shown = HelmCommand::show(ShowKind::Values, "repo/web", None)
+            .in_dir(Some(Path::new("/work/cwd")));
+        assert_eq!(shown.working_dir.as_deref(), Some(Path::new("/work/cwd")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_the_owners_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = private_dir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
     fn template_renders_on_the_client_only() {
         let mut request = TemplateRequest {
             release: "web".into(),
@@ -1109,6 +1251,7 @@ mod tests {
             },
             values: Sensitive::new("replicaCount: 2\n".into()),
             is_upgrade: false,
+            working_dir: None,
         };
         let command = HelmCommand::template(&request, None);
         assert_eq!(
@@ -1156,6 +1299,7 @@ mod tests {
             },
             values: Sensitive::new("a: 1\n".into()),
             is_upgrade: true,
+            working_dir: None,
         };
         let command = HelmCommand::template_on_cluster(&target(&["/k"]), &request, None);
         assert_eq!(

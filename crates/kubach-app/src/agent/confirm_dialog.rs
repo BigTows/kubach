@@ -933,6 +933,14 @@ impl Render for ConfirmView {
         let ask_user = credentials == HelmCredentials::AskUser;
         let as_user_block = helm.as_ref().and_then(|helm| match helm.credentials {
             HelmCredentials::Session => None,
+            // A client-only namespace (#173): no ServiceAccount stands
+            // in, and there are no objects to give as the reason.
+            HelmCredentials::AskUser if helm.user_objects.is_empty() => Some(warning_block(
+                t!("agent-helm-as-user-title"),
+                vec![t!("agent-helm-dry-run-own-warning")],
+                theme.danger,
+                cx,
+            )),
             HelmCredentials::AskUser => Some(warning_block(
                 t!("agent-helm-as-user-title"),
                 [
@@ -959,16 +967,20 @@ impl Render for ConfirmView {
                 cx,
             )),
         });
-        let show_all_objects = (ask_user && !self.show_user_objects).then(|| {
-            Button::new("confirm-show-user-objects")
-                .ghost()
-                .xsmall()
-                .label(t!("agent-helm-as-user-show-all"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.show_user_objects = true;
-                    cx.notify();
-                }))
-        });
+        let has_user_objects = helm
+            .as_ref()
+            .is_some_and(|helm| !helm.user_objects.is_empty());
+        let show_all_objects =
+            (ask_user && has_user_objects && !self.show_user_objects).then(|| {
+                Button::new("confirm-show-user-objects")
+                    .ghost()
+                    .xsmall()
+                    .label(t!("agent-helm-as-user-show-all"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_user_objects = true;
+                        cx.notify();
+                    }))
+            });
         let as_user_tick = ask_user.then(|| {
             Checkbox::new("confirm-as-user")
                 .label(t!("agent-helm-as-user-tick"))
