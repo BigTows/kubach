@@ -17,8 +17,6 @@ dock-container = 容器 { $container }
 dock-tab-close = 关闭
 dock-collapse = 收起
 dock-expand = 展开
-dock-logs-streaming = 正在接收 · { $lines } 行
-dock-logs-ended = 已结束 · { $lines } 行
 
 ## 详情面板中的流按钮
 

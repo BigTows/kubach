@@ -552,6 +552,15 @@ fn details_are_a_diff(request: &ConfirmationRequest) -> bool {
     ) && !request.details.trim().is_empty()
 }
 
+/// What Kubach left out of the diff in `details`, if anything: a Helm
+/// change carries its own, any other diff the request's.
+fn diff_cut_of(request: &ConfirmationRequest) -> Option<&DiffCut> {
+    match &request.kind {
+        RequestKind::Helm { helm } if helm.diff_cut.is_some() => helm.diff_cut.as_ref(),
+        _ => request.diff_cut.as_deref(),
+    }
+}
+
 /// What the warning about a diff cut by Kubach says (#137): how much is
 /// shown, how much is not and which objects' changes are not.
 fn cut_lines(cut: &DiffCut) -> (String, Vec<String>) {
@@ -871,7 +880,7 @@ impl Render for ConfirmView {
             )
         });
         // Kubach cut the diff (#137): said right above it, never silently.
-        let diff_cut = helm.and_then(|helm| helm.diff_cut.as_ref()).map(|cut| {
+        let diff_cut = diff_cut_of(&request).map(|cut| {
             let (title, lines) = cut_lines(cut);
             warning_block(title, lines, theme.danger, cx)
         });
@@ -1401,9 +1410,9 @@ impl Render for ConfirmView {
 mod tests {
     use super::{
         ArgPart, DiffKind, MAX_ROW_BYTES, SystemNotice, VISIBLE_SPACE, arg_parts, arg_text,
-        cut_lines, details_are_a_diff, diff_rows,
+        cut_lines, details_are_a_diff, diff_cut_of, diff_rows,
     };
-    use kubach_mcp::{ConfirmationRequest, DiffCut, RequestKind};
+    use kubach_mcp::{ConfirmationRequest, DiffCut, HelmChange, RequestKind};
 
     /// Only a new question with the window hidden or not focused posts
     /// (#102), and only what was posted is retracted.
@@ -1599,7 +1608,27 @@ mod tests {
             dangerous: Vec::new(),
             mode: kubach_mcp::SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
+        // The cut of an apply's diff comes with the request, that of a
+        // Helm change inside it: both reach the warning above the diff.
+        let cut = |shown_bytes| DiffCut {
+            shown_bytes,
+            ..DiffCut::default()
+        };
+        let mut apply = request(RequestKind::Call, "+a: 1\n");
+        assert_eq!(diff_cut_of(&apply), None);
+        apply.diff_cut = Some(Box::new(cut(1)));
+        assert_eq!(diff_cut_of(&apply), Some(&cut(1)));
+        let mut change: HelmChange = serde_json::from_value(serde_json::json!({
+            "action": "upgrade", "release": "web", "chart": "repo/web",
+        }))
+        .unwrap();
+        change.diff_cut = Some(cut(2));
+        let helm = RequestKind::Helm {
+            helm: Box::new(change),
+        };
+        assert_eq!(diff_cut_of(&request(helm, "+a: 1\n")), Some(&cut(2)));
         assert!(details_are_a_diff(&request(RequestKind::Call, "+a: 1\n")));
         assert!(!details_are_a_diff(&request(RequestKind::Call, " \n")));
         let exec = RequestKind::Exec {

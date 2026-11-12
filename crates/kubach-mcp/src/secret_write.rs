@@ -594,6 +594,7 @@ async fn ask_user(
         mode: ctx.session.mode_in(namespace),
         // Entering values is the confirmation of one write (#230).
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &request).await;
     if !ctx.session.is_active() {

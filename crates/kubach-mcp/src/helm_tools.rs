@@ -1263,6 +1263,7 @@ async fn ensure_source(ctx: &Ctx<'_>, source: &ChartSource) -> Result<(), ToolEr
         dangerous: Vec::new(),
         mode: ctx.session.mode(),
         allow_remember: false,
+        diff_cut: None,
     };
     match ask(ctx.confirmer, &request).await {
         decision if decision.is_approved() => {
@@ -1691,7 +1692,18 @@ pub(crate) struct WindowDiff {
 /// `diff` of the masked manifests `old` and `new` within `max` bytes: as it
 /// is when it fits, else cut after a whole line, with the size of the rest
 /// and the objects whose changes are in it.
-fn cut_diff(mut diff: String, old: &str, new: &str, max: usize) -> WindowDiff {
+fn cut_diff(diff: String, old: &str, new: &str, max: usize) -> WindowDiff {
+    cut_at(diff, max, |diff, from| hidden_objects(diff, from, old, new))
+}
+
+/// `diff` within `max` bytes for a confirmation window: as it is when it
+/// fits, else cut after a whole line, with the size of the rest and the
+/// objects `hidden` names for the whole diff and the byte the cut is at.
+pub(crate) fn cut_at(
+    mut diff: String,
+    max: usize,
+    hidden: impl FnOnce(&str, usize) -> Vec<String>,
+) -> WindowDiff {
     if diff.len() <= max {
         return WindowDiff {
             text: diff,
@@ -1706,7 +1718,7 @@ fn cut_diff(mut diff: String, old: &str, new: &str, max: usize) -> WindowDiff {
     if let Some(line_end) = diff[..end].rfind('\n') {
         end = line_end + 1;
     }
-    let mut objects = hidden_objects(&diff, end, old, new);
+    let mut objects = hidden(&diff, end);
     let more_objects = objects.len().saturating_sub(MAX_CUT_OBJECTS);
     objects.truncate(MAX_CUT_OBJECTS);
     let cut = DiffCut {
@@ -2410,6 +2422,7 @@ async fn approve(
         dangerous: findings,
         mode: ctx.session.mode_in(&allowed.namespace),
         allow_remember: false,
+        diff_cut: None,
     };
     // Under the user's credentials, beyond the namespace, uninstalling or
     // with cluster-scoped objects: always asked (#30).

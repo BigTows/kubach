@@ -176,6 +176,8 @@ pub(super) fn forward_terminal_event(
     }
 }
 
+impl EventEmitter<super::TabChanged> for TerminalTab {}
+
 pub struct TerminalTab {
     cluster: Entity<Cluster>,
     /// Context the tab was opened in: reconnects, container switches and
@@ -289,8 +291,10 @@ impl TerminalTab {
             .update(cx, |view, cx| view.feed(line.as_bytes(), cx));
     }
 
+    /// The dock's tab strip shows the state (and the title).
     fn set_state(&mut self, state: SessionState, cx: &mut Context<Self>) {
         self.state = state;
+        cx.emit(super::TabChanged);
         cx.notify();
     }
 

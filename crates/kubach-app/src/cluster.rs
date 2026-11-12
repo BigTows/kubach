@@ -15,7 +15,9 @@ use kubach_core::settings::{
     ContextKey, ContextPolicy, HotbarPrefs, SecretAction, SecuritySettings,
 };
 use kubach_core::vault::Imported;
-use kubach_core::{ApiCatalog, Connection, ConnectionState, ContextInfo, Contexts, discovery};
+use kubach_core::{
+    ApiCatalog, Connection, ConnectionState, ContextInfo, Contexts, discovery, disk_cache,
+};
 
 use crate::settings::AppSettings;
 use crate::shell_env;
@@ -220,6 +222,9 @@ impl Cluster {
                         {
                             this.pending = Some(new.to_owned());
                         }
+                        // A kubeconfig just imported: its contexts leave
+                        // the disk cache before they can be opened.
+                        this.sync_uncached(cx);
                         this.reload(cx);
                     }
                 })
@@ -227,6 +232,7 @@ impl Cluster {
         };
         // `KUBECONFIG` and exec plugins come from the login shell, which
         // loads while the window opens (#299).
+        this.sync_uncached(cx);
         let shell_env = shell_env::loaded(cx);
         this._loading = Some(cx.spawn(async move |this, cx| {
             shell_env.await;
@@ -254,6 +260,23 @@ impl Cluster {
     pub fn is_imported(&self, name: &str) -> bool {
         self.contexts()
             .is_ok_and(|contexts| contexts.source(name).is_some_and(Source::is_imported))
+    }
+
+    /// Keeps the contexts of the vault out of the disk cache (ADR 0008,
+    /// ADR 0012): nothing of them is stored or read from now on, and when
+    /// the list of them changes (and on start) the files already there are
+    /// removed in the background.
+    fn sync_uncached(&self, cx: &mut Context<Self>) {
+        let names = vault_contexts(crate::vault::imported(cx), self.contexts().ok());
+        if !disk_cache::uncached().set(names.clone()) {
+            return;
+        }
+        if let Some(dir) = disk_cache::dir() {
+            cx.background_spawn(async move {
+                disk_cache::sweep(&dir, &names);
+            })
+            .detach();
+        }
     }
 
     /// Whether `name` is loaded and may be connected to now. A context of
@@ -445,6 +468,7 @@ impl Cluster {
         self.contexts = Some(contexts);
         self.revision += 1;
         self.remember_seen();
+        self.sync_uncached(cx);
         let contexts = self.contexts().ok();
         let exists = |name: &str| contexts.is_some_and(|contexts| contexts.get(name).is_some());
         let gone: Vec<String> = self
@@ -661,9 +685,10 @@ impl Cluster {
                 .is_some_and(|session| !matches!(session.state, ConnectionState::Error(_)));
         if !reuse {
             let exec_command = contexts.exec_command(name).map(str::to_owned);
-            let catalog_file = discovery::cache::dir().map(|dir| {
-                discovery::cache::path(&dir, name, contexts.server(name).unwrap_or_default())
-            });
+            // `None` for a context of the vault: its catalog is neither
+            // read from the disk nor stored.
+            let catalog_file =
+                discovery::cache::file(name, contexts.server(name).unwrap_or_default());
             let cached = catalog_file
                 .clone()
                 .map(|file| cx.background_spawn(async move { discovery::cache::load(&file) }));
@@ -763,7 +788,9 @@ impl Cluster {
                         {
                             return;
                         }
-                        if let Some(file) = session.catalog_file.clone() {
+                        let file = session.catalog_file.clone();
+                        if let Some(file) = file.filter(|_| !disk_cache::uncached().contains(&name))
+                        {
                             let catalog = catalog.clone();
                             cx.background_spawn(async move {
                                 discovery::cache::store(&file, &catalog).ok();
@@ -845,6 +872,22 @@ fn next_active(
     default.map_or(Next::None, Next::Connect)
 }
 
+/// Names of the contexts of the vault: those its entries list (known while
+/// it is locked, and before the contexts are read) and those `contexts`
+/// took from it.
+fn vault_contexts(imported: Vec<Imported>, contexts: Option<&Contexts>) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = imported
+        .into_iter()
+        .flat_map(|entry| entry.contexts)
+        .collect();
+    if let Some(contexts) = contexts {
+        let from_vault = |name: &str| contexts.source(name).is_some_and(Source::is_imported);
+        let listed = contexts.list().iter().map(|context| &context.name);
+        names.extend(listed.filter(|name| from_vault(name)).cloned());
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
@@ -855,7 +898,7 @@ mod tests {
     use kubach_core::settings::SecuritySettings;
     use kubach_core::vault::Imported;
 
-    use super::{Cluster, Next, RecentContexts, Session, next_active};
+    use super::{Cluster, Next, RecentContexts, Session, next_active, vault_contexts};
 
     fn kubeconfig(context: &str) -> String {
         format!(
@@ -921,6 +964,32 @@ mod tests {
         assert_eq!(cluster.recent.names(), ["from-file"]);
         // Nothing left to close.
         assert!(!cluster.close_imported());
+    }
+
+    #[test]
+    fn vault_contexts_are_named_locked_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster = cluster_with_sessions(&dir);
+        let contexts = cluster.contexts().ok();
+        // From the loaded contexts: only those of the vault.
+        let names = vault_contexts(Vec::new(), contexts);
+        assert_eq!(names, BTreeSet::from(["from-vault".to_owned()]));
+        // From the entries of a locked vault, before anything is loaded.
+        let locked = vec![Imported {
+            source: Source::Imported {
+                vault: dir.path().join("vault.kubach"),
+                id: "2".into(),
+                name: "stage.yaml".into(),
+            },
+            config: Err(kubach_core::kubeconfig::FileProblem::Locked),
+            contexts: vec!["stage".into(), "stage-admin".into()],
+        }];
+        let names = vault_contexts(locked.clone(), None);
+        let stage = ["stage".to_owned(), "stage-admin".to_owned()];
+        assert_eq!(names, BTreeSet::from(stage.clone()));
+        let mut both = BTreeSet::from(stage);
+        both.insert("from-vault".to_owned());
+        assert_eq!(vault_contexts(locked, contexts), both);
     }
 
     #[test]

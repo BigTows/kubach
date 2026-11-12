@@ -42,6 +42,7 @@ pub mod shared;
 pub mod transport;
 
 mod all_namespaces;
+mod apply_diff;
 mod batch_tools;
 mod debug_tools;
 mod event_tools;

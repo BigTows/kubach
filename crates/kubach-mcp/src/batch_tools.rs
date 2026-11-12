@@ -703,6 +703,7 @@ fn question(ctx: &Ctx<'_>, op: Op, plan: &Plan) -> ConfirmationRequest {
         kind: RequestKind::Batch {
             batch: Box::new(batch),
         },
+        diff_cut: None,
     }
 }
 

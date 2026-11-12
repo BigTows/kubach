@@ -403,7 +403,7 @@ impl ResourceBrowser {
             details,
             details_events: None,
             details_panel,
-            disk: cached::DiskLists::new(),
+            disk: cached::DiskLists::new(cx),
             provisional_load: None,
             _subscriptions: subscriptions,
             _ages: ages,

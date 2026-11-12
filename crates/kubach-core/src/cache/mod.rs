@@ -58,6 +58,7 @@ use crate::status_bar::SyncSummary;
 use crate::sync::lock;
 use outage::Outage;
 
+pub(crate) use merge::merge_objects;
 pub use merge::{MergedChanges, MergedSnapshot, SubscriptionSet, merge};
 pub use store::{Change, ObjectStore, Objects, WatchError, WatchStatus};
 
