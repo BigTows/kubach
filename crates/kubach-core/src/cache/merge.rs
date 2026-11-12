@@ -164,7 +164,7 @@ fn sort_key(object: &DynamicObject) -> (Option<&str>, Option<&str>) {
 /// as they stand, which costs one comparison per object to make sure of.
 /// Anything else (a namespace watched twice with different lists, a watch of
 /// all namespaces next to one of a namespace, unsorted input) is sorted.
-fn merge_objects(parts: &[&Objects]) -> Objects {
+pub(crate) fn merge_objects(parts: &[&Objects]) -> Objects {
     // A namespace listed twice is the same watch, hence the same list.
     let mut distinct: Vec<&Objects> = Vec::with_capacity(parts.len());
     for part in parts {
