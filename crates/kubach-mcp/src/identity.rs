@@ -224,8 +224,9 @@ pub struct TemporaryServiceAccount {
 }
 
 impl TemporaryServiceAccount {
-    /// An account that exists only in the test, on `client`.
-    #[cfg(test)]
+    /// An account that exists only in the test, on `client`. Its only caller
+    /// is a test with a fake `helm` script, which is Unix only.
+    #[cfg(all(test, unix))]
     pub(crate) fn fake(client: Client, namespace: &str) -> Self {
         Self {
             namespace: namespace.to_owned(),
