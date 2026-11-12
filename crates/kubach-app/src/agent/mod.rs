@@ -1185,6 +1185,7 @@ impl AgentState {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
         let confirmer = self.confirmer.clone();
         let task = runtime::spawn(async move {
