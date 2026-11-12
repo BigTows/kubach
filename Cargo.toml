@@ -24,6 +24,8 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 # macOS only: CFString for the Touch ID prompt text (#80).
 core-foundation = "0.10.1"
+# Benchmarks of `docs/perf.md` (dev-dependency only): no plots, no rayon.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 dirs = "7.0.0"
 flate2 = "1.1.10"
 # Interface translations (ADR 0018): Fluent messages with CLDR plurals.

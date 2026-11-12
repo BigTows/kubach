@@ -1301,6 +1301,73 @@ impl Render for ResourceTable {
     }
 }
 
+/// The data side of a [`ResourceTable`] without a window, to measure what
+/// [`ResourceTable::set_rows`] costs (`docs/perf.md`): the same steps on the
+/// same delegate. What needs a window is left out: moving the selection in
+/// the table state, the age timer and the redraw.
+#[cfg(feature = "perf")]
+pub struct RowsProbe {
+    delegate: ResourceTableDelegate,
+    selected: Option<SharedString>,
+}
+
+#[cfg(feature = "perf")]
+impl RowsProbe {
+    pub fn new(columns: Vec<ResourceColumn>) -> Self {
+        Self {
+            delegate: ResourceTableDelegate::new(columns),
+            selected: None,
+        }
+    }
+
+    /// Sorts by the column with key `column`, like a click on its header.
+    pub fn sort_by(&mut self, column: &str, direction: SortDirection) {
+        self.delegate.set_column_sort(Some((column, direction)));
+    }
+
+    /// Selects the row with `key`: `set_rows` then looks it up again.
+    pub fn select(&mut self, key: impl Into<SharedString>) {
+        self.selected = Some(key.into());
+    }
+
+    pub fn check_all(&mut self) {
+        self.delegate.check_all();
+    }
+
+    pub fn len(&self) -> usize {
+        self.delegate.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.delegate.rows.is_empty()
+    }
+
+    /// The comparison `set_rows` starts with.
+    pub fn same_rows(&self, rows: &[ResourceRow]) -> bool {
+        self.delegate.rows == rows
+    }
+
+    /// What `set_rows` does once the rows differ: sorts, drops checked keys
+    /// that are gone, finds the youngest time and the selected row.
+    pub fn replace_rows(&mut self, rows: Vec<ResourceRow>) -> bool {
+        let unchecked = self.delegate.set_rows(rows);
+        std::hint::black_box(self.delegate.youngest());
+        if let Some(key) = &self.selected {
+            std::hint::black_box(self.delegate.view_index(key));
+        }
+        unchecked
+    }
+
+    /// [`ResourceTable::set_rows`]: returns whether the rows changed.
+    pub fn set_rows(&mut self, rows: Vec<ResourceRow>) -> bool {
+        if self.same_rows(&rows) {
+            return false;
+        }
+        self.replace_rows(rows);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` exports a `test` attribute that would shadow std's.
