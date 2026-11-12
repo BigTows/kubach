@@ -103,16 +103,12 @@ pub(crate) async fn list_nodes(
         .join("\t");
     out.push_str("\tPROBLEMS\n");
     for obj in &list.items {
-        let cells: Vec<String> = plugin
-            .cells(obj)
-            .iter()
-            .map(|cell| crate::tools::render_cell(cell, now))
-            .collect();
+        let row = crate::tools::table_row(plugin.as_ref(), obj, &kind.api, now);
         let problems = decode(obj).map(|node| problems(&node)).unwrap_or_default();
         let _ = writeln!(
             out,
             "{}\t{}",
-            cells.join("\t"),
+            row,
             if problems.is_empty() {
                 "-".to_owned()
             } else {
@@ -221,7 +217,8 @@ pub(crate) async fn describe_node(
             );
         }
     }
-    for section in plugin.details(&obj) {
+    // The details come from the masked object, like `describe_resource`.
+    for section in plugin.details(&crate::masking::plugin_view(&obj, &kind.api)) {
         if section.title == "Conditions" {
             continue;
         }
