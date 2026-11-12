@@ -460,7 +460,7 @@ mod tests {
         .unwrap()
     }
 
-    fn secret(version: &str, password: &str) -> DynamicObject {
+    fn secret(version: &str, encoded: &str) -> DynamicObject {
         serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -472,7 +472,7 @@ mod tests {
                 "managedFields": [{"manager": "kubectl", "operation": "Update"}]
             },
             "type": "Opaque",
-            "data": {"password": password}
+            "data": {"password": encoded}
         }))
         .unwrap()
     }
