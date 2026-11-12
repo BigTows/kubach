@@ -17,20 +17,6 @@ dock-container = Контейнер { $container }
 dock-tab-close = Закрыть
 dock-collapse = Свернуть
 dock-expand = Развернуть
-dock-logs-streaming =
-    { $lines ->
-        [one] Поток · { $lines } строка
-        [few] Поток · { $lines } строки
-        [many] Поток · { $lines } строк
-       *[other] Поток · { $lines } строки
-    }
-dock-logs-ended =
-    { $lines ->
-        [one] Завершён · { $lines } строка
-        [few] Завершён · { $lines } строки
-        [many] Завершён · { $lines } строк
-       *[other] Завершён · { $lines } строки
-    }
 
 ## Кнопки потоков в деталях
 
