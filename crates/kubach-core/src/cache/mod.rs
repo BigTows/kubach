@@ -19,6 +19,12 @@
 //!   and name.
 //! - **No secret values**: Secrets are [redacted](crate::secrets::mask::redact) on the way in,
 //!   so nothing reading the cache can display them.
+//! - **Trimmed objects**: `managedFields` and the last-applied annotation
+//!   are dropped on the way in; whoever needs them reads the object from the
+//!   cluster (as the editor does).
+//! - **Stable objects**: an object a relist returns unchanged (same uid and
+//!   resource version) stays the same `Arc`, so it is not copied and
+//!   `Arc::ptr_eq` tells readers it did not change.
 //! - **Narrowed watches**: a [`WatchFilter`] adds label/field selectors and
 //!   can ask for metadata only (e.g. Helm release objects, whose payload is
 //!   not needed to notice a change).
