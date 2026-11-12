@@ -81,6 +81,7 @@ async fn upgrade_and_uninstall() {
         namespace: namespace.clone(),
         driver: Driver::Secret,
         secret_env: Default::default(),
+        working_dir: None,
     };
     let releases = Releases::new(client);
     let charts = tempfile::tempdir().unwrap();
@@ -220,6 +221,7 @@ async fn install_into_a_new_namespace_when_unlisted() {
         namespace: namespace.into(),
         driver: Driver::Secret,
         secret_env: Default::default(),
+        working_dir: None,
     };
     let namespaces: Api<Namespace> = Api::all(client.clone());
     namespaces
