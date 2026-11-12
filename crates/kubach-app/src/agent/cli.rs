@@ -664,6 +664,7 @@ impl StdioChooser {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
         let decision = kubach_mcp::confirm::ask(&self.confirmer(), &question).await;
         match decision {

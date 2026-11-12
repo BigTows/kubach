@@ -24,6 +24,7 @@ fn call(tool: &str) -> ConfirmationRequest {
         dangerous: Vec::new(),
         mode: SessionMode::TemporaryServiceAccount,
         allow_remember: false,
+        diff_cut: None,
     }
 }
 

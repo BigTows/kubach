@@ -14,7 +14,7 @@ use k8s_openapi::api::core::v1::{Event, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::jiff::Timestamp;
-use kubach_core::apply::{self as core_apply, ApplyOptions, yaml_diff};
+use kubach_core::apply::{self as core_apply, ApplyOptions};
 use kubach_core::discovery::{self, ApiCatalog, ResourceKind};
 use kubach_core::plugin::builtin::action;
 use kubach_core::plugin::{
@@ -33,12 +33,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::all_namespaces;
+use crate::apply_diff::ApplyDiff;
 use crate::audit::DecidedBy;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
 use crate::event_tools::{EventFilter, list_events};
 use crate::fields::Fields;
 use crate::grants::{CustomRight, Grant};
-use crate::helm_tools;
+use crate::helm_tools::{self, DiffCut, MAX_CONFIRM_DIFF_BYTES};
 use crate::log_level::{Level, LevelCounts};
 use crate::masking::{Masked, mask_object, mask_text, plugin_view, truncate};
 use crate::policy::{
@@ -587,6 +588,7 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
         dangerous: Vec::new(),
         mode: ctx.session.mode_in(grant.namespace()),
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &request).await;
     if !ctx.session.is_active() {
@@ -733,6 +735,7 @@ pub(crate) async fn ask_access_now(
             ctx.session.mode_in(&namespace)
         },
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &question).await;
     if !ctx.session.is_active() {
@@ -850,6 +853,7 @@ async fn tell_reveal_blocked(ctx: &Ctx<'_>, request: &Request) {
         details: String::new(),
         dangerous: Vec::new(),
         allow_remember: false,
+        diff_cut: None,
     };
     let _ = tokio::time::timeout(Duration::from_secs(10), ctx.confirmer.confirm(&notice)).await;
 }
@@ -2429,6 +2433,22 @@ pub(crate) async fn confirm_as(
     details: String,
     dangerous: Vec<Finding>,
 ) -> Result<(), ToolError> {
+    confirm_cut(ctx, kind, allowed, tool, summary, details, None, dangerous).await
+}
+
+/// [`confirm_as`] for `details` that are a diff Kubach may have cut:
+/// `diff_cut` is what it leaves out.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_cut(
+    ctx: &Ctx<'_>,
+    kind: RequestKind,
+    allowed: &Allowed,
+    tool: &str,
+    summary: String,
+    details: String,
+    diff_cut: Option<DiffCut>,
+    dangerous: Vec<Finding>,
+) -> Result<(), ToolError> {
     debug_assert_eq!(allowed.confirmation, Confirmation::Required);
     let request = ConfirmationRequest {
         kind,
@@ -2442,6 +2462,7 @@ pub(crate) async fn confirm_as(
         dangerous,
         mode: ctx.session.mode_in(&allowed.namespace),
         allow_remember: false,
+        diff_cut: diff_cut.map(Box::new),
     };
     approve_change(
         ctx,
@@ -2522,14 +2543,12 @@ async fn apply_manifest(
     };
     // Always dry-run first, under the session identity: the diff and RBAC
     // errors the user sees are the real ones.
-    let mut diffs = String::new();
+    let mut diffs = ApplyDiff::default();
     let mut findings = allowed.findings.clone();
     for manifest in &allowed.manifests {
         let outcome = core_apply::apply(&client, manifest, &options)
             .await
             .map_err(apply_error)?;
-        let before = outcome.before.as_ref().map(masked_value);
-        let after = masked_value(&outcome.after);
         let raw_before = outcome
             .before
             .as_ref()
@@ -2550,22 +2569,16 @@ async fn apply_manifest(
             })
             .collect();
         findings.extend(changes);
-        let verb = if outcome.created() {
-            "create"
-        } else {
-            "update"
-        };
-        let _ = writeln!(diffs, "# {} ({verb})", manifest.label());
-        let diff = yaml_diff(before.as_ref(), &after);
-        diffs.push_str(if diff.is_empty() {
-            "(no changes)\n"
-        } else {
-            &diff
-        });
+        diffs.push(
+            &manifest.label(),
+            outcome.created(),
+            &manifest.value,
+            raw_before.as_ref(),
+            &raw_after,
+        );
     }
-    let diffs = finish(&diffs);
     if dry_run {
-        let mut out = format!("Dry run (nothing was changed):\n{diffs}");
+        let mut out = format!("Dry run (nothing was changed):\n{}", diffs.for_agent());
         if !findings.is_empty() {
             let _ = write!(
                 out,
@@ -2587,12 +2600,17 @@ async fn apply_manifest(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    confirm(
+    // The user sees what is written: the manifest's own values, and the
+    // whole diff or what it leaves out. None of it goes to the agent.
+    let diff = diffs.for_window(MAX_CONFIRM_DIFF_BYTES);
+    confirm_cut(
         ctx,
+        RequestKind::Call,
         allowed,
         "apply_manifest",
         summary,
-        diffs.clone(),
+        diff.text,
+        diff.cut,
         findings,
     )
     .await?;
