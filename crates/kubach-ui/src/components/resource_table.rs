@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
@@ -134,8 +135,8 @@ enum CellContent {
     CountAge(i64, i64),
     /// Status cubes (init ones first, dimmed) and the text they stand for.
     Cubes {
-        init: Rc<[StatusCube]>,
-        cubes: Rc<[StatusCube]>,
+        init: Arc<[StatusCube]>,
+        cubes: Arc<[StatusCube]>,
         text: SharedString,
     },
 }
@@ -159,8 +160,9 @@ impl CellContent {
     }
 }
 
-/// Draws what goes before a cell's content, e.g. an icon.
-type LeadingFn = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+/// Draws what goes before a cell's content, e.g. an icon. Shareable across
+/// threads like the rest of a cell, so rows can be built off the UI thread.
+type LeadingFn = Arc<dyn Fn(&mut Window, &mut App) -> AnyElement + Send + Sync>;
 
 /// An element drawn before a cell's content; see [`ResourceCell::leading`].
 #[derive(Clone)]
@@ -170,7 +172,7 @@ struct CellLeading(LeadingFn);
 /// one never equals its rebuilt self and is redrawn.
 impl PartialEq for CellLeading {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -254,8 +256,8 @@ impl ResourceCell {
         init: impl IntoIterator<Item = StatusCube>,
         cubes: impl IntoIterator<Item = StatusCube>,
     ) -> Self {
-        let init: Rc<[StatusCube]> = init.into_iter().collect();
-        let cubes: Rc<[StatusCube]> = cubes.into_iter().collect();
+        let init: Arc<[StatusCube]> = init.into_iter().collect();
+        let cubes: Arc<[StatusCube]> = cubes.into_iter().collect();
         let text = init
             .iter()
             .chain(cubes.iter())
@@ -284,9 +286,9 @@ impl ResourceCell {
     /// may start loading what it shows.
     pub fn leading(
         mut self,
-        leading: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+        leading: impl Fn(&mut Window, &mut App) -> AnyElement + Send + Sync + 'static,
     ) -> Self {
-        self.leading = Some(CellLeading(Rc::new(leading)));
+        self.leading = Some(CellLeading(Arc::new(leading)));
         self
     }
 
@@ -294,9 +296,9 @@ impl ResourceCell {
     /// [`leading`](Self::leading), it runs only for visible rows.
     pub fn trailing(
         mut self,
-        trailing: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+        trailing: impl Fn(&mut Window, &mut App) -> AnyElement + Send + Sync + 'static,
     ) -> Self {
-        self.trailing = Some(CellLeading(Rc::new(trailing)));
+        self.trailing = Some(CellLeading(Arc::new(trailing)));
         self
     }
 
@@ -321,6 +323,9 @@ impl ResourceCell {
 }
 
 /// A row of a [`ResourceTable`], one cell per column.
+///
+/// `Send + Sync`: rows of a long list can be built off the UI thread and
+/// shared ([`ResourceTable::set_shared_rows`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceRow {
     /// Stable identity (e.g. `namespace/name` or a UID) that keeps the
@@ -449,7 +454,9 @@ struct ResourceTableDelegate {
     movable: bool,
     /// Header menu "Reset column order".
     on_reset: Option<ResetHandler>,
-    rows: Vec<ResourceRow>,
+    /// Shared with the caller: a row it kept from the last update is the
+    /// same allocation, which [`same_rows`] sees without comparing cells.
+    rows: Vec<Arc<ResourceRow>>,
     /// Indices into `rows` in display order.
     order: Vec<usize>,
     sort: Option<(usize, SortDirection)>,
@@ -486,14 +493,14 @@ impl ResourceTableDelegate {
     fn youngest(&self) -> Option<i64> {
         self.rows
             .iter()
-            .flat_map(|row| &row.cells)
+            .flat_map(|row| row.cells.iter())
             .filter_map(ResourceCell::since)
             .max()
     }
 
     /// Replaces the rows; returns whether checked rows disappeared.
-    fn set_rows(&mut self, rows: Vec<ResourceRow>) -> bool {
-        self.rows = rows;
+    fn set_rows(&mut self, rows: impl IntoIterator<Item = impl Into<Arc<ResourceRow>>>) -> bool {
+        self.rows = rows.into_iter().map(Into::into).collect();
         self.apply_sort();
         let view = self.view_keys();
         self.checks.retain(&view)
@@ -667,7 +674,7 @@ impl ResourceTableDelegate {
     }
 
     fn row(&self, view_ix: usize) -> Option<&ResourceRow> {
-        self.order.get(view_ix).map(|&ix| &self.rows[ix])
+        self.order.get(view_ix).map(|&ix| &*self.rows[ix])
     }
 
     fn view_index(&self, key: &SharedString) -> Option<usize> {
@@ -677,6 +684,17 @@ impl ResourceTableDelegate {
     fn cell(&self, view_ix: usize, col_ix: usize) -> Option<&ResourceCell> {
         self.row(view_ix).and_then(|row| row.cells.get(col_ix))
     }
+}
+
+/// Whether `new` shows what `old` does. Rows the caller kept from the last
+/// update are the same allocations, so an unchanged long list costs a
+/// pointer comparison per row; rebuilt rows are compared cell by cell.
+fn same_rows(old: &[Arc<ResourceRow>], new: &[Arc<ResourceRow>]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|(old, new)| Arc::ptr_eq(old, new) || old == new)
 }
 
 /// Reselects the row with `key` after the rows moved, or clears the selection.
@@ -1196,7 +1214,15 @@ impl ResourceTable {
     /// Returns whether anything changed: the same rows again (a poll or
     /// timer with nothing new) leave the table as it is, without a redraw.
     pub fn set_rows(&mut self, rows: Vec<ResourceRow>, cx: &mut Context<Self>) -> bool {
-        if self.state.read(cx).delegate().rows == rows {
+        self.set_shared_rows(rows.into_iter().map(Arc::new).collect(), cx)
+    }
+
+    /// [`set_rows`](Self::set_rows) for rows the caller keeps between
+    /// updates (a long list where a few rows change at a time): a row
+    /// passed again is recognized by its allocation instead of being
+    /// compared cell by cell, and none is copied.
+    pub fn set_shared_rows(&mut self, rows: Vec<Arc<ResourceRow>>, cx: &mut Context<Self>) -> bool {
+        if same_rows(&self.state.read(cx).delegate().rows, &rows) {
             return false;
         }
         let unchecked = self.state.update(cx, |state, cx| {
@@ -1212,6 +1238,11 @@ impl ResourceTable {
             self.emit_checked(cx);
         }
         true
+    }
+
+    /// Whether the table has no rows.
+    pub fn is_empty(&self, cx: &App) -> bool {
+        self.state.read(cx).delegate().rows.is_empty()
     }
 
     /// Keys of the checked rows, in display order.
@@ -1302,8 +1333,8 @@ impl Render for ResourceTable {
 }
 
 /// The data side of a [`ResourceTable`] without a window, to measure what
-/// [`ResourceTable::set_rows`] costs (`docs/perf.md`): the same steps on the
-/// same delegate. What needs a window is left out: moving the selection in
+/// [`ResourceTable::set_shared_rows`] costs (`docs/perf.md`): the same steps
+/// on the same delegate. What needs a window is left out: moving the selection in
 /// the table state, the age timer and the redraw.
 #[cfg(feature = "perf")]
 pub struct RowsProbe {
@@ -1342,14 +1373,14 @@ impl RowsProbe {
         self.delegate.rows.is_empty()
     }
 
-    /// The comparison `set_rows` starts with.
-    pub fn same_rows(&self, rows: &[ResourceRow]) -> bool {
-        self.delegate.rows == rows
+    /// The comparison `set_shared_rows` starts with.
+    pub fn same_rows(&self, rows: &[Arc<ResourceRow>]) -> bool {
+        same_rows(&self.delegate.rows, rows)
     }
 
     /// What `set_rows` does once the rows differ: sorts, drops checked keys
     /// that are gone, finds the youngest time and the selected row.
-    pub fn replace_rows(&mut self, rows: Vec<ResourceRow>) -> bool {
+    pub fn replace_rows(&mut self, rows: Vec<Arc<ResourceRow>>) -> bool {
         let unchecked = self.delegate.set_rows(rows);
         std::hint::black_box(self.delegate.youngest());
         if let Some(key) = &self.selected {
@@ -1358,8 +1389,8 @@ impl RowsProbe {
         unchecked
     }
 
-    /// [`ResourceTable::set_rows`]: returns whether the rows changed.
-    pub fn set_rows(&mut self, rows: Vec<ResourceRow>) -> bool {
+    /// [`ResourceTable::set_shared_rows`]: returns whether the rows changed.
+    pub fn set_rows(&mut self, rows: Vec<Arc<ResourceRow>>) -> bool {
         if self.same_rows(&rows) {
             return false;
         }

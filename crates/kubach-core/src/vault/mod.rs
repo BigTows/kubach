@@ -1148,6 +1148,13 @@ impl Vault {
     }
 
     /// Stops keeping the key in `store`; the password stays the only way in.
+    ///
+    /// The copy in `store` is deleted first and a failure is returned with
+    /// the vault unchanged (still remembered, so it can be tried again):
+    /// the vault never says "not in the keychain" while the key is still
+    /// there. The data key itself stays the same. A new one would have to
+    /// be wrapped for the password slot, which takes the password, and this
+    /// call does not have it; [`Vault::change_password`] makes a new key.
     pub fn disable_keychain(&mut self, store: &dyn KeyStore) -> Result<(), VaultError> {
         let Some(account) = self.envelope.keychain_account().map(str::to_owned) else {
             return Ok(());
@@ -1155,13 +1162,17 @@ impl Vault {
         if !self.key_mode().password {
             return Err(VaultError::NoKey);
         }
+        store.delete(&account)?;
         let mut envelope = self.envelope.clone();
         envelope
             .slots
             .retain(|slot| !matches!(slot, Slot::Keychain { .. }));
-        self.write(envelope)?;
-        // A stale entry is harmless; ignore failures.
-        store.delete(&account).ok();
+        if let Err(error) = self.write(envelope) {
+            // The slot is still in the file: its key goes back, so the
+            // vault keeps opening the way the file says.
+            store.set(&account, self.key.as_slice()).ok();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -2056,6 +2067,51 @@ contexts:
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// A store that keeps what it has: deleting fails.
+    struct NoDelete(MemoryKeyStore);
+
+    impl KeyStore for NoDelete {
+        fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError> {
+            self.0.get(account)
+        }
+
+        fn set(&self, account: &str, secret: &[u8]) -> Result<(), KeyStoreError> {
+            self.0.set(account, secret)
+        }
+
+        fn delete(&self, _: &str) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError("the keychain is locked".into()))
+        }
+    }
+
+    #[test]
+    fn a_key_the_store_keeps_is_reported_and_stays_remembered() {
+        let (_dir, path) = setup();
+        let mut vault = create(&path, "pw").unwrap();
+        vault.add("team", &plan(), None).unwrap();
+        let store = NoDelete(MemoryKeyStore::default());
+        vault.enable_keychain(&store).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = vault.disable_keychain(&store).unwrap_err();
+        assert!(matches!(error, VaultError::KeyStore(_)), "{error}");
+        assert_eq!(error.to_string(), "the keychain is locked");
+        // Nothing changed: the key is in the store and the vault says so.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(vault.key_mode().keychain);
+        assert_eq!(store.0.len(), 1);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        locked.unlock_with_keychain(&store).unwrap();
+
+        // Once the store lets go, turning it off works.
+        vault.disable_keychain(&store.0).unwrap();
+        assert!(store.0.is_empty());
+        assert!(!vault.key_mode().keychain);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert!(!locked.key_mode().keychain);
+        locked.unlock_with_password("pw").unwrap();
     }
 
     #[test]

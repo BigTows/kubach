@@ -257,6 +257,14 @@ pub enum DownloadError {
     },
     #[error("{tool} {version} can't be checked: no signature keys and no pinned checksum")]
     Untrusted { tool: &'static str, version: String },
+    #[error(
+        "the downloaded {tool} reports version {reported}, not {version}; the copy was deleted"
+    )]
+    VersionMismatch {
+        tool: &'static str,
+        version: String,
+        reported: String,
+    },
     #[error("too many redirects from {0}")]
     TooManyRedirects(String),
     #[error(transparent)]
@@ -279,6 +287,7 @@ impl DownloadError {
                 | Self::ChecksumMismatch { .. }
                 | Self::Signature { .. }
                 | Self::Untrusted { .. }
+                | Self::VersionMismatch { .. }
                 | Self::TooManyRedirects(_)
                 | Self::InvalidUrl(_)
                 | Self::Archive(_)
@@ -295,24 +304,23 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The hash for `file` in a checksum file: a lone hash, or `<hash>
-/// [*]<file>` lines as written by `sha256sum`.
+/// The hash for `file` in a checksum file: the `<hash> [*]<file>` line
+/// `sha256sum` writes for it. The line must name `file`: an archive name
+/// carries the tool's version and platform, so a checksum file (and its
+/// signature) of another release does not stand in for this one. A hash
+/// without a file name is not accepted.
 pub fn parse_checksum(text: &str, file: &str) -> Option<String> {
     let is_hash = |s: &str| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
-    let lines: Vec<Vec<&str>> = text
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        .filter(|parts| !parts.is_empty())
-        .collect();
-    let named = lines.iter().find_map(|parts| match parts.as_slice() {
-        [hash, name] if is_hash(hash) && name.trim_start_matches('*') == file => Some(*hash),
-        _ => None,
-    });
-    let lone = match lines.as_slice() {
-        [parts] if parts.len() == 1 && is_hash(parts[0]) => Some(parts[0]),
-        _ => None,
-    };
-    named.or(lone).map(str::to_ascii_lowercase)
+    text.lines()
+        .find_map(
+            |line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [hash, name] if is_hash(hash) && name.trim_start_matches('*') == file => {
+                    Some(*hash)
+                }
+                _ => None,
+            },
+        )
+        .map(str::to_ascii_lowercase)
 }
 
 /// Checks `actual` against the published and, when given, the pinned hash.
@@ -916,9 +924,12 @@ mod tests {
             parse_checksum(&format!("{hash}  helm.tar.gz\n"), "helm.tar.gz").as_deref(),
             Some(lower.as_str())
         );
+        // The line must name the file: a lone hash or another file's line
+        // is not this file's checksum.
+        assert_eq!(parse_checksum(&format!("{hash}\n"), "helm.tar.gz"), None);
         assert_eq!(
-            parse_checksum(&format!("{hash}\n"), "helm.tar.gz").as_deref(),
-            Some(lower.as_str())
+            parse_checksum(&format!("{hash}  helm-old.tar.gz\n"), "helm.tar.gz"),
+            None
         );
         let many = format!("{}  other.tar.gz\n{hash} *helm.tar.gz\n", "0".repeat(64));
         assert_eq!(
