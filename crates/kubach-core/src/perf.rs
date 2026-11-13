@@ -568,6 +568,248 @@ pub fn cluster(size: ClusterSize, shape: PodShape) -> Vec<DynamicObject> {
     objects
 }
 
+/// The Namespace objects of a [`cluster`] of `count` namespaces, labelled
+/// by team and environment (what a `namespaceSelector` matches).
+pub fn namespaces(count: usize) -> Vec<DynamicObject> {
+    (0..count)
+        .map(|ns| {
+            let name = namespace(ns);
+            object(json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": name,
+                    "uid": uid(ns as u64 + (1 << 42)),
+                    "resourceVersion": "1",
+                    "labels": {
+                        "kubernetes.io/metadata.name": name,
+                        "team": format!("team-{}", ns % 10),
+                        "env": if ns % 5 == 0 { "staging" } else { "prod" }
+                    }
+                }
+            }))
+        })
+        .collect()
+}
+
+/// `count` NetworkPolicies for a [`cluster`] of `size`, spread evenly over
+/// its namespaces. Each namespace gets, in turn: a default deny of ingress,
+/// an app admitted to another app of the namespace on its HTTP port, a few
+/// apps of the `prod` namespaces admitted to an app, and an app whose egress
+/// is limited to another app and DNS.
+pub fn network_policies(size: ClusterSize, count: usize) -> Vec<DynamicObject> {
+    let namespaces = size.namespaces.max(1);
+    let apps = size.apps.max(1);
+    (0..count)
+        .map(|ix| {
+            let ns = ix % namespaces;
+            let round = ix / namespaces;
+            let app = |shift: usize| {
+                format!(
+                    "app-{:04}",
+                    ns * apps + (round / 4 * 3 + round + shift) % apps
+                )
+            };
+            let anywhere = |shift: usize| {
+                let ns = (ns + shift * 7 + 1) % namespaces;
+                format!("app-{:04}", ns * apps + (round + shift) % apps)
+            };
+            let (name, spec) = match round % 4 {
+                0 => (
+                    format!("default-deny-{round}"),
+                    json!({"podSelector": {}, "policyTypes": ["Ingress"]}),
+                ),
+                1 => (
+                    format!("allow-{}-from-{}", app(0), app(1)),
+                    json!({
+                        "podSelector": {"matchLabels": {"app": app(0)}},
+                        "policyTypes": ["Ingress"],
+                        "ingress": [{
+                            "from": [{"podSelector": {"matchLabels": {"app": app(1)}}}],
+                            "ports": [{"protocol": "TCP", "port": "http"}]
+                        }]
+                    }),
+                ),
+                2 => (
+                    format!("allow-{}-from-prod", app(2)),
+                    json!({
+                        "podSelector": {"matchLabels": {"app": app(2)}},
+                        "policyTypes": ["Ingress"],
+                        "ingress": [{
+                            "from": [{
+                                "namespaceSelector": {"matchLabels": {"env": "prod"}},
+                                "podSelector": {"matchExpressions": [{
+                                    "key": "app",
+                                    "operator": "In",
+                                    "values": [anywhere(0), anywhere(1), anywhere(2), app(3)]
+                                }]}
+                            }],
+                            "ports": [{"protocol": "TCP", "port": 8080}]
+                        }]
+                    }),
+                ),
+                _ => (
+                    format!("egress-of-{}", app(1)),
+                    json!({
+                        "podSelector": {"matchLabels": {"app": app(1)}},
+                        "policyTypes": ["Egress"],
+                        "egress": [
+                            {
+                                "to": [{"podSelector": {"matchLabels": {"app": app(0)}}}],
+                                "ports": [{"protocol": "TCP", "port": 8080}]
+                            },
+                            {
+                                "to": [{"namespaceSelector": {"matchLabels": {
+                                    "kubernetes.io/metadata.name": "kube-system"
+                                }}}],
+                                "ports": [{"protocol": "UDP", "port": 53}]
+                            }
+                        ]
+                    }),
+                ),
+            };
+            object(json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace(ns),
+                    "uid": uid(ix as u64 + (1 << 43)),
+                    "resourceVersion": "1"
+                },
+                "spec": spec
+            }))
+        })
+        .collect()
+}
+
+/// StatefulSets for a [`cluster`]: `sets` per namespace, each with
+/// `replicas` pods, two `volumeClaimTemplates` and the PVCs made from them
+/// (`<template>-<set>-<ordinal>`), plus what its pods read.
+pub fn stateful_sets(
+    namespaces: usize,
+    sets: usize,
+    replicas: usize,
+    shape: PodShape,
+) -> Vec<DynamicObject> {
+    const TEMPLATES: [&str; 2] = ["data", "wal"];
+    let mut objects = Vec::new();
+    let mut pod_ix = 50_000_000;
+    for ns in 0..namespaces {
+        let namespace = namespace(ns);
+        for s in 0..sets {
+            let set = format!("db-{:04}", ns * sets + s);
+            let labels = json!({"app": set});
+            let meta = |name: &str| {
+                json!({
+                    "name": name,
+                    "namespace": namespace,
+                    "uid": uid(objects_seed(name, ns) + (1 << 44)),
+                    "resourceVersion": "1",
+                    "creationTimestamp": "2026-09-01T00:00:00Z",
+                    "labels": labels
+                })
+            };
+            let set_uid = uid((ns * sets + s) as u64 + (1 << 45));
+            let mut set_meta = meta(&set);
+            set_meta["uid"] = json!(set_uid);
+            let mut template_spec = Value::Null;
+            for ordinal in 0..replicas {
+                let mut pod = pod_of(pod_ix, &namespace, &set, shape);
+                pod_ix += 1;
+                pod.metadata.name = Some(format!("{set}-{ordinal}"));
+                pod.metadata.generate_name = Some(format!("{set}-"));
+                pod.metadata.labels = Some([("app".to_owned(), set.clone())].into());
+                if let Some(owners) = &mut pod.metadata.owner_references
+                    && let Some(owner) = owners.first_mut()
+                {
+                    owner.kind = "StatefulSet".into();
+                    owner.name = set.clone();
+                    owner.uid = set_uid.clone();
+                }
+                if template_spec.is_null() {
+                    template_spec = pod.data.get("spec").cloned().unwrap_or(Value::Null);
+                }
+                if let Some(volumes) = pod
+                    .data
+                    .pointer_mut("/spec/volumes")
+                    .and_then(Value::as_array_mut)
+                {
+                    for template in TEMPLATES {
+                        volumes.push(json!({
+                            "name": template,
+                            "persistentVolumeClaim": {
+                                "claimName": format!("{template}-{set}-{ordinal}")
+                            }
+                        }));
+                    }
+                }
+                objects.push(pod);
+                for template in TEMPLATES {
+                    objects.push(object(json!({
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": meta(&format!("{template}-{set}-{ordinal}")),
+                        "spec": {
+                            "accessModes": ["ReadWriteOnce"],
+                            "resources": {"requests": {"storage": "10Gi"}}
+                        },
+                        "status": {"phase": "Bound"}
+                    })));
+                }
+            }
+            objects.push(object(json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": set_meta,
+                "spec": {
+                    "replicas": replicas,
+                    "serviceName": set,
+                    "selector": {"matchLabels": labels},
+                    "template": {"metadata": {"labels": labels}, "spec": template_spec},
+                    "volumeClaimTemplates": TEMPLATES.map(|template| json!({
+                        "metadata": {"name": template},
+                        "spec": {
+                            "accessModes": ["ReadWriteOnce"],
+                            "resources": {"requests": {"storage": "10Gi"}}
+                        }
+                    }))
+                },
+                "status": {"replicas": replicas, "readyReplicas": replicas}
+            })));
+            objects.push(object(json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": meta(&set),
+                "spec": {
+                    "clusterIP": "None",
+                    "selector": labels,
+                    "ports": [{"name": "http", "port": 8080, "targetPort": "http", "protocol": "TCP"}]
+                }
+            })));
+            objects.push(object(json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": meta(&format!("{set}-config"))
+            })));
+            for secret in ["tls", "db"] {
+                objects.push(object(json!({
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": meta(&format!("{set}-{secret}")),
+                    "type": "Opaque"
+                })));
+            }
+            objects.push(object(json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": meta(&set)
+            })));
+        }
+    }
+    objects
+}
+
 fn objects_seed(name: &str, ns: usize) -> u64 {
     name.bytes().fold(ns as u64 + 7, |seed, byte| {
         seed.wrapping_mul(31) + u64::from(byte)

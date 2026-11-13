@@ -691,10 +691,18 @@ impl Node {
 }
 
 /// A built topology: nodes and edges sorted by id, with diagnostics.
+///
+/// Shared: a clone is the same graph (one allocation), not a copy.
 #[derive(Clone, Debug, Default)]
 pub struct TopologyGraph {
+    inner: Arc<Inner>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Inner {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// Sorted by node first: the diagnostics of a node are one run.
     diagnostics: Vec<Diagnostic>,
     index: HashMap<NodeId, usize>,
     outgoing: HashMap<NodeId, Vec<usize>>,
@@ -703,9 +711,10 @@ pub struct TopologyGraph {
 
 impl PartialEq for TopologyGraph {
     fn eq(&self, other: &Self) -> bool {
-        self.nodes == other.nodes
-            && self.edges == other.edges
-            && self.diagnostics == other.diagnostics
+        self.same(other)
+            || self.inner.nodes == other.inner.nodes
+                && self.inner.edges == other.inner.edges
+                && self.inner.diagnostics == other.inner.diagnostics
     }
 }
 
@@ -714,25 +723,38 @@ impl TopologyGraph {
     /// among the nodes and duplicate ids are dropped (the first wins).
     pub fn new(nodes: Vec<Node>, edges: Vec<Edge>, diagnostics: Vec<Diagnostic>) -> Self {
         let mut nodes = nodes;
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        nodes.dedup_by(|a, b| a.id == b.id);
+        if !nodes.is_sorted_by(|a, b| a.id < b.id) {
+            nodes.sort_by(|a, b| a.id.cmp(&b.id));
+            nodes.dedup_by(|a, b| a.id == b.id);
+        }
         let index: HashMap<_, _> = nodes
             .iter()
             .enumerate()
             .map(|(ix, node)| (node.id.clone(), ix))
             .collect();
-        let mut edges: Vec<_> = edges
-            .into_iter()
-            .filter(|edge| index.contains_key(&edge.from) && index.contains_key(&edge.to))
-            .collect();
-        edges.sort_by(|a, b| a.id.cmp(&b.id));
-        edges.dedup_by(|a, b| a.id == b.id);
-        let mut diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|diagnostic| index.contains_key(&diagnostic.node))
-            .collect();
-        diagnostics.sort();
-        diagnostics.dedup();
+        Self::with_nodes(nodes, index, edges, diagnostics)
+    }
+
+    /// The rest of [`new`](Self::new), for nodes sorted by id without
+    /// duplicates and their `index`.
+    fn with_nodes(
+        nodes: Vec<Node>,
+        index: HashMap<NodeId, usize>,
+        edges: Vec<Edge>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        let mut edges = edges;
+        edges.retain(|edge| index.contains_key(&edge.from) && index.contains_key(&edge.to));
+        if !edges.is_sorted_by(|a, b| a.id < b.id) {
+            edges.sort_by(|a, b| a.id.cmp(&b.id));
+            edges.dedup_by(|a, b| a.id == b.id);
+        }
+        let mut diagnostics = diagnostics;
+        diagnostics.retain(|diagnostic| index.contains_key(&diagnostic.node));
+        if !diagnostics.is_sorted_by(|a, b| a < b) {
+            diagnostics.sort();
+            diagnostics.dedup();
+        }
         let mut outgoing: HashMap<NodeId, Vec<usize>> = HashMap::new();
         let mut incoming: HashMap<NodeId, Vec<usize>> = HashMap::new();
         for (ix, edge) in edges.iter().enumerate() {
@@ -740,59 +762,83 @@ impl TopologyGraph {
             incoming.entry(edge.to.clone()).or_default().push(ix);
         }
         Self {
-            nodes,
-            edges,
-            diagnostics,
-            index,
-            outgoing,
-            incoming,
+            inner: Arc::new(Inner {
+                nodes,
+                edges,
+                diagnostics,
+                index,
+                outgoing,
+                incoming,
+            }),
         }
+    }
+
+    /// The parts, copied only when the graph is shared.
+    fn into_inner(self) -> Inner {
+        Arc::try_unwrap(self.inner).unwrap_or_else(|shared| (*shared).clone())
+    }
+
+    /// Whether this is the very graph `other` is (a clone of it, or of
+    /// what it was cloned from): nothing was rebuilt in between.
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Sorted by id.
     pub fn nodes(&self) -> &[Node] {
-        &self.nodes
+        &self.inner.nodes
     }
 
     /// Sorted by id.
     pub fn edges(&self) -> &[Edge] {
-        &self.edges
+        &self.inner.edges
     }
 
     /// Sorted by node.
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        &self.inner.diagnostics
+    }
+
+    /// Position of a node in [`nodes`](Self::nodes).
+    pub(super) fn node_index(&self, id: &NodeId) -> Option<usize> {
+        self.inner.index.get(id).copied()
     }
 
     pub fn node(&self, id: &NodeId) -> Option<&Node> {
-        self.index.get(id).map(|&ix| &self.nodes[ix])
+        self.inner.index.get(id).map(|&ix| &self.inner.nodes[ix])
     }
 
     pub fn edges_from(&self, id: &NodeId) -> impl Iterator<Item = &Edge> {
-        self.outgoing
+        self.inner
+            .outgoing
             .get(id)
             .into_iter()
             .flatten()
-            .map(|&ix| &self.edges[ix])
+            .map(|&ix| &self.inner.edges[ix])
     }
 
     pub fn edges_to(&self, id: &NodeId) -> impl Iterator<Item = &Edge> {
-        self.incoming
+        self.inner
+            .incoming
             .get(id)
             .into_iter()
             .flatten()
-            .map(|&ix| &self.edges[ix])
+            .map(|&ix| &self.inner.edges[ix])
     }
 
+    /// The diagnostics of a node (a binary search: they are sorted by node).
     pub fn diagnostics_for<'a>(&'a self, id: &'a NodeId) -> impl Iterator<Item = &'a Diagnostic> {
-        self.diagnostics
+        let diagnostics = &self.inner.diagnostics;
+        let start = diagnostics.partition_point(|diagnostic| &diagnostic.node < id);
+        diagnostics[start..]
             .iter()
-            .filter(move |diagnostic| &diagnostic.node == id)
+            .take_while(move |diagnostic| &diagnostic.node == id)
     }
 
     /// Namespaces of the nodes, sorted (the groups to draw).
     pub fn namespaces(&self) -> BTreeSet<&str> {
-        self.nodes
+        self.inner
+            .nodes
             .iter()
             .filter_map(|node| node.namespace.as_deref())
             .collect()
@@ -817,7 +863,7 @@ impl TopologyGraph {
     ) -> BTreeSet<NodeId> {
         let seeds: Vec<_> = seeds
             .into_iter()
-            .filter(|id| self.index.contains_key(*id))
+            .filter(|id| self.inner.index.contains_key(*id))
             .cloned()
             .collect();
         let mut seen: BTreeSet<NodeId> = seeds.iter().cloned().collect();
@@ -845,31 +891,95 @@ impl TopologyGraph {
     /// Keeps the nodes `keep` accepts, with the edges and diagnostics
     /// between them.
     pub fn retain(self, mut keep: impl FnMut(&Node) -> bool) -> Self {
-        let nodes: Vec<_> = self.nodes.into_iter().filter(|node| keep(node)).collect();
-        Self::new(nodes, self.edges, self.diagnostics)
+        let kept: Vec<bool> = self.inner.nodes.iter().map(&mut keep).collect();
+        if kept.iter().all(|kept| *kept) {
+            return self;
+        }
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => {
+                let nodes: Vec<_> = inner
+                    .nodes
+                    .into_iter()
+                    .zip(kept)
+                    .filter_map(|(node, kept)| kept.then_some(node))
+                    .collect();
+                Self::new(nodes, inner.edges, inner.diagnostics)
+            }
+            // Shared: only what stays is copied.
+            Err(shared) => {
+                let stays = |id: &NodeId| shared.index.get(id).is_some_and(|&ix| kept[ix]);
+                let nodes: Vec<_> = shared
+                    .nodes
+                    .iter()
+                    .zip(&kept)
+                    .filter_map(|(node, kept)| kept.then(|| node.clone()))
+                    .collect();
+                let edges = shared
+                    .edges
+                    .iter()
+                    .filter(|edge| stays(&edge.from) && stays(&edge.to))
+                    .cloned()
+                    .collect();
+                let diagnostics = shared
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| stays(&diagnostic.node))
+                    .cloned()
+                    .collect();
+                Self::new(nodes, edges, diagnostics)
+            }
+        }
     }
 
     /// Changes nodes and edges in place (a layer's attributes); ids must
     /// stay as they are.
     pub fn map(self, mut node: impl FnMut(&mut Node), mut edge: impl FnMut(&mut Edge)) -> Self {
-        let mut nodes = self.nodes;
-        let mut edges = self.edges;
-        nodes.iter_mut().for_each(&mut node);
-        edges.iter_mut().for_each(&mut edge);
-        Self::new(nodes, edges, self.diagnostics)
+        let mut inner = self.into_inner();
+        inner.nodes.iter_mut().for_each(&mut node);
+        inner.edges.iter_mut().for_each(&mut edge);
+        Self::new(inner.nodes, inner.edges, inner.diagnostics)
     }
 
     /// Adds edges of another layer (network policies, traffic). Edges to
     /// unknown nodes are dropped; an edge with an existing id replaces it.
     pub fn with_edges(self, edges: impl IntoIterator<Item = Edge>) -> Self {
+        let inner = self.into_inner();
         let mut all: Vec<_> = edges.into_iter().collect();
         let ids: BTreeSet<_> = all.iter().map(|edge| edge.id.clone()).collect();
         all.extend(
-            self.edges
+            inner
+                .edges
                 .into_iter()
                 .filter(|edge| !ids.contains(&edge.id)),
         );
-        Self::new(self.nodes, all, self.diagnostics)
+        Self::with_nodes(inner.nodes, inner.index, all, inner.diagnostics)
+    }
+
+    /// [`map`](Self::map) and [`with_edges`](Self::with_edges) in one go:
+    /// the graph is put together once.
+    pub(super) fn layered(
+        self,
+        mut node: impl FnMut(&mut Node),
+        mut edge: impl FnMut(&mut Edge),
+        added: Vec<Edge>,
+    ) -> Self {
+        let mut inner = self.into_inner();
+        inner.nodes.iter_mut().for_each(&mut node);
+        inner.edges.iter_mut().for_each(&mut edge);
+        let edges = if added.is_empty() {
+            inner.edges
+        } else {
+            let ids: BTreeSet<_> = added.iter().map(|edge| edge.id.clone()).collect();
+            let mut all = added;
+            all.extend(
+                inner
+                    .edges
+                    .into_iter()
+                    .filter(|edge| !ids.contains(&edge.id)),
+            );
+            all
+        };
+        Self::with_nodes(inner.nodes, inner.index, edges, inner.diagnostics)
     }
 
     /// What changed from `self` to `newer`, by id.
@@ -899,9 +1009,13 @@ impl TopologyGraph {
             (added, removed, changed)
         }
         let (added_nodes, removed_nodes, changed_nodes) =
-            split(&self.nodes, &newer.nodes, |node: &Node| &node.id);
+            split(&self.inner.nodes, &newer.inner.nodes, |node: &Node| {
+                &node.id
+            });
         let (added_edges, removed_edges, changed_edges) =
-            split(&self.edges, &newer.edges, |edge: &Edge| &edge.id);
+            split(&self.inner.edges, &newer.inner.edges, |edge: &Edge| {
+                &edge.id
+            });
         GraphDiff {
             added_nodes,
             removed_nodes,

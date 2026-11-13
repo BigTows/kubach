@@ -129,7 +129,7 @@ impl TopologySource {
     /// the UI thread for big clusters.
     pub fn snapshot(&self, options: &BuildOptions) -> TopologySnapshot {
         let (input, loading, mut errors) = self.input();
-        let graph = lock(&self.builder).build(&input, options);
+        let (graph, policies) = lock(&self.builder).build_with_policies(&input, options);
         let layer = |kind: &SourceKind| SourceKind::LAYERS.contains(kind);
         if !options.network_policies {
             errors.retain(|(kind, _, _)| !layer(kind));
@@ -144,9 +144,7 @@ impl TopologySource {
                 .copied()
                 .filter(|kind| options.network_policies || !layer(kind))
                 .collect(),
-            policies: options
-                .network_policies
-                .then(|| Arc::new(PolicySet::from_input(&input))),
+            policies,
         }
     }
 }

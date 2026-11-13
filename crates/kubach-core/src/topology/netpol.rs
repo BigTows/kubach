@@ -28,15 +28,17 @@
 //! Service traffic gets to its pods ([`EdgeKind::Selects`] edges) and adds
 //! [`EdgeKind::PolicyAllows`] edges for explicitly admitted workloads.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
+use std::ops::Range;
+use std::rc::Rc;
 
 use kube::api::DynamicObject;
 use serde_json::Value;
 
 use super::model::{
-    Access, ContainerPort, Edge, EdgeAttrs, EdgeId, EdgeKind, EdgePolicy, Node, NodeClass, NodeId,
+    Access, ContainerPort, Edge, EdgeAttrs, EdgeId, EdgeKind, EdgePolicy, Node, NodeClass,
     NodeKind, NodePolicy, PolicyId, PortRef, Protocol, TopologyGraph,
 };
 use super::source::{SourceKind, TopologyInput};
@@ -129,19 +131,55 @@ impl Selector {
     }
 
     pub fn matches(&self, labels: &Labels) -> bool {
+        self.matches_by(|key| labels.get(key).map(String::as_str))
+    }
+
+    /// [`matches`](Self::matches) for labels read through `label`.
+    fn matches_by<'a>(&self, label: impl Fn(&str) -> Option<&'a str>) -> bool {
         self.match_labels
             .iter()
-            .all(|(key, value)| labels.get(key) == Some(value))
+            .all(|(key, value)| label(key) == Some(value.as_str()))
             && self.expressions.iter().all(|expression| {
-                let value = labels.get(&expression.key);
+                let value = label(&expression.key);
+                let listed = |value: &str| expression.values.iter().any(|listed| listed == value);
                 match expression.operator {
-                    Operator::In => value.is_some_and(|value| expression.values.contains(value)),
-                    Operator::NotIn => value.is_none_or(|value| !expression.values.contains(value)),
+                    Operator::In => value.is_some_and(listed),
+                    Operator::NotIn => value.is_none_or(|value| !listed(value)),
                     Operator::Exists => value.is_some(),
                     Operator::DoesNotExist => value.is_none(),
                     Operator::Invalid => false,
                 }
             })
+    }
+
+    /// Labels (`key`, `value`) one of which a matching object must have,
+    /// to look candidates up by: the `matchLabels`, or else the values of
+    /// an `In`. `None`: nothing narrows it, any object may match.
+    fn required(&self) -> Option<Vec<(&str, &str)>> {
+        if let Some((key, value)) = self.match_labels.iter().next() {
+            return Some(vec![(key.as_str(), value.as_str())]);
+        }
+        self.expressions
+            .iter()
+            .find(|expression| expression.operator == Operator::In)
+            .map(|expression| {
+                expression
+                    .values
+                    .iter()
+                    .map(|value| (expression.key.as_str(), value.as_str()))
+                    .collect()
+            })
+    }
+
+    /// Label keys [`required`](Self::required) may name.
+    fn required_keys(&self) -> impl Iterator<Item = &str> {
+        let first = self.match_labels.keys().next();
+        let listed = self
+            .expressions
+            .iter()
+            .filter(|expression| expression.operator == Operator::In)
+            .map(|expression| &expression.key);
+        first.into_iter().chain(listed).map(String::as_str)
     }
 }
 
@@ -461,16 +499,47 @@ pub struct PodGroup {
 impl PodGroup {
     /// The pods a pod or workload node stands for.
     pub fn of(node: &Node) -> Option<Self> {
-        matches!(node.kind, NodeKind::Pod | NodeKind::Workload(_)).then_some(())?;
+        let pods = Pods::of(node)?;
         Some(Self {
-            namespace: node.namespace.clone()?,
-            labels: node.attrs.pod_labels.clone(),
-            ports: node.attrs.container_ports.clone(),
+            namespace: pods.namespace.to_owned(),
+            labels: pods.labels.clone(),
+            ports: pods.ports.to_vec(),
         })
     }
 
     /// The number of a named port of `protocol`.
     pub fn port_named(&self, name: &str, protocol: Protocol) -> Option<i32> {
+        self.view().port_named(name, protocol)
+    }
+
+    fn view(&self) -> Pods<'_> {
+        Pods {
+            namespace: &self.namespace,
+            labels: &self.labels,
+            ports: &self.ports,
+        }
+    }
+}
+
+/// A [`PodGroup`] read in place: of a node of the graph, nothing copied.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Pods<'a> {
+    namespace: &'a str,
+    labels: &'a Labels,
+    ports: &'a [ContainerPort],
+}
+
+impl<'a> Pods<'a> {
+    fn of(node: &'a Node) -> Option<Self> {
+        matches!(node.kind, NodeKind::Pod | NodeKind::Workload(_)).then_some(())?;
+        Some(Self {
+            namespace: node.namespace.as_deref()?,
+            labels: &node.attrs.pod_labels,
+            ports: &node.attrs.container_ports,
+        })
+    }
+
+    fn port_named(&self, name: &str, protocol: Protocol) -> Option<i32> {
         self.ports
             .iter()
             .find(|port| port.name.as_deref() == Some(name) && port.protocol == protocol)
@@ -578,6 +647,9 @@ fn join(ids: &[PolicyId]) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct PolicySet {
     policies: Vec<Policy>,
+    /// Where the policies of a namespace are in `policies` (sorted by
+    /// namespace first): only they can select its pods.
+    by_namespace: HashMap<String, Range<usize>>,
     namespaces: HashMap<String, Labels>,
     /// Namespace labels were loaded; without them a `namespaceSelector`
     /// can only match `kubernetes.io/metadata.name`.
@@ -591,8 +663,18 @@ impl PolicySet {
     ) -> Self {
         let mut policies = policies;
         policies.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut by_namespace: HashMap<String, Range<usize>> = HashMap::new();
+        for (ix, policy) in policies.iter().enumerate() {
+            match by_namespace.get_mut(&policy.id.namespace) {
+                Some(range) => range.end = ix + 1,
+                None => {
+                    by_namespace.insert(policy.id.namespace.clone(), ix..ix + 1);
+                }
+            }
+        }
         Self {
             policies,
+            by_namespace,
             namespaces: namespaces.into_iter().collect(),
             namespaces_known: true,
         }
@@ -647,17 +729,44 @@ impl PolicySet {
         labels
     }
 
+    /// Whether `selector` matches the namespace: its labels, always with
+    /// `kubernetes.io/metadata.name`.
+    fn namespace_matches(&self, selector: &Selector, namespace: &str) -> bool {
+        let labels = self.namespaces.get(namespace);
+        selector.matches_by(|key| {
+            if key == NAME_LABEL {
+                Some(namespace)
+            } else {
+                labels?.get(key).map(String::as_str)
+            }
+        })
+    }
+
+    /// Positions in [`policies`](Self::policies) of those of a namespace.
+    fn in_namespace(&self, namespace: &str) -> Range<usize> {
+        self.by_namespace.get(namespace).cloned().unwrap_or(0..0)
+    }
+
     /// Policies selecting the pods (any direction).
     pub fn selecting<'a>(&'a self, pods: &'a PodGroup) -> impl Iterator<Item = &'a Policy> + 'a {
-        self.policies
-            .iter()
-            .filter(move |policy| policy.selects(pods))
+        self.selecting_pods(pods.view()).map(|(_, policy)| policy)
+    }
+
+    /// [`selecting`](Self::selecting), with the position of each policy.
+    fn selecting_pods<'a>(&'a self, pods: Pods<'a>) -> impl Iterator<Item = (usize, &'a Policy)> {
+        self.in_namespace(pods.namespace)
+            .map(|ix| (ix, &self.policies[ix]))
+            .filter(move |(_, policy)| policy.pod_selector.matches(pods.labels))
     }
 
     /// Policies isolating the pods, by direction.
     pub fn node_policy(&self, pods: &PodGroup) -> NodePolicy {
+        self.node_policy_of(pods.view())
+    }
+
+    fn node_policy_of(&self, pods: Pods<'_>) -> NodePolicy {
         let mut out = NodePolicy::default();
-        for policy in self.selecting(pods) {
+        for (_, policy) in self.selecting_pods(pods) {
             if policy.ingress.is_some() {
                 out.ingress.push(policy.id.clone());
             }
@@ -670,21 +779,61 @@ impl PolicySet {
 
     fn peer_matches(&self, policy: &Policy, peer: &Peer, other: &Target) -> bool {
         match (peer, other) {
-            (Peer::Pods { pods, namespaces }, Target::Pods(group)) => {
-                let namespace = match namespaces {
-                    None => group.namespace == policy.id.namespace,
-                    Some(selector) => selector.matches(&self.namespace_labels(&group.namespace)),
-                };
-                namespace
-                    && pods
-                        .as_ref()
-                        .is_none_or(|selector| selector.matches(&group.labels))
+            (Peer::Pods { .. }, Target::Pods(group)) => {
+                self.peer_matches_pods(policy, peer, group.view())
             }
             (Peer::IpBlock { cidr, except }, Target::Address(address)) => {
                 cidr.contains(*address) && !except.iter().any(|except| except.contains(*address))
             }
             _ => false,
         }
+    }
+
+    /// Whether a peer of `policy` names these pods (an `ipBlock` never
+    /// does).
+    fn peer_matches_pods(&self, policy: &Policy, peer: &Peer, group: Pods<'_>) -> bool {
+        let Peer::Pods { pods, namespaces } = peer else {
+            return false;
+        };
+        let namespace = match namespaces {
+            None => group.namespace == policy.id.namespace,
+            Some(selector) => self.namespace_matches(selector, group.namespace),
+        };
+        namespace
+            && pods
+                .as_ref()
+                .is_none_or(|selector| selector.matches(group.labels))
+    }
+
+    /// Whether the egress policies of `source` let it open a connection to
+    /// `port` of `destination`: what [`side`](Self::side) answers for
+    /// egress, without the explanation.
+    fn egress_allows(
+        &self,
+        source: Pods<'_>,
+        destination: Pods<'_>,
+        port: i32,
+        protocol: Protocol,
+    ) -> bool {
+        let mut isolated = false;
+        for (_, policy) in self.selecting_pods(source) {
+            let Some(rules) = policy.egress.as_deref() else {
+                continue;
+            };
+            isolated = true;
+            let admits = rules.iter().any(|rule| {
+                ports_match(&rule.ports, port, protocol, Some(destination))
+                    && (rule.peers.is_empty()
+                        || rule
+                            .peers
+                            .iter()
+                            .any(|peer| self.peer_matches_pods(policy, peer, destination)))
+            });
+            if admits {
+                return true;
+            }
+        }
+        !isolated
     }
 
     /// Whether a rule names this peer (or any peer).
@@ -739,7 +888,7 @@ impl PolicySet {
                     .peers
                     .iter()
                     .any(|peer| matches!(peer, Peer::IpBlock { .. }));
-                ports_match(&rule.ports, port, protocol, destination)
+                ports_match(&rule.ports, port, protocol, destination.map(PodGroup::view))
                     && self.rule_peers(policy, rule, other)
             });
             if admits {
@@ -854,8 +1003,13 @@ impl PolicySet {
     /// What gets in to `pods` on `ports` (`(number, protocol)`; empty: any
     /// port) from sources not known in advance (a Service's clients).
     pub fn admission(&self, pods: &PodGroup, ports: &[(i32, Protocol)]) -> EdgePolicy {
+        self.admission_of(pods.view(), ports)
+    }
+
+    fn admission_of(&self, pods: Pods<'_>, ports: &[(i32, Protocol)]) -> EdgePolicy {
         let isolating: Vec<&Policy> = self
-            .selecting(pods)
+            .selecting_pods(pods)
+            .map(|(_, policy)| policy)
             .filter(|policy| policy.ingress.is_some())
             .collect();
         let port_texts: Vec<String> = ports
@@ -929,7 +1083,7 @@ fn ports_match(
     ports: &[PolicyPort],
     port: i32,
     protocol: Protocol,
-    destination: Option<&PodGroup>,
+    destination: Option<Pods<'_>>,
 ) -> bool {
     ports.is_empty()
         || ports.iter().any(|rule| {
@@ -954,7 +1108,7 @@ const MAX_ALLOWED_SOURCES: usize = 24;
 
 /// Target port of a Service port on `pods`: a number, a resolved name, or
 /// the port itself.
-fn service_target(port: &super::model::ServicePort, pods: &PodGroup) -> Option<(i32, Protocol)> {
+fn service_target(port: &super::model::ServicePort, pods: Pods<'_>) -> Option<(i32, Protocol)> {
     let protocol = port
         .protocol
         .as_deref()
@@ -969,7 +1123,7 @@ fn service_target(port: &super::model::ServicePort, pods: &PodGroup) -> Option<(
 }
 
 /// The ports traffic to `destination` under `rule` may use, resolved.
-fn rule_ports(rule: &Rule, destination: &PodGroup) -> Vec<(i32, Protocol)> {
+fn rule_ports(rule: &Rule, destination: Pods<'_>) -> Vec<(i32, Protocol)> {
     let mut out = Vec::new();
     if rule.ports.is_empty() {
         out.extend(
@@ -1006,161 +1160,381 @@ fn rule_ports(rule: &Rule, destination: &PodGroup) -> Vec<(i32, Protocol)> {
 /// ports) and [`EdgeKind::PolicyAllows`] edges from workloads a rule
 /// explicitly admits (a non-empty `podSelector`) to isolated ones, when the
 /// source's egress lets the traffic out too.
+///
+/// The work is in proportion to the graph and to what the policies select:
+/// a pod is tried against the policies of its namespace only, and the
+/// sources a peer admits are looked up by namespace and label, once per
+/// peer and kind of target (pods of one workload are one kind).
 pub fn apply(graph: TopologyGraph, policies: &PolicySet) -> TopologyGraph {
-    // Workloads whose pods are drawn: the pods carry the layer's edges.
-    let with_pods: BTreeSet<&NodeId> = graph
-        .edges()
-        .iter()
-        .filter(|edge| {
-            edge.kind == EdgeKind::Owns
-                && graph
-                    .node(&edge.to)
-                    .is_some_and(|node| node.kind == NodeKind::Pod)
-        })
-        .map(|edge| &edge.from)
-        .collect();
-    let groups: Vec<(NodeId, PodGroup)> = graph
-        .nodes()
-        .iter()
-        .filter_map(|node| Some((node.id.clone(), PodGroup::of(node)?)))
-        .collect();
-    let mut node_policies: HashMap<NodeId, NodePolicy> = groups
-        .iter()
-        .map(|(id, pods)| (id.clone(), policies.node_policy(pods)))
-        .collect();
-    let by_id: HashMap<&NodeId, &PodGroup> = groups.iter().map(|(id, pods)| (id, pods)).collect();
+    let Layer {
+        nodes,
+        edges,
+        allows,
+    } = Layer::of(&graph, policies);
+    let mut nodes = nodes.into_iter();
+    let mut edges = edges.into_iter();
+    // Both run over the graph in order, as the layer was made.
+    graph.layered(
+        |node| {
+            if let Some(policy) = nodes.next().flatten() {
+                node.attrs.network_policy = Some(policy);
+            }
+        },
+        |edge| {
+            if let Some(policy) = edges.next().flatten() {
+                edge.attrs.policy = Some(policy);
+            }
+        },
+        allows,
+    )
+}
 
-    let mut edge_policies: HashMap<EdgeId, EdgePolicy> = HashMap::new();
-    for edge in graph.edges() {
-        if edge.kind != EdgeKind::Selects {
-            continue;
-        }
-        let (Some(pods), Some(service)) = (
-            by_id.get(&edge.to),
-            graph
-                .node(&edge.from)
-                .and_then(|node| node.attrs.service.as_ref()),
-        ) else {
-            continue;
-        };
-        let mut ports: Vec<(i32, Protocol)> = service
-            .ports
+/// What the layer adds to a graph.
+struct Layer {
+    /// By node, in the order of the graph.
+    nodes: Vec<Option<NodePolicy>>,
+    /// By edge, in the order of the graph.
+    edges: Vec<Option<EdgePolicy>>,
+    allows: Vec<Edge>,
+}
+
+/// Drawn pods and workloads a peer admits to a kind of target that can
+/// also get out to it, in the order of the graph, each with the ports open
+/// to it; at most [`MAX_ALLOWED_SOURCES`] + 1 (one may be the target itself).
+type Admitted = Rc<Vec<(usize, Vec<String>)>>;
+
+impl Layer {
+    fn of(graph: &TopologyGraph, policies: &PolicySet) -> Self {
+        let nodes = graph.nodes();
+        let groups: Vec<Option<Pods<'_>>> = nodes.iter().map(Pods::of).collect();
+        let node_policies: Vec<Option<NodePolicy>> = groups
             .iter()
-            .filter_map(|port| service_target(port, pods))
+            .map(|pods| pods.map(|pods| policies.node_policy_of(pods)))
             .collect();
-        ports.sort();
-        ports.dedup();
-        edge_policies.insert(edge.id.clone(), policies.admission(pods, &ports));
-    }
 
-    let mut allows: BTreeMap<EdgeId, Edge> = BTreeMap::new();
-    let drawn: Vec<&(NodeId, PodGroup)> = groups
-        .iter()
-        .filter(|(id, _)| !with_pods.contains(id))
-        .collect();
-    for (target_id, target) in &drawn {
-        if !node_policies
-            .get(target_id)
-            .is_some_and(NodePolicy::isolated_ingress)
-        {
-            continue;
-        }
-        let destination = Target::Pods(target.clone());
-        let mut sources = 0;
-        for policy in policies.selecting(target) {
-            for rule in policy.ingress.as_deref().unwrap_or_default() {
-                let ports = rule_ports(rule, target);
-                for peer in &rule.peers {
-                    let Peer::Pods {
-                        pods: Some(selector),
-                        ..
-                    } = peer
-                    else {
-                        continue;
-                    };
-                    if selector.is_empty() {
-                        continue;
+        // Workloads whose pods are drawn: the pods carry the layer's edges.
+        let mut with_pods = vec![false; nodes.len()];
+        let mut edge_policies: Vec<Option<EdgePolicy>> = Vec::with_capacity(graph.edges().len());
+        for edge in graph.edges() {
+            let mut policy = None;
+            match edge.kind {
+                EdgeKind::Owns => {
+                    if let (Some(from), Some(to)) =
+                        (graph.node_index(&edge.from), graph.node_index(&edge.to))
+                        && nodes[to].kind == NodeKind::Pod
+                    {
+                        with_pods[from] = true;
                     }
-                    for (source_id, source) in &drawn {
-                        if source_id == target_id || sources >= MAX_ALLOWED_SOURCES {
-                            continue;
-                        }
-                        let from = Target::Pods(source.clone());
-                        if !policies.peer_matches(policy, peer, &from) {
-                            continue;
-                        }
-                        // The source's egress must let it out on some port.
-                        let open: Vec<String> = ports
+                }
+                EdgeKind::Selects => {
+                    if let Some(pods) = graph.node_index(&edge.to).and_then(|to| groups[to])
+                        && let Some(service) = graph
+                            .node(&edge.from)
+                            .and_then(|node| node.attrs.service.as_ref())
+                    {
+                        let mut ports: Vec<(i32, Protocol)> = service
+                            .ports
                             .iter()
-                            .filter(|(port, protocol)| {
-                                policies
-                                    .side(
-                                        Direction::Egress,
-                                        &from,
-                                        &destination,
-                                        *port,
-                                        *protocol,
-                                        Some(target),
-                                    )
-                                    .allowed
-                            })
-                            .map(|(port, protocol)| format!("{protocol} {port}"))
+                            .filter_map(|port| service_target(port, pods))
                             .collect();
-                        let egress_open = !node_policies
-                            .get(source_id)
-                            .is_some_and(NodePolicy::isolated_egress);
-                        if open.is_empty() && !(ports.is_empty() && egress_open) {
+                        ports.sort();
+                        ports.dedup();
+                        policy = Some(policies.admission_of(pods, &ports));
+                    }
+                }
+                _ => {}
+            }
+            edge_policies.push(policy);
+        }
+
+        let drawn: Vec<usize> = (0..nodes.len())
+            .filter(|&ix| groups[ix].is_some() && !with_pods[ix])
+            .collect();
+        let allows = Allows {
+            policies,
+            nodes,
+            groups: &groups,
+            node_policies: &node_policies,
+            drawn: &drawn,
+            sources: None,
+            kinds: HashMap::new(),
+            admitted: HashMap::new(),
+        }
+        .edges();
+        Self {
+            nodes: node_policies,
+            edges: edge_policies,
+            allows,
+        }
+    }
+}
+
+/// Drawn nodes by namespace and by label, in the order of the graph.
+struct Sources<'g> {
+    namespaces: Vec<&'g str>,
+    in_namespace: HashMap<&'g str, Vec<usize>>,
+    /// Only for the label keys peers look sources up by.
+    by_label: HashMap<(&'g str, &'g str, &'g str), Vec<usize>>,
+}
+
+/// Makes the [`EdgeKind::PolicyAllows`] edges.
+struct Allows<'g> {
+    policies: &'g PolicySet,
+    nodes: &'g [Node],
+    groups: &'g [Option<Pods<'g>>],
+    node_policies: &'g [Option<NodePolicy>],
+    /// Nodes that may be an end of an edge, as positions in `nodes`.
+    drawn: &'g [usize],
+    /// Made for the first peer that needs it.
+    sources: Option<Sources<'g>>,
+    /// Pods policies can't tell apart are one kind: its number.
+    kinds: HashMap<Pods<'g>, usize>,
+    /// By policy, rule, peer (positions) and kind of target.
+    admitted: HashMap<(usize, usize, usize, usize), Admitted>,
+}
+
+impl<'g> Allows<'g> {
+    fn edges(mut self) -> Vec<Edge> {
+        let mut allows = Vec::new();
+        for &target_ix in self.drawn {
+            let isolated = self.node_policies[target_ix]
+                .as_ref()
+                .is_some_and(NodePolicy::isolated_ingress);
+            let Some(target) = self.groups[target_ix].filter(|_| isolated) else {
+                continue;
+            };
+            let target_id = &self.nodes[target_ix].id;
+            // The edges of this target, in the order their sources came.
+            let mut edges: Vec<(usize, Edge)> = Vec::new();
+            let policies = self.policies;
+            'target: for (policy_ix, policy) in policies.selecting_pods(target) {
+                let rules = policy.ingress.as_deref().unwrap_or_default();
+                for (rule_ix, rule) in rules.iter().enumerate() {
+                    for (peer_ix, peer) in rule.peers.iter().enumerate() {
+                        let Peer::Pods {
+                            pods: Some(selector),
+                            ..
+                        } = peer
+                        else {
+                            continue;
+                        };
+                        if selector.is_empty() {
                             continue;
                         }
-                        let id = EdgeId::new(EdgeKind::PolicyAllows, source_id, target_id);
-                        let edge = allows.entry(id.clone()).or_insert_with(|| {
-                            sources += 1;
-                            Edge {
-                                id,
-                                from: source_id.clone(),
-                                to: target_id.clone(),
-                                kind: EdgeKind::PolicyAllows,
-                                attrs: EdgeAttrs {
-                                    policy: Some(EdgePolicy {
-                                        access: Access::Allowed,
-                                        policies: Vec::new(),
-                                        ports: Vec::new(),
-                                    }),
-                                    ..EdgeAttrs::default()
-                                },
+                        let admitted = self.admitted(
+                            (policy_ix, rule_ix, peer_ix),
+                            policy,
+                            rule,
+                            peer,
+                            target,
+                        );
+                        for (source_ix, open) in admitted.iter() {
+                            if *source_ix == target_ix {
+                                continue;
                             }
-                        });
-                        if let Some(edge_policy) = &mut edge.attrs.policy {
-                            if !edge_policy.policies.contains(&policy.id) {
-                                edge_policy.policies.push(policy.id.clone());
-                            }
-                            for port in open {
-                                if !edge_policy.ports.contains(&port) {
-                                    edge_policy.ports.push(port);
+                            let position = match edges.iter().position(|(ix, _)| ix == source_ix) {
+                                Some(position) => position,
+                                None => {
+                                    let source_id = &self.nodes[*source_ix].id;
+                                    edges.push((
+                                        *source_ix,
+                                        Edge {
+                                            id: EdgeId::new(
+                                                EdgeKind::PolicyAllows,
+                                                source_id,
+                                                target_id,
+                                            ),
+                                            from: source_id.clone(),
+                                            to: target_id.clone(),
+                                            kind: EdgeKind::PolicyAllows,
+                                            attrs: EdgeAttrs {
+                                                policy: Some(EdgePolicy {
+                                                    access: Access::Allowed,
+                                                    policies: Vec::new(),
+                                                    ports: Vec::new(),
+                                                }),
+                                                ..EdgeAttrs::default()
+                                            },
+                                        },
+                                    ));
+                                    edges.len() - 1
                                 }
+                            };
+                            if let Some(edge_policy) = &mut edges[position].1.attrs.policy {
+                                if !edge_policy.policies.contains(&policy.id) {
+                                    edge_policy.policies.push(policy.id.clone());
+                                }
+                                for port in open {
+                                    if !edge_policy.ports.contains(port) {
+                                        edge_policy.ports.push(port.clone());
+                                    }
+                                }
+                            }
+                            // Enough sources drawn: the rest is left out.
+                            if edges.len() >= MAX_ALLOWED_SOURCES {
+                                break 'target;
                             }
                         }
                     }
                 }
             }
+            allows.extend(edges.into_iter().map(|(_, edge)| edge));
         }
+        allows
     }
 
-    graph
-        .map(
-            |node| {
-                if let Some(policy) = node_policies.remove(&node.id) {
-                    node.attrs.network_policy = Some(policy);
+    fn kind_of(&mut self, pods: Pods<'g>) -> usize {
+        let next = self.kinds.len();
+        *self.kinds.entry(pods).or_insert(next)
+    }
+
+    fn sources(&mut self) -> &Sources<'g> {
+        let (policies, groups, drawn) = (self.policies, self.groups, self.drawn);
+        self.sources.get_or_insert_with(|| {
+            let keys: HashSet<&str> = policies
+                .policies
+                .iter()
+                .flat_map(|policy| policy.ingress.iter().flatten())
+                .flat_map(|rule| &rule.peers)
+                .filter_map(|peer| match peer {
+                    Peer::Pods {
+                        pods: Some(selector),
+                        ..
+                    } => Some(selector),
+                    _ => None,
+                })
+                .flat_map(Selector::required_keys)
+                .collect();
+            let mut sources = Sources {
+                namespaces: Vec::new(),
+                in_namespace: HashMap::new(),
+                by_label: HashMap::new(),
+            };
+            for &ix in drawn {
+                let Some(pods) = groups[ix] else {
+                    continue;
+                };
+                let all = sources.in_namespace.entry(pods.namespace).or_default();
+                if all.is_empty() {
+                    sources.namespaces.push(pods.namespace);
                 }
-            },
-            |edge| {
-                if let Some(policy) = edge_policies.remove(&edge.id) {
-                    edge.attrs.policy = Some(policy);
+                all.push(ix);
+                for (key, value) in pods.labels {
+                    if keys.contains(key.as_str()) {
+                        sources
+                            .by_label
+                            .entry((pods.namespace, key.as_str(), value.as_str()))
+                            .or_default()
+                            .push(ix);
+                    }
                 }
-            },
-        )
-        .with_edges(allows.into_values())
+            }
+            sources
+        })
+    }
+
+    /// Drawn nodes `peer` of `policy` names, in the order of the graph.
+    fn matching(&mut self, policy: &'g Policy, peer: &'g Peer) -> Vec<usize> {
+        let Peer::Pods {
+            pods: Some(selector),
+            namespaces,
+        } = peer
+        else {
+            return Vec::new();
+        };
+        let (policies, groups) = (self.policies, self.groups);
+        let sources = self.sources();
+        let admitted: Vec<&str> = match namespaces {
+            None => vec![policy.id.namespace.as_str()],
+            Some(namespaces) => sources
+                .namespaces
+                .iter()
+                .copied()
+                .filter(|namespace| policies.namespace_matches(namespaces, namespace))
+                .collect(),
+        };
+        let required = selector.required();
+        let mut matching = Vec::new();
+        for namespace in admitted {
+            let mut candidates: Vec<&[usize]> = Vec::new();
+            match &required {
+                Some(labels) => candidates.extend(
+                    labels
+                        .iter()
+                        .filter_map(|(key, value)| sources.by_label.get(&(namespace, *key, *value)))
+                        .map(Vec::as_slice),
+                ),
+                None => candidates.extend(sources.in_namespace.get(namespace).map(Vec::as_slice)),
+            }
+            matching.extend(
+                candidates
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&ix| groups[ix].is_some_and(|pods| selector.matches(pods.labels))),
+            );
+        }
+        // Namespaces and labels were gone through one after another.
+        matching.sort_unstable();
+        matching.dedup();
+        matching
+    }
+
+    /// The sources `peer` admits to targets like `target` that also get
+    /// out to them, with the open ports.
+    fn admitted(
+        &mut self,
+        (policy_ix, rule_ix, peer_ix): (usize, usize, usize),
+        policy: &'g Policy,
+        rule: &'g Rule,
+        peer: &'g Peer,
+        target: Pods<'g>,
+    ) -> Admitted {
+        let key = (policy_ix, rule_ix, peer_ix, self.kind_of(target));
+        if let Some(admitted) = self.admitted.get(&key) {
+            return Rc::clone(admitted);
+        }
+        let ports = rule_ports(rule, target);
+        let mut admitted = Vec::new();
+        // Whether a kind of source gets out to the target, port by port.
+        let mut open_to: HashMap<usize, Option<Vec<String>>> = HashMap::new();
+        for source_ix in self.matching(policy, peer) {
+            let Some(source) = self.groups[source_ix] else {
+                continue;
+            };
+            let kind = self.kind_of(source);
+            let (policies, node_policies) = (self.policies, self.node_policies);
+            let open = open_to.entry(kind).or_insert_with(|| {
+                // The source's egress must let it out on some port.
+                let open: Vec<String> = ports
+                    .iter()
+                    .filter(|(port, protocol)| {
+                        policies.egress_allows(source, target, *port, *protocol)
+                    })
+                    .map(|(port, protocol)| format!("{protocol} {port}"))
+                    .collect();
+                let egress_open = !node_policies[source_ix]
+                    .as_ref()
+                    .is_some_and(NodePolicy::isolated_egress);
+                (!open.is_empty() || ports.is_empty() && egress_open).then_some(open)
+            });
+            if let Some(open) = open {
+                admitted.push((source_ix, open.clone()));
+                if admitted.len() > MAX_ALLOWED_SOURCES {
+                    break;
+                }
+            }
+        }
+        let admitted = Rc::new(admitted);
+        self.admitted.insert(key, Rc::clone(&admitted));
+        admitted
+    }
 }
+
+#[cfg(test)]
+mod reference;
+#[cfg(test)]
+pub(super) use reference::apply as reference_apply;
 
 /// Whether a node is something NetworkPolicies select (pod or workload).
 pub fn applies_to(node: &Node) -> bool {
