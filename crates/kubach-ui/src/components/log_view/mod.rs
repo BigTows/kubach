@@ -5,6 +5,7 @@
 mod buffer;
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::scroll::{ScrollableMask, Scrollbar};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme};
@@ -16,11 +17,28 @@ use crate::{layer_highlights, span_highlights, theme};
 use kubach_i18n::t;
 
 pub use buffer::{
-    FollowState, LogBuffer, LogEntry, LogMatch, LogSearch, LogTag, PushResult, find_matches,
+    FollowState, LogBuffer, LogEntry, LogMatch, LogSearch, LogTag, PushResult, ScanStep,
+    find_matches,
 };
 
 /// Lines kept by default before the oldest are dropped.
 pub const DEFAULT_LOG_CAPACITY: usize = 500_000;
+/// Bytes the lines of a view hold ([`LogEntry::bytes`]) before the oldest
+/// are dropped, whatever their number (#171). Lines of up to about 450
+/// bytes of text fill all of [`DEFAULT_LOG_CAPACITY`] within it, so common
+/// logs keep as many lines as before; a stream of long lines (they come cut
+/// at 64 KiB) keeps fewer lines instead of taking gigabytes.
+pub const DEFAULT_LOG_BYTES: usize = 256 * 1024 * 1024;
+/// Text searched between two looks at the clock while the buffer is
+/// searched for a new query.
+const SEARCH_STEP_BYTES: usize = 64 * 1024;
+/// How long the buffer is searched in one go, and the pause before the next
+/// one: the UI thread is never held longer by a query, whatever the size of
+/// the buffer.
+const SEARCH_SLICE: Duration = Duration::from_millis(3);
+const SEARCH_PAUSE: Duration = Duration::from_millis(3);
+/// The count of matches found so far is shown this often while searching.
+const SEARCH_REPORT: Duration = Duration::from_millis(50);
 const LINE_HEIGHT: Pixels = px(18.);
 /// Font size of the lines (`text_xs`).
 const FONT_SIZE: Rems = rems(0.75);
@@ -99,6 +117,11 @@ pub struct LogView {
     painted_width: Pixels,
     /// A search match to bring into view sideways on the next frame.
     reveal: Option<LogMatch>,
+    /// Searches the buffer for the query piece by piece; `None` once every
+    /// line is searched.
+    search_task: Option<Task<()>>,
+    /// When the count of matches was last reported while searching.
+    search_reported: Instant,
 }
 
 /// What the cached width of the widest line depends on.
@@ -113,6 +136,7 @@ struct WidestKey {
 impl EventEmitter<LogViewEvent> for LogView {}
 
 impl LogView {
+    /// A view of at most `capacity` lines and [`DEFAULT_LOG_BYTES`].
     pub fn new(capacity: usize, cx: &mut Context<Self>) -> Self {
         let list =
             ListState::new(0, ListAlignment::Top, px(200.)).with_uniform_item_height(LINE_HEIGHT);
@@ -124,7 +148,7 @@ impl LogView {
                 .ok();
         });
         Self {
-            buffer: LogBuffer::new(capacity),
+            buffer: LogBuffer::new(capacity).with_max_bytes(DEFAULT_LOG_BYTES),
             search: LogSearch::default(),
             list,
             follow: FollowState::Following,
@@ -140,6 +164,8 @@ impl LogView {
             widest: None,
             painted_width: px(0.),
             reveal: None,
+            search_task: None,
+            search_reported: Instant::now(),
         }
     }
 
@@ -161,13 +187,14 @@ impl LogView {
         cx.notify();
     }
 
-    /// Appends lines, dropping the oldest beyond capacity.
+    /// Appends lines, dropping the oldest beyond the limits of lines and
+    /// bytes.
     pub fn push(&mut self, entries: Vec<LogEntry>, cx: &mut Context<Self>) {
         if entries.is_empty() {
             return;
         }
         let old_len = self.buffer.len();
-        let from = self.buffer.end_id();
+        let searched = self.search.is_complete(&self.buffer);
         let pushed = self.buffer.push(entries);
         self.list.splice(old_len..old_len, pushed.added);
         if pushed.evicted > 0 {
@@ -176,18 +203,28 @@ impl LogView {
             self.search.evict(&self.buffer);
             self.selector.retain_from(self.buffer.first_id());
         }
-        self.search.extend(&self.buffer, from);
+        if searched {
+            self.search.finish(&self.buffer);
+        } else {
+            // The new lines are searched in their turn.
+            self.continue_search(cx);
+        }
         self.follow.appended(pushed.added);
         cx.notify();
     }
 
     /// Inserts earlier lines (oldest first) above the first one, keeping the
     /// visible lines in place, the selection, search matches and following.
-    /// Lines beyond capacity are not inserted. Always allows the next
+    /// Lines beyond the limits are not inserted (and count as dropped for
+    /// [`has_evicted`](Self::has_evicted)). Always allows the next
     /// [`LogViewEvent::ReachedTop`], so an empty batch asks for more.
     pub fn prepend(&mut self, entries: Vec<LogEntry>, cx: &mut Context<Self>) {
         self.top_armed = true;
+        let given = entries.len();
         let added = self.buffer.prepend(entries);
+        if added < given {
+            self.evicted = true;
+        }
         if added > 0 {
             let following = self.list.is_following_tail();
             let top = self.list.logical_scroll_top();
@@ -204,8 +241,9 @@ impl LogView {
         cx.notify();
     }
 
-    /// Whether lines were dropped from the front (beyond capacity) since the
-    /// last clear, so the first line is no longer the oldest one received.
+    /// Whether lines were dropped from the front (beyond the limits) since
+    /// the last clear, so the first line is no longer the oldest one
+    /// received.
     pub fn has_evicted(&self) -> bool {
         self.evicted
     }
@@ -230,6 +268,7 @@ impl LogView {
         self.follow = FollowState::Following;
         let query = self.search.query().to_owned();
         self.search.set_query(&query, &self.buffer);
+        self.search_task = None;
         cx.notify();
     }
 
@@ -327,28 +366,99 @@ impl LogView {
         self.search.query()
     }
 
-    /// Highlights `query` (ASCII ignores case) in every line.
+    /// Highlights `query` (ASCII ignores case) in every line. The lines in
+    /// view are highlighted at once; the matches are counted over the next
+    /// frames ([`search_running`](Self::search_running)), a few
+    /// milliseconds at a time, so a long buffer does not hold the UI thread.
+    /// A newer query replaces the one being counted.
     pub fn set_search(&mut self, query: &str, cx: &mut Context<Self>) {
         if self.search.query() != query {
             self.search.set_query(query, &self.buffer);
+            self.search_task = None;
+            self.search_reported = Instant::now();
+            // A short buffer is done with the keystroke.
+            self.search_slice(cx);
+            self.continue_search(cx);
             cx.notify();
         }
     }
 
-    /// `(current, total)` with `current` counted from 1, 0 when none.
+    /// Whether the buffer is still being searched for the query: the total
+    /// of [`match_position`](Self::match_position) may grow.
+    pub fn search_running(&self) -> bool {
+        !self.search.is_complete(&self.buffer)
+    }
+
+    /// `(current, total)` with `current` counted from 1, 0 when none. While
+    /// the [search is running](Self::search_running), `total` is what is
+    /// found so far; `current` is exact.
     pub fn match_position(&self) -> (usize, usize) {
         let current = self.search.current_index().map_or(0, |ix| ix + 1);
         (current, self.search.len())
     }
 
+    /// Goes to the next match, the first one after the last. While the
+    /// search is running and the next one is not found yet, goes there when
+    /// it is.
     pub fn next_match(&mut self, cx: &mut Context<Self>) {
-        let found = self.search.next_match().cloned();
+        let found = self.search.next_match(&self.buffer);
         self.reveal(found, cx);
     }
 
+    /// Goes to the previous match, the last one before the first. While the
+    /// search is running the last one is not known: goes there when it is.
     pub fn prev_match(&mut self, cx: &mut Context<Self>) {
-        let found = self.search.prev_match().cloned();
+        let found = self.search.prev_match(&self.buffer);
         self.reveal(found, cx);
+    }
+
+    /// Searches the buffer for [`SEARCH_SLICE`]; true when lines are left.
+    fn search_slice(&mut self, cx: &mut Context<Self>) -> bool {
+        let started = Instant::now();
+        let found = self.search.len();
+        let mut moved = false;
+        let complete = loop {
+            let step = self.search.step(&self.buffer, SEARCH_STEP_BYTES);
+            moved |= step.moved;
+            if step.complete || started.elapsed() >= SEARCH_SLICE {
+                break step.complete;
+            }
+        };
+        if moved {
+            // A step to a match that was waiting for these lines.
+            let current = self.search.current_match(&self.buffer);
+            self.reveal(current, cx);
+        }
+        // The count redraws the owner's toolbar: not with every piece.
+        let report = started.duration_since(self.search_reported) >= SEARCH_REPORT;
+        if complete || (report && self.search.len() != found) {
+            self.search_reported = started;
+            cx.notify();
+        }
+        !complete
+    }
+
+    /// Keeps searching the buffer over the next frames, if lines are left
+    /// and nothing does it yet.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if self.search_task.is_some() || self.search.is_complete(&self.buffer) {
+            return;
+        }
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SEARCH_PAUSE).await;
+                let more = this.update(cx, |view, cx| {
+                    let more = view.search_slice(cx);
+                    if !more {
+                        view.search_task = None;
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn reveal(&mut self, found: Option<LogMatch>, cx: &mut Context<Self>) {
@@ -466,9 +576,9 @@ impl LogView {
             line.push(' ');
         }
         if self.show_timestamps
-            && let Some(timestamp) = &entry.timestamp
+            && let Some(timestamp) = entry.time()
         {
-            line.push_str(timestamp);
+            buffer::write_timestamp(&mut line, timestamp);
             line.push(' ');
         }
         let offset = line.len();
@@ -508,11 +618,14 @@ impl LogView {
                 },
             ));
         }
-        let current = self.search.current();
-        for found in self.search.in_line(id) {
-            let is_current = current == Some(found);
+        // Found here, not taken from the search: it keeps only a count per
+        // line, and the lines in view are marked before it reaches them.
+        let current = self.search.current_in_line(id);
+        let found = find_matches(&entry.text, self.search.query());
+        for (nth, range) in found.into_iter().enumerate() {
+            let is_current = current == Some(nth);
             highlights.push((
-                found.range.start + offset..found.range.end + offset,
+                range.start + offset..range.end + offset,
                 HighlightStyle {
                     background_color: Some(if is_current {
                         theme.warning.opacity(0.85)
