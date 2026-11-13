@@ -5399,3 +5399,61 @@ async fn the_window_shows_sent_values_and_an_install_is_the_sessions_own() {
     let audit = std::fs::read_to_string(&f.audit_path).unwrap();
     assert!(!audit.contains("patched-by-the-agent"), "{audit}");
 }
+
+/// The future of a call stays small: every tool's own future is on the
+/// heap ([`tools::run`]), so what a tool keeps while it runs is not part of
+/// it. It was about 20 KiB with the tools inline and is about 1 KiB.
+#[tokio::test]
+async fn the_future_of_a_call_does_not_hold_the_tools() {
+    let f = fixture(Profile::Debug, permissive(), true).await;
+    let call = f.server.call("agent", "session_info", Map::new());
+    let size = std::mem::size_of_val(&call);
+    assert!(size <= 4 * 1024, "the future of a call takes {size} bytes");
+}
+
+/// Tool calls fit a thread with half the stack tokio gives its workers
+/// (2 MiB), in an unoptimized build as well. With the tools inline in the
+/// dispatch every call took over 1 MiB there, whatever the tool; now the
+/// deepest of these takes about 0.4 MiB. A call that needs more ends the
+/// test run with "has overflowed its stack".
+#[test]
+fn tool_calls_fit_half_of_a_worker_threads_stack() {
+    let calls = [
+        ("list_kinds", json!({})),
+        ("list_resources", json!({"kind": "Deployment"})),
+        (
+            "describe_resource",
+            json!({"kind": "Deployment", "name": "web"}),
+        ),
+        ("get_logs", json!({"pod": "web-0"})),
+        (
+            "scale",
+            json!({"kind": "Deployment", "name": "web", "replicas": 3}),
+        ),
+        (
+            "port_forward_start",
+            json!({"target": "pod/web-0", "port": 8080}),
+        ),
+        ("helm_list_releases", json!({})),
+        ("list_secrets", json!({})),
+        ("get_topology", json!({})),
+    ];
+    let thread = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let f = fixture(Profile::Debug, permissive(), true).await;
+                for (tool, arguments) in calls {
+                    // What a call answers is checked elsewhere: here it
+                    // only has to come back.
+                    let _ = f.server.call("agent", tool, args(arguments)).await;
+                }
+            });
+        })
+        .unwrap();
+    thread.join().unwrap();
+}
