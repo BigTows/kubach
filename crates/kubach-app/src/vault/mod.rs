@@ -30,6 +30,7 @@ use kubach_core::vault::{
 use kubach_i18n::t;
 use zeroize::Zeroizing;
 
+use dialogs::Remembered;
 pub use dialogs::{
     AfterUnlock, add_cluster, change_password, confirm_remove, confirm_reset, drop_zone, export,
     import_clipboard, import_file, prompt_unlock, rename, rename_context, update_from_file,
@@ -630,35 +631,42 @@ impl VaultState {
         })
     }
 
-    /// Keeps the key in the system keychain, or stops doing so, in the
-    /// background.
-    pub fn set_keychain(
+    /// Keeps the key in the system keychain, in the background.
+    pub fn enable_keychain(&mut self, cx: &mut Context<Self>) -> Task<Result<(), SharedString>> {
+        self.edit_in_background(Busy::Keychain, cx, |vault| vault.enable_keychain(store()))
+    }
+
+    /// Stops keeping the key in the system keychain, in the background:
+    /// the vault gets a new key, which takes its `password` (checked
+    /// there; a wrong one changes nothing).
+    pub fn disable_keychain(
         &mut self,
-        on: bool,
+        password: Zeroizing<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), SharedString>> {
         self.edit_in_background(Busy::Keychain, cx, move |vault| {
-            if on {
-                vault.enable_keychain(store())
-            } else {
-                vault.disable_keychain(store())
-            }
+            vault.disable_keychain(&password, store(), Some(biometric_store()))
         })
     }
 
-    /// Turns Touch ID / Windows Hello unlock on or off in the background
-    /// (Windows Hello asks to confirm when turned on).
-    pub fn set_biometric(
+    /// Turns Touch ID / Windows Hello unlock on in the background (Windows
+    /// Hello asks to confirm).
+    pub fn enable_biometric(&mut self, cx: &mut Context<Self>) -> Task<Result<(), SharedString>> {
+        self.edit_in_background(Busy::Biometric, cx, |vault| {
+            vault.enable_biometric(biometric_store())
+        })
+    }
+
+    /// Turns Touch ID / Windows Hello unlock off in the background: the
+    /// vault gets a new key, which takes its `password` (checked there; a
+    /// wrong one changes nothing).
+    pub fn disable_biometric(
         &mut self,
-        on: bool,
+        password: Zeroizing<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), SharedString>> {
         self.edit_in_background(Busy::Biometric, cx, move |vault| {
-            if on {
-                vault.enable_biometric(biometric_store())
-            } else {
-                vault.disable_biometric(biometric_store())
-            }
+            vault.disable_biometric(&password, biometric_store(), Some(store()))
         })
     }
 
@@ -698,24 +706,40 @@ impl VaultState {
     }
 }
 
-/// Turns "Remember in the system keychain" on or off; failures show as a
+/// Turns "Remember in the system keychain" on or off. Turning it off asks
+/// for the vault password in a dialog; other failures show as a
 /// notification.
 pub fn set_keychain(on: bool, window: &mut Window, cx: &mut App) {
     let Some(vault) = global(cx) else {
         return;
     };
-    let task = vault.update(cx, |vault, cx| vault.set_keychain(on, cx));
-    notify_failure(task, window, cx);
+    if on {
+        let task = vault.update(cx, |vault, cx| vault.enable_keychain(cx));
+        notify_failure(task, window, cx);
+    } else if vault.read(cx).key_mode().is_some_and(|mode| mode.password) {
+        dialogs::turn_off(Remembered::Keychain, window, cx);
+    } else {
+        // The keychain is the only way in: core refuses and says why.
+        let task = vault.update(cx, |vault, cx| {
+            vault.disable_keychain(Zeroizing::new(String::new()), cx)
+        });
+        notify_failure(task, window, cx);
+    }
 }
 
-/// Turns Touch ID / Windows Hello unlock on or off; failures show as a
+/// Turns Touch ID / Windows Hello unlock on or off. Turning it off asks
+/// for the vault password in a dialog; other failures show as a
 /// notification.
 pub fn set_biometric(on: bool, window: &mut Window, cx: &mut App) {
     let Some(vault) = global(cx) else {
         return;
     };
-    let task = vault.update(cx, |vault, cx| vault.set_biometric(on, cx));
-    notify_failure(task, window, cx);
+    if on {
+        let task = vault.update(cx, |vault, cx| vault.enable_biometric(cx));
+        notify_failure(task, window, cx);
+    } else {
+        dialogs::turn_off(Remembered::Biometric, window, cx);
+    }
 }
 
 fn notify_failure(task: Task<Result<(), SharedString>>, window: &mut Window, cx: &mut App) {
