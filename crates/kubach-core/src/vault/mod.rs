@@ -2089,7 +2089,9 @@ contexts:
     #[test]
     fn a_key_the_store_keeps_is_reported_and_stays_remembered() {
         let (_dir, path) = setup();
-        let mut vault = create(&path, "pw").unwrap();
+        // A fresh password on every run.
+        let password = uuid::Uuid::new_v4().to_string();
+        let mut vault = create(&path, &password).unwrap();
         vault.add("team", &plan(), None).unwrap();
         let store = NoDelete(MemoryKeyStore::default());
         vault.enable_keychain(&store).unwrap();
@@ -2111,7 +2113,7 @@ contexts:
         assert!(!vault.key_mode().keychain);
         let locked = LockedVault::read(&path).unwrap().unwrap();
         assert!(!locked.key_mode().keychain);
-        locked.unlock_with_password("pw").unwrap();
+        locked.unlock_with_password(&password).unwrap();
     }
 
     #[test]
