@@ -621,6 +621,9 @@ fn read_audit_tail(path: &Path) -> std::io::Result<Vec<AuditRow>> {
 pub struct AgentState {
     dir: Option<PathBuf>,
     token: Option<String>,
+    /// The bridge key in the file while the server listens; the file goes
+    /// when the server stops.
+    bridge_key: Option<String>,
     shared: SharedServer,
     endpoint: Option<HttpEndpoint>,
     status: ServerStatus,
@@ -730,6 +733,7 @@ impl AgentState {
         // Sessions run by the app end with the app (ADR 0005); a temporary
         // ServiceAccount is deleted on the way out.
         cx.on_app_quit(|this, _| {
+            this.forget_bridge_key();
             let mut sessions = this.hosted.drain();
             sessions.extend(this.session.take());
             this.shared.set(None);
@@ -747,6 +751,7 @@ impl AgentState {
         let mut this = Self {
             dir,
             token: None,
+            bridge_key: None,
             shared,
             endpoint: None,
             status: ServerStatus::Off,
@@ -938,10 +943,18 @@ impl AgentState {
         self.restart(wanted, cx);
     }
 
+    /// Removes the bridge key file this app wrote: its server stops.
+    fn forget_bridge_key(&mut self) {
+        if let (Some(dir), Some(key)) = (&self.dir, self.bridge_key.take()) {
+            bridge::remove_bridge_key(dir, &key);
+        }
+    }
+
     fn restart(&mut self, wanted: Option<u16>, cx: &mut Context<Self>) {
         self.wanted = wanted;
         self.generation += 1;
         self._start = None;
+        self.forget_bridge_key();
         if let Some(endpoint) = self.endpoint.take() {
             // Detached: the old server must finish shutting down (and free
             // its port) although nothing waits for it.
@@ -967,17 +980,11 @@ impl AgentState {
                 return;
             }
         };
-        // The bridge's own token, new on every start: never shown, never
-        // given to HTTP agents (#191).
-        let bridge_token = match bridge::regenerate_bridge_token(&dir) {
-            Ok(token) => token,
-            Err(error) => {
-                self.status =
-                    ServerStatus::Failed(format!("cannot store the bridge token: {error}").into());
-                cx.notify();
-                return;
-            }
-        };
+        // The bridge's own key, new on every start: never shown, never
+        // sent, never given to HTTP agents (#191). It reaches the file
+        // once this server listens, so an app that could not take the
+        // port leaves the file of the one that holds it alone.
+        let bridge_key = bridge::random_token();
         self.token = Some(token.clone());
         self.status = ServerStatus::Starting;
         let handler: Arc<dyn BridgeHandler> = Arc::new(AppBridge {
@@ -986,16 +993,14 @@ impl AgentState {
             hosted: self.hosted.clone(),
         });
         let shared = self.shared.clone();
+        let key = bridge_key.clone();
         let task = runtime::spawn(async move {
             kubach_mcp::serve_shared_http(
                 shared,
                 HttpOptions {
                     port,
                     token,
-                    bridge: Some(BridgeOptions {
-                        handler,
-                        token: bridge_token,
-                    }),
+                    bridge: Some(BridgeOptions { handler, key }),
                 },
             )
             .await
@@ -1010,10 +1015,21 @@ impl AgentState {
                 };
                 match result {
                     Ok(endpoint) if this.generation == generation => {
-                        this.status = ServerStatus::Running {
-                            url: endpoint.url(),
-                        };
-                        this.endpoint = Some(endpoint);
+                        match bridge::store_bridge_key(&dir, &bridge_key) {
+                            Ok(()) => {
+                                this.bridge_key = Some(bridge_key);
+                                this.status = ServerStatus::Running {
+                                    url: endpoint.url(),
+                                };
+                                this.endpoint = Some(endpoint);
+                            }
+                            Err(error) => {
+                                this.status = ServerStatus::Failed(
+                                    format!("cannot store the bridge key: {error}").into(),
+                                );
+                                runtime::spawn_detached(endpoint.shutdown());
+                            }
+                        }
                     }
                     Ok(endpoint) => {
                         // Detached: a server started for an older request
