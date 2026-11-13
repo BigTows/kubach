@@ -434,6 +434,9 @@ type Key<'w> = (SourceKind, &'w str, &'w str);
 
 type Labels = BTreeMap<String, String>;
 
+/// PVCs by namespace and name without the ordinal, as positions in their list.
+type Claims<'w> = HashMap<(Option<&'w str>, &'w str), Vec<usize>>;
+
 struct Assembler<'w> {
     world: &'w World,
     input: &'w TopologyInput,
@@ -452,7 +455,7 @@ struct Assembler<'w> {
     /// PVCs named `<prefix>-<ordinal>` by namespace and prefix, as
     /// positions in the PVC list; made for the first StatefulSet with
     /// `volumeClaimTemplates`.
-    claims: Option<HashMap<(Option<&'w str>, &'w str), Vec<usize>>>,
+    claims: Option<Claims<'w>>,
 }
 
 impl<'w> Assembler<'w> {
@@ -952,7 +955,7 @@ impl<'w> Assembler<'w> {
         let world = self.world;
         let all = world.of(SourceKind::PersistentVolumeClaim);
         let claims: &HashMap<_, _> = self.claims.get_or_insert_with(|| {
-            let mut claims: HashMap<(Option<&'w str>, &'w str), Vec<usize>> = HashMap::new();
+            let mut claims: Claims<'w> = HashMap::new();
             for (ix, claim) in all.iter().enumerate() {
                 if let Some((prefix, ordinal)) = claim.meta.name.rsplit_once('-')
                     && !ordinal.is_empty()

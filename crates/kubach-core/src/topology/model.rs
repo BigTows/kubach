@@ -912,7 +912,8 @@ impl TopologyGraph {
                     .nodes
                     .iter()
                     .zip(&kept)
-                    .filter_map(|(node, kept)| kept.then(|| node.clone()))
+                    .filter(|(_, kept)| **kept)
+                    .map(|(node, _)| node.clone())
                     .collect();
                 let edges = shared
                     .edges
