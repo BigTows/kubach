@@ -89,11 +89,14 @@
 | ОС | Пакет | Примечания |
 |---|---|---|
 | **macOS** 11+ | `Kubach-<version>-macos-<arch>.dmg` | Подписан Developer ID и нотаризован |
-| **Windows** 10+ | установщик `.msi` или portable `.zip` | Пока без подписи кода: SmartScreen может предупредить |
+| **Windows** 10+ | установщик `.msi` или portable `.zip` | Подпись кода через SignPath Foundation в процессе: пока SmartScreen может предупредить |
 | **Debian / Ubuntu** | `.deb` | `sudo apt install ./kubach_*.deb` |
 | **Fedora / RHEL / openSUSE** | `.rpm` | `sudo dnf install ./kubach-*.rpm` |
 | **Arch Linux** | `.pkg.tar.zst` или `PKGBUILD` (`kubach-bin`) | `sudo pacman -U kubach-*.pkg.tar.zst` |
 | **Любой Linux** | `.AppImage` или `.tar.gz` | Нужны glibc 2.35+ и драйвер Vulkan |
+
+**Подпись кода:** бесплатная подпись кода от [SignPath.io](https://about.signpath.io),
+сертификат от [SignPath Foundation](https://signpath.org).
 
 Свежие сборки с каждого коммита в `main` лежат в
 [артефактах Actions](https://github.com/BigTows/kubach/actions/workflows/build.yml).
