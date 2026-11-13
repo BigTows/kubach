@@ -1341,11 +1341,13 @@ mod tests {
                 thing(&name, namespace, next_version, turn)
             };
             let mut ahead: Vec<BuiltRow> = Vec::new();
+            // The rows of a long list being built off the UI thread.
+            let mut job: Option<(RowJob, Vec<BuiltRow>)> = None;
             for step in 0..400 {
                 let now = list.world.now();
                 let count = list.objects.len();
                 let at = dice.roll(count);
-                match dice.roll(14) {
+                match dice.roll(16) {
                     0 | 1 if count < 24 => {
                         let object = new_thing(&mut dice, now, None);
                         list.objects.insert(dice.roll(count + 1), object);
@@ -1430,9 +1432,51 @@ mod tests {
                         }
                     }
                     13 => list.cache.adopt(ahead.drain(..)),
+                    // A job for the missing rows, as for a long list:
+                    // built now (some rows not: the language was being
+                    // switched), taken after more changes.
+                    14 if job.is_none() => {
+                        let inputs = list.inputs();
+                        let missing = list.cache.missing(&list.objects, &inputs);
+                        let builder = list.cache.builder().clone();
+                        let mut rows = Vec::new();
+                        for object in &missing {
+                            if dice.chance(90) {
+                                rows.push(builder.build(object, inputs.now, inputs.locale));
+                            }
+                        }
+                        let list = list.objects.clone();
+                        let started = RowJob {
+                            builder,
+                            list,
+                            missing,
+                        };
+                        job = Some((started, rows));
+                    }
+                    // The job is done: the rows are those of its list, as
+                    // they are built now.
+                    15 => {
+                        if let Some((done, rows)) = job.take() {
+                            let listed = done.list.clone();
+                            let inputs = RowInputs {
+                                usage: list.usage.as_ref().map(|state| UsageView {
+                                    state,
+                                    revision: list.revision,
+                                }),
+                                now: list.world.now(),
+                                locale: list.world.locale(),
+                            };
+                            list.cache.finish(done, rows, &inputs);
+                            let current = std::mem::replace(&mut list.objects, listed);
+                            assert_eq!(list.shown(), list.rebuilt(), "seed {seed}, step {step}");
+                            list.objects = current;
+                        }
+                    }
                     _ => {}
                 }
-                if dice.chance(60) {
+                // The browser leaves the rows alone while a job runs; the
+                // cache does not rely on it.
+                if dice.chance(60) && (job.is_none() || dice.chance(25)) {
                     list.update();
                     assert_eq!(list.shown(), list.rebuilt(), "seed {seed}, step {step}");
                     let inputs = list.inputs();
