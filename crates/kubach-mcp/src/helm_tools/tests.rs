@@ -294,7 +294,15 @@ fn an_upgrade_with_a_patch_sends_the_merged_values_to_helm() {
         parse_values(values.yaml.expose()).unwrap(),
         json!({"replicaCount": 3, "auth": {"password": "kept-secret"}, "args": ["--b"]})
     );
-    assert!(!values.masked.contains("kept-secret"), "masked values leak");
+    assert!(
+        !values.window.contains("kept-secret"),
+        "the window's values leak"
+    );
+    assert!(
+        !values.window_diff.contains("kept-secret"),
+        "{}",
+        values.window_diff
+    );
     assert!(!values.diff.contains("kept-secret"), "the diff leaks");
     assert!(values.diff.contains("+replicaCount: 3"), "{}", values.diff);
     // Without values the release keeps its own, unchanged.
@@ -1718,4 +1726,305 @@ fn a_release_is_compared_with_its_dry_run_by_object() {
     assert_eq!(compared.missing, ["Service web"]);
     assert!(compared.changed.is_empty());
     assert_eq!(compared.json()["sameObjects"], false);
+}
+
+// ------------------------------------------------------------- #179
+
+const IN_A_LIST: &str = "---\napiVersion: v1\nkind: List\nitems:\n\
+     - apiVersion: rbac.authorization.k8s.io/v1\n  kind: ClusterRoleBinding\n  metadata:\n    \
+     name: in-a-list\n- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: settings\n    \
+     namespace: other\n";
+
+#[test]
+fn the_objects_inside_a_list_are_checked_as_any_other() {
+    let scan = beyond_service_account(&[IN_A_LIST], NS, &catalog()).unwrap();
+    assert_eq!(
+        scan.cluster,
+        ["ClusterRoleBinding in-a-list (cluster-scoped)"]
+    );
+    assert_eq!(other_namespaces(&scan.elsewhere), ["other"]);
+    assert_eq!(
+        paths(&scan.findings),
+        [
+            "ClusterRoleBinding in-a-list",
+            "ConfigMap settings (namespace other)"
+        ]
+    );
+}
+
+#[test]
+fn a_document_that_gives_no_certain_object_refuses_the_call() {
+    let ok = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\n";
+    for (document, reason) in [
+        // A name the API server makes up.
+        (
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: hook-secret-text-\n",
+            "generateName",
+        ),
+        // Helm takes the last of a repeated key.
+        (
+            "apiVersion: v1\nkind: ConfigMap\nkind: secret-text\nmetadata:\n  name: b\n",
+            "repeated key",
+        ),
+        // For Helm a merge key overrides the key before it.
+        (
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n  namespace: dev\n  \
+             <<: {namespace: secret-text}\n",
+            "merge key",
+        ),
+        ("kind: [ secret-text\n", "syntax error"),
+        (
+            "apiVersion: v1\nkind: List\nitems: secret-text\n",
+            "not a list of objects",
+        ),
+    ] {
+        let manifest = format!("{ok}{document}");
+        let denial = read_objects("helm template's render of the chart", &manifest, true)
+            .expect_err(document);
+        assert_eq!(denial.code, DenialCode::Manifest);
+        for part in [
+            "document 2,",
+            reason,
+            "nothing ran",
+            "helm template's render",
+        ] {
+            assert!(denial.message.contains(part), "{part}: {}", denial.message);
+        }
+        assert!(
+            !denial.message.contains("secret-text"),
+            "{}",
+            denial.message
+        );
+        // A dry run nobody approved yet: no number either.
+        let unnumbered = read_objects("the server-side dry run", &manifest, false).unwrap_err();
+        assert!(
+            !unnumbered.message.contains("document 2"),
+            "{}",
+            unnumbered.message
+        );
+        assert!(
+            unnumbered.message.contains(reason),
+            "{}",
+            unnumbered.message
+        );
+        // The same through the scan of a call.
+        assert!(beyond_service_account(&[ok, &manifest], NS, &catalog()).is_err());
+    }
+    assert_eq!(read_objects("x", ok, true).unwrap().len(), 1);
+}
+
+#[test]
+fn a_kind_the_cluster_does_not_serve_needs_a_tick() {
+    let widget = resource("unserved.example/v1", "Gadget", "w", None);
+    let preview = check_objects(
+        std::slice::from_ref(&widget),
+        NS,
+        &catalog(),
+        SessionMode::ClientOnly,
+    )
+    .unwrap();
+    assert_eq!(preview.objects, ["Gadget w"]);
+    assert_eq!(paths(&preview.findings), ["Gadget w"]);
+    assert_eq!(preview.findings[0].message, UNKNOWN_KIND);
+    // A temporary ServiceAccount asks for the user's credentials for it,
+    // and never meets it first in a dry run.
+    assert!(needs_user_credentials(
+        SessionMode::TemporaryServiceAccount,
+        &preview.findings
+    ));
+    let denial = check_objects(
+        &[widget],
+        NS,
+        &catalog(),
+        SessionMode::TemporaryServiceAccount,
+    )
+    .unwrap_err();
+    assert_eq!(denial.code, DenialCode::UnknownKind);
+    assert!(!denial.message.contains("Gadget"), "{}", denial.message);
+}
+
+fn hook(name: &str, command: &str) -> String {
+    format!(
+        "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: {name}\n  annotations:\n    \
+         helm.sh/hook: pre-upgrade\nspec:\n  template:\n    spec:\n      containers:\n      - \
+         name: run\n        image: busybox\n        command: [sh, -c, \"{command}\"]\n        \
+         env:\n        - name: DB_PASSWORD\n          value: hunter2\n"
+    )
+}
+
+#[test]
+fn the_window_has_the_hooks_of_both_sides_under_their_heading() {
+    let objects = secret_manifest("web", &[("a", "MQ==")], &[]);
+    let (old, new) = (hook("migrate", "echo one"), hook("migrate", "echo two"));
+    let diff = release_window_diff(
+        (&objects, &old),
+        (&objects, &new),
+        "revision 3",
+        "after the upgrade",
+        usize::MAX,
+    );
+    assert_eq!(diff.cut, None);
+    let text = diff.text;
+    assert!(text.starts_with(ONLY_HOOKS), "{text}");
+    let heading = text.find(HOOKS_HEADING).expect("the heading");
+    let hooks = &text[heading + HOOKS_HEADING.len()..];
+    assert!(
+        hooks.starts_with("--- hooks of revision 3\n+++ hooks after the upgrade\n"),
+        "{hooks}"
+    );
+    assert!(
+        hooks.contains("-        - echo one\n+        - echo two\n"),
+        "{hooks}"
+    );
+    // Masked as the objects are.
+    assert!(!text.contains("hunter2"), "{text}");
+
+    // Objects and hooks change: the objects first, the hooks after.
+    let changed = secret_manifest("web", &[("a", "Mg==")], &[]);
+    let both = release_window_diff(
+        (&objects, &old),
+        (&changed, &new),
+        "revision 3",
+        "after the upgrade",
+        usize::MAX,
+    )
+    .text;
+    assert!(
+        both.starts_with("--- revision 3\n+++ after the upgrade\n"),
+        "{both}"
+    );
+    assert!(!both.contains(ONLY_HOOKS), "{both}");
+    let heading = both.find(HOOKS_HEADING).expect("the heading");
+    assert!(both[..heading].contains("changed)"), "{both}");
+    assert!(both[heading..].contains("echo two"), "{both}");
+
+    // A hook that comes or goes is shown whole.
+    let added = release_window_diff((&objects, ""), (&objects, &new), "a", "b", usize::MAX).text;
+    assert!(added.contains("+kind: Job"), "{added}");
+    assert!(added.contains("+    helm.sh/hook: pre-upgrade"), "{added}");
+    let removed = release_window_diff((&objects, &old), (&objects, ""), "a", "b", usize::MAX).text;
+    assert!(removed.contains("-kind: Job"), "{removed}");
+
+    // Nothing changes on either side: nothing to show, and only then.
+    let same = release_window_diff((&objects, &old), (&objects, &old), "a", "b", usize::MAX);
+    assert_eq!(same, WindowDiff::default());
+    // Without hooks the diff is the objects' alone, as before.
+    assert_eq!(
+        release_window_diff((&objects, ""), (&changed, ""), "a", "b", usize::MAX),
+        window_diff(&objects, &changed, "a", "b", usize::MAX)
+    );
+}
+
+#[test]
+fn a_cut_in_the_hooks_names_them_as_hooks() {
+    let objects = secret_manifest("web", &[("a", "MQ==")], &[]);
+    let changed = secret_manifest("web", &[("a", "Mg==")], &[]);
+    let old = format!(
+        "{}---\n{}",
+        hook("first", "echo one"),
+        hook("second", "echo one")
+    );
+    let new = format!(
+        "{}---\n{}",
+        hook("first", "echo two"),
+        hook("second", "echo two")
+    );
+    let whole = release_window_diff((&objects, &old), (&changed, &new), "a", "b", usize::MAX);
+    let at = whole.text.find("echo two").unwrap() + 20;
+    let diff = release_window_diff((&objects, &old), (&changed, &new), "a", "b", at);
+    let cut = diff.cut.expect("cut");
+    assert_eq!(cut.total_bytes, whole.text.len());
+    assert_eq!(cut.objects, ["Job second (hook)"]);
+    // Cut inside the objects: the object, then every hook.
+    let at = whole.text.find(HOOKS_HEADING).unwrap() - 30;
+    let cut = release_window_diff((&objects, &old), (&changed, &new), "a", "b", at)
+        .cut
+        .expect("cut");
+    assert_eq!(
+        cut.objects,
+        ["Secret web", "Job first (hook)", "Job second (hook)"]
+    );
+}
+
+#[test]
+fn the_window_shows_the_values_the_agent_sends() {
+    // An install: every value is the agent's.
+    let text = "auth:\n  password: hunter22\n  apiToken: abc\nreplicas: 3\n";
+    let window = window_values_yaml(text);
+    for value in ["password: hunter22", "apiToken: abc", "replicas: 3"] {
+        assert!(window.contains(value), "{value}: {window}");
+    }
+    assert!(!window.contains("***"), "{window}");
+    // What is audited stays masked.
+    assert!(!masked_values_yaml(text).contains("hunter22"));
+
+    // A patch: what it sets is shown, what the release had is not.
+    let current = json!({"auth": {"password": "kept-secret", "apiToken": "old-token"},
+                         "replicaCount": 1});
+    let patch = json!({"auth": {"apiToken": "new-token"}, "replicaCount": 2});
+    let values = upgrade_values_now(ValuesEdit::Patch(patch), &current, 4);
+    assert!(
+        values.window.contains("apiToken: new-token"),
+        "{}",
+        values.window
+    );
+    assert!(
+        values.window.contains("password: \"*** (11 bytes)\""),
+        "{}",
+        values.window
+    );
+    for line in [
+        "-  apiToken: \"*** (9 bytes)\"\n",
+        "+  apiToken: new-token\n",
+    ] {
+        assert!(
+            values.window_diff.contains(line),
+            "{line}: {}",
+            values.window_diff
+        );
+    }
+    for text in [&values.window, &values.window_diff] {
+        assert!(
+            !text.contains("kept-secret") && !text.contains("old-token"),
+            "{text}"
+        );
+    }
+    // The agent's diff and a preview's rows are as before.
+    assert!(!values.diff.contains("new-token"), "{}", values.diff);
+    assert!(
+        values
+            .diff
+            .contains("+  apiToken: \"*** (9 bytes, changed)\""),
+        "{}",
+        values.diff
+    );
+    assert!(!json!(values.changes).to_string().contains("new-token"));
+
+    // values replace the release's: a value sent as it was stays masked on
+    // both sides, a changed one is shown.
+    let replaced = upgrade_values_now(
+        ValuesEdit::Replace("auth:\n  password: kept-secret\n  apiToken: new-token\n".into()),
+        &current,
+        4,
+    );
+    assert!(
+        !replaced.window.contains("kept-secret"),
+        "{}",
+        replaced.window
+    );
+    assert!(
+        replaced.window.contains("apiToken: new-token"),
+        "{}",
+        replaced.window
+    );
+    assert!(
+        !replaced.window_diff.contains("kept-secret"),
+        "{}",
+        replaced.window_diff
+    );
+
+    // No values in the call: the release's own, all masked.
+    let kept = upgrade_values_now(ValuesEdit::Keep, &current, 4);
+    assert!(!kept.window.contains("kept-secret") && !kept.window.contains("old-token"));
+    assert!(kept.window_diff.is_empty());
 }

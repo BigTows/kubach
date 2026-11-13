@@ -122,6 +122,16 @@ pub fn parse(text: &str) -> Result<Vec<Manifest>, YamlError> {
     Ok(manifests)
 }
 
+/// One document read the only way every YAML parser reads it: a repeated
+/// key and a merge key (`<<`) are errors, since parsers disagree on which
+/// value wins. For a reader that must see the object another tool creates.
+pub(crate) fn parse_strict(text: &str) -> Result<Value, ()> {
+    let mut options = options();
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::Error;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    serde_saphyr::from_str_with_options(text, options).map_err(|_| ())
+}
+
 /// The library's message without its rendered source snippet.
 pub(crate) fn first_line(message: &str) -> String {
     message
