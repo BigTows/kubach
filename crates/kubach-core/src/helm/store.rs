@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime;
 
+use super::codec::decode_release_sized;
 use super::{
     HelmError, Release, ReleaseSummary, RevisionDiff, StoredChart, decode_chart, decode_release,
     diff_revisions,
@@ -25,6 +26,13 @@ pub const SECRET_TYPE: &str = "helm.sh/release.v1";
 pub const OWNER_SELECTOR: &str = "owner=helm";
 /// Parallel GETs when listing releases.
 const CONCURRENCY: usize = 8;
+/// Newest revisions [`Releases::history`] reads. Helm keeps 10 by default
+/// (`--history-max`); a release kept without that limit shows its newest
+/// ones.
+pub const MAX_HISTORY_REVISIONS: usize = 256;
+/// Unpacked release JSON [`Releases::history`] keeps in memory at once;
+/// older revisions past it are left out (the newest one is always read).
+pub const MAX_HISTORY_JSON_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Helm storage driver (`HELM_DRIVER`). `sql` and `memory` are not supported.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -142,17 +150,51 @@ impl Releases {
         merge_listings(results)
     }
 
-    /// All revisions of a release, oldest first (`helm history`).
+    /// The revisions of a release, oldest first (`helm history`): the
+    /// newest [`MAX_HISTORY_REVISIONS`] at most, and of those as many of
+    /// the newest as unpack into [`MAX_HISTORY_JSON_BYTES`].
+    ///
+    /// Only labels are listed; the payloads are then fetched one object at
+    /// a time, newest first, so neither the number of storage objects nor
+    /// their unpacked size decides how much memory the history takes.
     pub async fn history(&self, namespace: &str, name: &str) -> Result<Vec<Release>, HelmError> {
         let selector = format!("{OWNER_SELECTOR},name={name}");
-        let payloads = self.list_payloads(namespace, &selector).await?;
-        let revisions = runtime::blocking(move || decode_history(&payloads)).await?;
+        let metas = self.list_meta(Some(namespace), &selector).await?;
+        let stored = newest_revisions(
+            metas.iter().filter_map(stored_revision),
+            MAX_HISTORY_REVISIONS,
+        );
+        let mut decoded = std::pin::pin!(
+            futures::stream::iter(stored)
+                .map(|stored| async move {
+                    // Deleted between list and get: skip it.
+                    match self.get_payload(&stored.namespace, &stored.object).await? {
+                        Some(payload) => runtime::blocking(move || decode_release_sized(&payload))
+                            .await
+                            .map(Some),
+                        None => Ok(None),
+                    }
+                })
+                .buffered(CONCURRENCY)
+        );
+        let mut budget = HistoryBudget::new(MAX_HISTORY_JSON_BYTES);
+        let mut revisions = Vec::new();
+        while let Some(result) = decoded.next().await {
+            let Some((release, size)) = result? else {
+                continue;
+            };
+            if !budget.take(size) {
+                break;
+            }
+            revisions.push(release);
+        }
         if revisions.is_empty() {
             return Err(HelmError::NotFound {
                 namespace: namespace.to_owned(),
                 name: name.to_owned(),
             });
         }
+        revisions.sort_by_key(|release| release.revision);
         Ok(revisions)
     }
 
@@ -235,32 +277,6 @@ impl Releases {
             Driver::ConfigMap => metadata(self.api::<ConfigMap>(namespace), &params).await?,
         };
         Ok(metas)
-    }
-
-    async fn list_payloads(
-        &self,
-        namespace: &str,
-        selector: &str,
-    ) -> Result<Vec<Vec<u8>>, HelmError> {
-        let params = ListParams::default().labels(selector);
-        let payloads = match self.driver {
-            Driver::Secret => {
-                let params = params.fields(&format!("type={SECRET_TYPE}"));
-                let list = self.api::<Secret>(Some(namespace)).list(&params).await?;
-                list.items
-                    .iter()
-                    .map(secret_payload)
-                    .collect::<Result<_, _>>()?
-            }
-            Driver::ConfigMap => {
-                let list = self.api::<ConfigMap>(Some(namespace)).list(&params).await?;
-                list.items
-                    .iter()
-                    .map(config_map_payload)
-                    .collect::<Result<_, _>>()?
-            }
-        };
-        Ok(payloads)
     }
 
     async fn get_payload(
@@ -383,14 +399,41 @@ async fn decode_summary(payload: Vec<u8>) -> Result<ReleaseSummary, HelmError> {
     runtime::blocking(move || decode_release(&payload).map(|release| release.summary())).await
 }
 
-/// Decodes revisions of one release, oldest first.
-fn decode_history(payloads: &[Vec<u8>]) -> Result<Vec<Release>, HelmError> {
-    let mut revisions = payloads
-        .iter()
-        .map(|payload| decode_release(payload))
-        .collect::<Result<Vec<_>, _>>()?;
-    revisions.sort_by_key(|release| release.revision);
-    Ok(revisions)
+/// The `limit` highest revisions, newest first.
+fn newest_revisions(
+    revisions: impl IntoIterator<Item = StoredRevision>,
+    limit: usize,
+) -> Vec<StoredRevision> {
+    let mut revisions: Vec<_> = revisions.into_iter().collect();
+    revisions.sort_by_key(|stored| std::cmp::Reverse(stored.revision));
+    revisions.truncate(limit);
+    revisions
+}
+
+/// How much unpacked release JSON a history may still keep.
+struct HistoryBudget {
+    left: u64,
+    any: bool,
+}
+
+impl HistoryBudget {
+    fn new(bytes: u64) -> Self {
+        Self {
+            left: bytes,
+            any: false,
+        }
+    }
+
+    /// Whether a revision of `size` bytes still fits; the first one always
+    /// does.
+    fn take(&mut self, size: u64) -> bool {
+        if self.any && size > self.left {
+            return false;
+        }
+        self.any = true;
+        self.left = self.left.saturating_sub(size);
+        true
+    }
 }
 
 /// Highest revision per `(namespace, release)`, sorted by that key.
@@ -545,23 +588,39 @@ mod tests {
     }
 
     #[test]
-    fn history_is_sorted_by_revision() {
-        let payloads: Vec<_> = [3, 1, 2]
-            .into_iter()
-            .map(|r| secret_payload(&secret(r)).unwrap())
-            .collect();
-        let history = decode_history(&payloads).unwrap();
-        let order: Vec<_> = history
-            .iter()
-            .map(|r| (r.revision, r.description.as_str()))
-            .collect();
-        assert_eq!(
-            order,
-            [
-                (1, "Install complete"),
-                (2, "Upgrade complete"),
-                (3, "Upgrade complete")
-            ]
-        );
+    fn history_reads_the_newest_revisions_within_the_limit() {
+        let metas: Vec<_> = [3, 1, 12, 2].map(|r| meta("apps", "web", r)).into();
+        let newest = |limit| -> Vec<u32> {
+            newest_revisions(metas.iter().filter_map(stored_revision), limit)
+                .iter()
+                .map(|stored| stored.revision)
+                .collect()
+        };
+        assert_eq!(newest(MAX_HISTORY_REVISIONS), [12, 3, 2, 1]);
+        assert_eq!(newest(2), [12, 3]);
+        assert!(newest(0).is_empty());
+    }
+
+    #[test]
+    fn history_budget_keeps_the_newest_revision_and_what_fits() {
+        // The newest revision is kept even when it alone is over.
+        let mut budget = HistoryBudget::new(10);
+        assert!(budget.take(64));
+        assert!(!budget.take(1));
+
+        let mut budget = HistoryBudget::new(10);
+        assert!(budget.take(4));
+        assert!(budget.take(6));
+        assert!(!budget.take(1));
+        assert!(budget.take(0));
+    }
+
+    #[test]
+    fn sized_decode_reports_the_unpacked_json() {
+        let json = release_json(3, "deployed", 3);
+        let payload = encode_release(&json);
+        let (release, size) = decode_release_sized(payload.as_bytes()).unwrap();
+        assert_eq!(release.revision, 3);
+        assert_eq!(size, serde_json::to_vec(&json).unwrap().len() as u64);
     }
 }

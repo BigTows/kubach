@@ -8,7 +8,8 @@
 use std::fmt;
 use std::io::Read;
 
-use pgp::composed::{Deserializable as _, DetachedSignature, SignedPublicKey};
+use pgp::composed::{Deserializable as _, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
+use pgp::crypto::hash::HashAlgorithm;
 use pgp::packet::{Signature, SignatureType};
 use pgp::types::{KeyDetails as _, SignedUser, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,8 @@ pub enum SignatureError {
     Expired { signer: String },
     #[error("the key {signer} is revoked")]
     Revoked { signer: String },
+    #[error("the signature uses the {algorithm} hash, which Kubach does not accept")]
+    WeakHash { algorithm: String },
 }
 
 /// Who made a valid signature.
@@ -100,8 +103,10 @@ impl Keyring {
     /// Checks the detached `signature` (armored `.asc`, or binary `.sig`
     /// as the AWS CLI publishes) over `data` and returns the
     /// signer. The issuer must be a primary key of the keyring or one of
-    /// its signing subkeys with a valid binding; the key must not be
-    /// revoked or expired at the signature's creation time.
+    /// its signing subkeys with a valid binding; neither the primary key
+    /// nor the subkey that signed may be revoked, or expired at the
+    /// signature's creation time. The signature must be made over a
+    /// SHA-2 (256 bits or more) or SHA-3 hash of the data.
     pub fn verify(&self, signature: &[u8], data: impl Read) -> Result<Signer, SignatureError> {
         let signature = parse_detached(signature)?;
         if !matches!(
@@ -111,6 +116,13 @@ impl Keyring {
             return Err(SignatureError::Malformed(
                 "not a signature over a file".into(),
             ));
+        }
+        if !signature.hash_alg().is_some_and(accepted_hash) {
+            return Err(SignatureError::WeakHash {
+                algorithm: signature
+                    .hash_alg()
+                    .map_or_else(|| "unknown".to_owned(), |hash| hash.to_string()),
+            });
         }
         let created = signature
             .created()
@@ -133,7 +145,11 @@ impl Keyring {
             Component::Subkey(ix) => signature.verify(&key.public_subkeys[ix], data),
         }
         .map_err(|e| invalid(e.to_string()))?;
-        if revoked(key) {
+        let subkey_revoked = match component {
+            Component::Primary => false,
+            Component::Subkey(ix) => subkey_revoked(key, ix),
+        };
+        if revoked(key) || subkey_revoked {
             return Err(SignatureError::Revoked {
                 signer: signer.to_string(),
             });
@@ -173,7 +189,7 @@ impl Keyring {
                 return Some((key, Component::Primary));
             }
             for (ix, subkey) in key.public_subkeys.iter().enumerate() {
-                let signs = subkey.signatures.iter().any(|sig| sig.key_flags().sign());
+                let signs = bindings(subkey).any(|sig| sig.key_flags().sign());
                 if signs
                     && matches(subkey.key.fingerprint(), subkey.key.legacy_key_id())
                     && subkey.verify_bindings(&key.primary_key).is_ok()
@@ -246,6 +262,40 @@ fn issuer(signature: &Signature) -> String {
     )
 }
 
+/// Hashes a signature over a release file may use: SHA-2 from 256 bits
+/// and SHA-3. MD5, SHA-1, RIPEMD-160 and SHA-224 are not accepted, whatever
+/// the library still verifies.
+fn accepted_hash(hash: HashAlgorithm) -> bool {
+    matches!(
+        hash,
+        HashAlgorithm::Sha256
+            | HashAlgorithm::Sha384
+            | HashAlgorithm::Sha512
+            | HashAlgorithm::Sha3_256
+            | HashAlgorithm::Sha3_512
+    )
+}
+
+/// The binding signatures of `subkey` (its other signatures are
+/// revocations).
+fn bindings(subkey: &SignedPublicSubKey) -> impl Iterator<Item = &Signature> {
+    subkey
+        .signatures
+        .iter()
+        .filter(|sig| sig.typ() == Some(SignatureType::SubkeyBinding))
+}
+
+/// A verified revocation signature by the primary key on subkey `ix`.
+fn subkey_revoked(key: &SignedPublicKey, ix: usize) -> bool {
+    let subkey = &key.public_subkeys[ix];
+    subkey.signatures.iter().any(|sig| {
+        sig.typ() == Some(SignatureType::SubkeyRevocation)
+            && sig
+                .verify_subkey_binding(&key.primary_key, &subkey.key)
+                .is_ok()
+    })
+}
+
 /// A verified key revocation signature on the primary key.
 fn revoked(key: &SignedPublicKey) -> bool {
     key.details
@@ -273,10 +323,7 @@ fn primary_expiry(key: &SignedPublicKey) -> Option<u32> {
 /// When subkey `ix` expires, from its newest binding signature.
 fn subkey_expiry(key: &SignedPublicKey, ix: usize) -> Option<u32> {
     let subkey = &key.public_subkeys[ix];
-    let newest = subkey
-        .signatures
-        .iter()
-        .max_by_key(|sig| sig.created().map(Timestamp::as_secs))?;
+    let newest = bindings(subkey).max_by_key(|sig| sig.created().map(Timestamp::as_secs))?;
     expiry(subkey.key.created_at(), newest)
 }
 
@@ -291,18 +338,29 @@ pub(crate) mod test_keys {
 
     use pgp::composed::{
         DetachedSignature, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
-        SignedSecretKey,
+        SignedSecretKey, SubkeyParamsBuilder,
     };
     use pgp::crypto::hash::HashAlgorithm;
-    use pgp::types::Password;
+    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    use pgp::types::{KeyDetails as _, Password, Timestamp};
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::SeedableRng as _;
 
     /// An Ed25519 signing key for `user`, from a fixed seed.
     pub fn secret_key(user: &str, seed: u64) -> SignedSecretKey {
+        secret_key_of(KeyType::Ed25519, user, seed)
+    }
+
+    /// An RSA signing key (as most release keys are): unlike Ed25519, the
+    /// library signs and verifies RSA over any hash.
+    pub fn rsa_secret_key(user: &str, seed: u64) -> SignedSecretKey {
+        secret_key_of(KeyType::Rsa(2048), user, seed)
+    }
+
+    fn secret_key_of(key_type: KeyType, user: &str, seed: u64) -> SignedSecretKey {
         let mut params = SecretKeyParamsBuilder::default();
         params
-            .key_type(KeyType::Ed25519)
+            .key_type(key_type)
             .can_certify(true)
             .can_sign(true)
             .can_encrypt(EncryptionCaps::None)
@@ -323,9 +381,47 @@ pub(crate) mod test_keys {
 
     /// An armored detached signature of `data` by `key`.
     pub fn sign(key: &SignedSecretKey, data: &[u8]) -> Vec<u8> {
+        sign_hashed(key, HashAlgorithm::Sha256, data)
+    }
+
+    /// [`sign`] over the given hash of `data`.
+    pub fn sign_hashed(key: &SignedSecretKey, hash: HashAlgorithm, data: &[u8]) -> Vec<u8> {
         DetachedSignature::sign_binary_data(
             ChaCha8Rng::seed_from_u64(7),
             &key.primary_key,
+            &Password::empty(),
+            hash,
+            data,
+        )
+        .unwrap()
+        .to_armored_bytes(Default::default())
+        .unwrap()
+    }
+
+    /// A certifying Ed25519 key for `user` with one signing subkey.
+    pub fn secret_key_with_signing_subkey(user: &str, seed: u64) -> SignedSecretKey {
+        let mut subkey = SubkeyParamsBuilder::default();
+        subkey.key_type(KeyType::Ed25519).can_sign(true);
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .key_type(KeyType::Ed25519)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::None)
+            .primary_user_id(user.into())
+            .subkey(subkey.build().unwrap());
+        params
+            .build()
+            .unwrap()
+            .generate(ChaCha8Rng::seed_from_u64(seed))
+            .unwrap()
+    }
+
+    /// An armored detached signature of `data` by the first subkey of `key`.
+    pub fn sign_with_subkey(key: &SignedSecretKey, data: &[u8]) -> Vec<u8> {
+        DetachedSignature::sign_binary_data(
+            ChaCha8Rng::seed_from_u64(7),
+            &key.secret_subkeys[0].key,
             &Password::empty(),
             HashAlgorithm::Sha256,
             data,
@@ -333,6 +429,35 @@ pub(crate) mod test_keys {
         .unwrap()
         .to_armored_bytes(Default::default())
         .unwrap()
+    }
+
+    /// The public key of `key`, armored, with its first subkey revoked by
+    /// the primary key.
+    pub fn armored_public_with_revoked_subkey(key: &SignedSecretKey) -> String {
+        let mut public = SignedPublicKey::from(key.clone());
+        let mut config = SignatureConfig::from_key(
+            ChaCha8Rng::seed_from_u64(8),
+            &key.primary_key,
+            SignatureType::SubkeyRevocation,
+        )
+        .unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                key.primary_key.fingerprint(),
+            ))
+            .unwrap(),
+        ];
+        let revocation = config
+            .sign_subkey_binding(
+                &key.primary_key,
+                &public.primary_key,
+                &Password::empty(),
+                &public.public_subkeys[0].key,
+            )
+            .unwrap();
+        public.public_subkeys[0].signatures.push(revocation);
+        public.to_armored_string(Default::default()).unwrap()
     }
 
     /// A binary detached signature (`.sig`, as the AWS CLI publishes).
@@ -353,8 +478,63 @@ pub(crate) mod test_keys {
 
 #[cfg(test)]
 mod tests {
-    use super::test_keys::{armored_public, secret_key, sign, sign_binary};
+    use super::test_keys::{
+        armored_public, armored_public_with_revoked_subkey, rsa_secret_key, secret_key,
+        secret_key_with_signing_subkey, sign, sign_binary, sign_hashed, sign_with_subkey,
+    };
     use super::*;
+
+    #[test]
+    fn weak_hashes_are_refused() {
+        let key = rsa_secret_key("A <a@example.com>", 5);
+        let keyring = Keyring::from_armored(&armored_public(&key));
+        let data = b"archive bytes";
+        for (hash, name) in [
+            (HashAlgorithm::Sha1, "SHA1"),
+            (HashAlgorithm::Md5, "MD5"),
+            (HashAlgorithm::Ripemd160, "RIPEMD160"),
+            (HashAlgorithm::Sha224, "SHA224"),
+        ] {
+            assert_eq!(
+                keyring.verify(&sign_hashed(&key, hash, data), &data[..]),
+                Err(SignatureError::WeakHash {
+                    algorithm: name.into()
+                }),
+                "{name}"
+            );
+        }
+        for hash in [
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha3_256,
+            HashAlgorithm::Sha3_512,
+        ] {
+            keyring
+                .verify(&sign_hashed(&key, hash, data), &data[..])
+                .unwrap_or_else(|error| panic!("{hash}: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_revoked_subkey_does_not_sign() {
+        let key = secret_key_with_signing_subkey("Sub <sub@example.com>", 6);
+        let data = b"archive bytes";
+        let signature = sign_with_subkey(&key, data);
+
+        let keyring = Keyring::from_armored(&armored_public(&key));
+        let signer = keyring.verify(&signature, &data[..]).unwrap();
+        assert_eq!(signer.user_id, "Sub <sub@example.com>");
+        // Named by the primary key, not the subkey that signed.
+        assert_eq!(signer.fingerprint, keyring.fingerprints()[0]);
+
+        let revoked = Keyring::from_armored(&armored_public_with_revoked_subkey(&key));
+        assert_eq!(revoked.fingerprints(), keyring.fingerprints());
+        assert!(matches!(
+            revoked.verify(&signature, &data[..]),
+            Err(SignatureError::Revoked { .. })
+        ));
+    }
 
     #[test]
     fn verifies_binary_signatures() {

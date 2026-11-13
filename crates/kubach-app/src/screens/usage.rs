@@ -10,13 +10,30 @@ use kubach_core::ResourceKind;
 use kubach_core::metrics::prometheus::{Endpoint, Prometheus};
 use kubach_core::metrics::shared::{PollResult, PollScope, PollSubscription};
 use kubach_core::metrics::{
-    self, DEFAULT_POLL_INTERVAL, MetricsError, MetricsIndex, Polling, format_cpu, format_memory,
+    self, DEFAULT_POLL_INTERVAL, MetricsError, MetricsIndex, Polling, Usage, format_cpu,
+    format_memory,
 };
 use kubach_i18n::t;
 use kubach_ui::{ResourceCell, ResourceColumn};
 use kube::api::DynamicObject;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::prometheus_link::{PrometheusStatus, doesnt_answer};
+
+/// The usage of a feed as rows are built from it.
+#[derive(Clone, Copy)]
+pub struct UsageView<'a> {
+    pub state: &'a MetricsState,
+    /// Another one for another `state`, also of another feed.
+    pub revision: u64,
+}
+
+/// A revision no state had before: a view that gets another feed (a cached
+/// list going live) never takes its usage for the one already shown.
+fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Kinds that get usage columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +111,10 @@ pub struct UsageFeed {
     pub kind: UsageKind,
     /// `None` while looking for Prometheus, or when there is no source.
     pub source: Option<UsageSource>,
-    pub state: MetricsState,
+    state: MetricsState,
+    /// Names this `state` among the states of all feeds: rows whose usage
+    /// cells show one revision need them looked at again only for another.
+    revision: u64,
     /// Prometheus feeds: the server being polled.
     polling: Option<Endpoint>,
     /// Prometheus feeds: why there is no server to poll (it doesn't answer,
@@ -110,6 +130,7 @@ impl UsageFeed {
             kind,
             source: Some(UsageSource::MetricsServer),
             state: MetricsState::Loading,
+            revision: next_revision(),
             polling: None,
             problem: None,
             _task: Some(task),
@@ -122,9 +143,23 @@ impl UsageFeed {
             kind,
             source: None,
             state: MetricsState::Loading,
+            revision: next_revision(),
             polling: None,
             problem: None,
             _task: None,
+        }
+    }
+
+    /// The usage as of a new poll.
+    pub fn set_state(&mut self, state: MetricsState) {
+        self.state = state;
+        self.revision = next_revision();
+    }
+
+    pub fn view(&self) -> UsageView<'_> {
+        UsageView {
+            state: &self.state,
+            revision: self.revision,
         }
     }
 
@@ -167,7 +202,7 @@ impl UsageFeed {
             Some(endpoint) => {
                 self.polling = Some(endpoint.clone());
                 self.source = Some(UsageSource::Prometheus);
-                self.state = MetricsState::Loading;
+                self.set_state(MetricsState::Loading);
                 self._task = None;
                 true
             }
@@ -175,11 +210,11 @@ impl UsageFeed {
                 self.polling = None;
                 self.source = None;
                 self._task = None;
-                self.state = if pending {
+                self.set_state(if pending {
                     MetricsState::Loading
                 } else {
                     MetricsState::Unavailable
-                };
+                });
                 false
             }
         }
@@ -253,11 +288,16 @@ pub fn columns() -> [ResourceColumn; 2] {
     ]
 }
 
-pub fn cells(state: &MetricsState, object: &DynamicObject) -> [ResourceCell; 2] {
-    let usage = match state {
+/// The usage `state` has for `object`; `None` without a sample.
+pub fn usage_of(state: &MetricsState, object: &DynamicObject) -> Option<Usage> {
+    match state {
         MetricsState::Ready(index) => index.usage_of(object),
         _ => None,
-    };
+    }
+}
+
+/// The CPU and Memory cells of an object with `usage`.
+pub fn usage_cells(usage: Option<Usage>) -> [ResourceCell; 2] {
     match usage {
         Some(usage) => [
             ResourceCell::mono(format_cpu(usage.cpu)).sort_by(saturate(usage.cpu)),
@@ -285,7 +325,9 @@ mod tests {
 
     use kubach_core::metrics::shared::{PollScope, Polled};
 
-    use super::{MetricsState, UsageFeed, UsageKind, UsageSource, cells, poll_scope};
+    use super::{
+        MetricsState, UsageFeed, UsageKind, UsageSource, poll_scope, usage_cells, usage_of,
+    };
     use crate::screens::prometheus_link::PrometheusStatus;
 
     fn service(name: &str) -> Endpoint {
@@ -307,7 +349,7 @@ mod tests {
         assert_eq!(feed.source, Some(UsageSource::MetricsServer));
         assert!(!matches!(feed.state, MetricsState::Unavailable));
         assert_eq!(feed.note().as_deref(), Some("metrics-server"));
-        feed.state = MetricsState::Unavailable;
+        feed.set_state(MetricsState::Unavailable);
         assert_eq!(feed.note().as_deref(), Some("metrics unavailable"));
     }
 
@@ -364,13 +406,13 @@ mod tests {
         // A server that answered the probe stops answering polls.
         assert!(feed.retarget(Some(&service("p")), false, None));
         let failed = Err(MetricsError::Unavailable("timeout".into()));
-        feed.state = MetricsState::from_result(failed);
+        feed.set_state(MetricsState::from_result(failed));
         assert_eq!(
             feed.note().as_deref(),
             Some("Prometheus at monitoring/p:web doesn't answer")
         );
         // It answers again.
-        feed.state = MetricsState::Ready(MetricsIndex::default());
+        feed.set_state(MetricsState::Ready(MetricsIndex::default()));
         assert_eq!(feed.note().as_deref(), Some("Prometheus"));
     }
 
@@ -413,10 +455,11 @@ mod tests {
                 memory: 512 << 20,
             },
         }]);
-        let [cpu, memory] = cells(&MetricsState::Ready(index), &node);
+        let cells = |state: &MetricsState| usage_cells(usage_of(state, &node));
+        let [cpu, memory] = cells(&MetricsState::Ready(index));
         assert_eq!(cpu.label().as_ref(), "0.250");
         assert_eq!(memory.label().as_ref(), "512.0 MiB");
-        let [cpu, _] = cells(&MetricsState::Unavailable, &node);
+        let [cpu, _] = cells(&MetricsState::Unavailable);
         assert_eq!(cpu.label().as_ref(), "—");
     }
 }

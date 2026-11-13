@@ -21,12 +21,15 @@ mod policy;
 // Kinds that were generic until #294.
 mod admission;
 mod crd;
+mod decode;
 mod rbac;
 mod refgrant;
 pub mod vpa;
 
 #[cfg(test)]
 mod action_tests;
+
+pub(crate) use decode::{decode, decode_or_err};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,7 +41,6 @@ use kube::api::{
 };
 use kube::discovery::Scope;
 use kube::{Client, Resource};
-use serde::de::DeserializeOwned;
 
 pub use admission::WebhookConfigurationPlugin;
 pub use autoscaling::HorizontalPodAutoscalerPlugin;
@@ -256,18 +258,6 @@ pub(crate) const PORT_FORWARD_ACTION: Action = Action::stream(
 );
 
 pub(crate) const DELETE_ACTION: Action = Action::api(action::DELETE, "Delete", true);
-
-/// Decodes a dynamic object into a typed one.
-pub(crate) fn decode<K: DeserializeOwned>(obj: &DynamicObject) -> Option<K> {
-    serde_json::to_value(obj)
-        .ok()
-        .and_then(|v| serde_json::from_value(v).ok())
-}
-
-pub(crate) fn decode_or_err<K: DeserializeOwned>(obj: &DynamicObject) -> Result<K, PluginError> {
-    let value = serde_json::to_value(obj).map_err(|e| PluginError::InvalidObject(e.to_string()))?;
-    serde_json::from_value(value).map_err(|e| PluginError::InvalidObject(e.to_string()))
-}
 
 /// Cells for an object that could not be decoded: name, namespace and age
 /// where the column ids match, empty text elsewhere.

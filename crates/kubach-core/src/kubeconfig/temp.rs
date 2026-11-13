@@ -10,18 +10,40 @@
 //! `<config dir>/run/kubeconfig` (`0700`) and not in the shared temp folder,
 //! and is removed when its tab closes, when Kubach quits and, for files left
 //! by a crash, on the next start.
+//!
+//! Whose file it is: the name carries the writer's process id and a token
+//! the process picks once, and the process keeps a lock on a marker file
+//! named after both for as long as it lives (in `kubeconfig.owners` next
+//! to the folder, which so holds nothing but kubeconfigs). A file is left over when its
+//! process id is gone, or when the marker is no longer locked: the system
+//! releases the lock with the process, whoever got its process id next.
 
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kube::config::Kubeconfig;
 use zeroize::Zeroizing;
 
-/// File name prefix: `terminal-<pid>-<n>.yaml`.
+/// File name prefix: `terminal-<pid>-<token>-<n>.yaml` (`terminal-<pid>-<n>.yaml`
+/// when the marker could not be locked, and from Kubach before the marker).
 const PREFIX: &str = "terminal-";
 const SUFFIX: &str = ".yaml";
+/// Marker of a writer process: `owner-<pid>-<token>.lock` in
+/// [`marker_dir`], locked while it lives.
+const MARKER_PREFIX: &str = "owner-";
+const MARKER_SUFFIX: &str = ".lock";
+
+/// Where the markers of the writers of `dir` are: `<dir>.owners` next to
+/// it. `None` for a path without a name.
+fn marker_dir(dir: &Path) -> Option<PathBuf> {
+    let mut name = dir.file_name()?.to_owned();
+    name.push(".owners");
+    Some(dir.with_file_name(name))
+}
 
 /// `run/kubeconfig` in the config directory (`KUBACH_CONFIG_DIR` overrides
 /// it). Not under `cache`, which "Clear cache" removes while tabs are open.
@@ -99,7 +121,16 @@ impl TempKubeconfig {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         crate::settings::create_private_dir(dir)?;
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{PREFIX}{}-{n}{SUFFIX}", std::process::id()));
+        // Without the marker (a file system without locks) the file is
+        // named the old way and only the process id tells whose it is.
+        let writer = match hold_marker(dir) {
+            Ok(()) => Writer::own(),
+            Err(_) => Writer {
+                token: None,
+                ..Writer::own()
+            },
+        };
+        let path = dir.join(writer.file_name(n));
         let mut file = create_private_file(&path)?;
         // From here on the file is ours to remove, also on errors below.
         let this = Self { path };
@@ -139,12 +170,149 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
-/// Process id in a file name written by [`TempKubeconfig::create`].
-fn owner_pid(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
-    let (pid, n) = rest.split_once('-')?;
-    n.parse::<u64>().ok()?;
-    pid.parse().ok()
+/// The process that wrote a file, from its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Writer {
+    pid: u32,
+    /// Picked once per process; `None` for a file without a marker.
+    token: Option<u64>,
+}
+
+impl Writer {
+    /// This process.
+    fn own() -> Self {
+        static TOKEN: OnceLock<u64> = OnceLock::new();
+        let token = *TOKEN.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos() as u64)
+        });
+        Self {
+            pid: std::process::id(),
+            token: Some(token),
+        }
+    }
+
+    fn file_name(self, n: u64) -> String {
+        match self.token {
+            Some(token) => format!("{PREFIX}{}-{token}-{n}{SUFFIX}", self.pid),
+            None => format!("{PREFIX}{}-{n}{SUFFIX}", self.pid),
+        }
+    }
+
+    /// The writer of a file named by [`Writer::file_name`].
+    fn of_file(name: &str) -> Option<Self> {
+        let rest = name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+        let parts: Vec<&str> = rest.split('-').collect();
+        let (pid, token, n) = match parts.as_slice() {
+            [pid, n] => (pid, None, n),
+            [pid, token, n] => (pid, Some(token.parse().ok()?), n),
+            _ => return None,
+        };
+        n.parse::<u64>().ok()?;
+        Some(Self {
+            pid: pid.parse().ok()?,
+            token,
+        })
+    }
+
+    /// `owner-<pid>-<token>.lock`; `None` for a writer without a token.
+    fn marker_name(self) -> Option<String> {
+        self.token
+            .map(|token| format!("{MARKER_PREFIX}{}-{token}{MARKER_SUFFIX}", self.pid))
+    }
+
+    /// The writer a marker file is named after.
+    fn of_marker(name: &str) -> Option<Self> {
+        let rest = name
+            .strip_prefix(MARKER_PREFIX)?
+            .strip_suffix(MARKER_SUFFIX)?;
+        let (pid, token) = rest.split_once('-')?;
+        Some(Self {
+            pid: pid.parse().ok()?,
+            token: Some(token.parse().ok()?),
+        })
+    }
+
+    /// Whether the writer is gone, so its files are left over. `alive`
+    /// tells whether a process id is in use.
+    ///
+    /// A live Kubach always holds the lock on its marker, so its files are
+    /// never taken for leftovers: a marker that is locked, missing or
+    /// unreadable leaves the answer to the process id alone, as for files
+    /// without a token.
+    fn is_gone(self, dir: &Path, alive: impl Fn(u32) -> bool) -> bool {
+        let own = Self::own();
+        if self == own {
+            return false;
+        }
+        if !alive(self.pid) {
+            return true;
+        }
+        match self.marker_name() {
+            // This process id with another token: an earlier process.
+            Some(_) if self.pid == own.pid => true,
+            Some(marker) => {
+                marker_dir(dir).is_some_and(|markers| marker_released(&markers.join(marker)))
+            }
+            None => false,
+        }
+    }
+}
+
+/// Markers this process holds locked, by path, until it exits.
+static HELD: Mutex<Vec<(PathBuf, fs::File)>> = Mutex::new(Vec::new());
+
+/// Makes sure this process holds the lock on its marker for `dir`.
+fn hold_marker(dir: &Path) -> io::Result<()> {
+    let (Some(markers), Some(name)) = (marker_dir(dir), Writer::own().marker_name()) else {
+        return Err(io::Error::other("no place for a marker"));
+    };
+    crate::settings::create_private_dir(&markers)?;
+    let path = markers.join(name);
+    let mut held = crate::sync::lock(&HELD);
+    if held.iter().any(|(held, _)| held == &path) && path.exists() {
+        return Ok(());
+    }
+    held.retain(|(held, _)| held != &path);
+    // A cleanup of another Kubach may look at the marker between its
+    // creation and its lock, and remove it: then the lock is on a file
+    // nobody finds, and the marker is made again.
+    for _ in 0..5 {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) if path.exists() => {
+                held.push((path, file));
+                return Ok(());
+            }
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Err(io::Error::other("the marker of this process stays locked"))
+}
+
+/// Whether nobody holds the lock on the marker at `path`: the process that
+/// made it is gone. A marker that is missing or can't be opened says
+/// nothing (`false`).
+fn marker_released(path: &Path) -> bool {
+    fs::File::open(path).is_ok_and(|file| file.try_lock().is_ok())
+}
+
+/// Removes the marker at `path` if its process is gone (checked under the
+/// lock, so a marker being taken is not removed).
+fn remove_released_marker(path: &Path) {
+    if let Ok(file) = fs::File::open(path)
+        && file.try_lock().is_ok()
+    {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Whether process `pid` still runs on this machine.
@@ -183,9 +351,9 @@ pub(crate) fn is_alive(pid: u32) -> bool {
     false
 }
 
-/// Removes the files in `dir` whose writer process is `stale`; returns how
-/// many were removed.
-fn remove_where(dir: &Path, stale: impl Fn(u32) -> bool) -> usize {
+/// Removes the files in `dir` whose writer is `stale`; returns how many
+/// were removed.
+fn remove_where(dir: &Path, stale: impl Fn(Writer) -> bool) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
@@ -195,22 +363,47 @@ fn remove_where(dir: &Path, stale: impl Fn(u32) -> bool) -> usize {
             entry
                 .file_name()
                 .to_str()
-                .and_then(owner_pid)
+                .and_then(Writer::of_file)
                 .is_some_and(&stale)
         })
         .filter(|entry| fs::remove_file(entry.path()).is_ok())
         .count()
 }
 
-/// At startup: removes files of Kubach processes that are gone.
+/// At startup: removes files of Kubach processes that are gone (see the
+/// module docs for how that is told), then their markers.
 pub fn remove_orphans(dir: &Path) -> usize {
-    remove_where(dir, |pid| !is_alive(pid))
+    remove_orphans_with(dir, is_alive)
 }
 
-/// At quit: removes every file this process wrote.
+fn remove_orphans_with(dir: &Path, alive: impl Fn(u32) -> bool) -> usize {
+    let removed = remove_where(dir, |writer| writer.is_gone(dir, &alive));
+    let own = Writer::own();
+    let markers = marker_dir(dir).and_then(|markers| fs::read_dir(markers).ok());
+    for entry in markers.into_iter().flatten().flatten() {
+        let other = entry
+            .file_name()
+            .to_str()
+            .and_then(Writer::of_marker)
+            .is_some_and(|writer| writer != own);
+        if other {
+            remove_released_marker(&entry.path());
+        }
+    }
+    removed
+}
+
+/// At quit: removes every file this process wrote, and its marker.
 pub fn remove_own(dir: &Path) -> usize {
-    let own = std::process::id();
-    remove_where(dir, |pid| pid == own)
+    let own = Writer::own();
+    let removed = remove_where(dir, |writer| writer.pid == own.pid);
+    if let (Some(markers), Some(name)) = (marker_dir(dir), own.marker_name()) {
+        let path = markers.join(name);
+        // Closed before it is removed: Windows keeps an open file's name.
+        crate::sync::lock(&HELD).retain(|(held, _)| held != &path);
+        let _ = fs::remove_file(path);
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -333,6 +526,17 @@ contexts:
         assert!(second.path().exists());
     }
 
+    /// Names of the files in `dir`.
+    fn kubeconfigs(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn file_is_removed_when_a_panic_unwinds() {
         let root = tempfile::tempdir().unwrap();
@@ -344,24 +548,27 @@ contexts:
             panic!("helm's caller panicked");
         });
         assert!(panicked.is_err());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(kubeconfigs(&dir).is_empty());
     }
 
     #[test]
     fn removes_orphans_and_own_files_only() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path();
+        let dir = &root.path().join("kubeconfig");
+        fs::create_dir(dir).unwrap();
         let own = std::process::id();
         // No process has this id: pids are below 2^22 on Linux, 99999 on macOS.
         let gone = 4_000_000_000u32;
         let write = |name: &str| fs::write(dir.join(name), "x").unwrap();
         write(&format!("terminal-{own}-0.yaml"));
         write(&format!("terminal-{gone}-3.yaml"));
+        write(&format!("terminal-{gone}-17-4.yaml"));
         write("terminal-x-1.yaml");
         write("notes.txt");
 
-        assert_eq!(remove_orphans(dir), 1);
+        assert_eq!(remove_orphans(dir), 2);
         assert!(!dir.join(format!("terminal-{gone}-3.yaml")).exists());
+        assert!(!dir.join(format!("terminal-{gone}-17-4.yaml")).exists());
         assert!(dir.join(format!("terminal-{own}-0.yaml")).exists());
         assert_eq!(remove_own(dir), 1);
         assert!(!dir.join(format!("terminal-{own}-0.yaml")).exists());
@@ -370,10 +577,110 @@ contexts:
         assert_eq!(remove_orphans(&dir.join("missing")), 0);
     }
 
+    /// A process id that is in use again does not keep the files of the
+    /// process that had it before: its marker is no longer locked.
     #[test]
-    fn parses_owner_pid() {
-        assert_eq!(owner_pid("terminal-42-7.yaml"), Some(42));
-        assert_eq!(owner_pid("terminal-42.yaml"), None);
-        assert_eq!(owner_pid("other-42-7.yaml"), None);
+    fn a_reused_process_id_does_not_keep_leftovers() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = &root.path().join("kubeconfig");
+        let markers = &marker_dir(dir).unwrap();
+        assert_eq!(markers, &root.path().join("kubeconfig.owners"));
+        fs::create_dir(dir).unwrap();
+        fs::create_dir(markers).unwrap();
+        let write = |name: &str| fs::write(dir.join(name), "x").unwrap();
+        let mark = |name: &str| fs::write(markers.join(name), "").unwrap();
+        // Every process id "runs": only the markers tell.
+        let alive = |_: u32| true;
+
+        // Gone: the marker is there and nobody holds it.
+        write("terminal-700-11-0.yaml");
+        write("terminal-700-11-1.yaml");
+        mark("owner-700-11.lock");
+        // Live: its marker is locked.
+        write("terminal-701-12-0.yaml");
+        mark("owner-701-12.lock");
+        let live = fs::File::open(markers.join("owner-701-12.lock")).unwrap();
+        live.try_lock().unwrap();
+        // No marker and no token: the process id alone decides, as before.
+        write("terminal-702-13-0.yaml");
+        write("terminal-703-0.yaml");
+        // This process id under another token: an earlier process.
+        write(&format!("terminal-{}-1-0.yaml", std::process::id()));
+
+        assert_eq!(remove_orphans_with(dir, alive), 3);
+        assert_eq!(
+            kubeconfigs(dir),
+            [
+                "terminal-701-12-0.yaml",
+                "terminal-702-13-0.yaml",
+                "terminal-703-0.yaml"
+            ]
+        );
+        assert!(!markers.join("owner-700-11.lock").exists());
+        assert!(markers.join("owner-701-12.lock").exists());
+
+        // The live process exits: the system drops its lock.
+        drop(live);
+        assert_eq!(remove_orphans_with(dir, alive), 1);
+        assert!(!markers.join("owner-701-12.lock").exists());
+        // A process id that is gone needs no marker.
+        assert_eq!(remove_orphans_with(dir, |_| false), 2);
+        assert!(kubeconfigs(dir).is_empty());
+    }
+
+    #[test]
+    fn own_files_are_marked_and_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("kubeconfig");
+        let single = single_context(&config(), "prod", None).unwrap();
+        let file = TempKubeconfig::create(&dir, &single).unwrap();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let own = Writer::own();
+        assert_eq!(Writer::of_file(&name), Some(own));
+        let marker = marker_dir(&dir).unwrap().join(own.marker_name().unwrap());
+        assert!(marker.exists());
+        // The folder itself holds nothing but the kubeconfig.
+        assert_eq!(kubeconfigs(&dir), std::slice::from_ref(&name));
+        // Locked: another look at the marker does not get the lock.
+        assert!(!marker_released(&marker));
+
+        assert_eq!(remove_orphans_with(&dir, |_| true), 0);
+        assert_eq!(remove_orphans_with(&dir, |_| false), 0);
+        assert!(file.path().exists() && marker.exists());
+
+        // Quit removes the files and the marker; a later file marks again.
+        assert_eq!(remove_own(&dir), 1);
+        assert!(!file.path().exists() && !marker.exists());
+        let again = TempKubeconfig::create(&dir, &single).unwrap();
+        assert!(marker.exists());
+        assert!(!marker_released(&marker));
+        drop(again);
+        assert_eq!(remove_own(&dir), 0);
+    }
+
+    #[test]
+    fn parses_writers_from_names() {
+        let writer = |pid, token| Some(Writer { pid, token });
+        assert_eq!(Writer::of_file("terminal-42-7.yaml"), writer(42, None));
+        assert_eq!(
+            Writer::of_file("terminal-42-99-7.yaml"),
+            writer(42, Some(99))
+        );
+        assert_eq!(Writer::of_file("terminal-42.yaml"), None);
+        assert_eq!(Writer::of_file("terminal-42-x-7.yaml"), None);
+        assert_eq!(Writer::of_file("terminal-1-2-3-4.yaml"), None);
+        assert_eq!(Writer::of_file("other-42-7.yaml"), None);
+        assert_eq!(Writer::of_marker("owner-42-99.lock"), writer(42, Some(99)));
+        assert_eq!(Writer::of_marker("owner-42.lock"), None);
+        assert_eq!(Writer::of_marker("terminal-42-99-7.yaml"), None);
+        let own = Writer::own();
+        assert_eq!(Writer::of_file(&own.file_name(3)), Some(own));
+        assert_eq!(Writer::of_marker(&own.marker_name().unwrap()), Some(own));
     }
 }

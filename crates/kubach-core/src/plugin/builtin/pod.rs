@@ -927,6 +927,13 @@ impl ResourcePlugin for PodPlugin {
         self.cells_at(obj, Timestamp::now())
     }
 
+    /// The status counts a pod as stuck from the first whole second after
+    /// its deletion deadline (see `diagnostics::diagnose_at`).
+    fn cells_turn_at(&self, obj: &DynamicObject) -> Option<Timestamp> {
+        let deadline = obj.metadata.deletion_timestamp.as_ref()?.0;
+        Timestamp::from_second(deadline.as_second() + 1).ok()
+    }
+
     fn details(&self, obj: &DynamicObject) -> Vec<DetailSection> {
         self.details_at(obj, Timestamp::now())
     }

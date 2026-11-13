@@ -61,6 +61,8 @@ kubeconfig-review-file-cluster = 集群 { $owner }，{ $key }
 kubeconfig-review-file-user = 用户 { $owner }，{ $key }
 kubeconfig-review-file-cluster-outside = 集群 { $owner }，{ $key }（在 kubeconfig 所在文件夹之外）
 kubeconfig-review-file-user-outside = 用户 { $owner }，{ $key }（在 kubeconfig 所在文件夹之外）
+kubeconfig-review-connection = 此配置更改了 Kubach 连接这些集群的方式：不验证服务器证书、通过代理连接，或按其他名称验证证书。仅在你预期如此时才继续。
+kubeconfig-review-connection-setting = 集群 { $cluster }，{ $key }
 
 ## “测试连接”失败
 
