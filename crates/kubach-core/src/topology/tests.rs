@@ -1000,7 +1000,12 @@ mod live {
             resource("apps", "v1", "Deployment", "deployments"),
             resource("apps", "v1", "ReplicaSet", "replicasets"),
             resource("networking.k8s.io", "v1", "Ingress", "ingresses"),
-            resource("networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies"),
+            resource(
+                "networking.k8s.io",
+                "v1",
+                "NetworkPolicy",
+                "networkpolicies",
+            ),
         ]);
         let namespaces = ["shop".to_string(), "other".to_string(), "third".to_string()];
         let source = TopologySource::subscribe(&cache, &catalog, Some(&namespaces));

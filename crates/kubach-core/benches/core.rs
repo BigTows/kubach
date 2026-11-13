@@ -19,7 +19,7 @@ use kubach_core::list_cache::{CachedKind, Limits, ListCache, ListKey};
 use kubach_core::perf::{self, ClusterSize, PodShape};
 use kubach_core::plugin::PluginRegistry;
 use kubach_core::topology::netpol::{self, PolicySet};
-use kubach_core::topology::{BuildOptions, Detail, TopologyBuilder, TopologyInput};
+use kubach_core::topology::{BuildOptions, Detail, SourceKind, TopologyBuilder, TopologyInput};
 
 const SHAPES: [(&str, PodShape); 3] = [
     ("full", PodShape::FULL),
@@ -155,6 +155,18 @@ fn merge_namespaces(c: &mut Criterion) {
     group.finish();
 }
 
+/// `input` after a watch delivered a change of one pod: every list but the
+/// pods' is the same allocation, and every pod but one the same object.
+fn one_pod_changed(input: &TopologyInput) -> TopologyInput {
+    let mut pods = input.objects(SourceKind::Pod).to_vec();
+    let mut pod = DynamicObject::clone(&pods[0]);
+    perf::touch(&mut pod, 99_000_000);
+    pods[0] = Arc::new(pod);
+    let mut changed = input.clone();
+    changed.set(SourceKind::Pod, pods);
+    changed
+}
+
 /// The topology of a cluster: the first build, a rebuild with nothing
 /// changed and one after a pod changed.
 fn topology(c: &mut Criterion) {
@@ -174,14 +186,8 @@ fn topology(c: &mut Criterion) {
     ];
     for size in sizes {
         let objects = perf::cluster(size, PodShape::MANAGED);
-        let input = TopologyInput::from_objects(objects.clone());
-        let mut touched = objects;
-        let pod = touched
-            .iter_mut()
-            .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "Pod"))
-            .expect("a pod");
-        perf::touch(pod, 99_000_000);
-        let changed = TopologyInput::from_objects(touched);
+        let input = TopologyInput::from_objects(objects);
+        let changed = one_pod_changed(&input);
         let label = format!("{}pods", size.pods());
         for (detail_name, detail) in [("workloads", Detail::Workloads), ("pods", Detail::Pods)] {
             let options = BuildOptions {
@@ -213,13 +219,7 @@ fn topology(c: &mut Criterion) {
 /// median of each phase over 15 builds.
 fn phases(objects: &[DynamicObject], size: ClusterSize) {
     let input = TopologyInput::from_objects(objects.to_vec());
-    let mut touched = objects.to_vec();
-    let pod = touched
-        .iter_mut()
-        .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "Pod"))
-        .expect("a pod");
-    perf::touch(pod, 99_000_000);
-    let changed = TopologyInput::from_objects(touched);
+    let changed = one_pod_changed(&input);
     for (detail_name, detail) in [("workloads", Detail::Workloads), ("pods", Detail::Pods)] {
         let options = BuildOptions {
             detail,
@@ -272,14 +272,8 @@ fn topology_layers(c: &mut Criterion) {
     let mut objects = base.clone();
     objects.extend(perf::namespaces(size.namespaces));
     objects.extend(perf::network_policies(size, 200));
-    let mut touched = objects.clone();
-    let pod = touched
-        .iter_mut()
-        .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "Pod"))
-        .expect("a pod");
-    perf::touch(pod, 99_000_000);
     let input = TopologyInput::from_objects(objects);
-    let changed = TopologyInput::from_objects(touched);
+    let changed = one_pod_changed(&input);
     group.bench_function("policy_set/200policies", |b| {
         b.iter(|| black_box(PolicySet::from_input(&input)));
     });
@@ -322,14 +316,8 @@ fn topology_layers(c: &mut Criterion) {
         3,
         PodShape::MANAGED,
     ));
-    let mut touched = objects.clone();
-    let pod = touched
-        .iter_mut()
-        .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "Pod"))
-        .expect("a pod");
-    perf::touch(pod, 99_000_000);
     let input = TopologyInput::from_objects(objects);
-    let changed = TopologyInput::from_objects(touched);
+    let changed = one_pod_changed(&input);
     let options = BuildOptions::default();
     group.bench_function("stateful_sets/cold", |b| {
         b.iter(|| black_box(TopologyBuilder::new().build(&input, &options)));

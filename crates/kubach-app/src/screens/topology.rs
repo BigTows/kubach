@@ -1489,52 +1489,53 @@ impl TopologyScreen {
             let count = edges.len();
             // A ConfigMap every pod reads has a row per pod.
             let more = count.saturating_sub(MAX_SUMMARY_ROWS);
-            let rows = edges.into_iter().take(MAX_SUMMARY_ROWS).map(|(kind, other, label)| {
-                link_ix += 1;
-                let id = other.id.as_str().to_owned();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child(StatusDot::new(map::tone(graph, other)))
-                    .child(
-                        div().min_w_0().overflow_hidden().child(
-                            Button::new(("topology-link", link_ix))
-                                .link()
-                                .small()
-                                .label(format!("{} {}", other.kind.label(), other.name))
-                                .tooltip(t!("topology-show-on-graph"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.focus_node(id.clone(), cx)
-                                })),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_right()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(match label {
-                                Some(label) => format!("{kind} · {label}"),
-                                None => kind,
-                            }),
-                    )
-            });
+            let rows = edges
+                .into_iter()
+                .take(MAX_SUMMARY_ROWS)
+                .map(|(kind, other, label)| {
+                    link_ix += 1;
+                    let id = other.id.as_str().to_owned();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(StatusDot::new(map::tone(graph, other)))
+                        .child(
+                            div().min_w_0().overflow_hidden().child(
+                                Button::new(("topology-link", link_ix))
+                                    .link()
+                                    .small()
+                                    .label(format!("{} {}", other.kind.label(), other.name))
+                                    .tooltip(t!("topology-show-on-graph"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.focus_node(id.clone(), cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_right()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(match label {
+                                    Some(label) => format!("{kind} · {label}"),
+                                    None => kind,
+                                }),
+                        )
+                });
             Some(
-                Panel::new()
-                    .title(format!("{title} · {count}"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .children(rows)
-                            .children(and_more(more, theme.muted_foreground)),
-                    ),
+                Panel::new().title(format!("{title} · {count}")).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(rows)
+                        .children(and_more(more, theme.muted_foreground)),
+                ),
             )
         };
         let incoming: Vec<_> = graph
