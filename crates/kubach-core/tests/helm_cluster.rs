@@ -221,7 +221,9 @@ async fn a_vault_context_installs_upgrades_rolls_back_and_uninstalls() {
     let mut plan = ImportPlan::from_kubeconfig(own, &Default::default());
     plan.read_files();
     plan.rename(0, &imported_name);
-    let password = DerivedPassword::derive("kubach-test", KdfParams::DEFAULT).unwrap();
+    // A fresh password on every run.
+    let secret = uuid::Uuid::new_v4().to_string();
+    let password = DerivedPassword::derive(&secret, KdfParams::DEFAULT).unwrap();
     let mut vault = Vault::create(&vault_path, Some(&password), None).unwrap();
     vault.add("test", &plan, None).unwrap();
     drop(vault);
@@ -231,7 +233,7 @@ async fn a_vault_context_installs_upgrades_rolls_back_and_uninstalls() {
     let from_locked = Contexts::load_all(Vec::new(), locked.imported()).unwrap();
     assert!(cli::kubeconfig_of(&from_locked, &imported_name, &[], Some(temp.clone())).is_none());
 
-    let unlocked = locked.unlock_with_password("kubach-test").unwrap();
+    let unlocked = locked.unlock_with_password(&secret).unwrap();
     let contexts = Contexts::load_all(Vec::new(), unlocked.imported()).unwrap();
     let (kubeconfig, memory) =
         cli::kubeconfig_of(&contexts, &imported_name, &[], Some(temp.clone())).unwrap();
