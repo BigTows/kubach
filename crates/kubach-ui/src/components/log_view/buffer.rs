@@ -14,7 +14,8 @@ use crate::StyledSpan;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogTag {
     /// Lines of one source should share one label (a clone of the same
-    /// `SharedString`), so a line does not pay for its own copy.
+    /// `SharedString`), so a line does not pay for its own copy: a label
+    /// longer than 23 bytes is an allocation (shorter ones are kept inline).
     pub label: SharedString,
     /// Index into the tag palette; equal indices get equal colors.
     pub color: usize,
@@ -38,7 +39,8 @@ pub struct LogEntry {
 const NO_TIME: i64 = i64::MIN;
 
 /// What the text of a line takes beside its bytes: the counters of its
-/// shared allocation.
+/// shared allocation. (Texts of up to 23 bytes are kept inline and take
+/// nothing; they are counted the same, which only errs on the safe side.)
 const TEXT_HEADER: usize = 2 * size_of::<usize>();
 
 impl LogEntry {
@@ -864,7 +866,7 @@ mod tests {
         let huge = "x".repeat(5000);
         let pushed = buffer.push([LogEntry::new(huge.clone())]);
         assert_eq!(pushed.evicted, 2);
-        assert_eq!(texts(&buffer), [huge.clone()]);
+        assert_eq!(texts(&buffer), std::slice::from_ref(&huge));
         assert_eq!(buffer.widest(), Some(FIRST_ID + 2));
         // The next line takes its place: the newest one always stays.
         assert_eq!(lines(&mut buffer, &["c"]).evicted, 1);
@@ -1127,7 +1129,7 @@ mod tests {
         // No query: nothing to search.
         search.set_query("", &buffer);
         assert!(search.is_complete(&buffer));
-        assert_eq!(search.step(&buffer, 1).complete, true);
+        assert!(search.step(&buffer, 1).complete);
         assert_eq!(search.len(), 0);
     }
 

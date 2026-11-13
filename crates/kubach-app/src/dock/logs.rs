@@ -141,7 +141,9 @@ pub fn log_entry(line: LogLine, tag: Option<(SharedString, usize)>) -> LogEntry 
 }
 
 /// The tag of every source, made once per stream: the lines of a source
-/// share its label instead of each allocating one (#171).
+/// share its label (#171). Before, every line cloned the label as a
+/// `String` and, when it is longer than the 23 bytes a `SharedString` keeps
+/// inline, allocated it once more for the view.
 fn source_tags(sources: &[Arc<LogSource>]) -> Vec<SharedString> {
     sources.iter().map(|source| source.label().into()).collect()
 }
@@ -947,6 +949,14 @@ mod tests {
 
     #[test]
     fn lines_of_a_source_share_its_tag() {
+        // A pod of a Deployment: the label is too long to be kept inline.
+        let source = |container: &str| {
+            Arc::new(LogSource::new(
+                "ns",
+                "payments-api-7d9f8c6b5-x2x4z",
+                container,
+            ))
+        };
         let sources = vec![source("a"), source("b")];
         let tags = source_tags(&sources);
         let line = |container: &str| LogLine {
@@ -959,14 +969,18 @@ mod tests {
             log_entry(line(container), tag).tag.unwrap()
         };
         let (first, second, other) = (label("b"), label("b"), label("a"));
-        assert_eq!((first.label.as_ref(), first.color), ("pod/b", 1));
-        assert_eq!((other.label.as_ref(), other.color), ("pod/a", 0));
+        assert_eq!(first.label.as_ref(), "payments-api-7d9f8c6b5-x2x4z/b");
+        assert_eq!(first.color, 1);
+        assert_eq!(other.label.as_ref(), "payments-api-7d9f8c6b5-x2x4z/a");
+        assert_eq!(other.color, 0);
         // One allocation for every line of the source.
         assert!(std::ptr::eq(first.label.as_ptr(), second.label.as_ptr()));
         assert!(std::ptr::eq(first.label.as_ptr(), tags[1].as_ptr()));
+        assert!(!std::ptr::eq(first.label.as_ptr(), other.label.as_ptr()));
         // A source the stream did not start with still gets a label.
         let unknown = tag_of(&sources, &tags, &source("c")).unwrap();
-        assert_eq!((unknown.0.as_ref(), unknown.1), ("pod/c", 0));
+        assert_eq!(unknown.0.as_ref(), "payments-api-7d9f8c6b5-x2x4z/c");
+        assert_eq!(unknown.1, 0);
         // A single source is not tagged.
         assert_eq!(tag_of(&sources[..1], &tags[..1], &source("a")), None);
     }
