@@ -406,9 +406,10 @@ fn failure(object: String, reason: Message) -> BulkFailure {
 /// A failure of the whole drain (cordon or listing), before any pod:
 /// `what` makes the reason from the API server's error.
 fn whole_failure(node: &str, what: fn(Message) -> Message, error: &kube::Error) -> DrainReport {
-    let forbidden = matches!(error, kube::Error::Api(status) if status.is_forbidden());
+    let forbidden =
+        matches!(error, kube::Error::Api(status) if crate::api_status::is_forbidden(status));
     let reason = what(match error {
-        kube::Error::Api(status) if status.is_forbidden() => {
+        kube::Error::Api(status) if crate::api_status::is_forbidden(status) => {
             msg!("action-error-forbidden", error = &status.message)
         }
         kube::Error::Api(status) => error_text(&status.message),
@@ -698,7 +699,7 @@ async fn pause(duration: Duration, cancel: &AtomicBool) -> bool {
 
 fn kube_reason(error: &kube::Error) -> Message {
     match error {
-        kube::Error::Api(status) if status.is_forbidden() => {
+        kube::Error::Api(status) if crate::api_status::is_forbidden(status) => {
             msg!("action-error-forbidden", error = &status.message)
         }
         kube::Error::Api(status) if !status.message.is_empty() => error_text(&status.message),

@@ -65,7 +65,9 @@ impl MetricsError {
 
     fn from_kube(error: kube::Error) -> Self {
         match &error {
-            kube::Error::Api(status) if status.is_not_found() || status.code == 503 => {
+            kube::Error::Api(status)
+                if crate::api_status::is_not_found(status) || status.code == 503 =>
+            {
                 Self::Unavailable(status.message.clone())
             }
             _ => Self::Api(Box::new(error)),

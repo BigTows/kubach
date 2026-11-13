@@ -75,7 +75,7 @@ impl HelmError {
     pub fn is_forbidden(&self) -> bool {
         match self {
             Self::Api(error) => {
-                matches!(error.as_ref(), kube::Error::Api(status) if status.is_forbidden())
+                matches!(error.as_ref(), kube::Error::Api(status) if crate::api_status::is_forbidden(status))
             }
             Self::Unavailable { forbidden, .. } => *forbidden,
             _ => false,
@@ -303,6 +303,9 @@ mod tests {
     fn detects_forbidden_api_errors() {
         assert!(api_error(403).is_forbidden());
         assert!(!api_error(404).is_forbidden());
+        let no_reason: kube::core::Status =
+            serde_json::from_value(serde_json::json!({"code": 403})).unwrap();
+        assert!(HelmError::from(kube::Error::Api(Box::new(no_reason))).is_forbidden());
         assert!(!HelmError::MissingPayload("x".into()).is_forbidden());
     }
 }

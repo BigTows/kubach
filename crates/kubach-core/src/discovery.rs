@@ -332,9 +332,7 @@ fn is_refusal(error: &watcher::Error) -> bool {
         | watcher::Error::WatchError(status) => status,
         _ => return false,
     };
-    // By code as well: `Status::is_forbidden` looks only at the reason,
-    // which an answer from a proxy does not have.
-    matches!(status.code, 403 | 404) || status.is_forbidden() || status.is_not_found()
+    crate::api_status::is_forbidden(status) || crate::api_status::is_not_found(status)
 }
 
 #[cfg(test)]
