@@ -167,9 +167,9 @@ pub fn explain_create_error(error: &kube::Error, namespace: &str) -> String {
         )
     } else if message.contains("admission webhook") || message.contains("denied the request") {
         format!("An admission policy refused the node shell pod: {message}")
-    } else if status.is_forbidden() {
+    } else if crate::api_status::is_forbidden(status) {
         format!("No permission (RBAC) to create pods in {namespace}: {message}")
-    } else if status.is_not_found() {
+    } else if crate::api_status::is_not_found(status) {
         format!("Namespace {namespace} not found: {message}")
     } else {
         format!("Couldn't create the node shell pod: {message}")
@@ -399,7 +399,7 @@ pub async fn sweep_orphans(client: &Client, fallback: &str) -> Result<usize, kub
     let all: Api<Pod> = Api::all(client.clone());
     let pods = match all.list(&params).await {
         Ok(list) => list.items,
-        Err(kube::Error::Api(status)) if status.is_forbidden() => {
+        Err(kube::Error::Api(status)) if crate::api_status::is_forbidden(&status) => {
             let api: Api<Pod> = Api::namespaced(client.clone(), fallback);
             api.list(&params).await?.items
         }

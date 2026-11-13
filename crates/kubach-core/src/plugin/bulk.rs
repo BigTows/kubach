@@ -133,9 +133,9 @@ pub fn describe_error(error: &PluginError) -> (Message, bool) {
             } else {
                 status.message.clone()
             };
-            if status.is_forbidden() {
+            if crate::api_status::is_forbidden(status) {
                 (msg!("action-error-forbidden", error = message), true)
-            } else if status.is_not_found() {
+            } else if crate::api_status::is_not_found(status) {
                 (msg!("action-error-not-found", error = message), false)
             } else {
                 (error_text(message), false)

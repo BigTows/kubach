@@ -458,7 +458,7 @@ pub async fn diff_each(
                 manifest,
                 live.map(|obj| serde_json::to_value(obj).unwrap_or(Value::Null)),
             )),
-            Err(kube::Error::Api(status)) if status.code == 403 => {
+            Err(kube::Error::Api(status)) if crate::api_status::is_forbidden(&status) => {
                 Err(format!("no permission to read {}", manifest.label()))
             }
             Err(error) => Err(format!("failed to get {}: {error}", manifest.label())),

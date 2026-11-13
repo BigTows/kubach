@@ -111,7 +111,7 @@ pub fn lookup_result(result: &Result<bool, kube::Error>) -> Lookup {
         Ok(true) => Lookup::Found,
         Ok(false) => Lookup::NotFound,
         Err(kube::Error::Api(status)) => Lookup::Unknown {
-            forbidden: status.is_forbidden(),
+            forbidden: crate::api_status::is_forbidden(status),
         },
         Err(_) => Lookup::Unknown { forbidden: false },
     }
