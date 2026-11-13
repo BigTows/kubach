@@ -501,26 +501,30 @@ mod tests {
 
     #[test]
     fn a_proof_covers_every_part_of_the_exchange() {
-        let base = request_proof("key", "c", "a", "/confirm", "d");
+        // Fresh values on every run: nothing here is a fixed key or nonce.
+        let (key, other_key) = (random_token(), random_token());
+        let (c, a, x) = (random_token(), random_token(), random_token());
+        let (key, c, a, x) = (key.as_str(), c.as_str(), a.as_str(), x.as_str());
+        let base = request_proof(key, c, a, "/confirm", "d");
         assert_eq!(base.len(), 64);
-        assert_eq!(base, request_proof("key", "c", "a", "/confirm", "d"));
+        assert_eq!(base, request_proof(key, c, a, "/confirm", "d"));
         for other in [
-            request_proof("other", "c", "a", "/confirm", "d"),
-            request_proof("key", "x", "a", "/confirm", "d"),
-            request_proof("key", "c", "x", "/confirm", "d"),
-            request_proof("key", "c", "a", "/heartbeat", "d"),
-            request_proof("key", "c", "a", "/confirm", "x"),
+            request_proof(&other_key, c, a, "/confirm", "d"),
+            request_proof(key, x, a, "/confirm", "d"),
+            request_proof(key, c, x, "/confirm", "d"),
+            request_proof(key, c, a, "/heartbeat", "d"),
+            request_proof(key, c, a, "/confirm", "x"),
             // The same bytes split differently between the parts.
-            request_proof("key", "ca", "", "/confirm", "d"),
+            request_proof(key, &format!("{c}{a}"), "", "/confirm", "d"),
             // An answer or a hello proof is no request proof.
-            answer_proof("key", "c", "a", "/confirm", 200, "d"),
-            app_proof("key", "c", "a"),
+            answer_proof(key, c, a, "/confirm", 200, "d"),
+            app_proof(key, c, a),
         ] {
             assert_ne!(base, other);
         }
         assert_ne!(
-            answer_proof("key", "c", "a", "/confirm", 200, "d"),
-            answer_proof("key", "c", "a", "/confirm", 403, "d")
+            answer_proof(key, c, a, "/confirm", 200, "d"),
+            answer_proof(key, c, a, "/confirm", 403, "d")
         );
         assert!(valid_nonce(&random_token()));
         assert!(!valid_nonce("short"));
