@@ -337,6 +337,16 @@ pub trait ResourcePlugin: Send + Sync {
     /// Cells in the same order as [`columns`](Self::columns).
     fn cells(&self, obj: &DynamicObject) -> Vec<Cell>;
 
+    /// The moment the [`cells`](Self::cells) of an unchanged object change
+    /// by themselves: a pod past its deletion deadline turns from
+    /// terminating into stuck. Cells built before it differ from cells
+    /// built at or after it; apart from that, cells follow the object
+    /// alone ([`Cell::Age`] holds a moment, not "now"). Views that keep
+    /// built rows build the row again once this moment has come.
+    fn cells_turn_at(&self, _obj: &DynamicObject) -> Option<Timestamp> {
+        None
+    }
+
     fn details(&self, obj: &DynamicObject) -> Vec<DetailSection>;
 
     fn actions(&self) -> Vec<Action> {
