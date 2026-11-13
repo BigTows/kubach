@@ -18,7 +18,8 @@ use kubach_core::cache::{ObjectStore, Snapshot, WatchStatus, merge};
 use kubach_core::list_cache::{CachedKind, Limits, ListCache, ListKey};
 use kubach_core::perf::{self, ClusterSize, PodShape};
 use kubach_core::plugin::PluginRegistry;
-use kubach_core::topology::{BuildOptions, Detail, TopologyBuilder, TopologyInput};
+use kubach_core::topology::netpol::{self, PolicySet};
+use kubach_core::topology::{BuildOptions, Detail, SourceKind, TopologyBuilder, TopologyInput};
 
 const SHAPES: [(&str, PodShape); 3] = [
     ("full", PodShape::FULL),
@@ -154,6 +155,18 @@ fn merge_namespaces(c: &mut Criterion) {
     group.finish();
 }
 
+/// `input` after a watch delivered a change of one pod: every list but the
+/// pods' is the same allocation, and every pod but one the same object.
+fn one_pod_changed(input: &TopologyInput) -> TopologyInput {
+    let mut pods = input.objects(SourceKind::Pod).to_vec();
+    let mut pod = DynamicObject::clone(&pods[0]);
+    perf::touch(&mut pod, 99_000_000);
+    pods[0] = Arc::new(pod);
+    let mut changed = input.clone();
+    changed.set(SourceKind::Pod, pods);
+    changed
+}
+
 /// The topology of a cluster: the first build, a rebuild with nothing
 /// changed and one after a pod changed.
 fn topology(c: &mut Criterion) {
@@ -173,14 +186,8 @@ fn topology(c: &mut Criterion) {
     ];
     for size in sizes {
         let objects = perf::cluster(size, PodShape::MANAGED);
-        let input = TopologyInput::from_objects(objects.clone());
-        let mut touched = objects;
-        let pod = touched
-            .iter_mut()
-            .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "Pod"))
-            .expect("a pod");
-        perf::touch(pod, 99_000_000);
-        let changed = TopologyInput::from_objects(touched);
+        let input = TopologyInput::from_objects(objects);
+        let changed = one_pod_changed(&input);
         let label = format!("{}pods", size.pods());
         for (detail_name, detail) in [("workloads", Detail::Workloads), ("pods", Detail::Pods)] {
             let options = BuildOptions {
@@ -205,6 +212,125 @@ fn topology(c: &mut Criterion) {
             });
         }
     }
+    group.finish();
+}
+
+/// Prints where a rebuild after one changed pod spends its time: the
+/// median of each phase over 15 builds.
+fn phases(objects: &[DynamicObject], size: ClusterSize) {
+    let input = TopologyInput::from_objects(objects.to_vec());
+    let changed = one_pod_changed(&input);
+    for (detail_name, detail) in [("workloads", Detail::Workloads), ("pods", Detail::Pods)] {
+        let options = BuildOptions {
+            detail,
+            ..BuildOptions::default()
+        };
+        let mut builder = TopologyBuilder::new();
+        builder.build(&input, &options);
+        let mut laps: Vec<(&str, Vec<Duration>)> = Vec::new();
+        for run in 0..15 {
+            builder.build(if run % 2 == 0 { &changed } else { &input }, &options);
+            for (ix, (name, time)) in builder.phases().iter().enumerate() {
+                if laps.len() <= ix {
+                    laps.push((name, Vec::new()));
+                }
+                laps[ix].1.push(*time);
+            }
+        }
+        let text: Vec<String> = laps
+            .iter_mut()
+            .map(|(name, times)| {
+                times.sort();
+                format!(
+                    "{name} {:.1} ms",
+                    times[times.len() / 2].as_secs_f64() * 1e3
+                )
+            })
+            .collect();
+        eprintln!(
+            "phases, one pod changed, {} pods, {detail_name}: {}",
+            size.pods(),
+            text.join(", ")
+        );
+    }
+}
+
+/// What the base cluster of [`topology`] lacks: the NetworkPolicy layer
+/// (200 policies over 10 000 pods in 50 namespaces) and StatefulSets with
+/// the PVCs of their volume claim templates (250 sets, 1 500 PVCs).
+fn topology_layers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("topology_layers");
+    group.sample_size(10);
+    let size = ClusterSize {
+        namespaces: 50,
+        apps: 40,
+        replicas: 5,
+    };
+    let base = perf::cluster(size, PodShape::MANAGED);
+    phases(&base, size);
+
+    let mut objects = base.clone();
+    objects.extend(perf::namespaces(size.namespaces));
+    objects.extend(perf::network_policies(size, 200));
+    let input = TopologyInput::from_objects(objects);
+    let changed = one_pod_changed(&input);
+    group.bench_function("policy_set/200policies", |b| {
+        b.iter(|| black_box(PolicySet::from_input(&input)));
+    });
+    for (detail_name, detail) in [("workloads", Detail::Workloads), ("pods", Detail::Pods)] {
+        let plain = BuildOptions {
+            detail,
+            ..BuildOptions::default()
+        };
+        let layered = BuildOptions {
+            network_policies: true,
+            ..plain.clone()
+        };
+        let graph = TopologyBuilder::new().build(&input, &plain);
+        let policies = PolicySet::from_input(&input);
+        let id = |step: &str| BenchmarkId::new(format!("{step}/{detail_name}"), "200policies");
+        // The layer alone, over a built graph.
+        group.bench_function(id("netpol_apply"), |b| {
+            b.iter_batched(
+                || graph.clone(),
+                |graph| black_box(netpol::apply(graph, &policies)),
+                BatchSize::LargeInput,
+            );
+        });
+        // A rebuild with the layer on, after a pod changed.
+        let mut warm = TopologyBuilder::new();
+        warm.build(&input, &layered);
+        let mut flip = false;
+        group.bench_function(id("one_pod_changed"), |b| {
+            b.iter(|| {
+                flip = !flip;
+                black_box(warm.build(if flip { &changed } else { &input }, &layered))
+            });
+        });
+    }
+
+    let mut objects = base;
+    objects.extend(perf::stateful_sets(
+        size.namespaces,
+        5,
+        3,
+        PodShape::MANAGED,
+    ));
+    let input = TopologyInput::from_objects(objects);
+    let changed = one_pod_changed(&input);
+    let options = BuildOptions::default();
+    group.bench_function("stateful_sets/cold", |b| {
+        b.iter(|| black_box(TopologyBuilder::new().build(&input, &options)));
+    });
+    let mut warm = TopologyBuilder::new();
+    warm.build(&input, &options);
+    let mut flip = false;
+    group.bench_function("stateful_sets/one_pod_changed", |b| {
+        b.iter(|| {
+            flip = !flip;
+            black_box(warm.build(if flip { &changed } else { &input }, &options))
+        });
+    });
     group.finish();
 }
 
@@ -281,6 +407,7 @@ criterion_group!(
     store,
     merge_namespaces,
     topology,
+    topology_layers,
     list_cache,
     log_lines
 );

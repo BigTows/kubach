@@ -41,7 +41,7 @@ use kubach_core::cache::ResourceCache;
 use kubach_core::discovery::ApiCatalog;
 use kubach_core::topology::netpol::{self, Direction, PodGroup};
 use kubach_core::topology::{
-    BuildOptions, Detail, Filter, LabelSelector, Node, NodeClass, NodeId, Severity,
+    BuildOptions, Detail, Filter, LabelSelector, Node, NodeClass, NodeId, Severity, TopologyGraph,
     TopologySnapshot, TopologySource,
 };
 use kubach_i18n::t;
@@ -67,6 +67,11 @@ use traffic::TrafficLayer;
 /// Changes that come in a burst are built once.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 const DETAILS_WIDTH: Pixels = px(360.);
+/// Rows of the "Issues" list; the rest is counted under it.
+const MAX_ISSUES: usize = 200;
+/// Rows of a list in a node's summary (its problems, incoming and
+/// outgoing links); the rest is counted under it.
+const MAX_SUMMARY_ROWS: usize = 100;
 
 /// Watches of a topology with a debounced background rebuild.
 pub(super) struct Live {
@@ -215,6 +220,11 @@ pub struct TopologyScreen {
     base: Option<Arc<TopologySnapshot>>,
     /// What is shown: `base` with the traffic layer laid over it.
     snapshot: Option<Arc<TopologySnapshot>>,
+    /// The canvas data of a newer `base` is being made off the UI thread.
+    showing: bool,
+    /// `base` or the traffic changed while that ran: it runs once more.
+    show_again: bool,
+    _show: Option<Task<()>>,
     graph: Entity<GraphView>,
     /// Id of the node whose details are open.
     selected: Option<String>,
@@ -266,33 +276,115 @@ impl LiveOwner for TopologyScreen {
     }
 
     fn apply(&mut self, snapshot: TopologySnapshot, cx: &mut Context<Self>) {
+        // A wake-up that changed nothing the topology reads: the builder
+        // handed back the graph it had, and what is shown stays.
+        if !self.refit
+            && self
+                .base
+                .as_ref()
+                .is_some_and(|base| same_snapshot(base, &snapshot))
+        {
+            return;
+        }
         self.base = Some(Arc::new(snapshot));
         self.show(cx);
     }
 }
 
+/// Whether `newer` is `base` again: the same graph (not rebuilt) with the
+/// same state of the watches and the same policies.
+fn same_snapshot(base: &TopologySnapshot, newer: &TopologySnapshot) -> bool {
+    base.graph.same(&newer.graph)
+        && base.loading == newer.loading
+        && base.errors == newer.errors
+        && base.unavailable == newer.unavailable
+        && match (&base.policies, &newer.policies) {
+            (None, None) => true,
+            (Some(base), Some(newer)) => Arc::ptr_eq(base, newer),
+            _ => false,
+        }
+}
+
+/// Index of the node `id` in `graph` (its nodes are sorted by id).
+fn node_index(graph: &TopologyGraph, id: &str) -> Option<usize> {
+    graph
+        .nodes()
+        .binary_search_by(|node| node.id.as_str().cmp(id))
+        .ok()
+}
+
 impl TopologyScreen {
     /// Draws the built graph, with the traffic layer when it has data.
+    ///
+    /// The traffic overlay and the canvas data (a box and a line per node
+    /// and edge, with their texts) are made off the UI thread; until they
+    /// are ready the previous graph stays. One run at a time: of the
+    /// graphs that come in meanwhile only the newest is drawn next, and a
+    /// result whose graph was replaced or dropped by then is thrown away.
     fn show(&mut self, cx: &mut Context<Self>) {
-        let Some(base) = self.base.clone() else {
+        if self.base.is_none() {
             return;
-        };
-        let snapshot = match (&self.traffic.data, self.traffic.on) {
-            (Some(data), true) => traffic::overlay(&base, data),
-            _ => (*base).clone(),
-        };
-        let data = map::graph_data(&snapshot.graph, MapOptions { groups: true });
+        }
+        self.show_again = true;
+        if self.showing {
+            return;
+        }
+        self.showing = true;
+        self._show = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let job = this.update(cx, |this, _| {
+                    this.show_again = false;
+                    let job = this.base.clone().map(|base| {
+                        let traffic = this.traffic.data.clone().filter(|_| this.traffic.on);
+                        (base, traffic)
+                    });
+                    this.showing = job.is_some();
+                    job
+                });
+                let Ok(Some((base, traffic))) = job else {
+                    return;
+                };
+                let built = base.clone();
+                let (snapshot, data) = cx
+                    .background_spawn(async move {
+                        let snapshot = match traffic {
+                            Some(traffic) => Arc::new(traffic::overlay(&built, &traffic)),
+                            None => built,
+                        };
+                        let data = map::graph_data(&snapshot.graph, MapOptions { groups: true });
+                        (snapshot, data)
+                    })
+                    .await;
+                let again = this.update(cx, |this, cx| {
+                    // Another graph (or none: another context) took over.
+                    if this
+                        .base
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &base))
+                    {
+                        this.shown(snapshot, data, cx);
+                    }
+                    if !this.show_again {
+                        this.showing = false;
+                    }
+                    this.show_again
+                });
+                if !matches!(again, Ok(true)) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Puts a graph made by [`show`](Self::show) on the canvas.
+    fn shown(&mut self, snapshot: Arc<TopologySnapshot>, data: GraphData, cx: &mut Context<Self>) {
         if let Some(selected) = &self.selected
             && !snapshot.loading
-            && !snapshot
-                .graph
-                .nodes()
-                .iter()
-                .any(|node| node.id.as_str() == selected)
+            && node_index(&snapshot.graph, selected).is_none()
         {
             self.selected = None;
         }
-        self.snapshot = Some(Arc::new(snapshot));
+        self.snapshot = Some(snapshot);
         self.set_graph(data, cx);
         if std::mem::take(&mut self.refit) {
             self.graph.update(cx, |graph, cx| graph.fit_to_view(cx));
@@ -355,6 +447,9 @@ impl TopologyScreen {
             context: None,
             base: None,
             snapshot: None,
+            showing: false,
+            show_again: false,
+            _show: None,
             graph,
             selected: None,
             refit: false,
@@ -527,13 +622,10 @@ impl TopologyScreen {
     }
 
     fn node(&self, id: &str) -> Option<&Node> {
-        self.snapshot
-            .as_ref()?
-            .graph
-            .nodes()
-            .iter()
-            .find(|node| node.id.as_str() == id)
+        let graph = &self.snapshot.as_ref()?.graph;
+        node_index(graph, id).map(|ix| &graph.nodes()[ix])
     }
+
     /// Selects a node and brings it into view (from the issues and links).
     fn focus_node(&mut self, id: String, cx: &mut Context<Self>) {
         let target = GraphTarget::Node(id.clone().into());
@@ -1170,6 +1262,9 @@ impl TopologyScreen {
         let graph = &snapshot.graph;
         let mut diagnostics: Vec<_> = graph.diagnostics().iter().collect();
         diagnostics.sort_by_key(|d| std::cmp::Reverse(d.severity()));
+        // Errors first, so what is cut off is the least severe.
+        let more = diagnostics.len().saturating_sub(MAX_ISSUES);
+        diagnostics.truncate(MAX_ISSUES);
         let rows = diagnostics.into_iter().enumerate().map(|(ix, diagnostic)| {
             let id = diagnostic.node.as_str().to_owned();
             div()
@@ -1206,6 +1301,7 @@ impl TopologyScreen {
             .flex_col()
             .gap_0p5()
             .children(rows)
+            .children(and_more(more, theme.muted_foreground).map(|more| more.px_2().py_1p5()))
             .when(graph.diagnostics().is_empty(), |list| {
                 list.child(
                     div()
@@ -1303,7 +1399,9 @@ impl TopologyScreen {
                     .on_click(cx.listener(|this, _, _, cx| this.close_details(cx))),
             );
 
-        let problems: Vec<_> = graph.diagnostics_for(&node.id).collect();
+        let mut problems: Vec<_> = graph.diagnostics_for(&node.id).collect();
+        let more_problems = problems.len().saturating_sub(MAX_SUMMARY_ROWS);
+        problems.truncate(MAX_SUMMARY_ROWS);
         let problems =
             (!problems.is_empty()).then(|| {
                 Panel::new().title(t!("topology-problems")).child(
@@ -1327,7 +1425,8 @@ impl TopologyScreen {
                                         .whitespace_normal()
                                         .child(map::diagnostic_text(diagnostic, graph)),
                                 )
-                        })),
+                        }))
+                        .children(and_more(more_problems, theme.muted_foreground)),
                 )
             });
 
@@ -1388,45 +1487,55 @@ impl TopologyScreen {
                 return None;
             }
             let count = edges.len();
-            let rows = edges.into_iter().map(|(kind, other, label)| {
-                link_ix += 1;
-                let id = other.id.as_str().to_owned();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child(StatusDot::new(map::tone(graph, other)))
-                    .child(
-                        div().min_w_0().overflow_hidden().child(
-                            Button::new(("topology-link", link_ix))
-                                .link()
-                                .small()
-                                .label(format!("{} {}", other.kind.label(), other.name))
-                                .tooltip(t!("topology-show-on-graph"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.focus_node(id.clone(), cx)
-                                })),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_right()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(match label {
-                                Some(label) => format!("{kind} · {label}"),
-                                None => kind,
-                            }),
-                    )
-            });
+            // A ConfigMap every pod reads has a row per pod.
+            let more = count.saturating_sub(MAX_SUMMARY_ROWS);
+            let rows = edges
+                .into_iter()
+                .take(MAX_SUMMARY_ROWS)
+                .map(|(kind, other, label)| {
+                    link_ix += 1;
+                    let id = other.id.as_str().to_owned();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(StatusDot::new(map::tone(graph, other)))
+                        .child(
+                            div().min_w_0().overflow_hidden().child(
+                                Button::new(("topology-link", link_ix))
+                                    .link()
+                                    .small()
+                                    .label(format!("{} {}", other.kind.label(), other.name))
+                                    .tooltip(t!("topology-show-on-graph"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.focus_node(id.clone(), cx)
+                                    })),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_right()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(match label {
+                                    Some(label) => format!("{kind} · {label}"),
+                                    None => kind,
+                                }),
+                        )
+                });
             Some(
-                Panel::new()
-                    .title(format!("{title} · {count}"))
-                    .child(div().flex().flex_col().gap_1().children(rows)),
+                Panel::new().title(format!("{title} · {count}")).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(rows)
+                        .children(and_more(more, theme.muted_foreground)),
+                ),
             )
         };
         let incoming: Vec<_> = graph
@@ -1499,6 +1608,17 @@ impl TopologyScreen {
             )
             .into_any_element()
     }
+}
+
+/// "and N more" under a list cut after its first rows; nothing when the
+/// whole list is shown.
+fn and_more(more: usize, color: Hsla) -> Option<Div> {
+    (more > 0).then(|| {
+        div()
+            .text_xs()
+            .text_color(color)
+            .child(t!("ui-and-more", count = more))
+    })
 }
 
 impl ScreenActivity for TopologyScreen {

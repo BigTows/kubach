@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use super::*;
 use crate::apply::yaml;
 
+mod random;
+
 const APP: &str = include_str!("fixtures/app.yaml");
 const STATEFULSET: &str = include_str!("fixtures/statefulset.yaml");
 const GATEWAY: &str = include_str!("fixtures/gateway.yaml");
@@ -966,6 +968,83 @@ mod live {
             Presence::Unknown
         );
         assert!(graph.diagnostics().is_empty(), "{:?}", messages(&graph));
+    }
+
+    /// Several namespaces: the list of a kind is merged from its watches.
+    /// While no watch changes, the merged lists are the ones handed out
+    /// before, and so are the graph and the policy set built from them.
+    #[tokio::test]
+    async fn unchanged_watches_hand_back_the_same_graph() {
+        let all = objects(APP);
+        let cache = ResourceCache::with_source(move |kind, key| {
+            let mut events = vec![Ok(Event::Init)];
+            events.extend(
+                all.iter()
+                    .filter(|object| {
+                        object.types.as_ref().unwrap().kind == kind.api.kind
+                            && object.metadata.namespace == key.namespace
+                    })
+                    .cloned()
+                    .map(|object| Ok(Event::InitApply(object))),
+            );
+            events.push(Ok(Event::InitDone));
+            futures::stream::iter(events)
+                .chain(futures::stream::pending())
+                .boxed()
+        });
+        let catalog = ApiCatalog::from_resources([
+            resource("", "v1", "Pod", "pods"),
+            resource("", "v1", "Service", "services"),
+            resource("", "v1", "ConfigMap", "configmaps"),
+            resource("", "v1", "Secret", "secrets"),
+            resource("apps", "v1", "Deployment", "deployments"),
+            resource("apps", "v1", "ReplicaSet", "replicasets"),
+            resource("networking.k8s.io", "v1", "Ingress", "ingresses"),
+            resource(
+                "networking.k8s.io",
+                "v1",
+                "NetworkPolicy",
+                "networkpolicies",
+            ),
+        ]);
+        let namespaces = ["shop".to_string(), "other".to_string(), "third".to_string()];
+        let source = TopologySource::subscribe(&cache, &catalog, Some(&namespaces));
+        let options = BuildOptions {
+            network_policies: true,
+            ..BuildOptions::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            let snapshot = source.snapshot(&options);
+            if !snapshot.loading || Instant::now() > deadline {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!first.loading);
+        assert!(!first.graph.nodes().is_empty());
+
+        let (before, _, _) = source.input();
+        let (after, _, _) = source.input();
+        for kind in SourceKind::every() {
+            assert!(
+                std::ptr::eq(before.objects(kind), after.objects(kind))
+                    || before.objects(kind).is_empty(),
+                "{kind:?} was merged again"
+            );
+        }
+        let second = source.snapshot(&options);
+        assert!(second.graph.same(&first.graph), "the graph was built again");
+        assert!(Arc::ptr_eq(
+            first.policies.as_ref().unwrap(),
+            second.policies.as_ref().unwrap()
+        ));
+        // Other options are another graph.
+        let pods = source.snapshot(&BuildOptions {
+            detail: Detail::Pods,
+            ..options
+        });
+        assert!(!pods.graph.same(&first.graph));
     }
 }
 

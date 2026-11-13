@@ -33,6 +33,8 @@ mod extract;
 mod live;
 mod model;
 pub mod netpol;
+#[cfg(test)]
+mod reference;
 mod source;
 #[cfg(test)]
 mod tests;

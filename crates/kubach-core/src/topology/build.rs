@@ -5,13 +5,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use kube::api::DynamicObject;
+
 use super::extract::{self, Body, Facts, Meta, OwnerRef, RefTarget, SpecFacts, WorkloadFacts};
 use super::model::{
     Diagnostic, DiagnosticKind, Edge, EdgeAttrs, EdgeId, EdgeKind, EndpointCounts, ExternalKind,
     Node, NodeAttrs, NodeClass, NodeId, NodeKind, PodCounts, PortRef, Presence, RefUse, RefVia,
     RouteRule, ServiceInfo, ServiceType, TopologyGraph, WorkloadKind,
 };
+use super::netpol::PolicySet;
 use super::source::{SourceKind, TopologyInput};
+use crate::cache::Objects;
 
 /// How much of a workload to show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -115,14 +119,132 @@ pub fn build(input: &TopologyInput, options: &BuildOptions) -> TopologyGraph {
     TopologyBuilder::new().build(input, options)
 }
 
-type MemoKey = (SourceKind, String, String);
-
-/// Rebuilds a graph cheaply: what each object contributes is read once per
-/// `resourceVersion` and reused while the object does not change; only the
-/// join runs on every build.
+/// Rebuilds a graph cheaply as the input changes.
+///
+/// - Nothing changed (every list is the one of the last build, with the
+///   same options): the last graph is handed back, not built again.
+/// - A list that did not change is not looked at; in one that did, an
+///   object is read again only when it is another object with another
+///   `resourceVersion`.
+/// - The join of the facts runs whenever anything changed.
 #[derive(Default)]
 pub struct TopologyBuilder {
-    memo: HashMap<MemoKey, (String, Arc<Facts>)>,
+    world: World,
+    /// The last graph with its options: the answer while nothing changes.
+    last: Option<(BuildOptions, TopologyGraph)>,
+    policies: Option<ReadPolicies>,
+    clock: Clock,
+}
+
+/// A kind as last read: its list and the facts of its objects, in order.
+struct Read {
+    /// `None`: the input had no list of the kind.
+    objects: Option<Objects>,
+    complete: bool,
+    facts: Vec<Arc<Facts>>,
+}
+
+/// The policy set with the lists it was parsed from.
+struct ReadPolicies {
+    policies: Option<Objects>,
+    namespaces: Option<Objects>,
+    namespaces_complete: bool,
+    set: Arc<PolicySet>,
+}
+
+/// Whether a list is the one read before: the same allocation, which the
+/// builder keeps alive, so its address is not reused. A watch hands out
+/// the same list until its objects change.
+fn same_list(old: Option<&Objects>, new: Option<&Objects>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) if Arc::ptr_eq(old, new) => true,
+        _ => old.is_none_or(|old| old.is_empty()) && new.is_none_or(|new| new.is_empty()),
+    }
+}
+
+fn key_of(object: &DynamicObject) -> (&str, &str) {
+    (
+        object.metadata.namespace.as_deref().unwrap_or_default(),
+        object.metadata.name.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Facts of `objects`, taking those of `old` for the objects it has: the
+/// same object, or one of the same namespace, name and `resourceVersion`.
+fn read_list(
+    kind: SourceKind,
+    old: Option<&Read>,
+    objects: &[Arc<DynamicObject>],
+) -> Vec<Arc<Facts>> {
+    let (old_objects, old_facts): (&[Arc<DynamicObject>], &[Arc<Facts>]) = match old {
+        Some(read) => (read.objects.as_deref().unwrap_or_default(), &read.facts),
+        None => (&[], &[]),
+    };
+    // Lists mostly differ in a few places: the old one is walked alongside,
+    // and looked up by name only where the two part.
+    let mut by_key: Option<HashMap<(&str, &str), usize>> = None;
+    let mut cursor = 0;
+    objects
+        .iter()
+        .map(|object| {
+            if old_objects
+                .get(cursor)
+                .is_some_and(|old| Arc::ptr_eq(old, object))
+            {
+                cursor += 1;
+                return Arc::clone(&old_facts[cursor - 1]);
+            }
+            let by_key = by_key.get_or_insert_with(|| {
+                old_objects
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, old)| (key_of(old), ix))
+                    .collect()
+            });
+            if let Some(&ix) = by_key.get(&key_of(object)) {
+                cursor = ix + 1;
+                let old = &old_objects[ix];
+                let same_version = matches!(
+                    (&old.metadata.resource_version, &object.metadata.resource_version),
+                    (Some(old), Some(new)) if old == new
+                );
+                if same_version || Arc::ptr_eq(old, object) {
+                    return Arc::clone(&old_facts[ix]);
+                }
+            }
+            Arc::new(extract::facts(kind, object))
+        })
+        .collect()
+}
+
+/// Time per phase of a build, measured only with the `perf` feature.
+#[derive(Default)]
+struct Clock {
+    #[cfg(feature = "perf")]
+    at: Option<std::time::Instant>,
+    #[cfg(feature = "perf")]
+    laps: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl Clock {
+    fn start(&mut self) {
+        #[cfg(feature = "perf")]
+        {
+            self.laps.clear();
+            self.at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Ends the phase `_name`: the time since the previous one.
+    fn lap(&mut self, _name: &'static str) {
+        #[cfg(feature = "perf")]
+        {
+            let now = std::time::Instant::now();
+            if let Some(at) = self.at.replace(now) {
+                self.laps.push((_name, now - at));
+            }
+        }
+    }
 }
 
 impl TopologyBuilder {
@@ -130,49 +252,109 @@ impl TopologyBuilder {
         Self::default()
     }
 
+    /// Phases of the last [`build`](Self::build) with the time each took.
+    #[cfg(feature = "perf")]
+    pub fn phases(&self) -> &[(&'static str, std::time::Duration)] {
+        &self.clock.laps
+    }
+
     pub fn build(&mut self, input: &TopologyInput, options: &BuildOptions) -> TopologyGraph {
-        let mut memo = HashMap::with_capacity(self.memo.len());
-        let mut world = World::default();
+        self.build_with_policies(input, options).0
+    }
+
+    /// [`build`](Self::build), with the policy set the network policy
+    /// layer came from (`None` unless [`BuildOptions::network_policies`]):
+    /// parsed once, and again only when NetworkPolicies or Namespaces change.
+    pub fn build_with_policies(
+        &mut self,
+        input: &TopologyInput,
+        options: &BuildOptions,
+    ) -> (TopologyGraph, Option<Arc<PolicySet>>) {
+        self.clock.start();
+        let mut changed = false;
         for kind in SourceKind::ALL {
-            let objects = input.objects(kind);
-            let mut facts = Vec::with_capacity(objects.len());
-            for object in objects {
-                let key = (
-                    kind,
-                    object.metadata.namespace.clone().unwrap_or_default(),
-                    object.metadata.name.clone().unwrap_or_default(),
-                );
-                let version = object.metadata.resource_version.as_deref();
-                let read = match (version, self.memo.remove(&key)) {
-                    (Some(version), Some((seen, read))) if seen == version => read,
-                    _ => Arc::new(extract::facts(kind, object)),
-                };
-                if let Some(version) = version {
-                    memo.insert(key, (version.to_owned(), Arc::clone(&read)));
-                }
-                facts.push(read);
-            }
-            world.facts.insert(kind, facts);
+            changed |= self.world.read(kind, input);
         }
-        self.memo = memo;
-        let graph = Assembler::new(&world, input, options).run();
+        let policies = options
+            .network_policies
+            .then(|| self.policy_set(input, &mut changed));
+        self.clock.lap("facts");
+        if !changed
+            && let Some((built, graph)) = &self.last
+            && built == options
+        {
+            return (graph.clone(), policies);
+        }
+        let graph = Assembler::new(&self.world, input, options).run(&mut self.clock);
         let graph = apply_filter(graph, &options.filter);
-        if options.network_policies {
-            super::netpol::apply(graph, &super::netpol::PolicySet::from_input(input))
-        } else {
-            graph
+        self.clock.lap("filter");
+        let graph = match &policies {
+            Some(policies) => super::netpol::apply(graph, policies),
+            None => graph,
+        };
+        self.clock.lap("network policies");
+        self.last = Some((options.clone(), graph.clone()));
+        (graph, policies)
+    }
+
+    fn policy_set(&mut self, input: &TopologyInput, changed: &mut bool) -> Arc<PolicySet> {
+        let policies = input.list(SourceKind::NetworkPolicy);
+        let namespaces = input.list(SourceKind::Namespace);
+        let namespaces_complete = input.is_complete(SourceKind::Namespace);
+        if let Some(read) = &self.policies
+            && same_list(read.policies.as_ref(), policies)
+            && same_list(read.namespaces.as_ref(), namespaces)
+            && read.namespaces_complete == namespaces_complete
+        {
+            return Arc::clone(&read.set);
         }
+        *changed = true;
+        let set = Arc::new(PolicySet::from_input(input));
+        self.policies = Some(ReadPolicies {
+            policies: policies.cloned(),
+            namespaces: namespaces.cloned(),
+            namespaces_complete,
+            set: Arc::clone(&set),
+        });
+        set
     }
 }
 
 #[derive(Default)]
 struct World {
-    facts: HashMap<SourceKind, Vec<Arc<Facts>>>,
+    kinds: HashMap<SourceKind, Read>,
 }
 
 impl World {
     fn of(&self, kind: SourceKind) -> &[Arc<Facts>] {
-        self.facts.get(&kind).map_or(&[], Vec::as_slice)
+        self.kinds
+            .get(&kind)
+            .map_or(&[], |read| read.facts.as_slice())
+    }
+
+    /// Takes the list of `kind` from `input`; whether anything the join
+    /// reads of it changed.
+    fn read(&mut self, kind: SourceKind, input: &TopologyInput) -> bool {
+        let objects = input.list(kind);
+        let complete = input.is_complete(kind);
+        if let Some(read) = self.kinds.get_mut(&kind)
+            && same_list(read.objects.as_ref(), objects)
+        {
+            let changed = read.complete != complete;
+            read.complete = complete;
+            return changed;
+        }
+        let old = self.kinds.remove(&kind);
+        let facts = read_list(kind, old.as_ref(), objects.map_or(&[], |objects| objects));
+        self.kinds.insert(
+            kind,
+            Read {
+                objects: objects.cloned(),
+                complete,
+                facts,
+            },
+        );
+        true
     }
 }
 
@@ -224,27 +406,36 @@ fn node_kind(kind: SourceKind, facts: Option<&Facts>) -> NodeKind {
 
 /// The node a controller owner stands for.
 #[derive(Clone, Debug)]
-struct OwnerTarget {
+struct OwnerTarget<'w> {
     id: NodeId,
-    group: String,
-    kind: String,
-    name: String,
+    group: &'w str,
+    kind: &'w str,
+    name: &'w str,
 }
 
-impl OwnerTarget {
-    fn of(namespace: Option<&str>, owner: &OwnerRef) -> Self {
+impl<'w> OwnerTarget<'w> {
+    fn of(namespace: Option<&str>, group: &'w str, kind: &'w str, name: &'w str) -> Self {
         Self {
-            id: NodeId::object(&owner.kind, &owner.group, namespace, &owner.name),
-            group: owner.group.clone(),
-            kind: owner.kind.clone(),
-            name: owner.name.clone(),
+            id: NodeId::object(kind, group, namespace, name),
+            group,
+            kind,
+            name,
         }
     }
+}
+
+/// Whether two pod specs point at the same objects in the same ways:
+/// [`Assembler::spec_refs`] of one adds nothing to that of the other.
+fn same_refs(a: &SpecFacts, b: &SpecFacts) -> bool {
+    std::ptr::eq(a, b) || a.service_account == b.service_account && a.refs == b.refs
 }
 
 type Key<'w> = (SourceKind, &'w str, &'w str);
 
 type Labels = BTreeMap<String, String>;
+
+/// PVCs by namespace and name without the ordinal, as positions in their list.
+type Claims<'w> = HashMap<(Option<&'w str>, &'w str), Vec<usize>>;
 
 struct Assembler<'w> {
     world: &'w World,
@@ -255,6 +446,16 @@ struct Assembler<'w> {
     nodes: HashMap<NodeId, Node>,
     edges: HashMap<EdgeId, Edge>,
     diagnostics: Vec<Diagnostic>,
+    /// What [`named`](Self::named) answered, by what it was asked: the
+    /// pods of an app ask for the same ConfigMaps and Secrets.
+    named: HashMap<Key<'w>, (NodeId, Presence)>,
+    /// The edge asked for last: several uses of one object by one pod
+    /// (a Secret in a few env variables) come in a row.
+    last_edge: Option<(EdgeKind, NodeId, NodeId, EdgeId)>,
+    /// PVCs named `<prefix>-<ordinal>` by namespace and prefix, as
+    /// positions in the PVC list; made for the first StatefulSet with
+    /// `volumeClaimTemplates`.
+    claims: Option<Claims<'w>>,
 }
 
 impl<'w> Assembler<'w> {
@@ -282,6 +483,9 @@ impl<'w> Assembler<'w> {
             nodes: HashMap::new(),
             edges: HashMap::new(),
             diagnostics: Vec::new(),
+            named: HashMap::new(),
+            last_edge: None,
+            claims: None,
         }
     }
 
@@ -301,12 +505,16 @@ impl<'w> Assembler<'w> {
         }
     }
 
-    fn run(mut self) -> TopologyGraph {
+    fn run(mut self, clock: &mut Clock) -> TopologyGraph {
+        clock.lap("index");
         let pod_display = self.workloads_and_pods();
+        clock.lap("workloads and pods");
         self.services(&pod_display);
+        clock.lap("services");
         self.ingresses();
         self.gateways();
         self.routes();
+        clock.lap("ingresses and routes");
         let world = self.world;
         if self.include_unreferenced {
             for kind in [
@@ -325,13 +533,27 @@ impl<'w> Assembler<'w> {
             edge.attrs.refs.sort();
             edge.attrs.refs.dedup();
         }
-        TopologyGraph::new(self.nodes.into_values().collect(), edges, self.diagnostics)
+        clock.lap("edges");
+        let graph = TopologyGraph::new(self.nodes.into_values().collect(), edges, self.diagnostics);
+        clock.lap("graph");
+        graph
     }
 
     // --- nodes and edges -------------------------------------------------
 
     fn edge(&mut self, kind: EdgeKind, from: &NodeId, to: &NodeId) -> &mut EdgeAttrs {
-        let id = EdgeId::new(kind, from, to);
+        let id = match &self.last_edge {
+            Some((last_kind, last_from, last_to, id))
+                if *last_kind == kind && last_from == from && last_to == to =>
+            {
+                id.clone()
+            }
+            _ => {
+                let id = EdgeId::new(kind, from, to);
+                self.last_edge = Some((kind, from.clone(), to.clone(), id.clone()));
+                id
+            }
+        };
         &mut self
             .edges
             .entry(id.clone())
@@ -360,7 +582,7 @@ impl<'w> Assembler<'w> {
         });
     }
 
-    fn object_node(&mut self, kind: SourceKind, facts: &Facts) -> NodeId {
+    fn object_node(&mut self, kind: SourceKind, facts: &'w Facts) -> NodeId {
         let meta = &facts.meta;
         let id = id_of(kind, meta.namespace.as_deref(), &meta.name);
         if !self.nodes.contains_key(&id) {
@@ -388,8 +610,24 @@ impl<'w> Assembler<'w> {
     fn named(
         &mut self,
         kind: SourceKind,
-        namespace: Option<&str>,
-        name: &str,
+        namespace: Option<&'w str>,
+        name: &'w str,
+    ) -> (NodeId, Presence) {
+        // Asked before: the node is there and stays as it is.
+        let key = (kind, namespace.unwrap_or_default(), name);
+        if let Some(answer) = self.named.get(&key) {
+            return answer.clone();
+        }
+        let answer = self.named_new(kind, namespace, name);
+        self.named.insert(key, answer.clone());
+        answer
+    }
+
+    fn named_new(
+        &mut self,
+        kind: SourceKind,
+        namespace: Option<&'w str>,
+        name: &'w str,
     ) -> (NodeId, Presence) {
         if let Some(facts) = self.get(kind, namespace, name) {
             return (self.object_node(kind, facts), Presence::Present);
@@ -432,7 +670,7 @@ impl<'w> Assembler<'w> {
 
     /// `Owns` from the node's controller, if it is in the graph already
     /// (no placeholder is made for owners of non-pods).
-    fn owner_edge(&mut self, id: &NodeId, meta: &Meta) {
+    fn owner_edge(&mut self, id: &NodeId, meta: &'w Meta) {
         let Some(owner) = &meta.owner else {
             return;
         };
@@ -450,10 +688,10 @@ impl<'w> Assembler<'w> {
     fn owner_target(
         &self,
         namespace: Option<&str>,
-        owner: &OwnerRef,
+        owner: &'w OwnerRef,
         pod_hash: Option<&str>,
         depth: u8,
-    ) -> Option<OwnerTarget> {
+    ) -> Option<OwnerTarget<'w>> {
         if owner.group.is_empty() && owner.kind == "Node" {
             return None;
         }
@@ -471,27 +709,25 @@ impl<'w> Assembler<'w> {
                 && let Some(deployment) = owner.name.strip_suffix(&format!("-{hash}"))
             {
                 // ReplicaSets not loaded: `<deployment>-<pod-template-hash>`.
-                return Some(OwnerTarget::of(
-                    namespace,
-                    &OwnerRef {
-                        group: "apps".into(),
-                        kind: "Deployment".into(),
-                        name: deployment.into(),
-                    },
-                ));
+                return Some(OwnerTarget::of(namespace, "apps", "Deployment", deployment));
             }
         }
-        Some(OwnerTarget::of(namespace, owner))
+        Some(OwnerTarget::of(
+            namespace,
+            &owner.group,
+            &owner.kind,
+            &owner.name,
+        ))
     }
 
     /// A workload node for an owner that is not among the objects.
-    fn owner_node(&mut self, target: &OwnerTarget, namespace: Option<&str>) {
+    fn owner_node(&mut self, target: &OwnerTarget<'w>, namespace: Option<&'w str>) {
         if self.nodes.contains_key(&target.id) {
             return;
         }
-        let source = SourceKind::from_api(&target.group, &target.kind);
+        let source = SourceKind::from_api(target.group, target.kind);
         if let Some(source) = source
-            && let Some(facts) = self.get(source, namespace, &target.name)
+            && let Some(facts) = self.get(source, namespace, target.name)
         {
             self.object_node(source, facts);
             return;
@@ -504,11 +740,11 @@ impl<'w> Assembler<'w> {
             target.id.clone(),
             Node {
                 id: target.id.clone(),
-                kind: NodeKind::Workload(WorkloadKind::from_api(&target.group, &target.kind)),
+                kind: NodeKind::Workload(WorkloadKind::from_api(target.group, target.kind)),
                 namespace: namespace.map(str::to_owned),
-                name: target.name.clone(),
-                api_kind: target.kind.clone(),
-                api_group: target.group.clone(),
+                name: target.name.to_owned(),
+                api_kind: target.kind.to_owned(),
+                api_group: target.group.to_owned(),
                 presence,
                 labels: BTreeMap::new(),
                 attrs: NodeAttrs::default(),
@@ -517,7 +753,7 @@ impl<'w> Assembler<'w> {
     }
 
     /// Edges from a pod spec to what it uses.
-    fn spec_refs(&mut self, from: &NodeId, namespace: Option<&str>, spec: &SpecFacts) {
+    fn spec_refs(&mut self, from: &NodeId, namespace: Option<&'w str>, spec: &'w SpecFacts) {
         for reference in &spec.refs {
             self.reference(
                 from,
@@ -541,8 +777,8 @@ impl<'w> Assembler<'w> {
         &mut self,
         from: &NodeId,
         target: RefTarget,
-        namespace: Option<&str>,
-        name: &str,
+        namespace: Option<&'w str>,
+        name: &'w str,
         edge: EdgeKind,
         use_: RefUse,
     ) {
@@ -561,7 +797,7 @@ impl<'w> Assembler<'w> {
     fn workloads_and_pods(&mut self) -> Vec<NodeId> {
         let world = self.world;
         // Workload nodes with the facts of their pod template.
-        let mut templates: Vec<(NodeId, Option<&str>, &'w WorkloadFacts)> = Vec::new();
+        let mut templates: Vec<(NodeId, Option<&'w str>, &'w WorkloadFacts)> = Vec::new();
         for kind in WORKLOADS {
             for facts in world.of(kind) {
                 let Body::Workload(workload) = &facts.body else {
@@ -611,6 +847,11 @@ impl<'w> Assembler<'w> {
         let mut counts: HashMap<NodeId, PodCounts> = HashMap::new();
         let mut with_pod_nodes: HashSet<NodeId> = HashSet::new();
         let mut display = Vec::with_capacity(world.of(SourceKind::Pod).len());
+        // The owner of the previous pod: pods of a ReplicaSet come in a row.
+        type Owner<'w> = (Option<&'w str>, &'w OwnerRef, Option<&'w str>);
+        let mut last_owner: Option<(Owner<'w>, Option<OwnerTarget<'w>>)> = None;
+        // Specs already joined to a workload its pods are collapsed into.
+        let mut joined: HashMap<NodeId, Vec<&'w SpecFacts>> = HashMap::new();
         for facts in world.of(SourceKind::Pod) {
             let Body::Pod(pod) = &facts.body else {
                 display.push(id_of(SourceKind::Pod, None, ""));
@@ -619,16 +860,24 @@ impl<'w> Assembler<'w> {
             let meta = &facts.meta;
             let namespace = meta.namespace.as_deref();
             let hash = meta.labels.get(POD_TEMPLATE_HASH).map(String::as_str);
-            let owner = meta
-                .owner
-                .as_ref()
-                .and_then(|owner| self.owner_target(namespace, owner, hash, 0));
+            let owner = meta.owner.as_ref().and_then(|owner| {
+                let asked = (namespace, owner, hash);
+                match &last_owner {
+                    Some((last, target)) if *last == asked => target.clone(),
+                    _ => {
+                        let target = self.owner_target(namespace, owner, hash, 0);
+                        last_owner = Some((asked, target.clone()));
+                        target
+                    }
+                }
+            });
             if let Some(owner) = &owner {
                 self.owner_node(owner, namespace);
                 let count = counts.entry(owner.id.clone()).or_default();
                 count.total += 1;
                 count.ready += u32::from(pod.ready);
             }
+            let collapsed = self.detail == Detail::Workloads && owner.is_some();
             let shown = match (self.detail, owner) {
                 (Detail::Workloads, Some(owner)) => owner.id,
                 (_, owner) => {
@@ -645,7 +894,19 @@ impl<'w> Assembler<'w> {
                     id
                 }
             };
-            self.spec_refs(&shown, namespace, &pod.spec);
+            // Replicas have the same spec: joining it again would add the
+            // same nodes, uses and diagnostics, which the graph has once.
+            let again = collapsed && {
+                let specs = joined.entry(shown.clone()).or_default();
+                let again = specs.iter().any(|spec| same_refs(spec, &pod.spec));
+                if !again {
+                    specs.push(&pod.spec);
+                }
+                again
+            };
+            if !again {
+                self.spec_refs(&shown, namespace, &pod.spec);
+            }
             display.push(shown);
         }
 
@@ -692,28 +953,39 @@ impl<'w> Assembler<'w> {
             return;
         };
         let world = self.world;
-        for claim in world.of(SourceKind::PersistentVolumeClaim) {
-            if claim.meta.namespace.as_deref() != namespace {
-                continue;
-            }
-            for template in &workload.claim_templates {
-                let ordinal = claim
-                    .meta
-                    .name
-                    .strip_prefix(&format!("{template}-{set}-"))
-                    .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
-                if ordinal.is_some() {
-                    let claim_id = self.object_node(SourceKind::PersistentVolumeClaim, claim);
-                    self.edge(EdgeKind::Mounts, id, &claim_id)
-                        .refs
-                        .push(RefUse {
-                            via: RefVia::ClaimTemplate,
-                            at: format!("volumeClaimTemplate {template}"),
-                            key: None,
-                            optional: false,
-                        });
+        let all = world.of(SourceKind::PersistentVolumeClaim);
+        let claims: &HashMap<_, _> = self.claims.get_or_insert_with(|| {
+            let mut claims: Claims<'w> = HashMap::new();
+            for (ix, claim) in all.iter().enumerate() {
+                if let Some((prefix, ordinal)) = claim.meta.name.rsplit_once('-')
+                    && !ordinal.is_empty()
+                    && ordinal.bytes().all(|b| b.is_ascii_digit())
+                {
+                    claims
+                        .entry((claim.meta.namespace.as_deref(), prefix))
+                        .or_default()
+                        .push(ix);
                 }
             }
+            claims
+        });
+        let mut found: Vec<(usize, &String)> = Vec::new();
+        for template in &workload.claim_templates {
+            let prefix = format!("{template}-{set}");
+            if let Some(claims) = claims.get(&(namespace, prefix.as_str())) {
+                found.extend(claims.iter().map(|&ix| (ix, template)));
+            }
+        }
+        for (ix, template) in found {
+            let claim_id = self.object_node(SourceKind::PersistentVolumeClaim, &all[ix]);
+            self.edge(EdgeKind::Mounts, id, &claim_id)
+                .refs
+                .push(RefUse {
+                    via: RefVia::ClaimTemplate,
+                    at: format!("volumeClaimTemplate {template}"),
+                    key: None,
+                    optional: false,
+                });
         }
     }
 
@@ -722,6 +994,15 @@ impl<'w> Assembler<'w> {
     fn services(&mut self, pod_display: &[NodeId]) {
         let world = self.world;
         let pods = world.of(SourceKind::Pod);
+        // Label keys some Service selects by: only those are indexed.
+        let mut keys: HashSet<&str> = HashSet::new();
+        for facts in world.of(SourceKind::Service) {
+            if let Body::Service(service) = &facts.body
+                && let Some(selector) = &service.selector
+            {
+                keys.extend(selector.keys().map(String::as_str));
+            }
+        }
         // (namespace, key, value) → pods with that label.
         let mut by_label: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
         let mut by_name: HashMap<(&str, &str), usize> = HashMap::new();
@@ -729,6 +1010,9 @@ impl<'w> Assembler<'w> {
             let namespace = facts.meta.namespace.as_deref().unwrap_or_default();
             by_name.insert((namespace, facts.meta.name.as_str()), ix);
             for (key, value) in &facts.meta.labels {
+                if !keys.contains(key.as_str()) {
+                    continue;
+                }
                 by_label
                     .entry((namespace, key.as_str(), value.as_str()))
                     .or_default()
@@ -749,14 +1033,35 @@ impl<'w> Assembler<'w> {
                     .push(slice);
             }
         }
-        // Workload nodes by namespace, for selectors that match templates.
-        let mut workloads: HashMap<Option<String>, Vec<(NodeId, Labels)>> = HashMap::new();
-        for node in self.nodes.values() {
-            if matches!(node.kind, NodeKind::Workload(_)) && !node.attrs.pod_labels.is_empty() {
-                workloads
-                    .entry(node.namespace.clone())
-                    .or_default()
-                    .push((node.id.clone(), node.attrs.pod_labels.clone()));
+        // Workload nodes, for selectors that match templates: by namespace,
+        // and by namespace and label (of the keys Services select by).
+        let workloads: Vec<(Option<String>, NodeId, Labels)> = self
+            .nodes
+            .values()
+            .filter(|node| {
+                matches!(node.kind, NodeKind::Workload(_)) && !node.attrs.pod_labels.is_empty()
+            })
+            .map(|node| {
+                (
+                    node.namespace.clone(),
+                    node.id.clone(),
+                    node.attrs.pod_labels.clone(),
+                )
+            })
+            .collect();
+        let mut workloads_in: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+        let mut workloads_by_label: HashMap<(Option<&str>, &str, &str), Vec<usize>> =
+            HashMap::new();
+        for (ix, (namespace, _, labels)) in workloads.iter().enumerate() {
+            let namespace = namespace.as_deref();
+            workloads_in.entry(namespace).or_default().push(ix);
+            for (key, value) in labels {
+                if keys.contains(key.as_str()) {
+                    workloads_by_label
+                        .entry((namespace, key.as_str(), value.as_str()))
+                        .or_default()
+                        .push(ix);
+                }
             }
         }
         let pods_complete = self.input.is_complete(SourceKind::Pod);
@@ -827,11 +1132,21 @@ impl<'w> Assembler<'w> {
                     count(pod_display[ix].clone(), ready);
                 }
                 let mut template_matches = 0;
-                for (workload, labels) in workloads
-                    .get(&facts.meta.namespace)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                {
+                // An empty selector matches every workload of the namespace.
+                let own = facts.meta.namespace.as_deref();
+                let candidates = if selector.is_empty() {
+                    workloads_in.get(&own)
+                } else {
+                    selector
+                        .iter()
+                        .map(|(key, value)| {
+                            workloads_by_label.get(&(own, key.as_str(), value.as_str()))
+                        })
+                        .min_by_key(|candidates| candidates.map_or(0, Vec::len))
+                        .flatten()
+                };
+                for &ix in candidates.map(Vec::as_slice).unwrap_or_default() {
+                    let (_, workload, labels) = &workloads[ix];
                     if selector
                         .iter()
                         .all(|(key, value)| labels.get(key) == Some(value))
@@ -915,7 +1230,12 @@ impl<'w> Assembler<'w> {
         }
     }
 
-    fn backend(&mut self, from: &NodeId, namespace: Option<&str>, backend: &extract::Backend) {
+    fn backend(
+        &mut self,
+        from: &NodeId,
+        namespace: Option<&'w str>,
+        backend: &'w extract::Backend,
+    ) {
         let namespace = backend.namespace.as_deref().or(namespace);
         let (service, presence) = self.named(SourceKind::Service, namespace, &backend.service);
         self.route(from, &service, backend.rule.clone());
@@ -926,7 +1246,7 @@ impl<'w> Assembler<'w> {
         }
     }
 
-    fn tls(&mut self, from: &NodeId, namespace: Option<&str>, secret: &str) {
+    fn tls(&mut self, from: &NodeId, namespace: Option<&'w str>, secret: &'w str) {
         let (id, presence) = self.named(SourceKind::Secret, namespace, secret);
         self.edge(EdgeKind::Tls, from, &id);
         if presence == Presence::Missing {
