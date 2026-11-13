@@ -103,8 +103,9 @@ fn or_no_changes(diff: &str) -> &str {
 /// Puts back into `shown` (the masked `new`) the values that the manifest
 /// `sent` and the apply sets or changes: masked in `shown`, equal in `sent`
 /// and `new`, and absent from or different in `old`. A value the apply
-/// leaves as it is stays masked on both sides.
-fn reveal_sent(sent: &Value, old: Option<&Value>, new: &Value, shown: &mut Value) {
+/// leaves as it is stays masked on both sides. The values of a Helm call
+/// follow the same rule (`helm_tools::window_values`).
+pub(crate) fn reveal_sent(sent: &Value, old: Option<&Value>, new: &Value, shown: &mut Value) {
     match (sent, new, shown) {
         (Value::Object(sent), Value::Object(new), Value::Object(shown)) => {
             for (key, shown) in shown.iter_mut() {
@@ -244,6 +245,23 @@ mod tests {
             assert!(window.text.contains(line), "{line}: {}", window.text);
         }
         assert!(!window.text.contains("aaaaaaa") && !window.text.contains("bbbbbbb"));
+    }
+
+    /// The API server counts `metadata.generation` up in a dry run that
+    /// changes the spec. The agent's diff does not have it, or it would say
+    /// whether a masked value differs from the one sent.
+    #[test]
+    fn the_agents_diff_has_no_generation() {
+        let with_generation = |value: &str, generation: u64| {
+            let mut object = deployment(json!([{"name": "DB_PASSWORD", "value": value}]));
+            object["metadata"]["generation"] = json!(generation);
+            object["metadata"]["resourceVersion"] = json!("7");
+            object
+        };
+        let (old, new) = (with_generation("hunter2", 1), with_generation("hunter3", 2));
+        let (agent, _) = one(&new, Some(&old), &new);
+        assert!(agent.ends_with("(no changes)\n"), "{agent}");
+        assert!(!agent.contains("generation"), "{agent}");
     }
 
     #[test]

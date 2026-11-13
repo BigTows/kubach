@@ -441,6 +441,18 @@ impl Session {
         &self.catalog
     }
 
+    /// The kinds the cluster serves now. [`Self::catalog`] is as old as the
+    /// session; whoever decides by a kind that is not in it asks again
+    /// (#179). A session made from prepared parts has only its own list.
+    pub async fn current_catalog(
+        &self,
+    ) -> Result<ApiCatalog, kubach_core::discovery::DiscoveryError> {
+        if self.test_rbac.is_some() {
+            return Ok(self.catalog.clone());
+        }
+        ApiCatalog::discover(&self.user_client).await
+    }
+
     /// `server-side limits are off: …` when the context asked for a
     /// server-enforced identity and `namespace` fell back to client-only
     /// limits. The UI must show it where it cannot be missed (#197).

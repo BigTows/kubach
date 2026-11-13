@@ -230,7 +230,16 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
         unreachable!()
     };
     assert_eq!(helm.action, HelmAction::Install);
-    assert!(!helm.values.contains("s3cret-value"), "{}", helm.values);
+    // The window shows the value the agent sent (#179); its answer does not.
+    assert!(
+        helm.values.contains("password: s3cret-value"),
+        "{}",
+        helm.values
+    );
+    assert!(
+        !installed.to_string().contains("s3cret-value"),
+        "{installed}"
+    );
     assert!(
         helm.identity.starts_with("serviceaccount:"),
         "{}",

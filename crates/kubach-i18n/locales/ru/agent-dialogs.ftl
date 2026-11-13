@@ -92,9 +92,9 @@ agent-access-secrets = Secret (метаданные и проверки)
 agent-access-crds = пользовательские ресурсы
 agent-access-nodes = ноды (чтение с вашими учётными данными)
 agent-tool-session = { $tool } · сессия { $session }
-agent-helm-values = Values (чувствительные ключи скрыты)
+agent-helm-values = Values (присланные агентом в этом вызове — как есть; чувствительные из релиза скрыты)
 agent-helm-values-show = Показать все values
-agent-helm-values-diff = Изменения values (чувствительные значения скрыты)
+agent-helm-values-diff = Изменения values (присланные агентом в этом вызове — как есть; чувствительные из релиза скрыты)
 agent-helm-objects = Объекты
 agent-diff-size =
     { $count ->
