@@ -650,6 +650,16 @@ impl HelmInstall {
         };
         self.install_failure = None;
         self.output_open = false;
+        if HelmScreen::vault_locked(&target, cx) {
+            self.preview = Some(Preview {
+                revision: self.revision,
+                namespace: target.namespace.clone(),
+                state: PreviewState::Failed(Failure::new(t!("vault-locked"))),
+                _task: Task::ready(()),
+            });
+            cx.notify();
+            return;
+        }
         let helm = HelmScreen::helm_path(cx);
         let namespace = target.namespace.clone();
         let handle = runtime::spawn(async move {

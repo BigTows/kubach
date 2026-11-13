@@ -73,7 +73,12 @@ pub fn check(cluster: &Cluster, captured: &Connection) -> Result<(), ContextChan
 /// Tells the user a change was not run, in the active window once the
 /// current update is over.
 pub fn refuse(changed: &ContextChanged, cx: &mut App) {
-    let message = changed.to_string();
+    warn(changed.to_string(), cx);
+}
+
+/// Shows `message` as a warning in the active window once the current
+/// update is over.
+pub fn warn(message: String, cx: &mut App) {
     cx.defer(move |cx| {
         let Some(handle) = cx
             .active_window()

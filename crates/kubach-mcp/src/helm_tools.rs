@@ -1481,6 +1481,7 @@ async fn helm_run(
             namespace: namespace.to_owned(),
             driver: Driver::Secret,
             secret_env: SecretEnv::new(vars),
+            memory: None,
             working_dir: Some(work.cwd()),
         },
         identity,

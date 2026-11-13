@@ -1186,6 +1186,7 @@ async fn lookup_flow(base: Config, context: String, namespace: String) {
         namespace: namespace.clone(),
         driver: Driver::Secret,
         secret_env: SecretEnv::default(),
+        memory: None,
         working_dir: None,
     };
     helm_cli::install(

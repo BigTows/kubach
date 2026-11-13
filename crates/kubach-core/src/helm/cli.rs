@@ -5,6 +5,10 @@
 //! namespace and storage driver matching the open connection, so the result
 //! is exactly what the user's CLI would do.
 //!
+//! A context that is in no kubeconfig file (imported into the vault) goes
+//! to helm as a temporary kubeconfig with that context alone, which lives
+//! for the one helm process ([`HelmTarget::memory`]).
+//!
 //! Values for an upgrade go through stdin (`--values -`), never a file; the
 //! chart kept in the release is written to a private temporary directory
 //! that is removed when the call ends.
@@ -19,6 +23,8 @@ use tokio::process::Command;
 
 use super::chart::StoredChart;
 use super::{Driver, Release, Sensitive, progress, release_from_json};
+use crate::cluster::Contexts;
+use crate::kubeconfig::temp::ContextKubeconfig;
 pub use crate::process::Cancel;
 use crate::process::{self, ProcessError, Stdin, Stream};
 use crate::validation::ValidationError;
@@ -34,7 +40,13 @@ pub struct HelmTarget {
     pub context: String,
     /// Kubeconfig files the connection was loaded from, in merge order.
     /// Empty leaves helm's own default (`KUBECONFIG` or `~/.kube/config`).
+    /// Not used with [`memory`](Self::memory).
     pub kubeconfig: Vec<PathBuf>,
+    /// The context itself, when it is in no file (imported into the vault,
+    /// #201): each helm process then reads it from a temporary kubeconfig
+    /// of its own, the only configuration it sees, and never the files in
+    /// [`kubeconfig`](Self::kubeconfig), `KUBECONFIG` or `~/.kube/config`.
+    pub memory: Option<ContextKubeconfig>,
     /// Release namespace (`--namespace`).
     pub namespace: String,
     /// Storage driver (`HELM_DRIVER`).
@@ -67,6 +79,9 @@ pub struct HelmCommand {
     pub stdin: Option<Sensitive<String>>,
     /// Set after `env`; see [`HelmTarget::secret_env`].
     pub secret_env: SecretEnv,
+    /// The context for a temporary kubeconfig written when helm starts;
+    /// see [`HelmTarget::memory`].
+    memory: Option<ContextKubeconfig>,
     /// The directory helm runs in. Helm takes a chart reference such as
     /// `repo/chart` for a path when a directory of that name is where it
     /// runs, so a call made for an agent runs in an empty private directory
@@ -272,6 +287,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: Some(request.values.clone()),
             secret_env: SecretEnv::default(),
+            memory: None,
             working_dir: request.working_dir.clone(),
             refusal: None,
         }
@@ -339,6 +355,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: None,
             secret_env: SecretEnv::default(),
+            memory: None,
             working_dir: None,
             refusal: None,
         }
@@ -410,6 +427,7 @@ impl HelmCommand {
             env: Vec::new(),
             stdin: None,
             secret_env: SecretEnv::default(),
+            memory: None,
             working_dir: None,
             refusal: None,
         }
@@ -441,6 +459,12 @@ impl HelmCommand {
             Some(OsString::from(driver_name(target.driver))),
         )];
         match target.kubeconfig.as_slice() {
+            // The context is in no file: `run_watched` writes it to one and
+            // names it. What the user's shell sets for another server or
+            // identity does not apply to it either.
+            _ if target.memory.is_some() => {
+                env.extend(CONNECTION_VARS.iter().map(|name| (*name, None)));
+            }
             [] => {}
             // `--kubeconfig` takes one file; it also wins over `KUBECONFIG`.
             [file] => args.extend(["--kubeconfig".into(), file.clone().into()]),
@@ -460,6 +484,7 @@ impl HelmCommand {
             env,
             stdin: None,
             secret_env: target.secret_env.clone(),
+            memory: target.memory.clone(),
             working_dir: target.working_dir.clone(),
             refusal: None,
         }
@@ -530,6 +555,43 @@ pub fn driver_name(driver: Driver) -> &'static str {
     }
 }
 
+/// Variables of the user's environment that would point helm at another
+/// server or identity than the kubeconfig names. Removed for a context
+/// that is in no file ([`HelmTarget::memory`]): its temporary kubeconfig is
+/// all helm goes by, as Kubach's own connection does.
+const CONNECTION_VARS: &[&str] = &[
+    "HELM_KUBEAPISERVER",
+    "HELM_KUBECAFILE",
+    "HELM_KUBETOKEN",
+    "HELM_KUBEASUSER",
+    "HELM_KUBEASGROUPS",
+    "HELM_KUBEINSECURE_SKIP_TLS_VERIFY",
+    "HELM_KUBETLS_SERVER_NAME",
+];
+
+/// What helm reads `context` from: the kubeconfig files and, for a context
+/// that is in none of them (imported into the vault), the context itself
+/// ([`HelmTarget::memory`]) with `temp_dir` for its temporary files
+/// ([`crate::kubeconfig::temp::dir`]). `None` when the context can't be
+/// given to helm: it is not loaded (the vault is locked) or there is no
+/// place for the file. Helm then must not run, as the files do not have it.
+pub fn kubeconfig_of(
+    contexts: &Contexts,
+    context: &str,
+    linked: &[PathBuf],
+    temp_dir: Option<PathBuf>,
+) -> Option<(Vec<PathBuf>, Option<ContextKubeconfig>)> {
+    contexts.get(context)?;
+    if !contexts
+        .source(context)
+        .is_some_and(crate::kubeconfig::Source::is_imported)
+    {
+        return Some((kubeconfig_files(linked), None));
+    }
+    let memory = contexts.context_kubeconfig(context, temp_dir?)?;
+    Some((Vec::new(), Some(memory)))
+}
+
 /// Kubeconfig files in merge order: `KUBECONFIG` (or `~/.kube/config`) and
 /// then `linked` files from settings, as the connection reads them.
 pub fn kubeconfig_files(linked: &[PathBuf]) -> Vec<PathBuf> {
@@ -559,6 +621,8 @@ pub enum HelmCliError {
     Cancelled { killed: bool, stderr: String },
     #[error("{}", failure_message(*.code, .stderr))]
     Failed { code: Option<i32>, stderr: String },
+    #[error("can't write the temporary kubeconfig for helm: {0}")]
+    Kubeconfig(std::io::ErrorKind),
     #[error("can't use the chart kept in the release: {0}")]
     StoredChart(String),
     #[error("can't read helm's output: {0}")]
@@ -656,8 +720,31 @@ pub async fn run_watched(
     let helm = helm.ok_or(HelmCliError::NotInstalled)?;
     let debug = command.debug();
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    // A context that is in no file: written for this process alone and
+    // removed when it ends, also when this future is dropped. The kind
+    // only: the file's text never reaches a message.
+    let kubeconfig = command
+        .memory
+        .as_ref()
+        .map(ContextKubeconfig::write)
+        .transpose()
+        .map_err(|error| HelmCliError::Kubeconfig(error.kind()))?;
     let mut process = Command::new(helm);
-    process.args(&command.args);
+    match &kubeconfig {
+        Some(file) => {
+            let names = command
+                .args
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(command.args.len());
+            process.args(&command.args[..names]);
+            process.arg("--kubeconfig").arg(file.path());
+            process.args(&command.args[names..]);
+        }
+        None => {
+            process.args(&command.args);
+        }
+    }
     if let Some(dir) = &command.working_dir {
         process.current_dir(dir);
     }
@@ -667,11 +754,18 @@ pub async fn run_watched(
             None => process.env_remove(name),
         };
     }
+    if let Some(file) = &kubeconfig {
+        // The flag wins over the variable; the variable is set as well, so
+        // that nothing helm starts reads the user's files instead.
+        process.env(crate::kubeconfig::KUBECONFIG_ENV, file.path());
+    }
     let stdin = command
         .stdin
         .as_ref()
         .map(|input| Stdin::new(input.expose().as_bytes()));
-    match process::run_watched(process, stdin, timeout, watch.process()).await {
+    let result = process::run_watched(process, stdin, timeout, watch.process()).await;
+    drop(kubeconfig);
+    match result {
         Ok(output) if debug => Ok(progress::strip_debug_output(&output.stdout_text())),
         Ok(output) => Ok(output.stdout_text()),
         Err(ProcessError::Cancelled { killed, stderr }) => Err(HelmCliError::Cancelled {
@@ -985,6 +1079,7 @@ mod tests {
             namespace: "apps".into(),
             driver: Driver::Secret,
             secret_env: SecretEnv::default(),
+            memory: None,
             working_dir: None,
         }
     }
@@ -1100,6 +1195,318 @@ mod tests {
             output.trim(),
             "secret rollback --kube-context minikube --namespace apps --kubeconfig /k -- web 3"
         );
+    }
+
+    /// A kubeconfig file with context `name` on `server`.
+    #[cfg(all(test, unix))]
+    fn kubeconfig_yaml(name: &str, server: &str, token: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {name}\n\
+             clusters:\n  - name: {name}-cluster\n    cluster: {{ server: \"{server}\" }}\n\
+             users:\n  - name: {name}-user\n    user: {{ token: {token} }}\n\
+             contexts:\n  - name: {name}\n    context: {{ cluster: {name}-cluster, user: {name}-user }}\n"
+        )
+    }
+
+    /// Contexts as Kubach loads them: the linked `file`, then a vault with
+    /// `prod` (and `spare`, which no call asks for); a locked vault gives
+    /// only the names.
+    #[cfg(all(test, unix))]
+    fn contexts_with_vault(file: &Path, unlocked: bool) -> Contexts {
+        use crate::kubeconfig::{FileProblem, Source};
+        use kube::config::Kubeconfig;
+        let config = Kubeconfig::from_yaml(&kubeconfig_yaml(
+            "prod",
+            "https://vault.example.com",
+            "vault-token",
+        ))
+        .unwrap()
+        .merge(
+            Kubeconfig::from_yaml(&kubeconfig_yaml(
+                "spare",
+                "https://spare.example.com",
+                "spare-token",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let imported = crate::vault::Imported {
+            source: Source::Imported {
+                vault: file.with_file_name("vault.json"),
+                id: "1".into(),
+                name: "work".into(),
+            },
+            config: if unlocked {
+                Ok(config)
+            } else {
+                Err(FileProblem::Locked)
+            },
+            contexts: vec!["prod".into(), "spare".into()],
+        };
+        Contexts::load_all(vec![Source::Linked(file.to_owned())], vec![imported]).unwrap()
+    }
+
+    /// A fake `helm` that writes what it was given to `log`: its arguments,
+    /// `KUBECONFIG`, the modes of the `--kubeconfig` file and its folder,
+    /// then the file itself. `after` runs last.
+    #[cfg(all(test, unix))]
+    fn recording_helm(dir: &Path, log: &Path, after: &str) -> PathBuf {
+        let body = format!(
+            r#"previous=; kubeconfig=
+for argument in "$@"; do
+  [ "$previous" = --kubeconfig ] && kubeconfig="$argument"
+  previous="$argument"
+done
+{{
+  printf 'args=%s\n' "$*"
+  printf 'env=%s\n' "$KUBECONFIG"
+  printf 'file=%s\n' "$kubeconfig"
+  printf 'modes=%s %s\n' "$(ls -l "$kubeconfig" | cut -c1-10)" \
+    "$(ls -ld "$(dirname "$kubeconfig")" | cut -c1-10)"
+  cat "$kubeconfig"
+}} > '{}'
+{after}"#,
+            log.display()
+        );
+        fake_helm(dir, &body)
+    }
+
+    /// The target the screens build for `context` (the namespace aside).
+    #[cfg(all(test, unix))]
+    fn screen_target(contexts: &Contexts, context: &str, file: &Path, temp: &Path) -> HelmTarget {
+        let (kubeconfig, memory) =
+            kubeconfig_of(contexts, context, &[file.to_owned()], Some(temp.to_owned())).unwrap();
+        HelmTarget {
+            context: context.into(),
+            kubeconfig,
+            memory,
+            ..target(&[])
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn files_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_vault_context_reaches_helm_alone_in_a_file_of_its_own() {
+        use kube::config::Kubeconfig;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(
+            &file,
+            kubeconfig_yaml("dev", "https://dev.example.com", "dev-token"),
+        )
+        .unwrap();
+        let temp = dir.path().join("run").join("kubeconfig");
+        let contexts = contexts_with_vault(&file, true);
+        let target = screen_target(&contexts, "prod", &file, &temp);
+        assert!(target.kubeconfig.is_empty());
+        // The file gets a context of the same name on another server after
+        // Kubach read it: helm must not see it.
+        std::fs::write(
+            &file,
+            kubeconfig_yaml("prod", "https://elsewhere.example.com", "file-token"),
+        )
+        .unwrap();
+
+        let command = HelmCommand::rollback(&target, "web", 3);
+        // The line shown to the user names no file: there is none yet.
+        assert_eq!(
+            command.display(),
+            "helm rollback --kube-context prod --namespace apps -- web 3"
+        );
+        for name in CONNECTION_VARS {
+            assert!(command.env.contains(&(*name, None)), "{name}");
+        }
+        assert!(!command.env.iter().any(|(name, _)| *name == "KUBECONFIG"));
+
+        let log = dir.path().join("log");
+        let helm = recording_helm(dir.path(), &log, "");
+        run(Some(&helm), &command, DEFAULT_TIMEOUT).await.unwrap();
+        let said = std::fs::read_to_string(&log).unwrap();
+        let mut lines = said.lines();
+        let args = lines.next().unwrap();
+        let env = lines.next().unwrap().strip_prefix("env=").unwrap();
+        let path = lines.next().unwrap().strip_prefix("file=").unwrap();
+        let modes = lines.next().unwrap();
+        let yaml: String = lines.map(|line| format!("{line}\n")).collect();
+
+        assert_eq!(
+            args,
+            format!(
+                "args=rollback --kube-context prod --namespace apps --kubeconfig {path} -- web 3"
+            )
+        );
+        // The flag and the variable name the same file, in Kubach's folder.
+        assert_eq!(env, path);
+        assert_eq!(Path::new(path).parent(), Some(temp.as_path()));
+        assert_eq!(modes, "modes=-rw------- drwx------");
+        // That one context, with its own server and credentials.
+        let seen = Kubeconfig::from_yaml(&yaml).unwrap();
+        assert_eq!(seen.current_context.as_deref(), Some("prod"));
+        assert_eq!(seen.contexts.len(), 1);
+        assert_eq!(seen.clusters.len(), 1);
+        assert_eq!(seen.auth_infos.len(), 1);
+        assert!(yaml.contains("https://vault.example.com"));
+        assert!(yaml.contains("vault-token"));
+        for other in ["elsewhere.example.com", "file-token", "spare", "dev"] {
+            assert!(!yaml.contains(other), "{other}");
+        }
+        // Gone with the process.
+        assert_eq!(files_in(&temp), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_file_of_a_vault_context_is_removed_however_helm_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(
+            &file,
+            kubeconfig_yaml("dev", "https://dev.example.com", "dev-token"),
+        )
+        .unwrap();
+        let temp = dir.path().join("run").join("kubeconfig");
+        let contexts = contexts_with_vault(&file, true);
+        let target = screen_target(&contexts, "prod", &file, &temp);
+        let command = HelmCommand::uninstall(&target, "web", false);
+        let log = dir.path().join("log");
+
+        // helm fails.
+        let failing = recording_helm(dir.path(), &log, "echo 'Error: no' >&2; exit 1");
+        let error = run(Some(&failing), &command, DEFAULT_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Error: no");
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("vault-token")
+        );
+        assert_eq!(files_in(&temp), 0);
+
+        // helm is stopped for running too long.
+        std::fs::remove_file(&log).unwrap();
+        let slow = recording_helm(dir.path(), &log, "sleep 5");
+        let error = run(Some(&slow), &command, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HelmCliError::Timeout(_)));
+        assert_eq!(files_in(&temp), 0);
+
+        // The call is dropped while helm runs.
+        std::fs::remove_file(&log).ok();
+        let call = tokio::spawn({
+            let (slow, command) = (slow.clone(), command.clone());
+            async move { run(Some(&slow), &command, DEFAULT_TIMEOUT).await }
+        });
+        for _ in 0..200 {
+            if log.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(files_in(&temp), 1);
+        call.abort();
+        let _ = call.await;
+        assert_eq!(files_in(&temp), 0);
+
+        // An upgrade and an install go the same way, each with its own file.
+        let done = recording_helm(dir.path(), &log, "cat > /dev/null; echo done");
+        let outcome = upgrade(
+            Some(&done),
+            &target,
+            &request(UpgradeChart::Reference {
+                chart: "repo/web".into(),
+                version: None,
+            }),
+            false,
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, UpgradeOutcome::Applied(_)));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("vault-token")
+        );
+        std::fs::remove_file(&log).unwrap();
+        install(
+            Some(&done),
+            &target,
+            &install_request(),
+            false,
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("vault-token")
+        );
+        assert_eq!(files_in(&temp), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helm_does_not_start_without_the_file_of_a_vault_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(
+            &file,
+            kubeconfig_yaml("prod", "https://elsewhere.example.com", "file-token"),
+        )
+        .unwrap();
+        // Nothing can be created under a file.
+        let temp = file.join("kubeconfig");
+        let contexts = contexts_with_vault(&dir.path().join("missing"), true);
+        let target = screen_target(&contexts, "prod", &file, &temp);
+        let log = dir.path().join("log");
+        let helm = recording_helm(dir.path(), &log, "");
+        let error = run(
+            Some(&helm),
+            &HelmCommand::rollback(&target, "web", 1),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, HelmCliError::Kubeconfig(_)), "{error}");
+        assert!(!error.to_string().contains("token"));
+        assert!(!log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_loaded_vault_context_is_given_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(
+            &file,
+            kubeconfig_yaml("dev", "https://dev.example.com", "dev-token"),
+        )
+        .unwrap();
+        let linked = [file.clone()];
+        let temp = || Some(dir.path().join("run"));
+        let contexts = contexts_with_vault(&file, true);
+        // A context of a file: the files, as before.
+        let (files, memory) = kubeconfig_of(&contexts, "dev", &linked, temp()).unwrap();
+        assert_eq!(files, kubeconfig_files(&linked));
+        assert!(memory.is_none());
+        // A context of the vault: never the files.
+        let (files, memory) = kubeconfig_of(&contexts, "prod", &linked, temp()).unwrap();
+        assert!(files.is_empty());
+        assert!(memory.is_some());
+        assert!(!format!("{memory:?}").contains("token"));
+        // No place for the file, or the vault is locked: nothing for helm.
+        assert!(kubeconfig_of(&contexts, "prod", &linked, None).is_none());
+        let locked = contexts_with_vault(&file, false);
+        assert!(kubeconfig_of(&locked, "prod", &linked, temp()).is_none());
+        assert!(kubeconfig_of(&locked, "dev", &linked, temp()).is_some());
     }
 
     #[cfg(unix)]

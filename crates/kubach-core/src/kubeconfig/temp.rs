@@ -2,7 +2,8 @@
 //! the one open in Kubach — with its namespace, written to a private file the
 //! terminal's shell gets as `KUBECONFIG`. An agent's helm call on a vault
 //! context under the user's credentials uses the same file for as long as
-//! helm runs (#113).
+//! helm runs (#113), and so does helm started from Kubach's own screens on
+//! such a context ([`ContextKubeconfig`], #201).
 //!
 //! The file holds credentials (tokens, client keys, materialized vault
 //! configs), so it is created readable by the owner only (`0600` from the
@@ -22,7 +23,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kube::config::Kubeconfig;
@@ -149,6 +150,52 @@ impl Drop for TempKubeconfig {
         let _ = fs::remove_file(&self.path);
     }
 }
+
+/// The kubeconfig of one context that is in no file (a context imported
+/// into the vault), for a tool that reads its configuration only from a
+/// file, such as `helm` (#113, #201). It stays in memory and goes to a
+/// [`TempKubeconfig`] only for as long as one process of the tool runs
+/// ([`write`](Self::write)).
+#[derive(Clone)]
+pub struct ContextKubeconfig(Arc<Kept>);
+
+struct Kept {
+    /// One context, its cluster and user.
+    config: Kubeconfig,
+    /// Where the temporary files live ([`dir`]), so that one left by a
+    /// crash is removed on the next start.
+    dir: PathBuf,
+}
+
+impl ContextKubeconfig {
+    /// `context` of `config` alone ([`single_context`]), for files in
+    /// `dir`. `None` when the config has no such context.
+    pub fn of(config: &Kubeconfig, context: &str, dir: PathBuf) -> Option<Self> {
+        let config = single_context(config, context, None)?;
+        Some(Self(Arc::new(Kept { config, dir })))
+    }
+
+    /// The owner-only file for one process, removed when dropped.
+    pub fn write(&self) -> io::Result<TempKubeconfig> {
+        TempKubeconfig::create(&self.0.dir, &self.0.config)
+    }
+}
+
+/// Never the contents: they hold credentials.
+impl std::fmt::Debug for ContextKubeconfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextKubeconfig").finish_non_exhaustive()
+    }
+}
+
+/// The same loaded config, not an equal one: contents are not compared.
+impl PartialEq for ContextKubeconfig {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ContextKubeconfig {}
 
 /// Creates `path` (failing if it exists) with no access for anyone but the
 /// owner before anything is written to it.
@@ -456,6 +503,30 @@ contexts:
         assert_eq!(users, ["eks"]);
         assert!(!yaml.contains("alice-token"));
         assert!(!yaml.contains("prod.example.com"));
+    }
+
+    #[test]
+    fn a_context_kept_in_memory_is_written_alone_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("kubeconfig");
+        assert!(ContextKubeconfig::of(&config(), "missing", folder.clone()).is_none());
+        let kept = ContextKubeconfig::of(&config(), "dev", folder.clone()).unwrap();
+        assert!(!format!("{kept:?}").contains("aws"));
+        assert_eq!(kept, kept.clone());
+        assert_ne!(
+            kept,
+            ContextKubeconfig::of(&config(), "dev", folder.clone()).unwrap()
+        );
+        let (first, second) = (kept.write().unwrap(), kept.write().unwrap());
+        assert_ne!(first.path(), second.path());
+        let yaml = fs::read_to_string(first.path()).unwrap();
+        let back = Kubeconfig::from_yaml(&yaml).unwrap();
+        assert_eq!(back.contexts.len(), 1);
+        assert_eq!(back.current_context.as_deref(), Some("dev"));
+        assert!(!yaml.contains("alice-token"));
+        let paths = [first.path().to_owned(), second.path().to_owned()];
+        drop((first, second));
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[test]
