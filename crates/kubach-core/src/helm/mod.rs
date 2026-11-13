@@ -36,7 +36,10 @@ pub use chart::StoredChart;
 pub use codec::{decode_chart, decode_release, encode_release, release_from_json};
 pub use diff::{RevisionDiff, diff_revisions, unified_diff};
 pub use live::{DriverChoice, DriverSource, ReleaseFeed};
-pub use manifest::{ManifestDiff, ManifestResource, diff_manifests, manifest_resources};
+pub use manifest::{
+    ManifestDiff, ManifestResource, UnreadDocument, diff_manifests, manifest_resources,
+    strict_documents, strict_resources,
+};
 pub use store::{Driver, ReleaseListing, Releases, StoredRevision};
 pub use values::{ComputedValues, check_values_yaml, coalesce_values, values_to_yaml};
 

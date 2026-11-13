@@ -95,9 +95,9 @@ agent-access-secrets = Secrets (metadata and checks)
 agent-access-crds = custom resources
 agent-access-nodes = nodes (read with your credentials)
 agent-tool-session = { $tool } · session { $session }
-agent-helm-values = Values (sensitive keys masked)
+agent-helm-values = Values (sent by the agent in this call: as is; the release's sensitive ones: masked)
 agent-helm-values-show = Show all values
-agent-helm-values-diff = Values changes (sensitive values masked)
+agent-helm-values-diff = Values changes (sent by the agent in this call: as is; the release's sensitive ones: masked)
 agent-helm-objects = Objects
 agent-diff-size =
     { $count ->

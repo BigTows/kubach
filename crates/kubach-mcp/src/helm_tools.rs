@@ -53,8 +53,22 @@
 //!   compared with the dry run the user approved;
 //! - charts only from repositories already added in Kubach, or an `oci://`
 //!   repository the user allows for the session; never a path or URL;
+//! - every document of a chart's render, of the dry run and of a revision
+//!   has to give objects that are certain before anybody is asked (#179):
+//!   the `items` of a document are its objects, as for Helm; a document
+//!   that does not parse, has no name, or that YAML parsers read in
+//!   different ways refuses the call by its number; a kind the session's
+//!   list of kinds does not have is looked up in the cluster again, and one
+//!   the cluster does not serve needs the user's tick;
+//! - the window's diff of an upgrade and of a rollback has the hooks of
+//!   both sides, under their own heading (#179);
 //! - values only as YAML the agent passes (never a file path), masked by
-//!   key name in the dialog, the audit log and answers;
+//!   key name in the audit log and answers. The confirmation window shows a
+//!   value the agent sent in this call where the call sets or changes it,
+//!   as an apply's window does (#175, #179); what the release had stays
+//!   masked there too;
+//! - what a call creates or changes is the session's own afterwards: the
+//!   logs of its pods are confirmed, as after `apply_manifest` (#190, #179);
 //! - a release's current values never reach the agent whole (#22):
 //!   `helm_get_values` returns them masked by key name and by what looks
 //!   like a key or token, and `helm_upgrade` with `valuesPatch` merges the
@@ -75,10 +89,11 @@ use kubach_core::helm::cli::{
     UpgradeRequest,
 };
 use kubach_core::helm::lookup::{lookup_objects, lookup_use};
+use kubach_core::helm::manifest::written_resources;
 use kubach_core::helm::repo::{self, HelmPaths, IndexState, SearchOptions};
 use kubach_core::helm::{
-    Driver, HelmError, ManifestResource, Release, Releases, Sensitive, manifest_resources, oci,
-    unified_diff,
+    Driver, HelmError, ManifestResource, Release, Releases, Sensitive, UnreadDocument, oci,
+    strict_resources, unified_diff,
 };
 use kubach_core::kubeconfig::temp::TempKubeconfig;
 use kubach_core::secrets::mask::{ends_with_sensitive_word, is_sensitive_name};
@@ -86,6 +101,7 @@ use kube::config::Kubeconfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::apply_diff::reveal_sent;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, RequestKind, ask};
 use crate::helm_preview::{PreviewInput, changed_values, compare};
 use crate::masking::{mask_text, masked_manifest, truncate};
@@ -134,6 +150,11 @@ const CLUSTER_KINDS: &[&str] = &[
     "IngressClass",
     "CSIDriver",
 ];
+
+/// The finding of an object whose kind the cluster does not serve (#179).
+pub(crate) const UNKNOWN_KIND: &str = "the cluster does not serve this kind, so Kubach cannot \
+                                       tell whether it is cluster-scoped: refused unless you \
+                                       allow it here";
 
 /// Who runs a call the user allowed under their own credentials (#18), for
 /// the dialog and the audit log.
@@ -252,7 +273,9 @@ pub struct HelmChange {
     /// The revision a rollback returns to.
     #[serde(default)]
     pub revision: Option<u32>,
-    /// User values as YAML, values of sensitive keys masked.
+    /// User values as YAML for the window: a value the agent sent in this
+    /// call and the call sets or changes as it is, the rest of the
+    /// sensitive ones masked (#179).
     #[serde(default)]
     pub values: String,
     /// `Deployment web`… of the dry run (or of the release, to uninstall).
@@ -278,9 +301,10 @@ pub struct HelmChange {
     /// allowed to the session (`modify(ns)`) before the user is asked.
     #[serde(default)]
     pub namespaces: Vec<String>,
-    /// How the release's values change (#22): a unified diff, values of
-    /// sensitive keys and secret-looking strings masked. Empty when they
-    /// stay as they are.
+    /// How the release's values change (#22): a unified diff for the
+    /// window. The old side has sensitive values masked; the new side shows
+    /// what the agent sent in this call and masks the rest (#179). Empty
+    /// when they stay as they are.
     #[serde(default)]
     pub values_diff: String,
     /// What the diff in `details` leaves out, when it is larger than
@@ -725,8 +749,58 @@ pub(crate) fn masked_values_diff(
     )
 }
 
-/// Values YAML as shown and audited: masked, or an outline when it does
-/// not parse.
+/// Values for the confirmation window (#179), by the rule of an apply's
+/// window (#175): masked as by [`mask_values`], except a value the agent
+/// `sent` in this call that the call sets or changes against `old`, which
+/// is shown as it is: the user approves it and has to see it. What the
+/// release had, and what the agent sent unchanged, stays masked. Never for
+/// the agent or the audit log.
+pub(crate) fn window_values(sent: Option<&Value>, old: Option<&Value>, new: &Value) -> Value {
+    let mut shown = new.clone();
+    mask_values(&mut shown);
+    if let Some(sent) = sent {
+        reveal_sent(sent, old, new, &mut shown);
+    }
+    shown
+}
+
+/// [`masked_values_diff`] for the confirmation window: the new side as by
+/// [`window_values`], the old side masked, and a value that stays masked
+/// on both sides marked when it changes.
+pub(crate) fn window_values_diff(
+    sent: Option<&Value>,
+    old: &Value,
+    new: &Value,
+    old_label: &str,
+    new_label: &str,
+) -> String {
+    let mut old_masked = old.clone();
+    mask_values(&mut old_masked);
+    let mut shown = new.clone();
+    mask_values(&mut shown);
+    mark_changed(old, new, &old_masked, &mut shown);
+    if let Some(sent) = sent {
+        reveal_sent(sent, Some(old), new, &mut shown);
+    }
+    unified_diff(
+        &kubach_core::helm::values_to_yaml(&old_masked),
+        &kubach_core::helm::values_to_yaml(&shown),
+        old_label,
+        new_label,
+    )
+}
+
+/// The values of an install for the confirmation window: all of them come
+/// from the agent in this call ([`window_values`]). An outline when they
+/// do not parse.
+pub(crate) fn window_values_yaml(text: &str) -> String {
+    match parse_values(text) {
+        Ok(value) => kubach_core::helm::values_to_yaml(&window_values(Some(&value), None, &value)),
+        Err(_) => format!("<values that do not parse, {} bytes>", text.len()),
+    }
+}
+
+/// Values YAML as audited: masked, or an outline when it does not parse.
 pub(crate) fn masked_values_yaml(text: &str) -> String {
     match parse_values(text) {
         Ok(mut value) => {
@@ -827,10 +901,14 @@ pub(crate) fn check_objects(
             .rsplit_once('/')
             .map_or("", |(group, _)| group);
         let served = catalog.find(group, &resource.kind);
+        let listed = CLUSTER_KINDS.contains(&resource.kind.as_str());
         let cluster_scoped = match served {
             Some(kind) => !kind.namespaced,
-            None => CLUSTER_KINDS.contains(&resource.kind.as_str()),
+            None => listed,
         };
+        // Neither served by the cluster nor one of the kinds known to be
+        // cluster-scoped: where it goes is not known (#179).
+        let unknown = served.is_none() && !listed;
         let elsewhere = match resource.namespace.as_deref() {
             Some(other) if !cluster_scoped && other != namespace => Some(other),
             _ => None,
@@ -918,6 +996,21 @@ pub(crate) fn check_objects(
                 message: "grants rights inside the namespace".into(),
             });
         }
+        if unknown {
+            if mode == SessionMode::TemporaryServiceAccount {
+                return Err(Denial::new(
+                    DenialCode::UnknownKind,
+                    "the server-side dry run shows an object of a kind the cluster does not \
+                     serve, which helm template did not render; Kubach cannot tell whether it is \
+                     cluster-scoped. Ask the user to install it from Kubach's Helm screen",
+                ));
+            }
+            preview.findings.push(Finding {
+                document: None,
+                path: format!("{} {}", resource.kind, resource.name),
+                message: UNKNOWN_KIND.into(),
+            });
+        }
         if !cluster_scoped
             && elsewhere.is_none()
             && let Some(kind) = served
@@ -932,22 +1025,52 @@ pub(crate) fn check_objects(
     Ok(preview)
 }
 
-/// The cluster-scoped objects, RBAC and objects in other namespaces of
-/// `manifests` (#18, #21): what a temporary ServiceAccount cannot create
-/// or delete, checked as for the user. Each object once, in order.
-pub(crate) fn beyond_service_account(
-    manifests: &[&str],
+/// The objects of the manifest `what` for the checks of a call (#179):
+/// every document has to give objects that are certain
+/// ([`strict_resources`]), or the call is refused by the document's number.
+/// `numbered` is off for a server-side dry run nobody approved: where it
+/// breaks is the chart's choice there (#173).
+pub(crate) fn read_objects(
+    what: &str,
+    manifest: &str,
+    numbered: bool,
+) -> Result<Vec<ManifestResource>, Denial> {
+    strict_resources(manifest).map_err(|error| unread(what, &error, numbered))
+}
+
+fn unread(what: &str, error: &UnreadDocument, numbered: bool) -> Denial {
+    let place = if numbered {
+        format!(
+            " (document {}, counting from 1 the documents that hold anything)",
+            error.index + 1
+        )
+    } else {
+        String::new()
+    };
+    Denial::new(
+        DenialCode::Manifest,
+        format!(
+            "{what} has a document whose objects are not certain{place}: {}. Kubach checks \
+             every object of a helm call before the user is asked, so nothing ran. A chart \
+             whose every document is one object with a name (or a list of such objects) passes; \
+             otherwise ask the user to do it from Kubach's Helm screen",
+            error.reason
+        ),
+    )
+}
+
+/// The cluster-scoped objects, RBAC and objects in other namespaces among
+/// the `objects` of a call's manifests (#18, #21): what a temporary
+/// ServiceAccount cannot create or delete, checked as for the user. Each
+/// object once, in order.
+pub(crate) fn scan_objects(
+    objects: &[Vec<ManifestResource>],
     namespace: &str,
     catalog: &ApiCatalog,
 ) -> Result<Scan, Denial> {
     let mut scan = Scan::default();
-    for manifest in manifests {
-        let preview = check_objects(
-            &manifest_resources(manifest),
-            namespace,
-            catalog,
-            SessionMode::ClientOnly,
-        )?;
+    for objects in objects {
+        let preview = check_objects(objects, namespace, catalog, SessionMode::ClientOnly)?;
         for finding in preview.findings {
             if !scan.findings.iter().any(|known| known.path == finding.path) {
                 scan.findings.push(finding);
@@ -965,6 +1088,20 @@ pub(crate) fn beyond_service_account(
         }
     }
     Ok(scan)
+}
+
+/// [`scan_objects`] of manifests as they are read for a call.
+#[cfg(test)]
+pub(crate) fn beyond_service_account(
+    manifests: &[&str],
+    namespace: &str,
+    catalog: &ApiCatalog,
+) -> Result<Scan, Denial> {
+    let objects = manifests
+        .iter()
+        .map(|manifest| read_objects("the manifest", manifest, true))
+        .collect::<Result<Vec<_>, _>>()?;
+    scan_objects(&objects, namespace, catalog)
 }
 
 /// Whether a call must ask for the user's credentials (#18): only under a
@@ -1580,20 +1717,104 @@ fn require_binary(env: &HelmEnv) -> Result<PathBuf, ToolError> {
         .ok_or_else(|| helm_error(HelmCliError::NotInstalled))
 }
 
-/// Manifests diffed with Secret values and sensitive env masked. Parsed
-/// on the blocking pool: the deep schemas of a chart's CRDs overflowed the
-/// async worker's stack on upgrade (#21), as in [`preview_from`].
-async fn masked_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> WindowDiff {
-    let (old, new) = (old.to_owned(), new.to_owned());
+/// The hooks of a release as one manifest, in an order that does not
+/// depend on the order helm keeps them in: by template, kind and name.
+fn hooks_manifest(release: &Release) -> String {
+    let mut hooks: Vec<_> = release.hooks.iter().collect();
+    hooks.sort_by(|a, b| (&a.path, &a.kind, &a.name).cmp(&(&b.path, &b.kind, &b.name)));
+    hooks
+        .iter()
+        .map(|hook| hook.manifest.expose().as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+/// The window's diff of two revisions (#179): their objects and, under a
+/// heading of their own, their hooks, with Secret values and sensitive env
+/// masked. Parsed on the blocking pool: the deep schemas of a chart's CRDs
+/// overflowed the async worker's stack on upgrade (#21), as in
+/// [`preview_from`].
+async fn release_diff(
+    old: &Release,
+    new: &Release,
+    old_label: &str,
+    new_label: &str,
+) -> WindowDiff {
+    let old = (old.manifest.expose().clone(), hooks_manifest(old));
+    let new = (new.manifest.expose().clone(), hooks_manifest(new));
     let (old_label, new_label) = (old_label.to_owned(), new_label.to_owned());
     kubach_core::runtime::blocking(move || {
-        window_diff(&old, &new, &old_label, &new_label, MAX_CONFIRM_DIFF_BYTES)
+        release_window_diff(
+            (&old.0, &old.1),
+            (&new.0, &new.1),
+            &old_label,
+            &new_label,
+            MAX_CONFIRM_DIFF_BYTES,
+        )
     })
     .await
 }
 
+/// What stands between the objects' diff and the hooks' in the window.
+pub(crate) const HOOKS_HEADING: &str = "# Hooks: objects helm creates and runs while the change \
+     goes (jobs before and after it, tests). They are not among the release's objects; below is \
+     how they change.\n";
+
+/// What the window has instead of the objects' diff when only hooks change.
+pub(crate) const ONLY_HOOKS: &str = "# No object of the release changes; its hooks do.\n";
+
+/// The diff of two revisions for the confirmation window: `(manifest,
+/// hooks)` of each side. The objects come first, as [`window_diff`] gives
+/// them, then the hooks under [`HOOKS_HEADING`]; empty when neither
+/// changes. Within `max` bytes, and what a cut leaves out names the hooks
+/// as such.
+pub(crate) fn release_window_diff(
+    old: (&str, &str),
+    new: (&str, &str),
+    old_label: &str,
+    new_label: &str,
+    max: usize,
+) -> WindowDiff {
+    let (old_objects, new_objects) = masked_sides(old.0, new.0);
+    let objects = unified_diff(&old_objects, &new_objects, old_label, new_label);
+    let (old_hooks, new_hooks) = masked_sides(old.1, new.1);
+    let hooks = unified_diff(
+        &old_hooks,
+        &new_hooks,
+        &format!("hooks of {old_label}"),
+        &format!("hooks {new_label}"),
+    );
+    if hooks.is_empty() {
+        return cut_diff(objects, &old_objects, &new_objects, max);
+    }
+    let mut text = if objects.is_empty() {
+        ONLY_HOOKS.to_owned()
+    } else {
+        format!("{objects}\n")
+    };
+    text.push_str(HOOKS_HEADING);
+    let hooks_at = text.len();
+    text.push_str(&hooks);
+    cut_at(text, max, |_, from| {
+        let mut hidden = hidden_objects(&objects, from, &old_objects, &new_objects);
+        hidden.extend(
+            hidden_objects(
+                &hooks,
+                from.saturating_sub(hooks_at),
+                &old_hooks,
+                &new_hooks,
+            )
+            .into_iter()
+            .map(|label| format!("{label} (hook)")),
+        );
+        hidden
+    })
+}
+
 /// The diff of two manifests for the confirmation window, both masked
-/// ([`masked_sides`]), within `max` bytes ([`cut_diff`]).
+/// ([`masked_sides`]), within `max` bytes ([`cut_diff`]): a
+/// [`release_window_diff`] without hooks.
+#[cfg(test)]
 pub(crate) fn window_diff(
     old: &str,
     new: &str,
@@ -1601,9 +1822,7 @@ pub(crate) fn window_diff(
     new_label: &str,
     max: usize,
 ) -> WindowDiff {
-    let (old, new) = masked_sides(old, new);
-    let diff = unified_diff(&old, &new, old_label, new_label);
-    cut_diff(diff, &old, &new, max)
+    release_window_diff((old, ""), (new, ""), old_label, new_label, max)
 }
 
 /// What an object of a manifest is compared with on the other side: its
@@ -2462,15 +2681,48 @@ fn release_manifest(release: &Release) -> String {
     manifest
 }
 
+/// The kinds of the cluster for the objects of a call: the session's list,
+/// or the cluster asked again when an object's kind is not in it (#179). The
+/// list is as old as the session, and a kind that came since (a CRD) would
+/// be taken for a namespaced one. When the cluster cannot be asked, the call
+/// is refused.
+async fn catalog_for(
+    ctx: &Ctx<'_>,
+    objects: impl IntoIterator<Item = &ManifestResource>,
+) -> Result<ApiCatalog, ToolError> {
+    let known = ctx.session.catalog();
+    let all_known = objects.into_iter().all(|object| {
+        let group = object
+            .api_version
+            .rsplit_once('/')
+            .map_or("", |(group, _)| group);
+        known.find(group, &object.kind).is_some()
+    });
+    if all_known {
+        return Ok(known.clone());
+    }
+    ctx.session.current_catalog().await.map_err(|_| {
+        ToolError::Failed(
+            "the chart has an object of a kind that is not in the session's list of the \
+             cluster's kinds, and Kubach could not read the cluster's kinds again to tell \
+             whether it is cluster-scoped. Nothing ran"
+                .into(),
+        )
+    })
+}
+
 /// The objects of `release` checked for the call: as for the user when
 /// the user allowed their credentials (`as_user`, #18), otherwise for the
-/// namespace's identity.
+/// namespace's identity. `what` names the release in a refusal; `dry_run`
+/// is a server-side dry run nobody approved yet (#173).
 ///
 /// Manifests are parsed on the blocking pool, not the async worker's
 /// stack: the deeply nested schemas of CRDs recurse deep (#18).
 async fn preview_from(
     ctx: &Ctx<'_>,
     release: &Release,
+    what: &str,
+    dry_run: bool,
     namespace: &str,
     as_user: bool,
 ) -> Result<Preview, ToolError> {
@@ -2480,29 +2732,66 @@ async fn preview_from(
         ctx.session.mode_in(namespace)
     };
     let manifest = release_manifest(release);
-    let namespace = namespace.to_owned();
-    let catalog = ctx.session.catalog().clone();
-    kubach_core::runtime::blocking(move || {
-        check_objects(&manifest_resources(&manifest), &namespace, &catalog, mode)
-    })
-    .await
-    .map_err(ToolError::from)
+    let what = what.to_owned();
+    let objects =
+        kubach_core::runtime::blocking(move || read_objects(&what, &manifest, !dry_run)).await?;
+    let catalog = catalog_for(ctx, &objects).await?;
+    check_objects(&objects, namespace, &catalog, mode).map_err(ToolError::from)
 }
 
 /// What a temporary ServiceAccount could not do among `manifests` (#18)
 /// and their objects in other namespaces (#21), whatever the namespace's
-/// identity: [`needs_user_credentials`] decides by the mode. Parsed on the
-/// blocking pool, as in [`preview_from`].
-async fn scan(ctx: &Ctx<'_>, namespace: &str, manifests: &[&str]) -> Result<Scan, ToolError> {
-    let manifests: Vec<String> = manifests.iter().map(|text| (*text).to_owned()).collect();
-    let namespace = namespace.to_owned();
-    let catalog = ctx.session.catalog().clone();
-    kubach_core::runtime::blocking(move || {
-        let manifests: Vec<&str> = manifests.iter().map(String::as_str).collect();
-        beyond_service_account(&manifests, &namespace, &catalog)
+/// identity: [`needs_user_credentials`] decides by the mode. Each manifest
+/// comes with what it is called in a refusal. Parsed on the blocking pool,
+/// as in [`preview_from`].
+async fn scan(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    manifests: &[(&str, &str)],
+) -> Result<Scan, ToolError> {
+    let manifests: Vec<(String, String)> = manifests
+        .iter()
+        .map(|(what, text)| ((*what).to_owned(), (*text).to_owned()))
+        .collect();
+    let objects = kubach_core::runtime::blocking(move || {
+        manifests
+            .iter()
+            .map(|(what, text)| read_objects(what, text, true))
+            .collect::<Result<Vec<_>, _>>()
     })
-    .await
-    .map_err(ToolError::from)
+    .await?;
+    let catalog = catalog_for(ctx, objects.iter().flatten()).await?;
+    scan_objects(&objects, namespace, &catalog).map_err(ToolError::from)
+}
+
+/// What the manifests of a call are called in a refusal (#179).
+const RENDER: &str = "helm template's render of the chart";
+const DRY_RUN: &str = "the server-side dry run";
+
+/// A stored revision with its hooks, for a refusal.
+fn revision_label(release: &Release) -> String {
+    format!(
+        "revision {} of the release (its hooks counted after its objects)",
+        release.revision
+    )
+}
+
+/// Records what a helm change creates or changes as the session's own
+/// (#179): the objects of `new` that `old` does not have as they are, hooks
+/// among them. The logs of their pods are then confirmed, as after
+/// `apply_manifest` (#190). Called before helm runs: a failed call may
+/// still have changed them.
+async fn note_written(ctx: &Ctx<'_>, namespace: &str, old: Option<&Release>, new: &Release) {
+    let old = old.map(release_manifest).unwrap_or_default();
+    let new = release_manifest(new);
+    let written = kubach_core::runtime::blocking(move || written_resources(&old, &new)).await;
+    for object in written {
+        ctx.session.note_change(
+            object.namespace.as_deref().unwrap_or(namespace),
+            &object.kind,
+            &object.name,
+        );
+    }
 }
 
 /// Sets up the session's rights in each namespace besides the release's
@@ -2576,7 +2865,9 @@ async fn rendered_objects(rendered: Option<&str>, namespace: &str) -> Vec<String
     let text = rendered.unwrap_or_default().to_owned();
     let namespace = namespace.to_owned();
     kubach_core::runtime::blocking(move || {
-        manifest_resources(&text)
+        // Read already by the scan of the call.
+        strict_resources(&text)
+            .unwrap_or_default()
             .iter()
             .map(|object| object_label(object, &namespace))
             .collect()
@@ -2902,8 +3193,8 @@ struct TemplatePreview<'a> {
     scan: &'a Scan,
     previous_manifest: &'a str,
     previous_label: &'a str,
-    /// Manifests scanned besides the render.
-    scanned: &'a [&'a str],
+    /// Manifests scanned besides the render, each with what it is called.
+    scanned: &'a [(&'a str, &'a str)],
     /// `--create-namespace` of an install.
     create_namespace: bool,
     values: Option<(&'a str, &'a [Value])>,
@@ -2948,7 +3239,7 @@ async fn template_preview(
     // What lookup found may change what the chart renders.
     let (mut findings, mut cluster, mut elsewhere) = match &live {
         Some(live) => {
-            let mut manifests = vec![live.as_str()];
+            let mut manifests = vec![(RENDER, live.as_str())];
             manifests.extend(preview.scanned);
             let scan = scan(ctx, namespace, &manifests).await?;
             (scan.findings, scan.cluster, scan.elsewhere)
@@ -3103,7 +3394,8 @@ async fn install_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
         chart: a.chart.trim().to_owned(),
         version: a.version.clone(),
         revision: None,
-        values: masked_values_yaml(&values),
+        // All of them come from the agent in this call: shown as they are.
+        values: window_values_yaml(&values),
         objects: Vec::new(),
         cluster_objects: Vec::new(),
         create_namespace: a.create_namespace,
@@ -3128,7 +3420,12 @@ async fn install_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     let rendered = rendered(&binary, &template).await;
     let render_failure = rendered.as_ref().err().map(RenderFailure::of);
     let rendered = rendered.ok();
-    let scan = scan(ctx, &namespace, &[rendered.as_deref().unwrap_or_default()]).await?;
+    let scan = scan(
+        ctx,
+        &namespace,
+        &[(RENDER, rendered.as_deref().unwrap_or_default())],
+    )
+    .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere, true).await?;
     let mode = ctx.session.mode_in(&namespace);
     let as_user = needs_user_credentials(mode, &scan.findings);
@@ -3194,7 +3491,8 @@ async fn install_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     let identity = run.identity.clone();
     // Nothing of the run stays on disk while the user decides.
     drop(run);
-    let mut preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
+    let mut preview =
+        preview_from(ctx, &preview_release, DRY_RUN, true, &namespace, as_user).await?;
     // The dry run may show more than helm template did (#21).
     authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere, false).await?;
     let others = other_namespaces(scan.elsewhere.iter().chain(&preview.elsewhere));
@@ -3231,6 +3529,7 @@ async fn install_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     );
     approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     still_fetched(Some(&pulled)).await?;
+    note_written(ctx, &namespace, None, &preview_release).await;
     // A fresh token: the user may have taken minutes to answer.
     let run = helm_run(ctx, &env, &work, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
@@ -3321,13 +3620,17 @@ pub(crate) fn values_edit(values: Option<&str>, patch: Option<&str>) -> Result<V
     }
 }
 
-/// An upgrade's values: what helm gets, what the dialog shows (masked) and
-/// the masked diff against the current revision.
+/// An upgrade's values: what helm gets, what the agent and the audit log
+/// get (masked) and what the confirmation window shows.
 pub(crate) struct UpgradeValues {
     pub yaml: Sensitive<String>,
-    pub masked: String,
-    /// Whole, for the confirmation window (#137).
+    /// The masked diff against the current revision, whole: for the agent
+    /// and the audit log, bounded by the caller.
     pub diff: String,
+    /// The values after the upgrade for the window ([`window_values`]).
+    pub window: String,
+    /// The diff for the window ([`window_values_diff`]), whole (#137).
+    pub window_diff: String,
     /// [`changed_values`], for a preview's summary (#115).
     pub changes: Vec<Value>,
 }
@@ -3339,30 +3642,33 @@ pub(crate) fn upgrade_values_now(
     current: &Value,
     revision: u32,
 ) -> UpgradeValues {
-    let (new, yaml) = match edit {
-        ValuesEdit::Keep => (current.clone(), None),
+    // `sent`: what the agent passed in this call, if anything.
+    let (new, yaml, sent) = match edit {
+        ValuesEdit::Keep => (current.clone(), None, None),
         // The agent's text goes to helm as it is.
-        ValuesEdit::Replace(text) => (
-            parse_values(&text).unwrap_or_else(|_| Value::Object(Map::new())),
-            Some(text),
-        ),
+        ValuesEdit::Replace(text) => {
+            let new = parse_values(&text).unwrap_or_else(|_| Value::Object(Map::new()));
+            (new.clone(), Some(text), Some(new))
+        }
         ValuesEdit::Patch(patch) => {
             let mut merged = current.clone();
             merge_values(&mut merged, &patch);
-            (merged, None)
+            (merged, None, Some(patch))
         }
     };
     let yaml = yaml.unwrap_or_else(|| kubach_core::helm::values_to_yaml(&new));
-    let mut masked = new.clone();
-    mask_values(&mut masked);
+    let (old_label, new_label) = (
+        format!("values of revision {revision}"),
+        "values after the upgrade",
+    );
     UpgradeValues {
-        masked: kubach_core::helm::values_to_yaml(&masked),
-        diff: masked_values_diff(
-            current,
+        diff: masked_values_diff(current, &new, &old_label, new_label),
+        window: kubach_core::helm::values_to_yaml(&window_values(
+            sent.as_ref(),
+            Some(current),
             &new,
-            &format!("values of revision {revision}"),
-            "values after the upgrade",
-        ),
+        )),
+        window_diff: window_values_diff(sent.as_ref(), current, &new, &old_label, new_label),
         changes: changed_values(current, &new),
         yaml: Sensitive::new(yaml),
     }
@@ -3457,7 +3763,7 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
         chart,
         version: a.version.clone(),
         revision: None,
-        values: values.masked,
+        values: values.window,
         objects: Vec::new(),
         cluster_objects: Vec::new(),
         create_namespace: false,
@@ -3465,7 +3771,7 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
         credentials: HelmCredentials::Session,
         user_objects: Vec::new(),
         namespaces: Vec::new(),
-        values_diff: values.diff.clone(),
+        values_diff: values.window_diff,
         diff_cut: None,
     };
     // What the new chart renders without the cluster and what the current
@@ -3483,6 +3789,7 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     let render_failure = rendered.as_ref().err().map(RenderFailure::of);
     let rendered = rendered.ok();
     let current_manifest = release_manifest(&current);
+    let current_what = revision_label(&current);
     let previous_label = format!("revision {}", current.revision);
     // The agent, a preview and the audit log get the values diff bounded.
     let agent_values_diff = truncate(&values.diff, MAX_AGENT_DIFF_BYTES).into_owned();
@@ -3490,7 +3797,10 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     let scan = scan(
         ctx,
         &namespace,
-        &[rendered.as_deref().unwrap_or_default(), &current_manifest],
+        &[
+            (RENDER, rendered.as_deref().unwrap_or_default()),
+            (&current_what, &current_manifest),
+        ],
     )
     .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere, true).await?;
@@ -3511,7 +3821,7 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
                 // `helm template` prints hooks: the revision's count too.
                 previous_manifest: &current_manifest,
                 previous_label: &previous_label,
-                scanned: &[&current_manifest],
+                scanned: &[(&current_what, &current_manifest)],
                 create_namespace: false,
                 values: preview_values,
             },
@@ -3557,7 +3867,7 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
     let identity = run.identity.clone();
     // Nothing of the run stays on disk while the user decides.
     drop(run);
-    let preview = preview_from(ctx, &preview_release, &namespace, as_user).await?;
+    let preview = preview_from(ctx, &preview_release, DRY_RUN, true, &namespace, as_user).await?;
     // The dry run may show more than helm template did (#21).
     authorize_elsewhere(ctx, &allowed, &a.release, &preview.elsewhere, false).await?;
     let others = other_namespaces(scan.elsewhere.iter().chain(&preview.elsewhere));
@@ -3575,9 +3885,9 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
         namespaces: others.clone(),
         ..base_change
     };
-    let diff = masked_diff(
-        current.manifest.expose(),
-        preview_release.manifest.expose(),
+    let diff = release_diff(
+        &current,
+        &preview_release,
         &format!("revision {}", current.revision),
         "after the upgrade",
     )
@@ -3587,12 +3897,13 @@ async fn upgrade_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolOu
         ..change
     };
     let details = if diff.text.trim().is_empty() {
-        "The dry run changes no object.".to_owned()
+        "The dry run changes no object and no hook.".to_owned()
     } else {
         diff.text
     };
     approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     still_fetched(pulled.as_ref()).await?;
+    note_written(ctx, &namespace, Some(&current), &preview_release).await;
     // A fresh token: the user may have taken minutes to answer.
     let run = helm_run(ctx, &env, &work, &namespace, as_user).await?;
     let phases = Arc::new(Mutex::new(Vec::new()));
@@ -3682,16 +3993,27 @@ async fn rollback_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolO
     let scan = scan(
         ctx,
         &namespace,
-        &[&release_manifest(&target), &release_manifest(&current)],
+        &[
+            (&revision_label(&target), &release_manifest(&target)),
+            (&revision_label(&current), &release_manifest(&current)),
+        ],
     )
     .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere, true).await?;
     let others = other_namespaces(&scan.elsewhere);
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
-    let preview = preview_from(ctx, &target, &namespace, as_user).await?;
-    let diff = masked_diff(
-        current.manifest.expose(),
-        target.manifest.expose(),
+    let preview = preview_from(
+        ctx,
+        &target,
+        &revision_label(&target),
+        false,
+        &namespace,
+        as_user,
+    )
+    .await?;
+    let diff = release_diff(
+        &current,
+        &target,
         &format!("revision {}", current.revision),
         &format!("revision {}", target.revision),
     )
@@ -3723,7 +4045,7 @@ async fn rollback_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolO
         diff_cut: diff.cut,
     };
     let details = if diff.text.trim().is_empty() {
-        "The rollback changes no object.".to_owned()
+        "The rollback changes no object and no hook.".to_owned()
     } else {
         diff.text
     };
@@ -3734,6 +4056,7 @@ async fn rollback_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<ToolO
     } else {
         approve(ctx, &allowed, change, details, preview.findings.clone()).await?;
     }
+    note_written(ctx, &namespace, Some(&current), &target).await;
     // A fresh token: the user may have taken minutes to answer. helm runs
     // in an empty private directory (#174).
     let work = Workspace::new()?;
@@ -3805,11 +4128,17 @@ async fn uninstall_call(ctx: &Ctx<'_>, args: &Map<String, Value>) -> Result<Tool
     })
     .await?;
     // Uninstalling deletes the revision's cluster-scoped objects too (#18).
-    let scan = scan(ctx, &namespace, &[&release_manifest(&current)]).await?;
+    let current_what = revision_label(&current);
+    let scan = scan(
+        ctx,
+        &namespace,
+        &[(&current_what, &release_manifest(&current))],
+    )
+    .await?;
     authorize_elsewhere(ctx, &allowed, &a.release, &scan.elsewhere, true).await?;
     let others = other_namespaces(&scan.elsewhere);
     let as_user = needs_user_credentials(ctx.session.mode_in(&namespace), &scan.findings);
-    let preview = preview_from(ctx, &current, &namespace, as_user).await?;
+    let preview = preview_from(ctx, &current, &current_what, false, &namespace, as_user).await?;
     let identity = if as_user {
         USER_IDENTITY.to_owned()
     } else {
