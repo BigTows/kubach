@@ -152,13 +152,35 @@ impl HelmScreen {
 
     pub(super) fn helm_target(&self, namespace: &str, cx: &App) -> Option<HelmTarget> {
         let cluster = self.cluster.read(cx);
+        let context = cluster.active()?.name.clone();
+        // A context of the vault is in no file: helm gets it alone, in a
+        // temporary kubeconfig per process (#201). None once the vault is
+        // locked, so nothing is built for it.
+        if !cluster.is_available(&context, cx) {
+            return None;
+        }
+        let (kubeconfig, memory) = cli::kubeconfig_of(
+            cluster.contexts().ok()?,
+            &context,
+            cluster.kubeconfig_paths(),
+            kubach_core::kubeconfig::temp::dir(),
+        )?;
         Some(HelmTarget {
-            context: cluster.active()?.name.clone(),
-            kubeconfig: cli::kubeconfig_files(cluster.kubeconfig_paths()),
+            context,
+            kubeconfig,
+            memory,
             namespace: namespace.to_owned(),
             driver: self.releases.read(cx).driver().driver,
             secret_env: Default::default(),
+            working_dir: None,
         })
+    }
+
+    /// Whether helm must not start on `target` any more: it is a context
+    /// of the vault ([`HelmTarget::memory`]) and the vault is locked (ADR
+    /// 0008). Asked right before each helm process.
+    pub(in crate::screens) fn vault_locked(target: &HelmTarget, cx: &App) -> bool {
+        locked_out(target, crate::vault::is_unlocked(cx))
     }
 
     /// The active connection, when `target` was made for its context; a
@@ -181,6 +203,13 @@ impl HelmScreen {
     ) {
         screen
             .update(cx, |this, cx| {
+                // A context of the vault after the lock: helm does not
+                // start, and the user is told why (ADR 0008).
+                let imported = this.cluster.read(cx).is_imported(&connection.context);
+                if crate::vault::lock_ends(imported, crate::vault::is_unlocked(cx)) {
+                    action_context::warn(t!("vault-locked"), cx);
+                    return;
+                }
                 if action_context::still_active(&this.cluster, connection, cx) {
                     run(this, cx);
                 }
@@ -1050,10 +1079,68 @@ impl HelmScreen {
     }
 }
 
+/// [`HelmScreen::vault_locked`] for a vault that is `unlocked` or not.
+fn locked_out(target: &HelmTarget, unlocked: bool) -> bool {
+    crate::vault::lock_ends(target.memory.is_some(), unlocked)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HelmChange, HelmNotice};
+    use super::{HelmChange, HelmNotice, locked_out};
+    use kubach_core::Contexts;
+    use kubach_core::helm::Driver;
+    use kubach_core::helm::cli::{self, HelmTarget};
+    use kubach_core::kubeconfig::Source;
     use kubach_ui::Tone;
+
+    /// Only helm on a context of the vault ends with the lock (ADR 0008).
+    #[test]
+    fn helm_on_a_vault_context_does_not_start_after_the_lock() {
+        let yaml = |name: &str| {
+            format!(
+                "apiVersion: v1\nkind: Config\n\
+                 clusters:\n  - name: {name}\n    cluster: {{ server: \"https://{name}.example.com\" }}\n\
+                 users:\n  - name: {name}\n    user: {{ token: t }}\n\
+                 contexts:\n  - name: {name}\n    context: {{ cluster: {name}, user: {name} }}\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, yaml("from-file")).unwrap();
+        let imported = kubach_core::vault::Imported {
+            source: Source::Imported {
+                vault: dir.path().join("vault.json"),
+                id: "1".into(),
+                name: "work".into(),
+            },
+            config: Ok(kube::config::Kubeconfig::from_yaml(&yaml("from-vault")).unwrap()),
+            contexts: vec!["from-vault".into()],
+        };
+        let contexts =
+            Contexts::load_all(vec![Source::Linked(file.clone())], vec![imported]).unwrap();
+        let target = |context: &str| {
+            let (kubeconfig, memory) = cli::kubeconfig_of(
+                &contexts,
+                context,
+                std::slice::from_ref(&file),
+                Some(dir.path().join("run")),
+            )
+            .unwrap();
+            HelmTarget {
+                context: context.into(),
+                kubeconfig,
+                memory,
+                namespace: "apps".into(),
+                driver: Driver::Secret,
+                secret_env: Default::default(),
+                working_dir: None,
+            }
+        };
+        assert!(locked_out(&target("from-vault"), false));
+        assert!(!locked_out(&target("from-vault"), true));
+        assert!(!locked_out(&target("from-file"), false));
+        assert!(!locked_out(&target("from-file"), true));
+    }
 
     #[test]
     fn notices_tell_start_and_outcome() {

@@ -45,12 +45,12 @@ fn service() -> Value {
 
 /// Serves `pod()` and `service()` and records `METHOD path` of each request.
 async fn fake_api() -> (String, Arc<Mutex<Vec<String>>>) {
-    fake_api_with(vec![pod()]).await
+    fake_api_with(Arc::new(Mutex::new(vec![pod()]))).await
 }
 
-/// Serves `pods` (listed for any selector) and `service()`.
-async fn fake_api_with(pods: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
-    let pods = Arc::new(pods);
+/// Serves `pods` (listed for any selector) as they are at each request, and
+/// `service()`.
+async fn fake_api_with(pods: Arc<Mutex<Vec<Value>>>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -88,7 +88,12 @@ async fn fake_api_with(pods: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
                     let method = parts.next().unwrap_or("").to_owned();
                     let path = parts.next().unwrap_or("").to_owned();
                     log.lock().unwrap().push(format!("{method} {path}"));
+                    // A connection through `slow-0` stays open.
+                    if path.contains("/slow-0/portforward") {
+                        std::future::pending::<()>().await;
+                    }
                     let pods = format!("/api/v1/namespaces/{NS}/pods");
+                    let served = served.lock().unwrap().clone();
                     let named = path
                         .strip_prefix(&format!("{pods}/"))
                         .and_then(|name| served.iter().find(|p| p["metadata"]["name"] == name));
@@ -96,7 +101,7 @@ async fn fake_api_with(pods: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
                         ("200 OK", pod.to_string())
                     } else if path.starts_with(&format!("{pods}?")) {
                         let list = json!({"apiVersion": "v1", "kind": "PodList",
-                                          "metadata": {}, "items": *served});
+                                          "metadata": {}, "items": served});
                         ("200 OK", list.to_string())
                     } else if path == format!("/api/v1/namespaces/{NS}/services/web") {
                         ("200 OK", service().to_string())
@@ -127,6 +132,8 @@ struct Fixture {
     client: Client,
     confirmer: Arc<ScriptedConfirmer>,
     requests: Arc<Mutex<Vec<String>>>,
+    /// The pods the API serves; a test may replace them.
+    pods: Arc<Mutex<Vec<Value>>>,
     audit_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -138,7 +145,8 @@ async fn fixture(approve: bool) -> Fixture {
 
 /// [`fixture`] with the API serving `pods`.
 async fn fixture_with(approve: bool, pods: Vec<Value>) -> Fixture {
-    let (url, requests) = fake_api_with(pods).await;
+    let pods = Arc::new(Mutex::new(pods));
+    let (url, requests) = fake_api_with(pods.clone()).await;
     let client = Client::try_from(Config::new(url.parse().unwrap())).unwrap();
     let scope = scope_with(Profile::Debug, &permissive(), &[NS]);
     let capabilities: HashSet<Capability> = Capability::ALL.into_iter().collect();
@@ -165,6 +173,7 @@ async fn fixture_with(approve: bool, pods: Vec<Value>) -> Fixture {
         client,
         confirmer,
         requests,
+        pods,
         audit_path,
         _dir: dir,
     }
@@ -517,11 +526,10 @@ async fn the_user_stops_a_forward_in_kubach_and_the_session_notices() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!f.server.session().grants().is_forwarding(NS));
-    let listed = f
-        .server
-        .call("agent", "port_forward_list", Map::new())
-        .await;
-    assert!(listed.text.contains("No port-forwards"), "{}", listed.text);
+    let listed = listed(&f).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["state"], "closed");
+    assert_eq!(listed[0]["reason"], "user");
 }
 
 #[tokio::test]
@@ -773,4 +781,319 @@ async fn a_silent_agent_loses_its_forwards_after_the_grace() {
     assert!(closed_within(addr, Duration::from_secs(10)).await);
     assert!(stop_audited(&f.audit_path, "disconnected").await);
     endpoint.shutdown().await;
+}
+
+// ------------------------------------------- closed forwards stay (#104)
+
+/// What `port_forward_list` shows.
+async fn listed(f: &Fixture) -> Vec<Value> {
+    let outcome = f
+        .server
+        .call("agent", "port_forward_list", Map::new())
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    serde_json::from_str(&outcome.text).unwrap_or_else(|_| panic!("{}", outcome.text))
+}
+
+/// Connects to `addr` and waits until forward `id` has its last error: the
+/// fake API has no port-forward.
+async fn fail_a_connection(f: &Fixture, id: u64, addr: SocketAddr) -> String {
+    drop(TcpStream::connect(addr).await.unwrap());
+    let manager = f.server.session().forwards().manager();
+    for _ in 0..250 {
+        if let Some(error) = manager.get(id).and_then(|info| info.last_error) {
+            return error;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no error on forward {id}");
+}
+
+#[tokio::test]
+async fn a_forward_closed_for_silence_stays_listed_with_why() {
+    let f = fixture(true).await;
+    let endpoint = endpoint(&f, Duration::from_millis(500)).await;
+    initialize(endpoint.addr.port()).await;
+    let (id, addr) = start(&f, "service/web", json!("http")).await;
+    let error = fail_a_connection(&f, id, addr).await;
+    assert!(closed_within(addr, Duration::from_secs(10)).await);
+    assert!(f.server.session().is_active());
+
+    let list = listed(&f).await;
+    assert_eq!(list.len(), 1, "{list:?}");
+    let forward = &list[0];
+    assert_eq!(forward["id"], id);
+    assert_eq!(forward["state"], "closed");
+    assert_eq!(forward["reason"], "disconnected");
+    assert!(
+        forward["detail"].as_str().unwrap().contains("disconnected"),
+        "{forward}"
+    );
+    assert_eq!(forward["lastError"], error.as_str());
+    assert_eq!(forward["address"], addr.to_string());
+    assert_eq!(forward["target"], "svc/web");
+    assert_eq!(forward["activeConnections"], 0);
+    let closed_at: k8s_openapi::jiff::Timestamp =
+        forward["closedAt"].as_str().unwrap().parse().unwrap();
+    assert!(closed_at <= k8s_openapi::jiff::Timestamp::now());
+
+    // A new forward works, and comes before the closed one.
+    let (again, _) = start(&f, "service/web", json!("http")).await;
+    let list = listed(&f).await;
+    assert_eq!(list[0]["id"], again);
+    assert_eq!(list[0]["state"], "ready");
+    assert_eq!(list[1]["id"], id);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_forward_in_use_outlives_a_silent_agent() {
+    let ready = pod()["status"].clone();
+    let f = fixture_with(true, vec![pod_with("slow-0", ready)]).await;
+    let grace = Duration::from_secs(1);
+    let endpoint = endpoint(&f, grace).await;
+    initialize(endpoint.addr.port()).await;
+    let (used, addr) = start(&f, "pod/slow-0", json!(8080)).await;
+    let (idle, _) = start(&f, "pod/slow-0", json!(8080)).await;
+    let _connection = TcpStream::connect(addr).await.unwrap();
+    let manager = f.server.session().forwards().manager();
+    for _ in 0..100 {
+        if manager.get(used).unwrap().active_connections == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(manager.get(used).unwrap().active_connections, 1);
+
+    for _ in 0..500 {
+        if manager.get(idle).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(manager.get(idle).is_none(), "the idle forward stopped");
+    tokio::time::sleep(grace).await;
+    assert!(manager.get(used).is_some(), "the used forward stays");
+    assert!(f.server.session().grants().is_forwarding(NS));
+    let closed = f.server.session().forwards().closed();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].info.id, idle);
+    endpoint.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_users_stop_keeps_the_last_error() {
+    let f = fixture(true).await;
+    let (id, addr) = start(&f, "pod/web-0", json!(8080)).await;
+    let error = fail_a_connection(&f, id, addr).await;
+    let forwards = f.server.session().forwards();
+    // What the watcher does on each change of the manager.
+    assert!(forwards.reconcile().is_empty());
+    assert!(forwards.manager().stop(id));
+    assert!(stop_audited(&f.audit_path, "user").await);
+    let closed = forwards.closed();
+    assert_eq!(closed[0].reason, super::StopReason::User);
+    assert_eq!(closed[0].info.last_error.as_deref(), Some(error.as_str()));
+}
+
+#[tokio::test]
+async fn stopping_a_closed_forward_says_when_and_why_it_closed() {
+    let f = fixture(true).await;
+    let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+    let call = async || {
+        f.server
+            .call("agent", "port_forward_stop", args(json!({"id": id})))
+            .await
+    };
+    assert!(!call().await.is_error);
+    let list = listed(&f).await;
+    assert_eq!(list[0]["reason"], "agent");
+    let again = call().await;
+    assert!(again.is_error);
+    assert!(again.text.contains("already closed"), "{}", again.text);
+    assert!(
+        again.text.contains(list[0]["closedAt"].as_str().unwrap()),
+        "{}",
+        again.text
+    );
+    assert!(again.text.contains("port_forward_stop"), "{}", again.text);
+}
+
+#[tokio::test]
+async fn revoking_and_the_sessions_end_are_kept_as_reasons() {
+    let f = fixture(true).await;
+    let (first, _) = start(&f, "pod/web-0", json!(8080)).await;
+    f.server.session().revoke(&Grant::read(NS)).await.unwrap();
+    f.server.session().set_grants(grants(&[Grant::read(NS)]));
+    let (second, _) = start(&f, "pod/web-0", json!(8080)).await;
+    f.server.session().close().await.unwrap();
+    let closed: Vec<_> = f
+        .server
+        .session()
+        .forwards()
+        .closed()
+        .into_iter()
+        .map(|closed| (closed.info.id, closed.reason.label()))
+        .collect();
+    assert_eq!(closed, [(second, "session-ended"), (first, "revoked")]);
+}
+
+#[tokio::test]
+async fn a_session_remembers_a_bounded_number_of_closed_forwards() {
+    let f = fixture(true).await;
+    let mut ids = Vec::new();
+    for _ in 0..super::MAX_CLOSED_FORWARDS + 3 {
+        let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+        f.server
+            .session()
+            .forwards()
+            .stop(id, super::StopReason::Agent);
+        ids.push(id);
+    }
+    let closed: Vec<u64> = listed(&f)
+        .await
+        .iter()
+        .map(|forward| forward["id"].as_u64().unwrap())
+        .collect();
+    ids.reverse();
+    ids.truncate(super::MAX_CLOSED_FORWARDS);
+    assert_eq!(closed, ids, "the newest, newest first");
+}
+
+#[tokio::test]
+async fn closed_forwards_do_not_count_against_the_limit() {
+    let f = fixture(true).await;
+    for _ in 0..super::MAX_FORWARDS_PER_SESSION {
+        let (id, _) = start(&f, "pod/web-0", json!(8080)).await;
+        f.server
+            .session()
+            .forwards()
+            .stop(id, super::StopReason::Agent);
+    }
+    start(&f, "pod/web-0", json!(8080)).await;
+    assert_eq!(f.server.session().forwards().count(), 1);
+}
+
+// ------------------------------------------------- the node's network (#179)
+
+/// `pod()` under `name`, running in its node's network.
+fn host_network_pod(name: &str) -> Value {
+    let mut pod = pod();
+    pod["metadata"]["name"] = json!(name);
+    pod["spec"]["hostNetwork"] = json!(true);
+    pod
+}
+
+fn forward_question(f: &Fixture) -> crate::confirm::ConfirmationRequest {
+    f.confirmer
+        .requests()
+        .into_iter()
+        .find(|r| matches!(r.kind, RequestKind::PortForward { .. }))
+        .expect("the forward was confirmed")
+}
+
+#[tokio::test]
+async fn a_pod_with_its_own_network_has_nothing_to_tick() {
+    let f = fixture(true).await;
+    start(&f, "pod/web-0", json!(8080)).await;
+    let question = forward_question(&f);
+    assert!(question.dangerous.is_empty(), "{:?}", question.dangerous);
+    assert!(!question.details.contains("hostNetwork"));
+}
+
+#[tokio::test]
+async fn a_pod_in_the_nodes_network_is_a_finding_and_is_never_remembered() {
+    for target in ["pod/web-0", "service/web"] {
+        let f = fixture_with(true, vec![host_network_pod("web-0")]).await;
+        let port = if target == "pod/web-0" {
+            json!(8080)
+        } else {
+            json!("http")
+        };
+        let outcome = f
+            .server
+            .call(
+                "agent",
+                "port_forward_start",
+                args(json!({"target": target, "port": port})),
+            )
+            .await;
+        assert!(!outcome.is_error, "{}", outcome.text);
+        assert!(
+            outcome.text.contains("\"hostNetwork\":true"),
+            "{}",
+            outcome.text
+        );
+        let mut question = forward_question(&f);
+        assert_eq!(question.dangerous.len(), 1, "{target}");
+        let finding = &question.dangerous[0];
+        assert_eq!(finding.path, "pod/web-0 .spec.hostNetwork");
+        assert!(finding.message.contains("node's network"), "{finding:?}");
+        assert!(question.details.contains("hostNetwork"));
+        // Not offered "don't ask again", whatever holds the boundary.
+        assert!(!question.allow_remember);
+        question.mode = crate::scope::SessionMode::TemporaryServiceAccount;
+        assert_eq!(crate::remember::rememberable(&question), None);
+        question.dangerous.clear();
+        assert!(crate::remember::rememberable(&question).is_some());
+
+        let line = audit_lines(&f.audit_path)
+            .into_iter()
+            .find(|line| line["tool"] == "port_forward_start")
+            .unwrap();
+        assert_eq!(line["change"]["hostNetwork"], true);
+        assert_eq!(line["change"]["pod"], "web-0");
+    }
+}
+
+#[tokio::test]
+async fn a_forward_never_moves_to_a_pod_in_the_nodes_network() {
+    for target in ["pod/web-0", "service/web"] {
+        let f = fixture(true).await;
+        let port = if target == "pod/web-0" {
+            json!(8080)
+        } else {
+            json!("http")
+        };
+        let (id, addr) = start(&f, target, port).await;
+        assert!(forward_question(&f).dangerous.is_empty());
+        // A pod of the same name, or the next pod of the Service, now runs
+        // in the node's network.
+        *f.pods.lock().unwrap() = vec![host_network_pod("web-0")];
+        f.requests.lock().unwrap().clear();
+        let error = fail_a_connection(&f, id, addr).await;
+        assert!(error.contains("hostNetwork"), "{target}: {error}");
+        let requests = f.requests.lock().unwrap().clone();
+        assert!(
+            requests.iter().all(|r| !r.contains("portforward")),
+            "{requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_forward_approved_for_a_pod_network_does_not_start_into_the_nodes() {
+    use kubach_core::streams::{ForwardAgent, HostNetwork, PortForwardManager, fetch_source};
+
+    let f = fixture_with(true, vec![host_network_pod("web-0")]).await;
+    let agent = || ForwardAgent {
+        context: "minikube".into(),
+        client: "agent".into(),
+        session: "s1".into(),
+    };
+    let manager = PortForwardManager::new();
+    for (kind, name, port) in [("Pod", "web-0", 8080), ("Service", "web", 80)] {
+        let source = fetch_source(&f.client, kind, NS, name).await.unwrap();
+        let refused = manager
+            .start_for_agent(&f.client, &source, port, 0, agent(), HostNetwork::Refused)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("hostNetwork"), "{refused}");
+        assert!(manager.list().is_empty());
+        let allowed = manager
+            .start_for_agent(&f.client, &source, port, 0, agent(), HostNetwork::Allowed)
+            .await
+            .unwrap();
+        manager.stop(allowed.id);
+    }
 }

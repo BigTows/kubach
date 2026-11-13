@@ -89,6 +89,8 @@ settings-session-no-grants = No rights granted yet.
 settings-session-remembered = Without asking: { $list }
 # $action: agent-action-*, $namespace: where.
 settings-session-remembered-item = { $action } in { $namespace }
+# $command: the exact command line, $node: the node.
+settings-session-remembered-command = { $command } on node { $node }
 settings-ask-again = Ask again
 settings-boundary-client-only = limits only in Kubach
 settings-boundary-impersonation = limits in Kubach and the API server (impersonation)
@@ -113,3 +115,7 @@ settings-audit-recent = Recent calls
 settings-audit-file = Newest first. File: { $path }
 settings-audit-no-folder = The OS has no settings folder: nothing is recorded.
 settings-audit-show-file = Show file
+
+settings-group-agent-notifications = Notifications
+settings-agent-system-notifications = Notify about agent requests
+settings-agent-system-notifications-description = A system notification when an agent waits for your answer and the Kubach window is hidden or not focused.

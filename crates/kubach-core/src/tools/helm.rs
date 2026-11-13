@@ -415,8 +415,44 @@ impl<P: FnMut(Progress) + Send> LineSteps for Network<'_, P> {
         spec: &'static ToolSpec,
         version: &str,
     ) -> Result<(Installed, Verification), DownloadError> {
-        download::download_version(spec, version, self.root, &mut *self.progress).await
+        let (installed, verification) =
+            download::download_version(spec, version, self.root, &mut *self.progress).await?;
+        confirm_version(spec, &installed).await?;
+        Ok((installed, verification))
     }
+}
+
+/// Asks the downloaded binary for its version and deletes the copy when it
+/// is another one than was asked for: the checksum and signatures say the
+/// archive is a Helm release, this says it is the release named in the URL.
+/// A binary that does not answer (it can't run here, or not in time) is
+/// left in place: it reported nothing to compare.
+async fn confirm_version(
+    spec: &'static ToolSpec,
+    installed: &Installed,
+) -> Result<(), DownloadError> {
+    let Some(reported) = binary_version(&installed.path).await else {
+        return Ok(());
+    };
+    if reports_version(&reported, &installed.version) {
+        return Ok(());
+    }
+    if let Some(dir) = installed.path.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    Err(DownloadError::VersionMismatch {
+        tool: spec.title,
+        version: installed.version.clone(),
+        reported,
+    })
+}
+
+/// Whether `helm version --short` output (`v4.3.1+g1a2b3c4`) names
+/// `version` (`4.3.1`).
+fn reports_version(reported: &str, version: &str) -> bool {
+    let reported = reported.trim();
+    let number = reported.split('+').next().unwrap_or(reported);
+    number.strip_prefix('v').unwrap_or(number) == version
 }
 
 /// [`download_line`] with its network steps passed in. `known` is a fresh
@@ -747,6 +783,60 @@ mod tests {
                 issuer: "208D D36E D5BB 3745 A167 43A4 C7C6 FBB5 B91C 1155".into()
             }
         );
+    }
+
+    #[test]
+    fn version_output_names_the_release() {
+        assert!(reports_version("v4.3.1+g1a2b3c4", "4.3.1"));
+        assert!(reports_version("v3.22.1\n", "3.22.1"));
+        assert!(!reports_version("v4.3.0+g1a2b3c4", "4.3.1"));
+        assert!(!reports_version("v4.3.10+g1a2b3c4", "4.3.1"));
+        assert!(!reports_version("v3.22.1+g1a2b3c4", "4.3.1"));
+        assert!(!reports_version("", "4.3.1"));
+    }
+
+    /// A downloaded copy under `root` whose `helm` prints `output`.
+    #[cfg(unix)]
+    fn fake_copy(root: &Path, version: &str, output: &str) -> Installed {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = root.join("helm").join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("helm");
+        std::fs::write(&path, format!("#!/bin/sh\n{output}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Installed {
+            version: version.to_owned(),
+            path,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_reporting_another_version_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let right = fake_copy(root.path(), "4.9.0", "echo v4.9.0+g1a2b3c4");
+        confirm_version(&HELM4, &right).await.unwrap();
+        assert!(right.path.exists());
+
+        let older = fake_copy(root.path(), "4.9.1", "echo v4.3.1+g1a2b3c4");
+        let error = confirm_version(&HELM4, &older).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                DownloadError::VersionMismatch { version, reported, .. }
+                    if version == "4.9.1" && reported == "v4.3.1+g1a2b3c4"
+            ),
+            "{error}"
+        );
+        // Another release may still install: the pinned one is tried next.
+        assert!(error.is_release_problem());
+        assert!(!older.path.parent().unwrap().exists());
+        assert!(right.path.exists());
+
+        // No answer, nothing to compare: the copy stays.
+        let silent = fake_copy(root.path(), "4.9.2", "exit 1");
+        confirm_version(&HELM4, &silent).await.unwrap();
+        assert!(silent.path.exists());
     }
 
     /// A version whose download fails, and how.

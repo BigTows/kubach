@@ -18,6 +18,9 @@ updates:
       cargo:
         update-types: [minor, patch]
 
+  # Workflows pin actions to a commit with the version in a comment
+  # (`uses: owner/name@<sha> # v1.2.3`); Dependabot moves both. Not
+  # dtolnay/rust-toolchain: it has no releases, its pin is moved by hand.
   - package-ecosystem: github-actions
     directories: [/, /.github/actions/*]
     target-branch: develop

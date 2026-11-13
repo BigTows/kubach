@@ -1113,19 +1113,39 @@ impl Vault {
         Ok(())
     }
 
-    /// Stops unlocking with Touch ID / Windows Hello and deletes the OS key.
-    pub fn disable_biometric(&mut self, store: &dyn BiometricStore) -> Result<(), VaultError> {
+    /// Stops unlocking with Touch ID / Windows Hello: the OS key is deleted
+    /// and everything is encrypted again under a new data key, so what the
+    /// OS key protected opens nothing any more. `password` is the vault's
+    /// password, checked here (the new key is wrapped for it); `keychain` is
+    /// required when the vault uses it and gets the new key. Slow
+    /// (Argon2id): run it off the UI thread.
+    ///
+    /// The OS key goes first and a failure is returned with the vault
+    /// unchanged. It cannot be put back: if the file cannot be written
+    /// afterwards, the vault keeps its key and its biometric slot, which no
+    /// longer opens (as after a change of fingerprints, the password does),
+    /// and turning it off can be tried again.
+    pub fn disable_biometric(
+        &mut self,
+        password: &str,
+        store: &dyn BiometricStore,
+        keychain: Option<&dyn KeyStore>,
+    ) -> Result<(), VaultError> {
         let Some(account) = self.envelope.biometric_account().map(str::to_owned) else {
             return Ok(());
         };
-        let mut envelope = self.envelope.clone();
-        envelope
-            .slots
-            .retain(|slot| !matches!(slot, Slot::Biometric { .. }));
-        self.write(envelope)?;
-        // A stale OS key is harmless; ignore failures.
-        store.delete(&account).ok();
-        Ok(())
+        let uses_keychain = self.key_mode().keychain;
+        if uses_keychain && keychain.is_none() {
+            return Err(VaultError::NoKeychain);
+        }
+        let password = self.password_key(password)?;
+        store.delete(&account)?;
+        self.rekey(
+            Some(&password),
+            keychain.filter(|_| uses_keychain),
+            None,
+            keychain,
+        )
     }
 
     /// Also keeps the data key in `store`, so the vault unlocks without the
@@ -1147,22 +1167,78 @@ impl Vault {
         Ok(())
     }
 
-    /// Stops keeping the key in `store`; the password stays the only way in.
-    pub fn disable_keychain(&mut self, store: &dyn KeyStore) -> Result<(), VaultError> {
+    /// Stops keeping the key in `store`: its copy is deleted and everything
+    /// is encrypted again under a new data key, so a copy of the old key
+    /// opens nothing any more. `password` is the vault's password, checked
+    /// here (the new key is wrapped for it). A biometric slot gets a fresh
+    /// OS key from `biometric`, as in [`Vault::change_password`]. Slow
+    /// (Argon2id): run it off the UI thread.
+    ///
+    /// The copy in `store` is deleted first and a failure is returned with
+    /// the vault unchanged (still remembered, so it can be tried again):
+    /// the vault never says "not in the keychain" while the key is still
+    /// there. If the file cannot be written afterwards, the key goes back
+    /// into `store` and the vault stays as it was.
+    pub fn disable_keychain(
+        &mut self,
+        password: &str,
+        store: &dyn KeyStore,
+        biometric: Option<&dyn BiometricStore>,
+    ) -> Result<(), VaultError> {
         let Some(account) = self.envelope.keychain_account().map(str::to_owned) else {
             return Ok(());
         };
         if !self.key_mode().password {
             return Err(VaultError::NoKey);
         }
-        let mut envelope = self.envelope.clone();
-        envelope
-            .slots
-            .retain(|slot| !matches!(slot, Slot::Keychain { .. }));
-        self.write(envelope)?;
-        // A stale entry is harmless; ignore failures.
-        store.delete(&account).ok();
+        let password = self.password_key(password)?;
+        store.delete(&account)?;
+        let old_biometric = self.envelope.biometric_account().map(str::to_owned);
+        let new_biometric = biometric.filter(|_| old_biometric.is_some());
+        if let Err(error) = self.rekey(Some(&password), None, new_biometric, None) {
+            // The slot is still in the file: its key goes back, so the
+            // vault keeps opening the way the file says.
+            store.set(&account, self.key.as_slice()).ok();
+            return Err(error);
+        }
+        if let (Some(account), Some(store)) = (old_biometric, biometric) {
+            store.delete(&account).ok();
+        }
         Ok(())
+    }
+
+    /// Checks `password` against the password slot of this vault and
+    /// returns its key, to wrap a new data key for the same password (same
+    /// salt and parameters).
+    fn password_key(&self, password: &str) -> Result<DerivedPassword, VaultError> {
+        let mut found = false;
+        for slot in &self.envelope.slots {
+            let Slot::Password {
+                kdf,
+                nonce,
+                wrapped_key,
+            } = slot
+            else {
+                continue;
+            };
+            found = true;
+            if kdf.alg != "argon2id" {
+                return Err(VaultError::UnsupportedVersion(self.envelope.version));
+            }
+            let kek = crypto::derive_key(password.as_bytes(), &kdf.salt, kdf.params)
+                .map_err(|_| corrupted(&self.path, "invalid key derivation parameters".into()))?;
+            if crypto::open(&kek, nonce, wrapped_key, PASSWORD_AAD).is_ok() {
+                return Ok(DerivedPassword {
+                    kdf: kdf.clone(),
+                    kek,
+                });
+            }
+        }
+        Err(if found {
+            VaultError::WrongPassword
+        } else {
+            VaultError::NoPassword
+        })
     }
 
     /// Writes `envelope` with the current secrets.
@@ -1542,6 +1618,28 @@ contexts:
     fn create(path: &Path, password: &str) -> Result<Vault, VaultError> {
         let password = DerivedPassword::derive(password, KdfParams::INSECURE_FAST)?;
         Vault::create(path, Some(&password), None)
+    }
+
+    /// A password made at run time.
+    fn fresh() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Makes writing the vault at `path` fail until the returned directory
+    /// is removed: it sits where the temporary file goes.
+    fn block_writes(path: &Path) -> PathBuf {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::create_dir(&tmp).unwrap();
+        tmp
+    }
+
+    /// Whether `key` still decrypts the vault file at `path`.
+    fn opens(path: &Path, key: &SecretKey) -> bool {
+        let envelope = LockedVault::read(path).unwrap().unwrap().envelope;
+        let aad = header_aad(&envelope.entries);
+        crypto::open(key, &envelope.nonce, &envelope.ciphertext, &aad).is_ok()
     }
 
     fn setup() -> (tempfile::TempDir, PathBuf) {
@@ -1925,6 +2023,7 @@ contexts:
     fn keychain_and_mixed_key_modes() {
         let (_dir, path) = setup();
         let store = MemoryKeyStore::default();
+        let second = fresh();
 
         // Keychain only.
         let mut vault = Vault::create(&path, None, Some(&store)).unwrap();
@@ -1939,7 +2038,7 @@ contexts:
         assert!(vault.kubeconfig_yaml(&id).is_some());
         // Can't drop the only key.
         assert!(matches!(
-            vault.disable_keychain(&store),
+            vault.disable_keychain(&second, &store, None),
             Err(VaultError::NoKey)
         ));
 
@@ -1960,39 +2059,39 @@ contexts:
         locked.unlock_with_password("pw").unwrap();
         locked.unlock_with_keychain(&store).unwrap();
         assert!(matches!(
-            vault.change_password(&derived("pw2"), None, None),
+            vault.change_password(&derived(&second), None, None),
             Err(VaultError::NoKeychain)
         ));
 
         // Changing the password replaces the keychain copy too.
         vault
-            .change_password(&derived("pw2"), Some(&store), None)
+            .change_password(&derived(&second), Some(&store), None)
             .unwrap();
         assert_eq!(store.len(), 1);
         let locked = LockedVault::read(&path).unwrap().unwrap();
         locked.unlock_with_keychain(&store).unwrap();
-        locked.unlock_with_password("pw2").unwrap();
+        locked.unlock_with_password(&second).unwrap();
         assert!(matches!(
             locked.unlock_with_keychain(&MemoryKeyStore::default()),
             Err(VaultError::KeychainMissing)
         ));
 
         // Password only: the keychain entry is removed.
-        vault.disable_keychain(&store).unwrap();
+        vault.disable_keychain(&second, &store, None).unwrap();
         assert!(store.is_empty());
         let locked = LockedVault::read(&path).unwrap().unwrap();
         assert!(matches!(
             locked.unlock_with_keychain(&store),
             Err(VaultError::NoKeychain)
         ));
-        locked.unlock_with_password("pw2").unwrap();
+        locked.unlock_with_password(&second).unwrap();
 
         // Remember in keychain again, without changing the password.
         vault.enable_keychain(&store).unwrap();
         assert_eq!(store.len(), 1);
         let locked = LockedVault::read(&path).unwrap().unwrap();
         locked.unlock_with_keychain(&store).unwrap();
-        locked.unlock_with_password("pw2").unwrap();
+        locked.unlock_with_password(&second).unwrap();
 
         assert!(matches!(
             Vault::create(&path.with_extension("none"), None, None),
@@ -2058,6 +2157,263 @@ contexts:
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
+    /// A store that keeps what it has: deleting fails.
+    struct NoDelete(MemoryKeyStore);
+
+    impl KeyStore for NoDelete {
+        fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError> {
+            self.0.get(account)
+        }
+
+        fn set(&self, account: &str, secret: &[u8]) -> Result<(), KeyStoreError> {
+            self.0.set(account, secret)
+        }
+
+        fn delete(&self, _: &str) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError("the keychain is locked".into()))
+        }
+    }
+
+    #[test]
+    fn a_key_the_store_keeps_is_reported_and_stays_remembered() {
+        let (_dir, path) = setup();
+        // A fresh password on every run.
+        let password = uuid::Uuid::new_v4().to_string();
+        let mut vault = create(&path, &password).unwrap();
+        vault.add("team", &plan(), None).unwrap();
+        let store = NoDelete(MemoryKeyStore::default());
+        vault.enable_keychain(&store).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = vault.disable_keychain(&password, &store, None).unwrap_err();
+        assert!(matches!(error, VaultError::KeyStore(_)), "{error}");
+        assert_eq!(error.to_string(), "the keychain is locked");
+        // Nothing changed: the key is in the store and the vault says so.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(vault.key_mode().keychain);
+        assert_eq!(store.0.len(), 1);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        locked.unlock_with_keychain(&store).unwrap();
+
+        // Once the store lets go, turning it off works.
+        vault.disable_keychain(&password, &store.0, None).unwrap();
+        assert!(store.0.is_empty());
+        assert!(!vault.key_mode().keychain);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert!(!locked.key_mode().keychain);
+        locked.unlock_with_password(&password).unwrap();
+    }
+
+    #[test]
+    fn turning_the_keychain_off_makes_a_new_data_key() {
+        let (_dir, path) = setup();
+        let password = fresh();
+        let mut vault = create(&path, &password).unwrap();
+        let id = vault.add("team", &plan(), None).unwrap();
+        let store = MemoryKeyStore::default();
+        vault.enable_keychain(&store).unwrap();
+        let account = vault.envelope.keychain_account().unwrap().to_owned();
+        // What a copy of the store's entry holds.
+        let copy = key_from(&store.get(&account).unwrap().unwrap()).unwrap();
+        assert!(opens(&path, &copy));
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Another password: nothing changes, the key stays remembered.
+        let error = vault.disable_keychain(&fresh(), &store, None).unwrap_err();
+        assert!(matches!(error, VaultError::WrongPassword), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(store.len(), 1);
+        assert!(vault.key_mode().keychain);
+
+        vault.disable_keychain(&password, &store, None).unwrap();
+        assert!(store.is_empty());
+        assert!(!vault.key_mode().keychain);
+        assert!(!opens(&path, &copy));
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert!(!locked.key_mode().keychain);
+        let unlocked = locked.unlock_with_password(&password).unwrap();
+        assert!(unlocked.kubeconfig_yaml(&id).is_some());
+        // The vault in memory goes on with the new key.
+        vault.rename(&id, "renamed").unwrap();
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert_eq!(locked.entries()[0].name, "renamed");
+        locked.unlock_with_password(&password).unwrap();
+        // Already off: nothing to do, whatever the password.
+        vault.disable_keychain(&fresh(), &store, None).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_puts_the_keychain_entry_back() {
+        let (_dir, path) = setup();
+        let password = fresh();
+        let mut vault = create(&path, &password).unwrap();
+        vault.add("team", &plan(), None).unwrap();
+        let store = MemoryKeyStore::default();
+        vault.enable_keychain(&store).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let blocked = block_writes(&path);
+        let error = vault.disable_keychain(&password, &store, None).unwrap_err();
+        assert!(matches!(error, VaultError::Io(_)), "{error}");
+        // As it was: the file, the entry and the vault in memory.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(store.len(), 1);
+        assert!(vault.key_mode().keychain);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        locked.unlock_with_keychain(&store).unwrap();
+        locked.unlock_with_password(&password).unwrap();
+
+        std::fs::remove_dir(blocked).unwrap();
+        let id = vault.entries()[0].id.clone();
+        vault.rename(&id, "still-mine").unwrap();
+        LockedVault::read(&path)
+            .unwrap()
+            .unwrap()
+            .unlock_with_keychain(&store)
+            .unwrap();
+        vault.disable_keychain(&password, &store, None).unwrap();
+        assert!(store.is_empty());
+    }
+
+    /// A biometric store that keeps what it has: deleting fails.
+    struct NoBiometricDelete(super::biometric::FakeBiometricStore);
+
+    impl super::biometric::BiometricStore for NoBiometricDelete {
+        fn availability(&self) -> Result<(), BiometricError> {
+            self.0.availability()
+        }
+
+        fn create(&self, account: &str) -> Result<SecretKey, BiometricError> {
+            self.0.create(account)
+        }
+
+        fn open(&self, account: &str) -> Result<SecretKey, BiometricError> {
+            self.0.open(account)
+        }
+
+        fn delete(&self, _: &str) -> Result<(), BiometricError> {
+            Err(BiometricError::Failed("the store is busy".into()))
+        }
+    }
+
+    #[test]
+    fn turning_biometrics_off_makes_a_new_data_key() {
+        use super::biometric::FakeBiometricStore;
+        let (_dir, path) = setup();
+        let password = fresh();
+        let mut vault = create(&path, &password).unwrap();
+        let id = vault.add("team", &plan(), None).unwrap();
+        let bio = NoBiometricDelete(FakeBiometricStore::default());
+        let store = MemoryKeyStore::default();
+        vault.enable_biometric(&bio).unwrap();
+        vault.enable_keychain(&store).unwrap();
+        let old_key = vault.key.clone();
+        let old_account = vault.envelope.keychain_account().unwrap().to_owned();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let unchanged = |vault: &Vault| {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert!(vault.key_mode().biometric);
+            assert_eq!(bio.0.len(), 1);
+            assert_eq!(store.len(), 1);
+        };
+
+        // The vault remembers its key: the store for it is needed.
+        let error = vault.disable_biometric(&password, &bio, None).unwrap_err();
+        assert!(matches!(error, VaultError::NoKeychain), "{error}");
+        unchanged(&vault);
+        let error = vault
+            .disable_biometric(&fresh(), &bio, Some(&store))
+            .unwrap_err();
+        assert!(matches!(error, VaultError::WrongPassword), "{error}");
+        unchanged(&vault);
+        // The OS keeps its key: reported, nothing changes.
+        let error = vault
+            .disable_biometric(&password, &bio, Some(&store))
+            .unwrap_err();
+        assert!(matches!(error, VaultError::Biometric(_)), "{error}");
+        unchanged(&vault);
+        LockedVault::read(&path)
+            .unwrap()
+            .unwrap()
+            .unlock_with_biometric(&bio)
+            .unwrap();
+
+        vault
+            .disable_biometric(&password, &bio.0, Some(&store))
+            .unwrap();
+        assert!(bio.0.is_empty());
+        assert!(!vault.key_mode().biometric);
+        assert!(!opens(&path, &old_key));
+        // The keychain holds the new key only.
+        assert_eq!(store.len(), 1);
+        assert!(store.get(&old_account).unwrap().is_none());
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert!(matches!(
+            locked.unlock_with_biometric(&bio),
+            Err(VaultError::NoBiometric)
+        ));
+        let unlocked = locked.unlock_with_keychain(&store).unwrap();
+        assert!(unlocked.kubeconfig_yaml(&id).is_some());
+        locked.unlock_with_password(&password).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_while_turning_biometrics_off_keeps_the_vault_readable() {
+        use super::biometric::FakeBiometricStore;
+        let (_dir, path) = setup();
+        let password = fresh();
+        let mut vault = create(&path, &password).unwrap();
+        vault.add("team", &plan(), None).unwrap();
+        let bio = FakeBiometricStore::default();
+        vault.enable_biometric(&bio).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let blocked = block_writes(&path);
+        let error = vault.disable_biometric(&password, &bio, None).unwrap_err();
+        assert!(matches!(error, VaultError::Io(_)), "{error}");
+        // The file and the key are the old ones; the OS key is gone, so
+        // the slot left in the file opens nothing and the password does.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(bio.is_empty());
+        assert!(vault.key_mode().biometric);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        let error = locked.unlock_with_biometric(&bio).unwrap_err();
+        assert!(error.falls_back_to_password(), "{error}");
+        locked.unlock_with_password(&password).unwrap();
+
+        // It can be tried again.
+        std::fs::remove_dir(blocked).unwrap();
+        vault.disable_biometric(&password, &bio, None).unwrap();
+        assert!(!vault.key_mode().biometric);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        assert!(!locked.key_mode().biometric);
+        locked.unlock_with_password(&password).unwrap();
+    }
+
+    #[test]
+    fn turning_the_keychain_off_keeps_biometric_unlock() {
+        use super::biometric::FakeBiometricStore;
+        let (_dir, path) = setup();
+        let password = fresh();
+        let mut vault = create(&path, &password).unwrap();
+        vault.add("team", &plan(), None).unwrap();
+        let (bio, store) = (FakeBiometricStore::default(), MemoryKeyStore::default());
+        vault.enable_biometric(&bio).unwrap();
+        vault.enable_keychain(&store).unwrap();
+        let old_key = vault.key.clone();
+
+        vault
+            .disable_keychain(&password, &store, Some(&bio))
+            .unwrap();
+        assert!(store.is_empty());
+        assert!(!opens(&path, &old_key));
+        // One OS key, made for the new data key.
+        assert_eq!(bio.len(), 1);
+        let locked = LockedVault::read(&path).unwrap().unwrap();
+        locked.unlock_with_biometric(&bio).unwrap();
+        locked.unlock_with_password(&password).unwrap();
+    }
+
     #[test]
     fn automatic_unlock_order() {
         let mode = |password, keychain, biometric| KeyMode {
@@ -2090,6 +2446,7 @@ contexts:
         use super::biometric::{BiometricError, BiometricStore as _, FakeBiometricStore};
         let (_dir, path) = setup();
         let bio = FakeBiometricStore::default();
+        let (first, third) = (fresh(), fresh());
 
         // Needs a password to fall back on.
         let store = MemoryKeyStore::default();
@@ -2100,7 +2457,7 @@ contexts:
             Err(VaultError::BiometricNeedsPassword)
         ));
 
-        let mut vault = create(&path, "pw").unwrap();
+        let mut vault = create(&path, &first).unwrap();
         let id = vault.add("team", &plan(), None).unwrap();
         // Unavailable (unsigned build, Linux): nothing changes on disk.
         let before = std::fs::read_to_string(&path).unwrap();
@@ -2118,7 +2475,7 @@ contexts:
         assert!(locked.key_mode().biometric && locked.key_mode().password);
         let unlocked = locked.unlock_without_password(Some(&bio), None).unwrap();
         assert!(unlocked.kubeconfig_yaml(&id).is_some());
-        locked.unlock_with_password("pw").unwrap();
+        locked.unlock_with_password(&first).unwrap();
 
         // Cancelled prompt: the password form, without trying the keychain.
         vault.enable_keychain(&store).unwrap();
@@ -2134,7 +2491,8 @@ contexts:
             .unlock_without_password(Some(&bio), Some(&store))
             .unwrap();
         bio.fail_open(None);
-        vault.disable_keychain(&store).unwrap();
+        vault.disable_keychain(&first, &store, Some(&bio)).unwrap();
+        assert_eq!(bio.len(), 1);
 
         // Fingerprints changed: the key is gone, a clear message, password.
         bio.invalidate();
@@ -2148,7 +2506,7 @@ contexts:
         ));
         assert!(error.falls_back_to_password());
         assert!(error.to_string().contains("Enter the password"));
-        let mut vault = locked.unlock_with_password("pw").unwrap();
+        let mut vault = locked.unlock_with_password(&first).unwrap();
         // Turning it on again replaces the stale slot.
         vault.enable_biometric(&bio).unwrap();
         let locked = LockedVault::read(&path).unwrap().unwrap();
@@ -2189,7 +2547,7 @@ contexts:
         // biometric unlock turns off.
         vault
             .change_password(
-                &derived("pw3"),
+                &derived(&third),
                 None,
                 Some(&FakeBiometricStore::unavailable("gone")),
             )
@@ -2206,14 +2564,14 @@ contexts:
         vault.enable_biometric(&bio).unwrap();
 
         // Off: the slot and the OS key are removed.
-        vault.disable_biometric(&bio).unwrap();
+        vault.disable_biometric(&third, &bio, None).unwrap();
         assert!(bio.is_empty());
         let locked = LockedVault::read(&path).unwrap().unwrap();
         assert!(matches!(
             locked.unlock_with_biometric(&bio),
             Err(VaultError::NoBiometric)
         ));
-        locked.unlock_with_password("pw3").unwrap();
+        locked.unlock_with_password(&third).unwrap();
 
         // Reset deletes the OS key too.
         vault.enable_biometric(&bio).unwrap();

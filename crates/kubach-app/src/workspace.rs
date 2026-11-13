@@ -76,26 +76,40 @@ macro_rules! for_each_cluster_shortcut {
     };
 }
 
+/// Keystrokes of the hotbar shortcuts, by tile: `KeyBinding::new` takes only
+/// static strings.
+const CLUSTER_KEYS: [[&str; 2]; 9] = [
+    ["cmd-1", "ctrl-1"],
+    ["cmd-2", "ctrl-2"],
+    ["cmd-3", "ctrl-3"],
+    ["cmd-4", "ctrl-4"],
+    ["cmd-5", "ctrl-5"],
+    ["cmd-6", "ctrl-6"],
+    ["cmd-7", "ctrl-7"],
+    ["cmd-8", "ctrl-8"],
+    ["cmd-9", "ctrl-9"],
+];
+
 /// `cmd-1…9` (and `ctrl-1…9`) jump to the first nine hotbar tiles.
 pub fn bind_keys(cx: &mut App) {
     macro_rules! bind {
         ($ix:literal, $action:ident) => {
-            let key = $ix + 1;
+            let [cmd, ctrl] = CLUSTER_KEYS[$ix];
             cx.bind_keys([
-                KeyBinding::new(&format!("cmd-{key}"), $action, None),
-                KeyBinding::new(&format!("ctrl-{key}"), $action, None),
+                KeyBinding::new(cmd, $action, None),
+                KeyBinding::new(ctrl, $action, None),
             ]);
         };
     }
     for_each_cluster_shortcut!(bind);
     cx.bind_keys([
-        KeyBinding::new("secondary-f", FocusSearch, None),
-        KeyBinding::new("secondary-shift-n", PickNamespaces, None),
+        KeyBinding::new(kubach_ui::secondary!("f"), FocusSearch, None),
+        KeyBinding::new(kubach_ui::secondary!("shift-n"), PickNamespaces, None),
         KeyBinding::new("ctrl-`", NewTerminal, None),
         // Back to where a jump came from (#395): `⌘[` on macOS, `Ctrl+[`
         // and `Alt+←` elsewhere. A terminal keeps them: `Ctrl+[` is Esc
         // and `Alt+←` moves by word in a shell.
-        KeyBinding::new("secondary-[", GoBack, None),
+        KeyBinding::new(kubach_ui::secondary!("["), GoBack, None),
         KeyBinding::new(
             "ctrl-[",
             NoAction,
@@ -181,10 +195,10 @@ impl Workspace {
             nav.set_state(default_nav_state(), cx);
             nav
         });
-        let forwards = cx.new(Forwards::new);
+        let forwards = cx.new(|cx| Forwards::new(&cluster, cx));
         // Forwards of the last run restart as their contexts connect (#474).
-        forwards.update(cx, |forwards, cx| forwards.restore(&cluster, cx));
-        let dock = cx.new(|_| Dock::new(cluster.clone(), forwards.clone()));
+        forwards.update(cx, |forwards, cx| forwards.restore(cx));
+        let dock = cx.new(|cx| Dock::new(cluster.clone(), forwards.clone(), cx));
         Dock::install(&dock, cx);
         let forwards_screen = cx.new(|cx| ForwardsScreen::new(forwards.clone(), cx));
         let access = cx.new(|cx| AccessScreen::new(cluster.clone(), namespaces.clone(), cx));
@@ -196,7 +210,9 @@ impl Workspace {
         // The first screen shown.
         set_active(&overview, true, cx);
         let mut subscriptions = vec![
-            cx.observe(&dock, |_, _, cx| cx.notify()),
+            // The dock draws its own tab strip and tabs; the workspace
+            // only places it (#166).
+            crate::dock::observe_shape(&dock, cx),
             cx.observe(&forwards, |_, _, cx| cx.notify()),
             cx.observe(&cluster, |this, _, cx| this.on_cluster_change(cx)),
             // After on_cluster_change: the context switch is taken in.
@@ -747,11 +763,11 @@ impl Workspace {
     /// `content` with the bottom dock under it once a log or terminal tab
     /// is open.
     fn with_dock(&self, content: AnyElement, cx: &App) -> AnyElement {
-        let dock = self.dock.read(cx);
-        if !dock.has_tabs() {
+        let dock = self.dock.read(cx).shape();
+        if !dock.has_tabs {
             return content;
         }
-        if !dock.is_expanded() {
+        if !dock.expanded {
             return div()
                 .flex_1()
                 .min_w_0()

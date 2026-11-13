@@ -8,17 +8,28 @@
 //! requests below: get and list Node, events of Nodes, Pods on one node,
 //! eviction events, NodeMetrics. Nothing else gets the user's client.
 //!
+//! Without metrics-server `top_nodes` asks the context's Prometheus instead
+//! (#112, ADR 0009): the server chosen in Settings → Clusters → Prometheus,
+//! never one searched for here, and only with the two fixed node queries of
+//! the Nodes table. The agent sends no PromQL.
+//!
 //! Pods and evictions on a node are named only in namespaces the session
 //! may read; elsewhere they are counted.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::jiff::Timestamp;
 use kubach_core::discovery;
-use kubach_core::metrics::{MetricsApi, MetricsError, QuantityError, cpu_nanocores, memory_bytes};
+use kubach_core::metrics::prometheus::source::Plan;
+use kubach_core::metrics::prometheus::{Endpoint, Prometheus};
+use kubach_core::metrics::{
+    MetricsApi, MetricsError, MetricsIndex, QuantityError, cpu_nanocores, memory_bytes,
+};
 use kube::api::{Api, DynamicObject, ListParams};
 use kube::{Client, ResourceExt as _};
 use serde::Deserialize;
@@ -27,6 +38,16 @@ use serde_json::{Map, Value};
 use crate::grants::Grant;
 use crate::policy::Request;
 use crate::tools::{Ctx, MAX_LIST_ITEMS, ToolError, ToolOutput, authorize, finish, parse};
+
+/// The Prometheus of a context, as the user set it up in Kubach (ADR 0009):
+/// called with the context's name on each `top_nodes` without
+/// metrics-server, so a change in the settings applies at once.
+pub type PrometheusPlan = Arc<dyn Fn(&str) -> Plan + Send + Sync>;
+
+/// Prometheus has this long to answer `top_nodes`.
+const PROMETHEUS_TIMEOUT: Duration = Duration::from_secs(15);
+
+const NO_METRICS_SERVER: &str = "metrics-server is not installed in this cluster";
 
 /// Node events and evictions shown at most.
 const MAX_EVENTS: usize = 20;
@@ -82,16 +103,12 @@ pub(crate) async fn list_nodes(
         .join("\t");
     out.push_str("\tPROBLEMS\n");
     for obj in &list.items {
-        let cells: Vec<String> = plugin
-            .cells(obj)
-            .iter()
-            .map(|cell| crate::tools::render_cell(cell, now))
-            .collect();
+        let row = crate::tools::table_row(plugin.as_ref(), obj, &kind.api, now);
         let problems = decode(obj).map(|node| problems(&node)).unwrap_or_default();
         let _ = writeln!(
             out,
             "{}\t{}",
-            cells.join("\t"),
+            row,
             if problems.is_empty() {
                 "-".to_owned()
             } else {
@@ -200,7 +217,8 @@ pub(crate) async fn describe_node(
             );
         }
     }
-    for section in plugin.details(&obj) {
+    // The details come from the masked object, like `describe_resource`.
+    for section in plugin.details(&crate::masking::plugin_view(&obj, &kind.api)) {
         if section.title == "Conditions" {
             continue;
         }
@@ -474,59 +492,129 @@ fn event_line(event: &Event) -> String {
     )
 }
 
-/// `top_nodes`: CPU and memory used per node, from metrics-server, against
-/// what the node can give to pods.
+/// `top_nodes`: CPU and memory used per node against what the node can give
+/// to pods: from metrics-server, without it from the context's Prometheus.
 pub(crate) async fn top_nodes(
     ctx: &Ctx<'_>,
     args: &Map<String, Value>,
 ) -> Result<ToolOutput, ToolError> {
     let _: NoArgs = parse(args)?;
     let client = nodes_client(ctx, None).await?;
-    let metrics = MetricsApi::new(&client, ctx.session.catalog()).map_err(metrics_error)?;
-    let usage = metrics.nodes().await.map_err(metrics_error)?;
+    let (usage, source) = node_usage(ctx, &client).await?;
     let nodes = Api::<Node>::all(client)
         .list(&ListParams::default().limit(MAX_LIST_ITEMS))
         .await?;
-    let allocatable: BTreeMap<String, (Option<u64>, Option<u64>)> = nodes
-        .items
-        .iter()
-        .map(|node| {
-            let alloc = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
-            (
-                node.name_any(),
-                (
-                    amount(alloc, "cpu", cpu_nanocores),
-                    amount(alloc, "memory", memory_bytes),
-                ),
-            )
-        })
-        .collect();
     let mut out = String::from("NODE\tCPU\tCPU%\tMEMORY\tMEMORY%\n");
-    for node in &usage {
-        let (cpu, memory) = allocatable.get(&node.name).copied().unwrap_or_default();
+    let mut rows = 0;
+    for node in &nodes.items {
+        let name = node.name_any();
+        let Some(used) = usage.node(&name).map(|metrics| metrics.usage) else {
+            continue;
+        };
+        let alloc = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
         let percent = |used: u64, of: Option<u64>| match of {
             Some(total) if total > 0 => format!("{}%", used * 100 / total),
             _ => "-".into(),
         };
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}",
-            node.name,
-            cores(node.usage.cpu),
-            percent(node.usage.cpu, cpu),
-            mib(node.usage.memory),
-            percent(node.usage.memory, memory),
+            "{name}\t{}\t{}\t{}\t{}",
+            cores(used.cpu),
+            percent(used.cpu, amount(alloc, "cpu", cpu_nanocores)),
+            mib(used.memory),
+            percent(used.memory, amount(alloc, "memory", memory_bytes)),
         );
+        rows += 1;
     }
-    out.push_str("(% of allocatable; read with the user's credentials)");
+    if rows == 0
+        && let Some(prometheus) = &source
+    {
+        return Err(ToolError::Failed(format!(
+            "{NO_METRICS_SERVER}, and Prometheus {prometheus} has no CPU or memory series for \
+             its nodes (node-exporter or cAdvisor)"
+        )));
+    }
+    out.push_str(&footer(source.as_deref()));
     Ok(ToolOutput::read(finish(&out)))
+}
+
+fn footer(prometheus: Option<&str>) -> String {
+    match prometheus {
+        None => "(% of allocatable; read with the user's credentials)".into(),
+        Some(prometheus) => format!(
+            "(% of allocatable; no metrics-server: from Prometheus {prometheus}, CPU averaged \
+             over {}; read with the user's credentials)",
+            kubach_core::metrics::prometheus::usage::USAGE_RATE_WINDOW
+        ),
+    }
+}
+
+/// Usage per node and, when it is not from metrics-server, the Prometheus
+/// it is from.
+async fn node_usage(
+    ctx: &Ctx<'_>,
+    client: &Client,
+) -> Result<(MetricsIndex, Option<String>), ToolError> {
+    match MetricsApi::new(client, ctx.session.catalog()) {
+        Ok(metrics) => {
+            let nodes = metrics.nodes().await.map_err(metrics_error)?;
+            return Ok((MetricsIndex::from_nodes(nodes), None));
+        }
+        // A metrics-server that is there but fails is not replaced: the
+        // same rule as the Nodes table (ADR 0009).
+        Err(MetricsError::NotInstalled) => {}
+        Err(other) => return Err(metrics_error(other)),
+    }
+    let plan = ctx
+        .prometheus
+        .as_ref()
+        .map(|plan| plan(&ctx.session.scope().context));
+    let endpoint = prometheus_endpoint(plan).map_err(ToolError::Failed)?;
+    let described = endpoint.describe();
+    let failed = |reason: String| ToolError::Failed(format!("{NO_METRICS_SERVER}, and {reason}"));
+    let prometheus = Prometheus::new(client, endpoint).map_err(|e| failed(e.to_string()))?;
+    let usage = tokio::time::timeout(PROMETHEUS_TIMEOUT, prometheus.node_usage())
+        .await
+        .map_err(|_| failed(format!("Prometheus {described} did not answer in time")))?
+        .map_err(|e| failed(format!("Prometheus {described}: {e}")))?;
+    Ok((usage, Some(described)))
+}
+
+/// The Prometheus to ask without metrics-server, or why there is none. A
+/// server the user has not confirmed (found only in an unusual namespace,
+/// #200) is not asked here either, and nothing is searched for: the search
+/// and its result belong to the app.
+fn prometheus_endpoint(plan: Option<Plan>) -> Result<Endpoint, String> {
+    const WHERE: &str = "Kubach: Settings → Clusters → Prometheus";
+    let why = match plan {
+        Some(Plan::Use(endpoint)) => return Ok(endpoint),
+        None => return Err(NO_METRICS_SERVER.into()),
+        Some(Plan::Off) => format!("Prometheus is turned off for this context ({WHERE})"),
+        Some(Plan::Discover) => "Kubach has not looked for Prometheus in this cluster yet: it \
+                                 does once the user opens the context in the Kubach window"
+            .into(),
+        Some(Plan::NotFound) => format!(
+            "Kubach found no Prometheus in it (the user can search again or type an address: \
+             {WHERE})"
+        ),
+        Some(Plan::NoAddress) => {
+            format!("no Prometheus address is typed for this context ({WHERE})")
+        }
+        Some(Plan::Invalid(address)) => {
+            format!("the Prometheus address `{address}` of this context cannot be read ({WHERE})")
+        }
+        Some(Plan::Confirm(endpoint)) => format!(
+            "the Prometheus Kubach found, {}, is in an unusual namespace: it is not used until \
+             the user confirms it ({WHERE})",
+            endpoint.describe()
+        ),
+    };
+    Err(format!("{NO_METRICS_SERVER}, and {why}"))
 }
 
 fn metrics_error(error: MetricsError) -> ToolError {
     match error {
-        MetricsError::NotInstalled => {
-            ToolError::Failed("metrics-server is not installed in this cluster".into())
-        }
+        MetricsError::NotInstalled => ToolError::Failed(NO_METRICS_SERVER.into()),
         other => ToolError::Failed(other.to_string()),
     }
 }
@@ -536,7 +624,71 @@ mod tests {
     use k8s_openapi::api::core::v1::{Event, Node};
     use serde_json::json;
 
-    use super::{on_node, pressure, problems};
+    use kubach_core::metrics::prometheus::Endpoint;
+    use kubach_core::metrics::prometheus::source::Plan;
+
+    use super::{footer, on_node, pressure, problems, prometheus_endpoint};
+
+    fn service(namespace: &str) -> Endpoint {
+        Endpoint::Service {
+            namespace: namespace.into(),
+            name: "prometheus-operated".into(),
+            port: "web".into(),
+            https: false,
+        }
+    }
+
+    #[test]
+    fn without_metrics_server_only_the_chosen_prometheus_is_asked() {
+        let chosen = service("monitoring");
+        assert_eq!(
+            prometheus_endpoint(Some(Plan::Use(chosen.clone()))),
+            Ok(chosen)
+        );
+        // No app settings behind the server: the answer of before #112.
+        assert_eq!(
+            prometheus_endpoint(None).unwrap_err(),
+            "metrics-server is not installed in this cluster"
+        );
+        // Found only in an unusual namespace: waits for the user (#200).
+        let unconfirmed = prometheus_endpoint(Some(Plan::Confirm(service("aaa-dev")))).unwrap_err();
+        assert!(
+            unconfirmed.contains("aaa-dev/prometheus-operated"),
+            "{unconfirmed}"
+        );
+        assert!(
+            unconfirmed.contains("until the user confirms"),
+            "{unconfirmed}"
+        );
+        for (plan, says) in [
+            (Plan::Off, "turned off"),
+            (Plan::Discover, "has not looked for Prometheus"),
+            (Plan::NotFound, "found no Prometheus"),
+            (Plan::NoAddress, "no Prometheus address"),
+            (Plan::Invalid("::".into()), "`::`"),
+        ] {
+            let why = prometheus_endpoint(Some(plan)).unwrap_err();
+            assert!(
+                why.starts_with("metrics-server is not installed in this cluster, and "),
+                "{why}"
+            );
+            assert!(why.contains(says), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_answer_names_where_the_numbers_are_from() {
+        assert_eq!(
+            footer(None),
+            "(% of allocatable; read with the user's credentials)"
+        );
+        let from = footer(Some("monitoring/prometheus-operated:web"));
+        assert!(
+            from.contains("from Prometheus monitoring/prometheus-operated:web"),
+            "{from}"
+        );
+        assert!(from.contains("no metrics-server"), "{from}");
+    }
 
     #[test]
     fn a_nodes_problems_are_its_off_conditions() {

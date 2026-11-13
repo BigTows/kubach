@@ -42,6 +42,7 @@ fn list(kind: &str, namespace: Option<&str>) -> Request {
         namespace: namespace.map(str::to_owned),
         all_namespaces: false,
         label_selector: None,
+        field_selector: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn every_read_path_rejects_foreign_namespaces() {
             Request::Events {
                 namespace: ns.map(str::to_owned),
                 object: None,
+                all_namespaces: false,
             },
             Request::Top {
                 namespace: ns.map(str::to_owned),
@@ -166,15 +168,174 @@ fn every_debug_and_deploy_path_rejects_foreign_namespaces() {
     }
 }
 
-#[test]
-fn all_namespaces_flag_is_rejected() {
-    let request = Request::List {
-        kind: KindRef::new("Pod"),
+fn everywhere(kind: &str) -> Request {
+    Request::List {
+        kind: KindRef::new(kind),
         namespace: None,
         all_namespaces: true,
         label_selector: None,
+        field_selector: None,
+    }
+}
+
+fn selecting(selector: &str) -> Request {
+    Request::List {
+        kind: KindRef::new("Pod"),
+        namespace: Some(NS.to_owned()),
+        all_namespaces: false,
+        label_selector: None,
+        field_selector: Some(selector.to_owned()),
+    }
+}
+
+#[test]
+fn all_namespaces_clears_the_kind_and_touches_no_namespace() {
+    let allowed = check(Profile::ReadOnly, everywhere("Pod")).unwrap();
+    assert_eq!(allowed.namespace, "");
+    assert_eq!(allowed.kind.unwrap().api.kind, "Pod");
+    for (kind, code) in [
+        ("Secret", DenialCode::Secret),
+        ("Namespace", DenialCode::ClusterScoped),
+        ("Node", DenialCode::ClusterScoped),
+    ] {
+        assert_eq!(denied(Profile::Deploy, everywhere(kind)), code, "{kind}");
+    }
+    let events = Request::Events {
+        namespace: None,
+        object: Some((KindRef::new("Secret"), "db".into())),
+        all_namespaces: true,
     };
-    assert_eq!(denied(Profile::Deploy, request), DenialCode::Namespace);
+    assert_eq!(denied(Profile::Deploy, events), DenialCode::Secret);
+}
+
+#[test]
+fn all_namespaces_does_not_go_with_a_namespace() {
+    for request in [
+        Request::List {
+            kind: KindRef::new("Pod"),
+            namespace: Some(NS.to_owned()),
+            all_namespaces: true,
+            label_selector: None,
+            field_selector: None,
+        },
+        Request::Events {
+            namespace: Some(NS.to_owned()),
+            object: None,
+            all_namespaces: true,
+        },
+    ] {
+        assert_eq!(denied(Profile::Deploy, request), DenialCode::InvalidInput);
+    }
+}
+
+#[test]
+fn all_namespaces_plan_sorts_namespaces_by_what_the_session_may_do() {
+    let settings = several();
+    let catalog = catalog();
+    let known: Vec<String> = ["fresh", "gone", "open", "NOT A NAME"]
+        .map(str::to_owned)
+        .to_vec();
+    let mut table = Grants::new();
+    table.set(Grant::read("open"), GrantState::Granted);
+    table.set(Grant::read("gone"), GrantState::Denied);
+    table.set(Grant::read("only-in-session"), GrantState::Granted);
+
+    let open = scope_with(Profile::ReadOnly, &settings, &[]);
+    let plan =
+        Policy::new(&open, &catalog, false, table.clone(), SERVER).all_namespaces_plan(&known);
+    assert_eq!(plan.readable, ["only-in-session", "open"]);
+    assert_eq!(plan.unopened, ["fresh"]);
+    assert_eq!(plan.refused, ["gone"]);
+
+    // Pinned: its namespaces, whatever else is known; nothing to ask.
+    let pinned = scope_with(Profile::ReadOnly, &settings, &["gone", "new"]);
+    let plan = Policy::new(&pinned, &catalog, false, table, SERVER).all_namespaces_plan(&known);
+    assert_eq!(plan.readable, ["new"]);
+    assert!(plan.unopened.is_empty());
+    assert_eq!(plan.refused, ["gone"]);
+}
+
+#[test]
+fn field_selectors_kubernetes_understands_pass() {
+    for selector in [
+        "spec.nodeName=node-1",
+        "spec.nodeName==node-1",
+        "status.phase!=Running",
+        "status.phase=Running,spec.nodeName=minikube",
+        "spec.nodeName=",
+        "metadata.name=web-0",
+        "spec.serviceAccountName=default",
+        "spec.restartPolicy=Always",
+        "spec.schedulerName=default-scheduler",
+        "spec.hostNetwork=true",
+        "status.podIP=10.0.0.1",
+        "status.nominatedNodeName=node-1",
+        "involvedObject.kind=Pod",
+        "type=Warning",
+    ] {
+        assert!(
+            check(Profile::ReadOnly, selecting(selector)).is_ok(),
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn malformed_field_selectors_are_refused_with_the_expected_form() {
+    let long = format!("spec.nodeName={}", "a".repeat(1024));
+    for selector in [
+        "",
+        "nonsense",
+        "=value",
+        "a=b,",
+        ",a=b",
+        "a=b,,c=d",
+        "spec..nodeName=x",
+        ".spec=x",
+        "spec nodeName=x",
+        "spec.nodeName=a b",
+        "spec.nodeName=a\nb",
+        "spec.nodeName=a=b",
+        "spec.nodeName=\u{202e}x",
+        "spec.nodeName=a!b",
+        "a>b",
+        "spec.nodeName in (a,b)",
+        long.as_str(),
+    ] {
+        let denial = check(Profile::ReadOnly, selecting(selector)).unwrap_err();
+        assert_eq!(denial.code, DenialCode::InvalidInput, "{selector:?}");
+        assert!(denial.message.contains("Expected field=value"), "{denial}");
+    }
+}
+
+#[test]
+fn a_field_selector_chooses_no_namespace_and_guesses_no_credential() {
+    for selector in [
+        "metadata.namespace=kube-system",
+        "metadata.namespace!=kube-system",
+        "METADATA.namespace==kube-system",
+        "status.phase=Running,metadata.namespace=kube-system",
+    ] {
+        assert_eq!(
+            denied(Profile::Deploy, selecting(selector)),
+            DenialCode::Namespace,
+            "{selector}"
+        );
+    }
+    // A custom resource's selectableFields would answer yes or no about a
+    // value masking hides.
+    for selector in [
+        "spec.password=hunter2",
+        "spec.apiKey=abc",
+        "spec.auth.token!=abc",
+        "status.phase=Running,data.secret=x",
+    ] {
+        assert_eq!(
+            denied(Profile::Deploy, selecting(selector)),
+            DenialCode::Secret,
+            "{selector}"
+        );
+    }
 }
 
 #[test]
@@ -326,6 +487,7 @@ fn kinds_cannot_smuggle_paths_or_versions() {
         namespace: None,
         all_namespaces: false,
         label_selector: None,
+        field_selector: None,
     };
     assert_eq!(denied(Profile::Deploy, request), DenialCode::InvalidName);
 }
@@ -370,6 +532,7 @@ fn secrets_are_never_readable() {
     let events = Request::Events {
         namespace: None,
         object: Some((KindRef::new("Secret"), "db".into())),
+        all_namespaces: false,
     };
     assert_eq!(denied(Profile::Deploy, events), DenialCode::Secret);
 }
@@ -394,6 +557,7 @@ fn kinds_resolve_by_name_plural_and_group() {
         namespace: None,
         all_namespaces: false,
         label_selector: None,
+        field_selector: None,
     };
     let allowed = check(Profile::ReadOnly, request).unwrap();
     assert_eq!(allowed.kind.unwrap().api.group, "other.example.com");
@@ -426,6 +590,7 @@ fn label_selector_cannot_carry_control_characters() {
         namespace: None,
         all_namespaces: false,
         label_selector: Some("app=web\r\nX-Injected: 1".into()),
+        field_selector: None,
     };
     assert_eq!(denied(Profile::ReadOnly, request), DenialCode::InvalidInput);
 }
@@ -2055,6 +2220,7 @@ fn naming(ns: &str) -> Vec<Request> {
         Request::Events {
             namespace: ns.clone(),
             object: None,
+            all_namespaces: false,
         },
         Request::Logs {
             pod: Some("web-0".into()),
@@ -2129,7 +2295,7 @@ fn strings_that_are_not_one_namespace_are_never_asked_for() {
 }
 
 #[test]
-fn dynamic_sessions_still_refuse_cluster_scope_and_all_namespaces() {
+fn dynamic_sessions_still_refuse_cluster_scope() {
     let settings = several();
     let all = [
         Grant::read(NS),
@@ -2137,16 +2303,6 @@ fn dynamic_sessions_still_refuse_cluster_scope_and_all_namespaces() {
         Grant::read(OTHER_NS),
         Grant::modify(OTHER_NS),
     ];
-    let everywhere = Request::List {
-        kind: KindRef::new("Pod"),
-        namespace: None,
-        all_namespaces: true,
-        label_selector: None,
-    };
-    assert_eq!(
-        on_request(&settings, &all, &everywhere).unwrap_err().code,
-        DenialCode::Namespace
-    );
     for kind in ["Namespace", "Node", "PersistentVolume", "ClusterRole"] {
         assert_eq!(
             on_request(&settings, &all, &list(kind, Some(NS)))
@@ -2598,5 +2754,64 @@ fn debug_containers_are_like_exec_and_check_their_input() {
     assert_eq!(
         denied(Profile::Debug, debug(None, vec!["a\u{200B}b".into()])),
         DenialCode::InvalidInput
+    );
+}
+
+#[test]
+fn custom_rights_name_what_a_call_uses_beyond_the_lists() {
+    let rights = |request: Request| {
+        let allowed = check(Profile::Deploy, request.clone()).unwrap();
+        Policy::custom_rights(&request, &allowed)
+            .into_iter()
+            .map(|right| format!("{} {}.{}", right.verb, right.resource, right.group))
+            .collect::<Vec<_>>()
+    };
+    let widget = || KindRef {
+        kind: "Widget".into(),
+        api_version: Some("example.com/v1".into()),
+    };
+    let reads = ["get widgets.example.com", "list widgets.example.com"];
+
+    assert_eq!(
+        rights(Request::List {
+            kind: widget(),
+            namespace: Some(NS.into()),
+            all_namespaces: false,
+            label_selector: None,
+            field_selector: None,
+        }),
+        reads
+    );
+    assert_eq!(
+        rights(Request::Delete {
+            kind: widget(),
+            name: "w".into(),
+            namespace: Some(NS.into()),
+        }),
+        [reads[0], reads[1], "delete widgets.example.com"]
+    );
+    assert_eq!(
+        rights(Request::Apply {
+            yaml: "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\n".into(),
+            namespace: Some(NS.into()),
+            dry_run: true,
+        }),
+        [
+            reads[0],
+            reads[1],
+            "create widgets.example.com",
+            "patch widgets.example.com"
+        ]
+    );
+    // Built-in kinds are the Role's anyway.
+    assert!(
+        rights(Request::List {
+            kind: KindRef::new("Deployment"),
+            namespace: Some(NS.into()),
+            all_namespaces: false,
+            label_selector: None,
+            field_selector: None,
+        })
+        .is_empty()
     );
 }

@@ -11,7 +11,9 @@
 //! (the app checks the vault and the settings again). A revoked or expired
 //! session stays ended.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -21,11 +23,18 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{BridgeClient, BridgeError, HostReply, HostRequest, Locate, RefusalKind};
+use crate::confirm::{notice_if_slow, waiting_text};
 use crate::hosted::Gone;
-use crate::server::{CallOutcome, client_name};
+use crate::server::{CallOutcome, client_name, progress_of, stops_on_cancel};
+use crate::tools::Progress;
 use kubach_core::sync;
+
+/// How often a relayed call asks the app whether it waits for the user,
+/// when the agent wants progress notifications (#116).
+const WAITING_POLL: Duration = Duration::from_millis(500);
 
 /// Why no session could be started.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,11 +245,31 @@ impl ProxyServer {
         tool: &str,
         args: Map<String, Value>,
     ) -> (CallOutcome, bool) {
+        self.call_with_progress(client_name, tool, args, None).await
+    }
+
+    /// [`Self::call`], telling `progress` when the call waits for the user.
+    pub(crate) async fn call_with_progress(
+        &self,
+        client_name: &str,
+        tool: &str,
+        args: Map<String, Value>,
+        progress: Option<Progress>,
+    ) -> (CallOutcome, bool) {
         let error = |text: String| CallOutcome {
             text,
             is_error: true,
         };
-        let (client, id, key) = match self.ensure().await {
+        let ensured = notice_if_slow(self.ensure(), || {
+            if let Some(progress) = &progress {
+                progress(waiting_text(&format!(
+                    "a session on context {}",
+                    self.context()
+                )));
+            }
+        })
+        .await;
+        let (client, id, key) = match ensured {
             Ok(found) => found,
             Err(not) => {
                 let text = format!(
@@ -253,7 +282,17 @@ impl ProxyServer {
         };
         // The agent knew only the placeholder: it learns of the real tools.
         let list_changed = std::mem::take(&mut self.inner.state.lock().await.placeholder);
-        let outcome = match client.hosted_call(&id, &key, client_name, tool, args).await {
+        let call = client.hosted_call(&id, &key, client_name, tool, args);
+        let result = match &progress {
+            Some(progress) => {
+                tokio::select! {
+                    result = call => result,
+                    result = relay_waits(&client, &id, &key, tool, progress) => result,
+                }
+            }
+            None => call.await,
+        };
+        let outcome = match result {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(gone)) => {
                 self.ended(&id, &gone).await;
@@ -262,6 +301,30 @@ impl ProxyServer {
             Err(error_) => error(self.unreachable(error_).message),
         };
         (outcome, list_changed)
+    }
+
+    /// [`Self::call_with_progress`], dropping the relayed request when `cancel` fires on a
+    /// tool that stops then: the app ends the call on that (#109).
+    pub(crate) async fn call_cancellable(
+        &self,
+        client_name: &str,
+        tool: &str,
+        args: Map<String, Value>,
+        progress: Option<Progress>,
+        cancel: &CancellationToken,
+    ) -> (CallOutcome, bool) {
+        if !stops_on_cancel(tool) {
+            return self
+                .call_with_progress(client_name, tool, args, progress)
+                .await;
+        }
+        tokio::select! {
+            result = self.call_with_progress(client_name, tool, args, progress) => result,
+            () = cancel.cancelled() => {
+                let text = "the call was cancelled".to_owned();
+                (CallOutcome { text, is_error: true }, false)
+            }
+        }
     }
 
     /// Tells the app the process is alive. Returns how the session ended
@@ -298,6 +361,30 @@ impl ProxyServer {
     /// Id of the running session.
     pub async fn session_id(&self) -> Option<String> {
         self.inner.state.lock().await.id.clone()
+    }
+}
+
+/// Tells `progress` of each wait for the user of a `tool` call in the
+/// hosted session, while the call runs in the app (#116). Never ends: it is
+/// dropped with the call, and just stops asking an app that cannot tell.
+async fn relay_waits<T>(
+    client: &BridgeClient,
+    id: &str,
+    key: &str,
+    tool: &str,
+    progress: &Progress,
+) -> T {
+    let mut told = HashSet::new();
+    loop {
+        tokio::time::sleep(WAITING_POLL).await;
+        let Ok(Ok(calls)) = client.hosted_waiting(id, key).await else {
+            return std::future::pending().await;
+        };
+        for call in calls {
+            if call.tool == tool && told.insert(call.id) {
+                progress(waiting_text(&call.summary));
+            }
+        }
     }
 }
 
@@ -342,11 +429,14 @@ impl ServerHandler for ProxyServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let client = client_name(&context);
+        let progress = progress_of(&context);
         let (outcome, list_changed) = self
-            .call(
+            .call_cancellable(
                 &client,
                 &request.name,
                 request.arguments.unwrap_or_default(),
+                progress,
+                &context.ct,
             )
             .await;
         if list_changed {
@@ -365,24 +455,25 @@ impl ServerHandler for ProxyServer {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use kubach_core::plugin::BoxFuture;
+    use kubach_core::sync;
     use serde_json::Map;
 
-    use super::ProxyServer;
+    use super::{Progress, ProxyServer, WAITING_POLL};
     use crate::bridge::{
         BridgeClient, BridgeHandler, ExternalSession, HostRefusal, HostReply, HostRequest,
     };
-    use crate::confirm::{ConfirmationDecision, ConfirmationRequest, DenyAll};
+    use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll};
     use crate::hosted::{EndReason, Gone, HostedSessions};
     use crate::identity::Identity;
     use crate::server::McpServer;
     use crate::session::Session;
     use crate::settings::Profile;
     use crate::shared::{ChosenSession, ContextChooser, ContextEntry, SharedServer};
-    use crate::testutil::{catalog, permissive, scope_with};
+    use crate::testutil::{Gate, catalog, permissive, scope_with};
     use crate::transport::{BridgeOptions, HttpEndpoint, HttpOptions, serve_shared_http};
 
     const CONTEXT: &str = "prod-imported";
@@ -394,6 +485,9 @@ mod tests {
         approve: Arc<AtomicBool>,
         asked: Arc<AtomicUsize>,
         hosted: HostedSessions,
+        audit: Option<Arc<crate::audit::AuditLog>>,
+        /// Answers the questions of hosted sessions.
+        confirmer: Arc<dyn Confirmer>,
     }
 
     impl FakeApp {
@@ -403,6 +497,8 @@ mod tests {
                 approve: Arc::new(AtomicBool::new(true)),
                 asked: Arc::default(),
                 hosted: HostedSessions::new(),
+                audit: None,
+                confirmer: Arc::new(DenyAll),
             }
         }
     }
@@ -425,6 +521,8 @@ mod tests {
             let approve = self.approve.load(Ordering::SeqCst);
             let asked = self.asked.clone();
             let hosted = self.hosted.clone();
+            let audit = self.audit.clone();
+            let confirmer = self.confirmer.clone();
             Box::pin(async move {
                 if !unlocked {
                     return Err(HostRefusal::locked(&request.context));
@@ -446,7 +544,7 @@ mod tests {
                     catalog(),
                     HashSet::new(),
                 );
-                let server = McpServer::new(session.clone(), Arc::new(DenyAll), None);
+                let server = McpServer::new(session.clone(), confirmer, audit);
                 let session_info = ExternalSession::with_pid(&session, request.pid);
                 let instructions = server.instructions();
                 let key = hosted.insert(server, request.pid);
@@ -483,7 +581,7 @@ mod tests {
                 token: "m".repeat(64),
                 bridge: Some(BridgeOptions {
                     handler: app,
-                    token: "b".repeat(64),
+                    key: "b".repeat(64),
                 }),
             },
         )
@@ -498,6 +596,105 @@ mod tests {
             Box::new(move || Some(BridgeClient::new(port, "b".repeat(64)))),
             request(context),
         )
+    }
+
+    /// The app runs the session, yet the agent of the process hears of a
+    /// call waiting for the user, once; without a progress token it sees
+    /// the wait in `session_info` (#116).
+    #[tokio::test]
+    async fn a_hosted_call_waiting_for_the_user_is_relayed() {
+        let gate = Arc::new(Gate::new());
+        let mut app = FakeApp::new(true);
+        app.confirmer = gate.clone();
+        let (endpoint, port) = serve(Arc::new(app)).await;
+        let proxy = proxy(port, CONTEXT);
+        proxy.connect().await.unwrap();
+
+        let told: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = told.clone();
+        let progress: Progress = Arc::new(move |text| sync::lock(&sink).push(text));
+        let call = {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                // Beyond the session's access, so the user is asked.
+                let args = serde_json::json!({"pod": "web-0"});
+                let args = args.as_object().unwrap().clone();
+                proxy
+                    .call_with_progress("agent", "get_logs", args, Some(progress))
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sync::lock(&told).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the agent is told of the wait");
+        assert!(sync::lock(&told)[0].contains("Kubach window"));
+
+        let (info, _) = proxy.call("agent", "session_info", Map::new()).await;
+        let info: serde_json::Value = serde_json::from_str(&info.text).unwrap();
+        assert_eq!(info["waitingForUser"][0]["tool"], "get_logs");
+
+        // Polled again meanwhile, it is still one notice.
+        tokio::time::sleep(WAITING_POLL * 2).await;
+        assert_eq!(sync::lock(&told).len(), 1);
+
+        gate.release();
+        let (outcome, _) = call.await.unwrap();
+        assert!(outcome.is_error, "{}", outcome.text);
+        let (info, _) = proxy.call("agent", "session_info", Map::new()).await;
+        let info: serde_json::Value = serde_json::from_str(&info.text).unwrap();
+        assert_eq!(info["waitingForUser"], serde_json::json!([]));
+        proxy.end().await;
+        endpoint.shutdown().await;
+    }
+
+    /// A cancelled `wait_for_condition` stops in the app too, through the
+    /// real bridge: nothing but the dropped request tells it (#109).
+    #[tokio::test]
+    async fn cancelling_a_relayed_wait_stops_it_in_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut app = FakeApp::new(true);
+        app.audit = Some(Arc::new(crate::audit::AuditLog::open(&path).unwrap()));
+        let (endpoint, port) = serve(Arc::new(app)).await;
+        let proxy = proxy(port, CONTEXT);
+        proxy.connect().await.unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let call = {
+            let (proxy, cancel) = (proxy.clone(), cancel.clone());
+            tokio::spawn(async move {
+                let args = serde_json::json!({"kind": "Pod", "name": "web-0", "namespace": "web",
+                                              "condition": "exists", "timeoutSeconds": 60});
+                let args = args.as_object().unwrap().clone();
+                proxy
+                    .call_cancellable("agent", "wait_for_condition", args, None, &cancel)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+        let (outcome, _) = call.await.unwrap();
+        assert!(outcome.is_error, "{}", outcome.text);
+        assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
+
+        let audited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let lines = std::fs::read_to_string(&path).unwrap();
+                if let Some(line) = lines.lines().find(|l| l.contains("was cancelled")) {
+                    return line.to_owned();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the app ended the call");
+        assert!(audited.contains("wait_for_condition"), "{audited}");
+        proxy.end().await;
+        endpoint.shutdown().await;
     }
 
     #[tokio::test]

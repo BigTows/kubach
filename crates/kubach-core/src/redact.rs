@@ -63,19 +63,45 @@ pub fn mask_secrets(text: &str) -> String {
 
 /// [`mask_secrets`] that borrows `text` when there is nothing to mask.
 pub fn mask_text(text: &str) -> Cow<'_, str> {
-    let mut out = Cow::Borrowed(text);
-    let mut apply = |re: &Regex, replacement: &str| {
-        if re.is_match(&out) {
-            out = Cow::Owned(re.replace_all(&out, replacement).into_owned());
+    fn apply(out: &mut Cow<'_, str>, re: &Regex, replacement: impl regex::Replacer) {
+        if let Cow::Owned(replaced) = re.replace_all(out, replacement) {
+            *out = Cow::Owned(replaced);
         }
-    };
-    apply(&PEM, "-----BEGIN $1----- *** (masked)");
-    apply(&JWT, MASK);
-    apply(&BEARER, "${1}***");
-    apply(&FLAG_VALUE, "${1}${2}${3}***");
-    apply(&ASSIGNMENT, "${1}${2}${3}***");
-    apply(&URL_PASSWORD, "${1}***@");
+    }
+    let mut out = Cow::Borrowed(text);
+    apply(&mut out, &PEM, "-----BEGIN $1----- *** (masked)");
+    apply(&mut out, &JWT, MASK);
+    apply(&mut out, &BEARER, "${1}***");
+    apply(&mut out, &FLAG_VALUE, "${1}${2}${3}***");
+    apply(&mut out, &ASSIGNMENT, |found: &regex::Captures<'_>| {
+        if is_no_credential(&found[4]) {
+            found[0].to_owned()
+        } else {
+            format!("{}{}{}***", &found[1], &found[2], &found[3])
+        }
+    });
+    apply(&mut out, &URL_PASSWORD, "${1}***@");
     out
+}
+
+/// A value after a credential-looking key that cannot be a credential: an
+/// empty list or mapping, null or a switch (`imagePullSecrets: []`,
+/// `automountServiceAccountToken: true`), as in chart values.
+fn is_no_credential(value: &str) -> bool {
+    matches!(
+        value,
+        "[]" | "{}"
+            | "null"
+            | "Null"
+            | "NULL"
+            | "~"
+            | "true"
+            | "True"
+            | "TRUE"
+            | "false"
+            | "False"
+            | "FALSE"
+    )
 }
 
 /// Cuts `text` to `limit` characters, noting the cut.
@@ -187,12 +213,12 @@ fn exit_text(status: &std::process::ExitStatus) -> String {
 /// masked).
 pub fn auth_error_text(error: &AuthError) -> String {
     match error {
-        AuthError::AuthExecRun { cmd, status, out } => {
+        AuthError::AuthExecRun { cmd, out } => {
             let stderr = stderr_text(&out.stderr);
             let head = format!(
                 "auth plugin {} failed with {}",
                 program_label(cmd),
-                exit_text(status)
+                exit_text(&out.status)
             );
             if stderr.is_empty() {
                 head
@@ -222,14 +248,13 @@ fn auth_exec_text(message: &str) -> String {
 /// `Display` and `Debug` are safe wherever it ends up.
 pub fn sanitize_auth_error(error: AuthError) -> AuthError {
     match error {
-        AuthError::AuthExecRun { cmd, status, out } => AuthError::AuthExecRun {
+        AuthError::AuthExecRun { cmd, out } => AuthError::AuthExecRun {
             cmd: program_name(&cmd).unwrap_or_else(|| "exec plugin".into()),
-            status,
-            out: Output {
+            out: Box::new(Output {
                 status: out.status,
                 stdout: Vec::new(),
                 stderr: stderr_text(&out.stderr).into_bytes(),
-            },
+            }),
         },
         AuthError::AuthExec(message) => {
             let text = auth_exec_text(&message);
@@ -331,12 +356,11 @@ mod tests {
         let status = failed_status();
         AuthError::AuthExecRun {
             cmd: format!("{cmd:?}"),
-            status,
-            out: Output {
+            out: Box::new(Output {
                 status,
                 stdout: format!("{{\"token\":\"{SECRET}\"}}").into_bytes(),
                 stderr: stderr.as_bytes().to_vec(),
-            },
+            }),
         }
     }
 
@@ -410,12 +434,11 @@ mod tests {
         assert!(!sanitize_auth_error(error).to_string().contains(SECRET));
         let run = AuthError::AuthExecRun {
             cmd: format!("/opt/gcloud config-helper --secret={SECRET}"),
-            status: failed_status(),
-            out: Output {
+            out: Box::new(Output {
                 status: failed_status(),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-            },
+            }),
         };
         assert_eq!(
             auth_error_text(&run),
@@ -459,5 +482,23 @@ mod tests {
             mask_secrets("connection refused (os error 61)"),
             "connection refused (os error 61)"
         );
+    }
+    #[test]
+    fn empty_values_and_switches_under_credential_keys_stay() {
+        // Chart values: nothing here can hold a credential.
+        let values = "imagePullSecrets: []\nserviceAccount:\n  secrets: []\n  \
+                      automountServiceAccountToken: true\nextraSecret: {}\napiKey: null\n\
+                      tokenReview: false\npassword: ~\n";
+        assert_eq!(mask_text(values), values);
+
+        // A real value under the same keys is still hidden, and a value that
+        // only starts like a switch is one.
+        let hidden = uuid::Uuid::new_v4().simple().to_string();
+        let masked = mask_text(&format!(
+            "imagePullSecrets: {hidden}\npassword: true{hidden}\ntoken={hidden}\n"
+        ))
+        .into_owned();
+        assert!(!masked.contains(&hidden), "{masked}");
+        assert_eq!(masked, "imagePullSecrets: ***\npassword: ***\ntoken=***\n");
     }
 }

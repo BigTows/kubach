@@ -10,6 +10,9 @@ repository.workspace = true
 # In-memory fakes of the OS key stores (`MemoryKeyStore`,
 # `FakeBiometricStore`) for tests of dependent crates. Never in release builds.
 test-support = []
+# Synthetic clusters and hooks for the benches and stands of `docs/perf.md`.
+# Never in release builds.
+perf = []
 
 [dependencies]
 argon2.workspace = true
@@ -67,6 +70,13 @@ windows-sys.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+# The benches and stands read the synthetic clusters of the `perf` module.
+kubach-core = { workspace = true, features = ["perf"] }
 rand_chacha.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
+
+[[bench]]
+name = "core"
+harness = false

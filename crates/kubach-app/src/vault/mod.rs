@@ -16,7 +16,7 @@ mod dialogs;
 mod manual;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::*;
 use kubach_core::secrets::ClearTrigger;
@@ -30,6 +30,7 @@ use kubach_core::vault::{
 use kubach_i18n::t;
 use zeroize::Zeroizing;
 
+use dialogs::Remembered;
 pub use dialogs::{
     AfterUnlock, add_cluster, change_password, confirm_remove, confirm_reset, drop_zone, export,
     import_clipboard, import_file, prompt_unlock, rename, rename_context, update_from_file,
@@ -54,6 +55,46 @@ fn closing() -> SharedString {
 
 fn locked_error() -> SharedString {
     t!("vault-locked").into()
+}
+
+/// The last user input on two clocks. The monotonic one stands still while
+/// the computer sleeps (macOS, Linux), so the wall clock is read as well;
+/// the wall clock can be set back, so it never shortens what the monotonic
+/// one measured.
+#[derive(Clone, Copy, Debug)]
+struct Activity {
+    at: Instant,
+    wall: SystemTime,
+}
+
+impl Activity {
+    fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    /// Time without input as of `now` / `wall`: the longer of the two
+    /// clocks. Sleep counts (the wall clock went on); a wall clock set back
+    /// reads as zero and the monotonic clock decides; one set forward locks
+    /// early, which is the safe side.
+    fn idle(&self, now: Instant, wall: SystemTime) -> Duration {
+        let awake = now.saturating_duration_since(self.at);
+        let elapsed = wall.duration_since(self.wall).unwrap_or_default();
+        awake.max(elapsed)
+    }
+
+    fn idle_now(&self) -> Duration {
+        self.idle(Instant::now(), SystemTime::now())
+    }
+}
+
+/// Whether work on a context ends with the vault lock (ADR 0008): only a
+/// context imported into the vault, once it is no longer unlocked. Tabs,
+/// port-forwards and connections all ask here.
+pub fn lock_ends(imported: bool, unlocked: bool) -> bool {
+    imported && !unlocked
 }
 
 /// What the vault is doing in the background.
@@ -96,7 +137,7 @@ pub struct VaultState {
     attempts: Attempts,
     /// No password attempt before this.
     retry_at: Option<Instant>,
-    last_activity: Instant,
+    last_activity: Activity,
     keychain: Support,
     /// Touch ID / Windows Hello.
     biometric: Support,
@@ -138,11 +179,16 @@ pub fn imported(cx: &App) -> Vec<Imported> {
         .unwrap_or_default()
 }
 
+/// Whether the imported configs are decrypted now. False without a vault.
+pub fn is_unlocked(cx: &App) -> bool {
+    global(cx).is_some_and(|vault| vault.read(cx).is_unlocked())
+}
+
 /// Records user input, postponing the idle lock. Cheap; call on any click
 /// or key press.
 pub fn touch(cx: &mut App) {
     if let Some(vault) = global(cx) {
-        vault.update(cx, |vault, _| vault.last_activity = Instant::now());
+        vault.update(cx, |vault, _| vault.last_activity = Activity::now());
     }
 }
 
@@ -234,7 +280,7 @@ impl VaultState {
             status: VaultStatus::Missing,
             attempts: Attempts::default(),
             retry_at: None,
-            last_activity: Instant::now(),
+            last_activity: Activity::now(),
             keychain: Support::Checking,
             biometric: Support::Checking,
             busy: None,
@@ -361,7 +407,9 @@ impl VaultState {
     }
 
     /// Drops the decrypted configs and the key (wiped from memory), and a
-    /// copied Secret value still in the clipboard.
+    /// copied Secret value still in the clipboard. Observers end what runs
+    /// on the imported contexts: connections ([`Cluster`](crate::cluster::Cluster)),
+    /// dock tabs and port-forwards ([`dock`](crate::dock)), agent sessions.
     pub fn lock(&mut self, cx: &mut Context<Self>) {
         if let VaultStatus::Unlocked(vault) = &self.status {
             self.status = VaultStatus::Locked(vault.locked());
@@ -393,7 +441,7 @@ impl VaultState {
             .and_then(|settings| settings.read(cx).get().clusters.vault_lock_after());
         if let Some(after) = lock_after
             && self.is_unlocked()
-            && self.last_activity.elapsed() >= after
+            && self.last_activity.idle_now() >= after
         {
             self.lock(cx);
         }
@@ -409,7 +457,7 @@ impl VaultState {
     fn unlocked(&mut self, vault: Vault, cx: &mut Context<Self>) {
         self.attempts.succeeded();
         self.retry_at = None;
-        self.last_activity = Instant::now();
+        self.last_activity = Activity::now();
         self.status = VaultStatus::Unlocked(Box::new(vault));
         self.revision += 1;
         cx.notify();
@@ -583,35 +631,42 @@ impl VaultState {
         })
     }
 
-    /// Keeps the key in the system keychain, or stops doing so, in the
-    /// background.
-    pub fn set_keychain(
+    /// Keeps the key in the system keychain, in the background.
+    pub fn enable_keychain(&mut self, cx: &mut Context<Self>) -> Task<Result<(), SharedString>> {
+        self.edit_in_background(Busy::Keychain, cx, |vault| vault.enable_keychain(store()))
+    }
+
+    /// Stops keeping the key in the system keychain, in the background:
+    /// the vault gets a new key, which takes its `password` (checked
+    /// there; a wrong one changes nothing).
+    pub fn disable_keychain(
         &mut self,
-        on: bool,
+        password: Zeroizing<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), SharedString>> {
         self.edit_in_background(Busy::Keychain, cx, move |vault| {
-            if on {
-                vault.enable_keychain(store())
-            } else {
-                vault.disable_keychain(store())
-            }
+            vault.disable_keychain(&password, store(), Some(biometric_store()))
         })
     }
 
-    /// Turns Touch ID / Windows Hello unlock on or off in the background
-    /// (Windows Hello asks to confirm when turned on).
-    pub fn set_biometric(
+    /// Turns Touch ID / Windows Hello unlock on in the background (Windows
+    /// Hello asks to confirm).
+    pub fn enable_biometric(&mut self, cx: &mut Context<Self>) -> Task<Result<(), SharedString>> {
+        self.edit_in_background(Busy::Biometric, cx, |vault| {
+            vault.enable_biometric(biometric_store())
+        })
+    }
+
+    /// Turns Touch ID / Windows Hello unlock off in the background: the
+    /// vault gets a new key, which takes its `password` (checked there; a
+    /// wrong one changes nothing).
+    pub fn disable_biometric(
         &mut self,
-        on: bool,
+        password: Zeroizing<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), SharedString>> {
         self.edit_in_background(Busy::Biometric, cx, move |vault| {
-            if on {
-                vault.enable_biometric(biometric_store())
-            } else {
-                vault.disable_biometric(biometric_store())
-            }
+            vault.disable_biometric(&password, biometric_store(), Some(store()))
         })
     }
 
@@ -651,24 +706,40 @@ impl VaultState {
     }
 }
 
-/// Turns "Remember in the system keychain" on or off; failures show as a
+/// Turns "Remember in the system keychain" on or off. Turning it off asks
+/// for the vault password in a dialog; other failures show as a
 /// notification.
 pub fn set_keychain(on: bool, window: &mut Window, cx: &mut App) {
     let Some(vault) = global(cx) else {
         return;
     };
-    let task = vault.update(cx, |vault, cx| vault.set_keychain(on, cx));
-    notify_failure(task, window, cx);
+    if on {
+        let task = vault.update(cx, |vault, cx| vault.enable_keychain(cx));
+        notify_failure(task, window, cx);
+    } else if vault.read(cx).key_mode().is_some_and(|mode| mode.password) {
+        dialogs::turn_off(Remembered::Keychain, window, cx);
+    } else {
+        // The keychain is the only way in: core refuses and says why.
+        let task = vault.update(cx, |vault, cx| {
+            vault.disable_keychain(Zeroizing::new(String::new()), cx)
+        });
+        notify_failure(task, window, cx);
+    }
 }
 
-/// Turns Touch ID / Windows Hello unlock on or off; failures show as a
+/// Turns Touch ID / Windows Hello unlock on or off. Turning it off asks
+/// for the vault password in a dialog; other failures show as a
 /// notification.
 pub fn set_biometric(on: bool, window: &mut Window, cx: &mut App) {
     let Some(vault) = global(cx) else {
         return;
     };
-    let task = vault.update(cx, |vault, cx| vault.set_biometric(on, cx));
-    notify_failure(task, window, cx);
+    if on {
+        let task = vault.update(cx, |vault, cx| vault.enable_biometric(cx));
+        notify_failure(task, window, cx);
+    } else {
+        dialogs::turn_off(Remembered::Biometric, window, cx);
+    }
 }
 
 fn notify_failure(task: Task<Result<(), SharedString>>, window: &mut Window, cx: &mut App) {
@@ -684,4 +755,46 @@ fn notify_failure(task: Task<Result<(), SharedString>>, window: &mut Window, cx:
             }
         })
         .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{Activity, lock_ends};
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn idle_time_counts_sleep_and_survives_a_clock_set_back() {
+        let last = Activity::now();
+        // Awake the whole time: both clocks agree.
+        assert_eq!(last.idle(last.at + MINUTE, last.wall + MINUTE), MINUTE);
+        // Asleep for 14 minutes: the monotonic clock saw one, the wall
+        // clock all fifteen.
+        assert_eq!(
+            last.idle(last.at + MINUTE, last.wall + 15 * MINUTE),
+            15 * MINUTE
+        );
+        // The wall clock set back an hour: the monotonic clock decides.
+        assert_eq!(
+            last.idle(last.at + 20 * MINUTE, last.wall - 60 * MINUTE),
+            20 * MINUTE
+        );
+        // A monotonic reading older than the activity is no idle time.
+        let earlier = Activity {
+            at: last.at + MINUTE,
+            wall: last.wall,
+        };
+        assert_eq!(earlier.idle(last.at, last.wall), Duration::ZERO);
+    }
+
+    #[test]
+    fn only_imported_contexts_end_with_the_lock() {
+        assert!(lock_ends(true, false));
+        assert!(!lock_ends(true, true));
+        // A kubeconfig file's context is untouched, locked or not.
+        assert!(!lock_ends(false, false));
+        assert!(!lock_ends(false, true));
+    }
 }

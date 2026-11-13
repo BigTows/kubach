@@ -80,6 +80,8 @@ settings-session-no-grants = 尚未授予权限。
 settings-session-remembered = 无需询问：{ $list }
 # $action：agent-action-*，$namespace：位置。
 settings-session-remembered-item = { $namespace } 中的{ $action }
+# $command：确切的命令行，$node：节点。
+settings-session-remembered-command = 节点 { $node } 上的 { $command }
 settings-ask-again = 重新询问
 settings-boundary-client-only = 仅在 Kubach 中限制
 settings-boundary-impersonation = 在 Kubach 和 API 服务器中限制（impersonation）
@@ -103,3 +105,7 @@ settings-audit-recent = 最近的调用
 settings-audit-file = 最新的在前。文件：{ $path }
 settings-audit-no-folder = 操作系统没有设置文件夹：不会记录任何内容。
 settings-audit-show-file = 显示文件
+
+settings-group-agent-notifications = 通知
+settings-agent-system-notifications = 代理请求通知
+settings-agent-system-notifications-description = 当代理等待你的答复且 Kubach 窗口已隐藏或未获得焦点时，显示系统通知。

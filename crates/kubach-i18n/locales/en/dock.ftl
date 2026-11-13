@@ -20,17 +20,6 @@ dock-container = Container { $container }
 dock-tab-close = Close
 dock-collapse = Collapse
 dock-expand = Expand
-# Status of a logs tab; $lines is how many lines it shows.
-dock-logs-streaming =
-    { $lines ->
-        [one] Streaming · { $lines } line
-       *[other] Streaming · { $lines } lines
-    }
-dock-logs-ended =
-    { $lines ->
-        [one] Ended · { $lines } line
-       *[other] Ended · { $lines } lines
-    }
 
 ## Stream buttons in the details panel
 
@@ -113,6 +102,7 @@ dock-exit-code = Exited with code { $code }
 dock-exit-failed = Failed
 dock-exit-failed-message = Failed: { $message }
 dock-exit-disconnected = Disconnected
+dock-vault-locked = Closed: the vault is locked
 
 ## Local terminal
 

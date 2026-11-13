@@ -24,6 +24,7 @@ pub mod bridge;
 pub mod confirm;
 pub mod forwards;
 pub mod grants;
+pub mod handshake;
 pub mod helm_tools;
 pub mod hosted;
 pub mod identity;
@@ -41,13 +42,23 @@ pub mod settings;
 pub mod shared;
 pub mod transport;
 
+mod all_namespaces;
+mod apply_diff;
+mod batch_tools;
 mod debug_tools;
+mod event_tools;
+mod fields;
+mod helm_preview;
+mod log_level;
+mod node_host;
+mod node_maintenance;
 mod node_tools;
 mod rollout_tools;
 mod secret_tools;
 pub mod secret_write;
 mod tools;
 mod topology_tools;
+mod wait_tools;
 
 #[cfg(test)]
 mod testutil;
@@ -55,13 +66,19 @@ mod testutil;
 pub use access::{Access, Raises};
 pub use audit::{AuditEntry, AuditLog, DecidedBy};
 pub use confirm::{
-    ConfirmationDecision, ConfirmationRequest, Confirmer, DenyAll, RequestKind, ScriptedConfirmer,
+    BatchAction, BatchChange, BatchObject, ConfirmationDecision, ConfirmationRequest, Confirmer,
+    DenyAll, RequestKind, ScriptedConfirmer, WaitingCall, WaitingCalls,
 };
-pub use grants::{Grant, GrantEntry, GrantState, Grants};
-pub use helm_tools::{HelmAction, HelmChange, HelmCredentials, HelmEnv, USER_IDENTITY};
+pub use grants::{CustomRight, Grant, GrantEntry, GrantState, Grants};
+pub use helm_tools::{
+    DiffCut, HelmAction, HelmChange, HelmCredentials, HelmEnv, MAX_CONFIRM_DIFF_BYTES,
+    USER_IDENTITY, VaultKubeconfig,
+};
 pub use identity::{Identity, sweep_expired};
+pub use node_host::{NodeShellPod, NodeShellPrefs};
+pub use node_tools::PrometheusPlan;
 pub use policy::{Denial, DenialCode, NamespaceModes, Policy, Request};
-pub use remember::{Remembered, RememberedAction, rememberable};
+pub use remember::{ExactCommand, Remembered, RememberedAction, rememberable};
 pub use scope::{NamespaceHint, NamespaceSource, SessionMode, SessionScope, SessionSpec};
 pub use secret_write::{
     KeySize, SecretInput, SecretOp, SecretRequest, SecretSource, SecretUser, check_input,

@@ -5,8 +5,9 @@
 mod buffer;
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
-use gpui_kit::component::scroll::Scrollbar;
+use gpui_kit::component::scroll::{ScrollableMask, Scrollbar};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -16,12 +17,35 @@ use crate::{layer_highlights, span_highlights, theme};
 use kubach_i18n::t;
 
 pub use buffer::{
-    FollowState, LogBuffer, LogEntry, LogMatch, LogSearch, LogTag, PushResult, find_matches,
+    FollowState, LogBuffer, LogEntry, LogMatch, LogSearch, LogTag, PushResult, ScanStep,
+    find_matches,
 };
 
 /// Lines kept by default before the oldest are dropped.
 pub const DEFAULT_LOG_CAPACITY: usize = 500_000;
+/// Bytes the lines of a view hold ([`LogEntry::bytes`]) before the oldest
+/// are dropped, whatever their number (#171). Lines of up to about 450
+/// bytes of text fill all of [`DEFAULT_LOG_CAPACITY`] within it, so common
+/// logs keep as many lines as before; a stream of long lines (they come cut
+/// at 64 KiB) keeps fewer lines instead of taking gigabytes.
+pub const DEFAULT_LOG_BYTES: usize = 256 * 1024 * 1024;
+/// Text searched between two looks at the clock while the buffer is
+/// searched for a new query.
+const SEARCH_STEP_BYTES: usize = 64 * 1024;
+/// How long the buffer is searched in one go, and the pause before the next
+/// one: the UI thread is never held longer by a query, whatever the size of
+/// the buffer.
+const SEARCH_SLICE: Duration = Duration::from_millis(3);
+const SEARCH_PAUSE: Duration = Duration::from_millis(3);
+/// The count of matches found so far is shown this often while searching.
+const SEARCH_REPORT: Duration = Duration::from_millis(50);
 const LINE_HEIGHT: Pixels = px(18.);
+/// Font size of the lines (`text_xs`).
+const FONT_SIZE: Rems = rems(0.75);
+/// Horizontal padding of a row, on each side.
+const ROW_PADDING: Pixels = px(12.);
+/// Space kept between a revealed search match and the edge of the view.
+const REVEAL_MARGIN: Pixels = px(48.);
 
 /// Color of tag `index` (cycles through the theme's accent colors).
 pub fn tag_color(index: usize, theme: &Theme) -> Hsla {
@@ -82,11 +106,37 @@ pub struct LogView {
     top_notice: Option<LogTopNotice>,
     /// Lines were dropped from the front since the last clear.
     evicted: bool,
+    /// Sideways scroll of all rows together while lines are not wrapped.
+    horizontal: ScrollHandle,
+    /// The shaped width of the buffer's widest line, and what it was shaped
+    /// for.
+    widest: Option<(WidestKey, Pixels)>,
+    /// Width of the widest row painted so far. The widest line is picked by
+    /// its cell count, which glyphs of a fallback font do not follow, so a
+    /// row seen to be wider than that still gets room.
+    painted_width: Pixels,
+    /// A search match to bring into view sideways on the next frame.
+    reveal: Option<LogMatch>,
+    /// Searches the buffer for the query piece by piece; `None` once every
+    /// line is searched.
+    search_task: Option<Task<()>>,
+    /// When the count of matches was last reported while searching.
+    search_reported: Instant,
+}
+
+/// What the cached width of the widest line depends on.
+#[derive(Clone, PartialEq)]
+struct WidestKey {
+    line: u64,
+    timestamps: bool,
+    font_size: Pixels,
+    font_family: SharedString,
 }
 
 impl EventEmitter<LogViewEvent> for LogView {}
 
 impl LogView {
+    /// A view of at most `capacity` lines and [`DEFAULT_LOG_BYTES`].
     pub fn new(capacity: usize, cx: &mut Context<Self>) -> Self {
         let list =
             ListState::new(0, ListAlignment::Top, px(200.)).with_uniform_item_height(LINE_HEIGHT);
@@ -98,7 +148,7 @@ impl LogView {
                 .ok();
         });
         Self {
-            buffer: LogBuffer::new(capacity),
+            buffer: LogBuffer::new(capacity).with_max_bytes(DEFAULT_LOG_BYTES),
             search: LogSearch::default(),
             list,
             follow: FollowState::Following,
@@ -110,6 +160,12 @@ impl LogView {
             top_armed: true,
             top_notice: None,
             evicted: false,
+            horizontal: ScrollHandle::new(),
+            widest: None,
+            painted_width: px(0.),
+            reveal: None,
+            search_task: None,
+            search_reported: Instant::now(),
         }
     }
 
@@ -131,13 +187,14 @@ impl LogView {
         cx.notify();
     }
 
-    /// Appends lines, dropping the oldest beyond capacity.
+    /// Appends lines, dropping the oldest beyond the limits of lines and
+    /// bytes.
     pub fn push(&mut self, entries: Vec<LogEntry>, cx: &mut Context<Self>) {
         if entries.is_empty() {
             return;
         }
         let old_len = self.buffer.len();
-        let from = self.buffer.end_id();
+        let searched = self.search.is_complete(&self.buffer);
         let pushed = self.buffer.push(entries);
         self.list.splice(old_len..old_len, pushed.added);
         if pushed.evicted > 0 {
@@ -146,18 +203,28 @@ impl LogView {
             self.search.evict(&self.buffer);
             self.selector.retain_from(self.buffer.first_id());
         }
-        self.search.extend(&self.buffer, from);
+        if searched {
+            self.search.finish(&self.buffer);
+        } else {
+            // The new lines are searched in their turn.
+            self.continue_search(cx);
+        }
         self.follow.appended(pushed.added);
         cx.notify();
     }
 
     /// Inserts earlier lines (oldest first) above the first one, keeping the
     /// visible lines in place, the selection, search matches and following.
-    /// Lines beyond capacity are not inserted. Always allows the next
+    /// Lines beyond the limits are not inserted (and count as dropped for
+    /// [`has_evicted`](Self::has_evicted)). Always allows the next
     /// [`LogViewEvent::ReachedTop`], so an empty batch asks for more.
     pub fn prepend(&mut self, entries: Vec<LogEntry>, cx: &mut Context<Self>) {
         self.top_armed = true;
+        let given = entries.len();
         let added = self.buffer.prepend(entries);
+        if added < given {
+            self.evicted = true;
+        }
         if added > 0 {
             let following = self.list.is_following_tail();
             let top = self.list.logical_scroll_top();
@@ -174,8 +241,9 @@ impl LogView {
         cx.notify();
     }
 
-    /// Whether lines were dropped from the front (beyond capacity) since the
-    /// last clear, so the first line is no longer the oldest one received.
+    /// Whether lines were dropped from the front (beyond the limits) since
+    /// the last clear, so the first line is no longer the oldest one
+    /// received.
     pub fn has_evicted(&self) -> bool {
         self.evicted
     }
@@ -190,6 +258,8 @@ impl LogView {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.evicted = false;
         self.top_armed = true;
+        self.painted_width = px(0.);
+        self.reveal = None;
         self.selector.clear();
         self.resume_follow = false;
         self.buffer.clear();
@@ -198,6 +268,7 @@ impl LogView {
         self.follow = FollowState::Following;
         let query = self.search.query().to_owned();
         self.search.set_query(&query, &self.buffer);
+        self.search_task = None;
         cx.notify();
     }
 
@@ -221,6 +292,7 @@ impl LogView {
         if self.show_timestamps != show {
             self.show_timestamps = show;
             // Offsets index the displayed line, which just changed.
+            self.painted_width = px(0.);
             self.selector.clear();
             self.resume_follow = false;
             self.list.remeasure();
@@ -294,38 +366,196 @@ impl LogView {
         self.search.query()
     }
 
-    /// Highlights `query` (ASCII ignores case) in every line.
+    /// Highlights `query` (ASCII ignores case) in every line. The lines in
+    /// view are highlighted at once; the matches are counted over the next
+    /// frames ([`search_running`](Self::search_running)), a few
+    /// milliseconds at a time, so a long buffer does not hold the UI thread.
+    /// A newer query replaces the one being counted.
     pub fn set_search(&mut self, query: &str, cx: &mut Context<Self>) {
         if self.search.query() != query {
             self.search.set_query(query, &self.buffer);
+            self.search_task = None;
+            self.search_reported = Instant::now();
+            // A short buffer is done with the keystroke.
+            self.search_slice(cx);
+            self.continue_search(cx);
             cx.notify();
         }
     }
 
-    /// `(current, total)` with `current` counted from 1, 0 when none.
+    /// Whether the buffer is still being searched for the query: the total
+    /// of [`match_position`](Self::match_position) may grow.
+    pub fn search_running(&self) -> bool {
+        !self.search.is_complete(&self.buffer)
+    }
+
+    /// `(current, total)` with `current` counted from 1, 0 when none. While
+    /// the [search is running](Self::search_running), `total` is what is
+    /// found so far; `current` is exact.
     pub fn match_position(&self) -> (usize, usize) {
         let current = self.search.current_index().map_or(0, |ix| ix + 1);
         (current, self.search.len())
     }
 
+    /// Goes to the next match, the first one after the last. While the
+    /// search is running and the next one is not found yet, goes there when
+    /// it is.
     pub fn next_match(&mut self, cx: &mut Context<Self>) {
-        let line = self.search.next_match().map(|m| m.line);
-        self.reveal(line, cx);
+        let found = self.search.next_match(&self.buffer);
+        self.reveal(found, cx);
     }
 
+    /// Goes to the previous match, the last one before the first. While the
+    /// search is running the last one is not known: goes there when it is.
     pub fn prev_match(&mut self, cx: &mut Context<Self>) {
-        let line = self.search.prev_match().map(|m| m.line);
-        self.reveal(line, cx);
+        let found = self.search.prev_match(&self.buffer);
+        self.reveal(found, cx);
     }
 
-    fn reveal(&mut self, line: Option<u64>, cx: &mut Context<Self>) {
-        let Some(index) = line.and_then(|id| self.buffer.index_of(id)) else {
+    /// Searches the buffer for [`SEARCH_SLICE`]; true when lines are left.
+    fn search_slice(&mut self, cx: &mut Context<Self>) -> bool {
+        let started = Instant::now();
+        let found = self.search.len();
+        let mut moved = false;
+        let complete = loop {
+            let step = self.search.step(&self.buffer, SEARCH_STEP_BYTES);
+            moved |= step.moved;
+            if step.complete || started.elapsed() >= SEARCH_SLICE {
+                break step.complete;
+            }
+        };
+        if moved {
+            // A step to a match that was waiting for these lines.
+            let current = self.search.current_match(&self.buffer);
+            self.reveal(current, cx);
+        }
+        // The count redraws the owner's toolbar: not with every piece.
+        let report = started.duration_since(self.search_reported) >= SEARCH_REPORT;
+        if complete || (report && self.search.len() != found) {
+            self.search_reported = started;
+            cx.notify();
+        }
+        !complete
+    }
+
+    /// Keeps searching the buffer over the next frames, if lines are left
+    /// and nothing does it yet.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if self.search_task.is_some() || self.search.is_complete(&self.buffer) {
+            return;
+        }
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SEARCH_PAUSE).await;
+                let more = this.update(cx, |view, cx| {
+                    let more = view.search_slice(cx);
+                    if !more {
+                        view.search_task = None;
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn reveal(&mut self, found: Option<LogMatch>, cx: &mut Context<Self>) {
+        let Some(found) = found else {
+            return;
+        };
+        let Some(index) = self.buffer.index_of(found.line) else {
             return;
         };
         self.list.pause_following_tail();
         self.follow.sync(false);
         self.list.scroll_to_reveal_item(index);
+        // Sideways it takes the text system: done while rendering.
+        self.reveal = Some(found);
         cx.notify();
+    }
+
+    /// Shapes a displayed line the way rows draw it. Highlights only change
+    /// colors and the weight of a monospace font, so one run measures it.
+    fn shape(&self, line: String, window: &Window, cx: &App) -> ShapedLine {
+        let line = if line.contains('\n') {
+            line.replace('\n', " ")
+        } else {
+            line
+        };
+        let theme = cx.theme();
+        let run = TextRun {
+            len: line.len(),
+            font: font(theme.mono_font_family.clone()),
+            color: theme.foreground,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let font_size = FONT_SIZE.to_pixels(window.rem_size());
+        window
+            .text_system()
+            .shape_line(line.into(), font_size, &[run], None)
+    }
+
+    /// Width of the unwrapped list: room for the widest buffered line, so
+    /// the scroll range does not change while scrolling through the log.
+    fn content_width(&mut self, window: &Window, cx: &App) -> Pixels {
+        if let Some(width) = self.selector.painted_width() {
+            self.painted_width = self.painted_width.max(width);
+        }
+        let Some(line) = self.buffer.widest() else {
+            return px(0.);
+        };
+        let key = WidestKey {
+            line,
+            timestamps: self.show_timestamps,
+            font_size: FONT_SIZE.to_pixels(window.rem_size()),
+            font_family: cx.theme().mono_font_family.clone(),
+        };
+        let width = match &self.widest {
+            Some((cached, width)) if *cached == key => *width,
+            _ => {
+                let width = self
+                    .buffer
+                    .index_of(line)
+                    .and_then(|index| self.buffer.get(index))
+                    .map_or(px(0.), |entry| {
+                        self.shape(self.display_line(entry).0, window, cx).width()
+                    });
+                self.widest = Some((key, width));
+                width
+            }
+        };
+        (width.max(self.painted_width) + ROW_PADDING * 2.).ceil()
+    }
+
+    /// Scrolls sideways so the pending search match is in view.
+    fn reveal_sideways(&mut self, window: &Window, cx: &App) {
+        let Some(found) = self.reveal.take() else {
+            return;
+        };
+        let Some(entry) = self
+            .buffer
+            .index_of(found.line)
+            .and_then(|index| self.buffer.get(index))
+        else {
+            return;
+        };
+        let (line, offset) = self.display_line(entry);
+        let shaped = self.shape(line, window, cx);
+        let start = ROW_PADDING + shaped.x_for_index(offset + found.range.start);
+        let end = ROW_PADDING + shaped.x_for_index(offset + found.range.end);
+        let current = self.horizontal.offset();
+        let scrolled = reveal_scroll(
+            start..end,
+            -current.x,
+            self.horizontal.bounds().size.width,
+            REVEAL_MARGIN,
+        );
+        // Past the end is clamped when the list is laid out.
+        self.horizontal.set_offset(point(-scrolled, current.y));
     }
 
     /// All buffered lines as shown (with tags and timestamps when visible).
@@ -346,9 +576,9 @@ impl LogView {
             line.push(' ');
         }
         if self.show_timestamps
-            && let Some(timestamp) = &entry.timestamp
+            && let Some(timestamp) = entry.time()
         {
-            line.push_str(timestamp);
+            buffer::write_timestamp(&mut line, timestamp);
             line.push(' ');
         }
         let offset = line.len();
@@ -388,11 +618,14 @@ impl LogView {
                 },
             ));
         }
-        let current = self.search.current();
-        for found in self.search.in_line(id) {
-            let is_current = current == Some(found);
+        // Found here, not taken from the search: it keeps only a count per
+        // line, and the lines in view are marked before it reaches them.
+        let current = self.search.current_in_line(id);
+        let found = find_matches(&entry.text, self.search.query());
+        for (nth, range) in found.into_iter().enumerate() {
+            let is_current = current == Some(nth);
             highlights.push((
-                found.range.start + offset..found.range.end + offset,
+                range.start + offset..range.end + offset,
                 HighlightStyle {
                     background_color: Some(if is_current {
                         theme.warning.opacity(0.85)
@@ -410,11 +643,9 @@ impl LogView {
         self.selector
             .row(id, text)
             .w_full()
-            .px_3()
+            .px(ROW_PADDING)
             .line_height(LINE_HEIGHT)
-            .when(!self.wrap, |line| {
-                line.whitespace_nowrap().overflow_hidden()
-            })
+            .when(!self.wrap, |line| line.whitespace_nowrap())
             .into_any_element()
     }
 
@@ -538,14 +769,21 @@ impl LogView {
 }
 
 impl Render for LogView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reads the rows of the previous frame, so before forgetting them.
+        let content_width = (!self.wrap).then(|| self.content_width(window, cx));
+        if self.wrap {
+            self.reveal = None;
+        } else {
+            self.reveal_sideways(window, cx);
+        }
         self.selector.begin_frame();
         let theme = cx.theme();
         let root = div()
             .relative()
             .size_full()
             .font_family(theme.mono_font_family.clone())
-            .text_xs()
+            .text_size(FONT_SIZE)
             .text_color(theme.foreground);
         if self.buffer.is_empty() {
             return root
@@ -563,16 +801,35 @@ impl Render for LogView {
         let render_line =
             cx.processor(|this: &mut Self, index: usize, _, cx| this.render_line(index, cx));
         let root = line_selection::selectable(root, &self.selector, cx);
-        root.child(
-            list(self.list.clone(), move |index, window, cx| {
-                render_line(index, window, cx)
+        let lines = list(self.list.clone(), move |index, window, cx| {
+            render_line(index, window, cx)
+        })
+        .h_full()
+        .py_1();
+        let root = match content_width {
+            // Wrapped lines fit the view.
+            None => root.child(lines.w_full()),
+            // The whole list is as wide as the widest line and slides under
+            // the view, so every row moves by the same offset. Clipping and
+            // the offset come from the tracked handle; the wheel goes
+            // through the mask, which leaves vertical scrolling to the list.
+            Some(width) => root
+                .child(
+                    div()
+                        .id("log-sideways")
+                        .size_full()
+                        .overflow_x_hidden()
+                        .track_scroll(&self.horizontal)
+                        .child(lines.min_w_full().w(width)),
+                )
+                .child(ScrollableMask::new(Axis::Horizontal, &self.horizontal).id("log-wheel")),
+        };
+        root.child(Scrollbar::vertical(&self.list))
+            .when(content_width.is_some(), |root| {
+                root.child(Scrollbar::horizontal(&self.horizontal))
             })
-            .size_full()
-            .py_1(),
-        )
-        .child(Scrollbar::vertical(&self.list))
-        .children(self.render_top_notice(cx))
-        .children(self.render_unseen(cx))
+            .children(self.render_top_notice(cx))
+            .children(self.render_unseen(cx))
     }
 }
 
@@ -599,6 +856,19 @@ impl SelectableLines for LogView {
         cx.notify();
     }
 
+    fn scroll_sideways_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        if self.wrap {
+            return;
+        }
+        let offset = self.horizontal.offset();
+        let max = self.horizontal.max_offset().x;
+        let x = (offset.x - delta).clamp(-max, px(0.));
+        if x != offset.x {
+            self.horizontal.set_offset(point(x, offset.y));
+            cx.notify();
+        }
+    }
+
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
         if self.selector.has_selection() {
             if self.follow.is_following() {
@@ -612,5 +882,66 @@ impl SelectableLines for LogView {
             self.follow = FollowState::Following;
         }
         cx.notify();
+    }
+}
+
+/// Where to scroll sideways (distance from the start of the content) so the
+/// span `target` is in a view `viewport` wide that is now at `scrolled`,
+/// keeping `margin` around it. A span that fits at the start of the line
+/// goes back to the start; one in view stays; otherwise the nearer edge.
+fn reveal_scroll(
+    target: Range<Pixels>,
+    scrolled: Pixels,
+    viewport: Pixels,
+    margin: Pixels,
+) -> Pixels {
+    if target.end + margin <= viewport {
+        return px(0.);
+    }
+    if target.start - margin >= scrolled && target.end + margin <= scrolled + viewport {
+        return scrolled;
+    }
+    if target.start - margin < scrolled || target.end - target.start + margin * 2. > viewport {
+        // To the left of the view, or too long to fit: show where it starts.
+        (target.start - margin).max(px(0.))
+    } else {
+        target.end + margin - viewport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::px;
+
+    use super::reveal_scroll;
+
+    fn scroll(start: f32, end: f32, scrolled: f32) -> f32 {
+        f32::from(reveal_scroll(
+            px(start)..px(end),
+            px(scrolled),
+            px(500.),
+            px(40.),
+        ))
+    }
+
+    #[test]
+    fn match_near_the_line_start_scrolls_back() {
+        assert_eq!(scroll(100., 150., 0.), 0.);
+        assert_eq!(scroll(100., 150., 900.), 0.);
+    }
+
+    #[test]
+    fn match_in_view_does_not_move() {
+        assert_eq!(scroll(1000., 1050., 800.), 800.);
+    }
+
+    #[test]
+    fn match_outside_moves_to_the_nearer_edge() {
+        // To the right: its end lands a margin before the right edge.
+        assert_eq!(scroll(1000., 1050., 0.), 590.);
+        // To the left: its start lands a margin after the left edge.
+        assert_eq!(scroll(1000., 1050., 2000.), 960.);
+        // Wider than the view: its start wins.
+        assert_eq!(scroll(1000., 1900., 0.), 960.);
     }
 }

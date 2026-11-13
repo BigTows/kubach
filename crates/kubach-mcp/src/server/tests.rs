@@ -102,6 +102,19 @@ fn selected_pod_logs(path: &str) -> String {
     format!("hello from {pod}/{container}\npassword=hunter2\nERROR {pod} failed\n")
 }
 
+/// Logs of pod `levels-0`: every format `minLevel` knows, a line masking
+/// breaks the JSON of, and lines without a level.
+const LEVELED_LOGS: &str = r#"level=info msg=started
+level=error msg="disk full" password=hunter2
+{"level":"warn","token_count":5,"msg":"slow"}
+{"level":50,"msg":"boom"}
+{"level":30,"msg":"level=error in a message"}
+E1103 12:00:00.000000       1 main.go:1] failed
+I1103 12:00:00.000000       1 main.go:2] ok
+    at main.go:3
+plain error text
+"#;
+
 /// Pods for `debug_container` (#64): `distroless-0` takes any debug
 /// container, `restricted-0` only one with a restricted security context,
 /// `locked-0` none (Pod Security refuses), `pending-0` is not running. Once
@@ -213,6 +226,49 @@ fn helm_storage() -> Value {
     })
 }
 
+/// What release `infra` has: an object no temporary ServiceAccount may
+/// touch, next to a namespaced one.
+const INFRA_MANIFEST: &str = "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\n\
+     metadata:\n  name: infra-reader\nrules: []\n---\napiVersion: v1\nkind: ConfigMap\n\
+     metadata:\n  name: infra\n";
+
+fn infra_release(revision: u32) -> Value {
+    json!({
+        "name": "infra", "namespace": NS, "version": revision,
+        "info": {"status": "deployed", "description": "Upgrade complete"},
+        "chart": {"metadata": {"name": "infra", "version": "1.0.0"}},
+        "config": {},
+        "manifest": INFRA_MANIFEST,
+    })
+}
+
+/// Revision `revision` of release `infra` in its storage Secret.
+fn infra_storage(revision: u32) -> Value {
+    use base64::Engine as _;
+    let payload = kubach_core::helm::encode_release(&infra_release(revision));
+    json!({
+        "apiVersion": "v1", "kind": "Secret", "type": "helm.sh/release.v1",
+        "metadata": {"name": format!("sh.helm.release.v1.infra.v{revision}"), "namespace": NS,
+                     "labels": {"owner": "helm", "name": "infra",
+                                "version": revision.to_string()}},
+        "data": {"release": base64::engine::general_purpose::STANDARD.encode(payload)},
+    })
+}
+
+/// The labels of `infra`'s storage: revisions 1 and 2.
+fn infra_metadata() -> Value {
+    let item = |revision: u32| {
+        json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata",
+               "metadata": {"name": format!("sh.helm.release.v1.infra.v{revision}"),
+                            "namespace": NS,
+                            "labels": {"owner": "helm", "name": "infra",
+                                       "version": revision.to_string(),
+                                       "status": "deployed"}}})
+    };
+    json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadataList",
+           "metadata": {}, "items": [item(1), item(2)]})
+}
+
 /// Lists the topology tools read (#327): Deployment `web` with its
 /// ReplicaSet, Service `web` (80 → 8080) selecting it, ConfigMap
 /// `app-config`, Ingress `web` and a default-deny NetworkPolicy.
@@ -322,8 +378,17 @@ impl FakeApi {
                         let secrets = format!("/api/v1/namespaces/{NS}/secrets");
                         let pods = format!("/api/v1/namespaces/{NS}/pods");
                         let storage = format!("{secrets}/sh.helm.release.v1.web.v");
+                        let infra = format!("{secrets}/sh.helm.release.v1.infra.v");
                         let (status, body) = if method == "GET" && path == format!("{storage}2") {
                             ("200 OK", helm_storage().to_string())
+                        } else if method == "GET" && path.starts_with(&infra) {
+                            let revision = path[infra.len()..].parse().unwrap_or(0);
+                            ("200 OK", infra_storage(revision).to_string())
+                        } else if method == "GET"
+                            && path.starts_with(&format!("{secrets}?"))
+                            && path.contains("name%3Dinfra")
+                        {
+                            ("200 OK", infra_metadata().to_string())
                         } else if method == "GET" && path == format!("{storage}9") {
                             (
                                 "403 Forbidden",
@@ -368,6 +433,10 @@ impl FakeApi {
                                 "metadata": {"name": "db", "namespace": NS, "uid": "7"},
                                 "spec": {"selector": {"matchLabels": {"app": "db"}}}});
                             ("200 OK", db.to_string())
+                        } else if method == "GET"
+                            && path.starts_with(&format!("{pods}/levels-0/log"))
+                        {
+                            ("200 OK", LEVELED_LOGS.to_owned())
                         } else if method == "GET" && path.starts_with(&format!("{pods}/web-0/log"))
                         {
                             ("200 OK", "starting\nready\n".to_owned())
@@ -572,7 +641,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ]);
     }
     attempts.extend([
-        ("list_resources", json!({"kind": "Pod", "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Pod", "namespace": NS, "allNamespaces": true})),
+        ("list_resources", json!({"kind": "Secret", "allNamespaces": true})),
         ("list_resources", json!({"kind": "Pod", "fieldSelector": "metadata.namespace=kube-system"})),
         ("list_resources", json!({"kind": "Namespace"})),
         ("list_resources", json!({"kind": "nodes"})),
@@ -594,6 +664,8 @@ fn escape_attempts() -> Vec<(&'static str, Value)> {
         ("get_logs", json!({"pod": "web-0", "allContainers": true, "container": "app"})),
         ("get_logs", json!({"pod": "web-0", "filter": "(", "regex": true})),
         ("get_logs", json!({"pod": "web-0", "filter": ""})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": "loud"})),
+        ("get_logs", json!({"pod": "web-0", "minLevel": ""})),
         ("list_events", json!({"kind": "Secret", "name": "db"})),
         ("scale", json!({"kind": "Deployment", "name": "web/../../x", "replicas": 1})),
         ("delete_resource", json!({"kind": "RoleBinding", "name": "x"})),
@@ -1492,6 +1564,98 @@ async fn logs_by_selector_are_filtered_per_line_after_masking() {
 }
 
 #[tokio::test]
+async fn logs_by_min_level_cover_the_formats_and_count_what_was_read() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let call = |arguments: Value| f.server.call("agent", "get_logs", args(arguments));
+
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn"})).await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel warn: 9 read, 7 with a recognized level, 4 matched; \
+             2 without a recognized level were excluded)",
+            "",
+            "level=error msg=\"disk full\" password=***",
+            "{\"level\":\"warn\",\"token_count\":***,\"msg\":\"slow\"}",
+            "{\"level\":50,\"msg\":\"boom\"}",
+            "E1103 12:00:00.000000       1 main.go:1] failed",
+        ]
+    );
+
+    // Both narrow the result, and the note says so.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "error", "filter": "boom"})).await;
+    let lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "(minLevel error: 9 read, 7 with a recognized level, 1 matched and the filter; \
+             2 without a recognized level were excluded)",
+            "",
+            "{\"level\":50,\"msg\":\"boom\"}",
+        ]
+    );
+
+    // The level comes from the masked line, and the filter can't see past it.
+    let outcome = call(json!({"pod": "levels-0", "minLevel": "warn", "filter": "hunter2"})).await;
+    assert!(!outcome.text.contains("hunter2"), "{}", outcome.text);
+    assert!(
+        outcome.text.contains("0 matched and the filter"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.contains("no line matched"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
+async fn logs_in_an_unknown_format_say_so_under_min_level() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "minLevel": "error"})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome
+            .text
+            .starts_with("(minLevel error: 9 read, 0 with a recognized level, 0 matched; "),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("says nothing about their levels"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("ERROR db-0"), "{}", outcome.text);
+
+    // Without minLevel nothing changes: no counts, the same note.
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "get_logs",
+            args(json!({"labelSelector": "app=db", "filter": "absent"})),
+        )
+        .await;
+    assert!(
+        outcome.text.starts_with("(no line matched the filter)"),
+        "{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains("minLevel"), "{}", outcome.text);
+}
+
+#[tokio::test]
 async fn logs_of_many_pods_are_capped_and_say_what_was_left_out() {
     let f = fixture(Profile::Deploy, permissive(), false).await;
     let outcome = f
@@ -1698,7 +1862,10 @@ async fn beyond_the_ceiling_the_user_is_asked_once() {
     assert_eq!(*current, Access::ALL.capped(Profile::ReadOnly));
     assert_eq!(
         requests[0].summary,
-        format!("claude-code asks for {raise} on minikube (namespace {NS})")
+        format!(
+            "claude-code asks for {} on minikube (namespace {NS})",
+            raise.asked()
+        )
     );
     // Refused: the same request does not bother the user again.
     let again = f.server.call("claude-code", "scale", args(scale)).await;
@@ -1863,6 +2030,70 @@ async fn works_over_the_mcp_protocol() {
     let audit = audit_lines(&f.audit_path);
     // The client's self-reported name ends up in the audit log.
     assert_ne!(audit[0]["client"], "");
+    client.cancel().await.unwrap();
+}
+
+/// Hears the progress notifications of its calls.
+struct ProgressClient(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl rmcp::ClientHandler for ProgressClient {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0.send(params.message.unwrap_or_default()).ok();
+    }
+}
+
+/// A call waiting for the user says so through the protocol right away,
+/// to a client with a progress token, and any call of `session_info` meanwhile
+/// shows it (#116).
+#[tokio::test]
+async fn a_call_waiting_for_the_user_says_so_over_the_mcp_protocol() {
+    let f = fixture(Profile::Deploy, permissive(), false).await;
+    let gate = Arc::new(crate::testutil::Gate::new());
+    let server = McpServer::new(f.server.session().clone(), gate.clone(), None);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (told, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let client = ProgressClient(told).serve(client_io).await.unwrap();
+    assert!(
+        client
+            .peer_info()
+            .and_then(|info| info.instructions.clone())
+            .is_some_and(|text| text.contains("waitingForUser"))
+    );
+
+    // The rmcp client sends a progress token with every request.
+    let scale = CallToolRequestParams::new("scale").with_arguments(args(
+        json!({"kind": "Deployment", "name": "web", "replicas": 3}),
+    ));
+    let peer = client.peer().clone();
+    let call = tokio::spawn(async move { peer.call_tool(scale).await });
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), heard.recv())
+        .await
+        .expect("a progress notification")
+        .unwrap();
+    assert!(message.contains("Kubach window"), "{message}");
+    assert!(message.contains("web"), "{message}");
+
+    let info = client
+        .call_tool(CallToolRequestParams::new("session_info"))
+        .await
+        .unwrap();
+    let info = serde_json::to_value(&info.content).unwrap();
+    let info = info[0]["text"].as_str().unwrap();
+    let info: Value = serde_json::from_str(info).unwrap();
+    assert_eq!(info["waitingForUser"][0]["tool"], "scale");
+
+    gate.release();
+    let done = call.await.unwrap().unwrap();
+    assert_eq!(done.is_error, Some(true));
+    assert!(f.server.session().waiting().list().is_empty());
     client.cancel().await.unwrap();
 }
 
@@ -2810,6 +3041,7 @@ fn remembered(action: crate::RememberedAction) -> crate::Remembered {
     crate::Remembered {
         action,
         namespace: NS.into(),
+        exact: None,
     }
 }
 
@@ -3529,4 +3761,1699 @@ async fn debug_container_needs_debug_access_rbac_and_valid_input() {
         outcome.text
     );
     assert!(api.writes().is_empty(), "{:?}", api.writes());
+}
+
+/// The token of the vault context in the tests of #113.
+#[cfg(unix)]
+const VAULT_TOKEN: &str = "vault-token-of-113";
+
+/// Answers every question with a yes, except the one about the user's
+/// credentials when `allow_user` is off, and notes what each window showed
+/// and which temporary kubeconfigs were on disk meanwhile.
+#[cfg(unix)]
+struct VaultConfirmer {
+    dir: std::path::PathBuf,
+    allow_user: bool,
+    /// Closed while the user is asked about their credentials: the vault
+    /// locked.
+    locks: Mutex<Option<Arc<Session>>>,
+    helm: Mutex<Vec<(crate::helm_tools::HelmChange, String, usize)>>,
+}
+
+#[cfg(unix)]
+impl crate::confirm::Confirmer for VaultConfirmer {
+    fn confirm<'a>(
+        &'a self,
+        request: &'a crate::confirm::ConfirmationRequest,
+    ) -> kubach_core::plugin::BoxFuture<'a, crate::confirm::ConfirmationDecision> {
+        Box::pin(async move {
+            use crate::confirm::ConfirmationDecision;
+            use crate::helm_tools::HelmCredentials;
+            let RequestKind::Helm { helm } = &request.kind else {
+                return ConfirmationDecision::Approved;
+            };
+            let files = vault_files(&self.dir);
+            self.helm
+                .lock()
+                .unwrap()
+                .push(((**helm).clone(), request.details.clone(), files));
+            if helm.credentials != HelmCredentials::AskUser {
+                return ConfirmationDecision::Approved;
+            }
+            let locks = self.locks.lock().unwrap().take();
+            if let Some(session) = locks {
+                let _ = session.close().await;
+            }
+            if self.allow_user {
+                ConfirmationDecision::Approved
+            } else {
+                ConfirmationDecision::Rejected { reason: None }
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+fn vault_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, Iterator::count)
+}
+
+/// A session under a temporary ServiceAccount on a vault context, with a
+/// fake `helm` that notes how it was called and what its kubeconfig was.
+#[cfg(unix)]
+struct VaultHelm {
+    _api: FakeApi,
+    server: McpServer,
+    confirmer: Arc<VaultConfirmer>,
+    audit_path: std::path::PathBuf,
+    /// Where the temporary kubeconfigs go.
+    kubeconfigs: std::path::PathBuf,
+    log: std::path::PathBuf,
+    root: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// `on_change`: shell run for a real (not dry) change.
+    async fn start(allow_user: bool, on_change: &str) -> Self {
+        Self::start_in(false, allow_user, on_change).await
+    }
+
+    /// `client_only`: the session has the user's own kubeconfig and no
+    /// ServiceAccount, in a file as a kubeconfig context is.
+    async fn start_in(client_only: bool, allow_user: bool, on_change: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let kubeconfigs = root.path().join("run").join("kubeconfig");
+        let log = root.path().join("helm.log");
+        let manifest = root.path().join("manifest.yaml");
+        std::fs::write(&manifest, INFRA_MANIFEST).unwrap();
+        let dry_run = root.path().join("dry-run.json");
+        std::fs::write(&dry_run, infra_release(3).to_string()).unwrap();
+        let helm = root.path().join("helm");
+        std::fs::write(
+            &helm,
+            format!(
+                r#"#!/bin/sh
+kubeconfig=; context=; dry=; previous=; destination=
+# Where helm runs (#174): the mode of the directory above, what is in this
+# one, and for a chart archive its checksum.
+for last; do :; done
+{{
+  printf '%s ' "$1"
+  [ -f "$last" ] && printf 'chart=%s ' "$(cksum < "$last" | tr -d ' ')"
+  printf 'above=%s files=%s\n' "$(ls -ld .. | cut -c1-10)" "$(ls -A . | wc -l | tr -d ' ')"
+}} >> '{places}'
+for argument in "$@"; do
+  [ "$previous" = --kubeconfig ] && kubeconfig="$argument"
+  [ "$previous" = --kube-context ] && context="$argument"
+  [ "$previous" = --destination ] && destination="$argument"
+  [ "$argument" = --dry-run=server ] && dry=dry
+  previous="$argument"
+done
+if [ "$1" = pull ]; then
+  echo pull >> '{pulls}'
+  [ -f '{no_chart}' ] && {{ echo 'Error: chart "password=hunter2" not found' >&2; exit 1; }}
+  # No chart of the test: an archive whose templates cannot be read.
+  [ -d '{chart}' ] || {{ echo junk > "$destination/infra-1.0.0.tgz"; exit 0; }}
+  tar -czf "$destination/infra-1.0.0.tgz" -C '{chart}' infra
+  exit 0
+fi
+if [ "$1" = template ] && [ -n "$dry" ]; then
+  {{
+    printf 'context=%s token=%s ' "$context" "${{HELM_KUBETOKEN:-none}}"
+    printf 'credentials=%s vault-files=%s\n' "$(grep -c '{VAULT_TOKEN}' "$kubeconfig")" \
+      "$(ls '{kubeconfigs}' 2>/dev/null | wc -l | tr -d ' ')"
+  }} >> '{renders}'
+  cat > /dev/null
+  [ -f '{live}' ] || {{ echo 'Error: secrets "password=hunter2" is forbidden' >&2; exit 1; }}
+  cat '{live}'
+  exit 0
+fi
+if [ "$1" = template ]; then cat '{manifest}'; exit 0; fi
+{{
+  printf '%s %s context=%s token=%s ' "$1" "$dry" "$context" "${{HELM_KUBETOKEN:-none}}"
+  printf 'file=%s ' "$(ls -l "$kubeconfig" | cut -c1-10)"
+  printf 'dir=%s ' "$(ls -ld "$(dirname "$kubeconfig")" | cut -c1-10)"
+  printf 'credentials=%s\n' "$(grep -c '{VAULT_TOKEN}' "$kubeconfig")"
+}} >> '{log}'
+case "$1" in install|upgrade) cat > /dev/null ;; esac
+if [ -n "$dry" ] && [ -f '{dry_fails}' ]; then cat '{dry_fails}' >&2; exit 1; fi
+if [ -n "$dry" ]; then cat '{dry_run}'; exit 0; fi
+{on_change}
+echo 'STATUS: deployed'
+"#,
+                manifest = manifest.display(),
+                log = log.display(),
+                dry_run = dry_run.display(),
+                chart = root.path().join("chart").display(),
+                pulls = root.path().join("pulls.log").display(),
+                places = root.path().join("places.log").display(),
+                dry_fails = root.path().join("dry-run-fails").display(),
+                no_chart = root.path().join("no-chart").display(),
+                live = root.path().join("live.yaml").display(),
+                renders = root.path().join("renders.log").display(),
+                kubeconfigs = kubeconfigs.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let api = FakeApi::start().await;
+        let client = Client::try_from(Config::new(api.url.parse().unwrap())).unwrap();
+        let scope = scope_with(Profile::Deploy, &permissive(), &[NS]);
+        let context = scope.context.clone();
+        let identity = if client_only {
+            Identity::ClientOnly { client }
+        } else {
+            Identity::TemporaryServiceAccount(crate::identity::TemporaryServiceAccount::fake(
+                client, NS,
+            ))
+        };
+        let capabilities: HashSet<Capability> = Capability::ALL.into_iter().collect();
+        let session = Session::from_parts(scope, identity, catalog(), capabilities);
+        session.set_grants(grants(&[Grant::read(NS)]));
+        let audit_path = root.path().join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+        let confirmer = Arc::new(VaultConfirmer {
+            dir: kubeconfigs.clone(),
+            allow_user,
+            locks: Mutex::default(),
+            helm: Mutex::default(),
+        });
+        let server = McpServer::new(session, confirmer.clone(), Some(audit));
+        let config = kube::config::Kubeconfig::from_yaml(&format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: {context}\n\
+             clusters: [{{name: c, cluster: {{server: 'https://vault.example.com'}}}}]\n\
+             users: [{{name: u, user: {{token: {VAULT_TOKEN}}}}}]\n\
+             contexts: [{{name: {context}, context: {{cluster: c, user: u}}}}]\n"
+        ))
+        .unwrap();
+        let file = root.path().join("user-kubeconfig");
+        std::fs::write(&file, "apiVersion: v1\nkind: Config\n").unwrap();
+        server.set_helm(crate::helm_tools::HelmEnv {
+            binary: Some(helm),
+            kubeconfig: client_only.then(|| vec![file]),
+            vault: (!client_only)
+                .then(|| crate::helm_tools::VaultKubeconfig::new(config, kubeconfigs.clone())),
+            paths: None,
+        });
+        Self {
+            _api: api,
+            server,
+            confirmer,
+            audit_path,
+            kubeconfigs,
+            log,
+            root,
+        }
+    }
+
+    /// What helm said about each call it got with a kubeconfig.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `(credentials, temporary kubeconfigs on disk)` of each Helm window.
+    fn windows(&self) -> Vec<(crate::helm_tools::HelmCredentials, usize)> {
+        self.confirmer
+            .helm
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(change, _, files)| (change.credentials, *files))
+            .collect()
+    }
+
+    /// Neither the answer nor the audit log has the vault's credentials
+    /// or says where they were, and nothing is left on disk.
+    fn assert_clean(&self, answer: &str) {
+        let audit = std::fs::read_to_string(&self.audit_path).unwrap_or_default();
+        let root = self.root.path().display().to_string();
+        for text in [answer, audit.as_str()] {
+            assert!(!text.contains(VAULT_TOKEN), "credentials leaked");
+            assert!(!text.contains(&root), "a path leaked");
+        }
+        assert_eq!(vault_files(&self.kubeconfigs), 0);
+    }
+}
+
+#[cfg(unix)]
+fn vault_call(kind: &str, dry: bool, context: &str) -> String {
+    let dry = if dry { "dry" } else { "" };
+    format!(
+        "{kind} {dry} context={context} token=none file=-rw------- dir=drwx------ credentials=1"
+    )
+}
+
+/// The flow of a kubeconfig context on a vault context (#113): asked with
+/// the objects, a dry run as the user, the diff window, the install. The
+/// credentials reach helm in an owner-only file only while it runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_runs_as_the_user_after_consent() {
+    use crate::helm_tools::{HelmCredentials, USER_IDENTITY};
+    let f = VaultHelm::start(true, "").await;
+    let context = f.server.session().scope().context.clone();
+
+    let install = f
+        .server
+        .call(
+            "agent",
+            "helm_install",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!install.is_error, "{}", install.text);
+    assert_eq!(
+        f.calls(),
+        [
+            vault_call("install", true, &context),
+            vault_call("install", false, &context),
+        ]
+    );
+    // No file while the user decides, in either window.
+    assert_eq!(
+        f.windows(),
+        [(HelmCredentials::AskUser, 0), (HelmCredentials::User, 0)]
+    );
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (asked, details, _) = &windows[0];
+        assert_eq!(asked.identity, USER_IDENTITY);
+        assert_eq!(asked.user_objects, ["ClusterRole infra-reader"]);
+        assert!(details.contains("temporary file"), "{details}");
+        let (diff, _, _) = &windows[1];
+        assert_eq!(diff.identity, USER_IDENTITY);
+        assert!(
+            diff.cluster_objects
+                .iter()
+                .any(|object| object.contains("ClusterRole infra-reader")),
+            "{:?}",
+            diff.cluster_objects
+        );
+    }
+    f.assert_clean(&install.text);
+    let audit = audit_lines(&f.audit_path);
+    let line = audit.last().unwrap();
+    assert_eq!(line["change"]["ranAs"], "user", "{line}");
+
+    // Upgrading goes the same way.
+    let upgrade = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!upgrade.is_error, "{}", upgrade.text);
+    assert_eq!(f.calls().len(), 4);
+    assert_eq!(f.calls()[2], vault_call("upgrade", true, &context));
+    assert_eq!(f.calls()[3], vault_call("upgrade", false, &context));
+    assert_eq!(
+        f.windows()[2..],
+        [(HelmCredentials::AskUser, 0), (HelmCredentials::User, 0)]
+    );
+    f.assert_clean(&upgrade.text);
+
+    // A rollback and an uninstall ask once and run once.
+    for (tool, kind, arguments) in [
+        (
+            "helm_rollback",
+            "rollback",
+            json!({"release": "infra", "revision": 1, "namespace": NS}),
+        ),
+        (
+            "helm_uninstall",
+            "uninstall",
+            json!({"release": "infra", "namespace": NS}),
+        ),
+    ] {
+        let windows = f.windows().len();
+        let outcome = f.server.call("agent", tool, args(arguments)).await;
+        assert!(!outcome.is_error, "{tool}: {}", outcome.text);
+        assert_eq!(
+            f.calls().last().unwrap(),
+            &vault_call(kind, false, &context)
+        );
+        assert_eq!(f.windows()[windows..], [(HelmCredentials::AskUser, 0)]);
+        f.assert_clean(&outcome.text);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_writes_nothing_without_consent() {
+    let f = VaultHelm::start(false, "").await;
+    let refused = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(refused.is_error);
+    assert!(refused.text.contains("did not allow"), "{}", refused.text);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(!f.kubeconfigs.exists());
+    f.assert_clean(&refused.text);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_on_a_vault_context_writes_nothing_once_the_vault_locks() {
+    let f = VaultHelm::start(true, "").await;
+    *f.confirmer.locks.lock().unwrap() = Some(f.server.session().clone());
+    let ended = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(ended.is_error);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(!f.kubeconfigs.exists());
+    f.assert_clean(&ended.text);
+}
+
+/// A failing helm: its error reaches the agent, the file does not stay.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_failing_on_a_vault_context_leaves_no_file() {
+    let f = VaultHelm::start(true, "echo 'Error: cannot delete' >&2; exit 1").await;
+    let failed = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(failed.is_error);
+    assert!(failed.text.contains("cannot delete"), "{}", failed.text);
+    assert_eq!(f.calls().len(), 1);
+    f.assert_clean(&failed.text);
+}
+
+/// The agent goes away while helm runs: dropping the call removes the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cancelled_helm_call_on_a_vault_context_leaves_no_file() {
+    let f = VaultHelm::start(true, "sleep 5").await;
+    let mut call = Box::pin(f.server.call(
+        "agent",
+        "helm_uninstall",
+        args(json!({"release": "infra", "namespace": NS})),
+    ));
+    while f.calls().is_empty() {
+        tokio::select! {
+            outcome = &mut call => panic!("helm ended early: {}", outcome.text),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+    assert_eq!(vault_files(&f.kubeconfigs), 1);
+    drop(call);
+    f.assert_clean("");
+}
+
+/// A session with neither a kubeconfig file nor the vault's credentials
+/// refuses before asking anyone.
+#[cfg(unix)]
+#[tokio::test]
+async fn helm_with_no_kubeconfig_at_all_is_refused_before_asking() {
+    let f = VaultHelm::start(true, "").await;
+    let binary = f.root.path().join("helm");
+    f.server.set_helm(crate::helm_tools::HelmEnv {
+        binary: Some(binary),
+        ..crate::helm_tools::HelmEnv::default()
+    });
+    let refused = f
+        .server
+        .call(
+            "agent",
+            "helm_uninstall",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(refused.is_error);
+    assert!(refused.text.contains("ClusterRole"), "{}", refused.text);
+    assert!(f.windows().is_empty());
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+}
+
+/// A search over `repositories.yaml` text and cached indexes (name, text)
+/// in a temporary Helm home, as the agent sees it.
+async fn search_charts(
+    list: Option<&str>,
+    indexes: &[(&str, &str)],
+    query: &str,
+) -> serde_json::Value {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = kubach_core::helm::repo::HelmPaths {
+        repository_config: dir.path().join("repositories.yaml"),
+        repository_cache: dir.path().to_owned(),
+    };
+    if let Some(list) = list {
+        std::fs::write(&paths.repository_config, list).unwrap();
+    }
+    for (name, text) in indexes {
+        std::fs::write(paths.index_file(name), text).unwrap();
+    }
+    let f = fixture(Profile::ReadOnly, permissive(), false).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv {
+        paths: Some(paths),
+        ..crate::helm_tools::HelmEnv::default()
+    });
+    let result = f
+        .server
+        .call("agent", "helm_search_charts", args(json!({"query": query})))
+        .await;
+    assert!(!result.is_error, "{}", result.text);
+    serde_json::from_str(&result.text).unwrap()
+}
+
+const TWO_REPOSITORIES: &str = "repositories:
+- name: podinfo
+  url: https://login:hunter2@example.com/podinfo
+- name: bitnami
+  url: https://example.com/bitnami
+";
+const PODINFO_INDEX: &str = "entries:
+  podinfo:
+  - name: podinfo
+    version: 6.7.0
+    description: A small web application
+";
+
+fn assert_oci_hint(found: &serde_json::Value) {
+    let oci = found["ociCharts"].as_str().unwrap();
+    assert!(oci.contains("oci://registry/path"), "{oci}");
+    assert!(oci.contains("helm_install"), "{oci}");
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_says_no_repositories_are_added() {
+    for list in [None, Some(""), Some("repositories: []\n")] {
+        let found = search_charts(list, &[], "redis").await;
+        assert_eq!(found["charts"], json!([]));
+        assert_eq!(found["reason"], "noRepositories");
+        assert_eq!(found["searched"], json!([]));
+        assert_eq!(found["withoutIndex"], json!([]));
+        let note = found["note"].as_str().unwrap();
+        assert!(note.contains("No repositories are added"), "{note}");
+        assert_oci_hint(&found);
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_repository_list_is_not_reported_as_no_repositories() {
+    let found = search_charts(Some("repositories: [password: hunter2"), &[], "redis").await;
+    assert_eq!(found["reason"], "repositoryListUnreadable");
+    let text = found.to_string();
+    assert!(!text.contains("No repositories are added"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert_oci_hint(&found);
+
+    // No Helm home at all: the same, not an empty list.
+    let f = fixture(Profile::ReadOnly, permissive(), false).await;
+    f.server.set_helm(crate::helm_tools::HelmEnv::default());
+    let result = f
+        .server
+        .call("agent", "helm_search_charts", args(json!({})))
+        .await;
+    assert!(
+        result.text.contains("repositoryListUnreadable"),
+        "{}",
+        result.text
+    );
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_names_repositories_without_an_index() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("bitnami", "entries: [not: an index")],
+        "redis",
+    )
+    .await;
+    assert_eq!(found["reason"], "noLoadedIndex");
+    assert_eq!(found["searched"], json!([]));
+    assert_eq!(found["withoutIndex"], json!(["podinfo", "bitnami"]));
+    let note = found["note"].as_str().unwrap();
+    assert!(note.contains("podinfo, bitnami"), "{note}");
+    assert_oci_hint(&found);
+    assert!(!found.to_string().contains("hunter2"), "{found}");
+}
+
+#[tokio::test]
+async fn an_empty_chart_search_names_what_was_searched_and_skipped() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("podinfo", PODINFO_INDEX)],
+        "redis",
+    )
+    .await;
+    assert_eq!(found["reason"], "noMatch");
+    assert_eq!(found["searched"], json!(["podinfo"]));
+    assert_eq!(found["withoutIndex"], json!(["bitnami"]));
+    let note = found["note"].as_str().unwrap();
+    assert!(note.contains("No chart matched in podinfo."), "{note}");
+    assert!(note.contains("no loaded index: bitnami."), "{note}");
+    assert_oci_hint(&found);
+
+    let every_index = search_charts(
+        Some("repositories:\n- name: podinfo\n  url: https://example.com\n"),
+        &[("podinfo", PODINFO_INDEX)],
+        "redis",
+    )
+    .await;
+    assert_eq!(every_index["reason"], "noMatch");
+    assert_eq!(every_index["withoutIndex"], json!([]));
+    let note = every_index["note"].as_str().unwrap();
+    assert!(!note.contains("no loaded index"), "{note}");
+}
+
+#[tokio::test]
+async fn a_chart_search_with_results_keeps_its_answer() {
+    let found = search_charts(
+        Some(TWO_REPOSITORIES),
+        &[("podinfo", PODINFO_INDEX)],
+        "podinfo",
+    )
+    .await;
+    assert_eq!(
+        found,
+        json!({
+            "charts": [{
+                "chart": "podinfo/podinfo",
+                "version": "6.7.0",
+                "appVersion": null,
+                "description": "A small web application",
+                "deprecated": false,
+            }],
+            "more": false,
+            "repositories": [
+                {"name": "podinfo", "index": "ready"},
+                {"name": "bitnami", "index": "missing: update it in Kubach"},
+            ],
+            "note": "Charts of the repositories added in Kubach. An oci:// chart can be looked \
+                     at with oci; the user is asked to allow its registry.",
+        })
+    );
+}
+
+/// `# Source:` comments as `helm template` writes them.
+#[cfg(unix)]
+const LOOKUP_RENDER: &str = "---\n# Source: infra/templates/secret.yaml\napiVersion: v1\n\
+     kind: Secret\nmetadata:\n  name: infra-tls\ndata:\n  tls.key: Z2VuZXJhdGVk\n---\n\
+     # Source: infra/templates/config.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  \
+     name: infra\n---\n# Source: infra/templates/rbac.yaml\n\
+     apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
+     name: infra-reader\nrules: []\n";
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// The chart `helm pull` gives, and what `helm template` renders.
+    fn lookup_chart(&self, secret_template: &str) {
+        let templates = self.root.path().join("chart/infra/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            self.root.path().join("chart/infra/Chart.yaml"),
+            "name: infra\n",
+        )
+        .unwrap();
+        std::fs::write(templates.join("secret.yaml"), secret_template).unwrap();
+        std::fs::write(templates.join("config.yaml"), "kind: ConfigMap\n").unwrap();
+        std::fs::write(self.root.path().join("manifest.yaml"), LOOKUP_RENDER).unwrap();
+    }
+
+    /// How helm was called for a render on the cluster.
+    fn renders(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.path().join("renders.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn preview(&self, tool: &str) -> Value {
+        let outcome = self
+            .server
+            .call(
+                "agent",
+                tool,
+                args(
+                    json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                            "namespace": NS, "preview": true}),
+                ),
+            )
+            .await;
+        assert!(!outcome.is_error, "{tool}: {}", outcome.text);
+        // Nobody asked, nothing of the user's on disk, helm changed nothing.
+        assert!(self.windows().is_empty());
+        assert!(self.calls().is_empty(), "{:?}", self.calls());
+        assert!(!self.kubeconfigs.exists());
+        self.assert_clean(&outcome.text);
+        serde_json::from_str(&outcome.text).unwrap()
+    }
+}
+
+#[cfg(unix)]
+const USES_LOOKUP: &str = r#"{{ $old := lookup "v1" "Secret" "ns" "infra-tls" }}"#;
+
+/// A chart with `lookup` that needs the user's credentials (#114): the
+/// preview renders under the ServiceAccount's token, with the cluster-only
+/// kubeconfig and before anyone is asked. What it read stays masked.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_renders_under_the_service_account() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(USES_LOOKUP);
+    let live = LOOKUP_RENDER.replace("Z2VuZXJhdGVk", "cmVhbC1rZXktZnJvbS1jbHVzdGVy");
+    std::fs::write(f.root.path().join("live.yaml"), live).unwrap();
+    for tool in ["helm_install", "helm_upgrade"] {
+        let preview = f.preview(tool).await;
+        assert_eq!(preview["lookup"]["status"], "read", "{preview}");
+        assert_eq!(preview["lookup"]["wholePreview"], false);
+        assert!(
+            preview["note"].as_str().unwrap().contains("ServiceAccount"),
+            "{preview}"
+        );
+        let text = preview.to_string();
+        assert!(!text.contains("cmVhbC1rZXktZnJvbS1jbHVzdGVy"), "{text}");
+        assert!(!text.contains("real-key-from-cluster"), "{text}");
+        assert!(
+            preview["summary"].to_string().contains("Secret infra-tls"),
+            "{preview}"
+        );
+        assert!(
+            text.contains("ClusterRole infra-reader"),
+            "the render's findings: {text}"
+        );
+    }
+    assert_eq!(
+        f.renders(),
+        vec!["context=kubach token=fake-sa-token credentials=0 vault-files=0"; 2]
+    );
+}
+
+/// The ServiceAccount cannot render it: the objects of the templates with
+/// `lookup` are marked, and helm's error stays out of the answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_marks_the_objects_when_the_render_fails() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(USES_LOOKUP);
+    let preview = f.preview("helm_upgrade").await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(preview["lookup"]["objects"], json!(["Secret infra-tls"]));
+    assert_eq!(preview["lookup"]["wholePreview"], false);
+    assert_eq!(
+        preview["summary"]["added"],
+        json!([{"object": "Secret infra-tls", "lookupAffected": true}]),
+        "{preview}"
+    );
+    assert!(
+        preview["lookup"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("may be false"),
+        "{preview}"
+    );
+    let text = preview.to_string();
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("forbidden"), "{text}");
+    assert!(!text.contains("Z2VuZXJhdGVk"), "{text}");
+    assert_eq!(f.renders().len(), 1);
+}
+
+/// A computed include: which objects depend on `lookup` cannot be told.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_marks_everything_when_the_mapping_is_unreliable() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart(&format!(
+        r#"{USES_LOOKUP}{{{{ include (print $.Template.BasePath "/x.yaml") . }}}}"#
+    ));
+    let preview = f.preview("helm_install").await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(preview["lookup"]["wholePreview"], true);
+    assert!(
+        preview["summary"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["lookupAffected"] == true),
+        "{preview}"
+    );
+    assert!(
+        preview["lookup"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("any change"),
+        "{preview}"
+    );
+}
+
+/// The chart's templates cannot be read: the preview says it does not know.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lookup_preview_says_when_the_templates_are_unknown() {
+    let f = VaultHelm::start(true, "").await;
+    let preview = f.preview("helm_install").await;
+    assert_eq!(preview["lookup"]["status"], "unknown", "{preview}");
+    assert_eq!(preview["lookup"]["wholePreview"], true);
+    assert!(f.renders().is_empty());
+}
+
+/// A render of a large chart: a changed ConfigMap, a Secret and a Deployment,
+/// and enough objects that the diff takes pages (#115).
+#[cfg(unix)]
+fn large_render(mark: &str) -> String {
+    let mut render = format!(
+        "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  \
+         name: infra-reader\nrules: []\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  \
+         name: infra\ndata:\n  level: debug\n  DB_PASSWORD: hunter2-in-a-config-map\n---\n\
+         apiVersion: v1\nkind: Secret\nmetadata:\n  name: infra-tls\ndata:\n  \
+         tls.key: Z2VuZXJhdGVk\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  \
+         name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        \
+         image: web:{mark}\n"
+    );
+    for n in 0..40 {
+        let filler = format!("{mark}-{n} ").repeat(150);
+        render.push_str(&format!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: filler-{n}\ndata:\n  \
+             text: {filler}\n"
+        ));
+    }
+    render
+}
+
+#[cfg(unix)]
+impl VaultHelm {
+    async fn preview_diff(&self, query: Value) -> Result<Value, String> {
+        let outcome = self
+            .server
+            .call("agent", "helm_preview_diff", args(query))
+            .await;
+        self.assert_clean(&outcome.text);
+        if outcome.is_error {
+            return Err(outcome.text);
+        }
+        Ok(serde_json::from_str(&outcome.text).unwrap())
+    }
+}
+
+/// The default answer is a summary, the full diff comes by object and by
+/// page, and a render that changes meanwhile does not reach the pages.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_is_a_summary_and_its_pages_are_of_one_render() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let manifest = f.root.path().join("manifest.yaml");
+    std::fs::write(&manifest, large_render("one")).unwrap();
+
+    let preview = f.preview("helm_upgrade").await;
+    let text = preview.to_string();
+    assert!(preview.get("diff").is_none(), "{text}");
+    assert!(text.len() < 16 * 1024, "{} bytes", text.len());
+    let summary = &preview["summary"];
+    assert_eq!(summary["counts"]["added"], 42, "{summary}");
+    assert_eq!(summary["counts"]["changed"], 1, "{summary}");
+    assert_eq!(summary["counts"]["unchanged"], 1, "{summary}");
+    assert_eq!(
+        summary["images"][0],
+        json!({"object": "Deployment web", "new": "web:one",
+               "path": "spec.template.spec.containers[app].image"})
+    );
+    assert_eq!(
+        summary["configMapKeys"],
+        json!([
+            {"object": "ConfigMap infra", "key": "DB_PASSWORD", "change": "added",
+             "new": "*** (23 bytes)"},
+            {"object": "ConfigMap infra", "key": "level", "change": "added", "new": "debug"},
+        ])
+    );
+    assert!(!text.contains("hunter2"), "{text}");
+
+    let id = preview["fullDiff"]["previewId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pages = preview["fullDiff"]["pages"].as_u64().unwrap();
+    assert!(pages >= 2, "{preview}");
+
+    // The chart renders differently from now on; the kept pages do not.
+    let first = f.preview_diff(json!({"previewId": id})).await.unwrap();
+    assert_eq!(first["pages"], pages);
+    assert_eq!(first["nextPage"], 2);
+    std::fs::write(&manifest, large_render("two")).unwrap();
+    let mut whole = first["diff"].as_str().unwrap().to_owned();
+    for page in 2..=pages {
+        let next = f
+            .preview_diff(json!({"previewId": id, "page": page}))
+            .await
+            .unwrap();
+        assert_eq!(next["pages"], pages);
+        whole.push_str(next["diff"].as_str().unwrap());
+    }
+    assert_eq!(
+        whole.len() as u64,
+        preview["fullDiff"]["bytes"].as_u64().unwrap()
+    );
+    assert!(whole.contains("image: web:one"), "{whole}");
+    assert!(
+        !whole.contains("web:two") && !whole.contains("two-0"),
+        "another render"
+    );
+    assert!(!whole.contains("hunter2") && !whole.contains("Z2VuZXJhdGVk"));
+    assert!(whole.contains("*** (9 bytes)"), "{whole}");
+    assert!(f.renders().is_empty());
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+
+    // A filter takes the objects, and the same text.
+    let one = f
+        .preview_diff(json!({"previewId": id, "kind": "deployment", "name": "we"}))
+        .await
+        .unwrap();
+    assert_eq!(one["matchedObjects"], 1);
+    assert_eq!(one["pages"], 1);
+    let diff = one["diff"].as_str().unwrap();
+    assert!(diff.starts_with("=== added Deployment web\n"), "{diff}");
+    assert!(
+        diff.contains("image: web:one") && !diff.contains("filler"),
+        "{diff}"
+    );
+    assert!(one.get("nextPage").is_none());
+    let none = f
+        .preview_diff(json!({"previewId": id, "kind": "Ingress"}))
+        .await
+        .unwrap();
+    assert_eq!(none["matchedObjects"], 0);
+    assert!(none["diff"].as_str().unwrap().contains("no change matches"));
+
+    let beyond = f
+        .preview_diff(json!({"previewId": id, "page": pages + 1}))
+        .await
+        .unwrap_err();
+    assert!(beyond.contains("does not exist"), "{beyond}");
+
+    // A new preview is a new render, under another id.
+    let again = f.preview("helm_upgrade").await;
+    assert_ne!(again["fullDiff"]["previewId"], json!(id));
+    assert_eq!(again["summary"]["images"][0]["new"], "web:two", "{again}");
+}
+
+/// A preview that fell out of the session says so; nothing renders anew.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_no_longer_kept_says_so() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let first = f.preview("helm_install").await;
+    let id = first["fullDiff"]["previewId"].clone();
+    for _ in 0..crate::helm_preview::MAX_KEPT_PREVIEWS {
+        f.preview("helm_install").await;
+    }
+    let gone = f.preview_diff(json!({"previewId": id})).await.unwrap_err();
+    assert!(gone.contains("is not kept"), "{gone}");
+    assert!(gone.contains("new render"), "{gone}");
+    assert!(f.renders().is_empty());
+}
+
+/// The kept diff ends with the session.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_closed_session_keeps_no_preview() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let preview = f.preview("helm_install").await;
+    let id = preview["fullDiff"]["previewId"].as_str().unwrap();
+    f.server.session().close().await.unwrap();
+    let text = f
+        .server
+        .call("agent", "helm_preview_diff", args(json!({"previewId": id})))
+        .await;
+    assert!(text.is_error, "{}", text.text);
+}
+
+/// The summary is for the agent: the window keeps the whole diff, however
+/// the summary would cut it (#115).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_confirmation_window_keeps_the_full_diff() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: ConfigMap\n");
+    let mut release = infra_release(3);
+    release["manifest"] = json!(large_render("one"));
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let outcome = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (_, details, _) = windows.last().unwrap();
+    assert!(details.starts_with("--- revision"), "{details}");
+    assert!(details.contains("after the upgrade"), "{details}");
+    for n in 0..40 {
+        assert!(details.contains(&format!("filler-{n}\n")), "filler-{n}");
+    }
+    assert!(details.contains("image: web:one"), "{details}");
+    assert!(!details.contains("previewId"), "{details}");
+    assert!(!details.contains("hunter2"), "{details}");
+}
+
+/// A chart without `lookup`: the preview is as before, and the cluster is
+/// not contacted for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_without_lookup_is_not_marked() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n# lookup is only a word here\n");
+    let preview = f.preview("helm_install").await;
+    assert!(preview.get("lookup").is_none(), "{preview}");
+    assert!(f.renders().is_empty());
+}
+
+// ------------------------------------------------ comparing Secrets (#179)
+
+async fn compare_db(f: &Fixture, key: &str, other_key: &str) -> CallOutcome {
+    f.server
+        .call(
+            "agent",
+            "compare_secret_values",
+            args(json!({"name": "db", "key": key, "otherName": "db", "otherKey": other_key})),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn one_secret_key_is_compared_a_bounded_number_of_times() {
+    let f = session_fixture(Profile::ReadOnly, permissive(), true, false).await;
+    for n in 0..crate::session::MAX_COMPARISONS_PER_KEY {
+        let compared = compare_db(&f, "password", "copy").await;
+        assert!(!compared.is_error, "{n}: {}", compared.text);
+    }
+    let refused = compare_db(&f, "password", "copy").await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused.text.contains("db[password] was compared 10 times"),
+        "{}",
+        refused.text
+    );
+    assert!(!refused.text.contains("equal"), "{}", refused.text);
+    // The limit is the key's, whatever it is compared with; a key that
+    // was not compared yet still is.
+    let other = compare_db(&f, "url", "password").await;
+    assert!(other.is_error, "{}", other.text);
+    let fresh = compare_db(&f, "url", "url").await;
+    assert!(!fresh.is_error, "{}", fresh.text);
+    let last = audit_lines(&f.audit_path)
+        .into_iter()
+        .rfind(|line| line["result"] == "denied")
+        .unwrap();
+    assert_eq!(last["tool"], "compare_secret_values");
+    assert_eq!(last["decided_by"], "policy");
+}
+
+#[tokio::test]
+async fn a_secret_written_in_the_session_is_not_compared() {
+    let f = writing_fixture(ScriptedConfirmer::providing(provided(
+        &[("password", TYPED)],
+        &[],
+    )))
+    .await;
+    let before = compare_db(&f, "password", "copy").await;
+    assert!(!before.is_error, "{}", before.text);
+    let written = f
+        .server
+        .call(
+            "agent",
+            "request_secret_input",
+            args(json!({"name": "db", "mode": "update", "keys": ["password"]})),
+        )
+        .await;
+    assert!(!written.is_error, "{}", written.text);
+    let after = compare_db(&f, "password", "copy").await;
+    assert!(after.is_error, "{}", after.text);
+    assert!(
+        after
+            .text
+            .contains("created or changed during this session"),
+        "{}",
+        after.text
+    );
+    assert!(!after.text.contains("equal"), "{}", after.text);
+}
+
+// ----------------------------------------------- the client's name (#179)
+
+#[tokio::test]
+async fn a_clients_name_is_cleaned_for_windows_the_sessions_list_and_the_audit_log() {
+    let f = fixture_with(
+        Profile::Deploy,
+        permissive(),
+        ScriptedConfirmer::approving(),
+        false,
+    )
+    .await;
+    f.server.session().set_grants(grants(&[Grant::read(NS)]));
+    let name = format!(
+        "agent\r\n\u{202E}Kubach\u{200B}: approve\tall {}",
+        "x".repeat(5000)
+    );
+    let outcome = f
+        .server
+        .call(
+            &name,
+            "scale",
+            args(json!({"kind": "Deployment", "name": "web", "replicas": 2})),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.text);
+    let shown = format!("agent Kubach: approve all {}…", "x".repeat(38));
+    assert_eq!(shown.chars().count(), 65);
+    let requests = f.confirmer.requests();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        assert_eq!(request.client, shown);
+        for text in [&request.summary, &request.details] {
+            assert!(!text.contains(['\u{202E}', '\u{200B}', '\r']), "{text:?}");
+            assert!(!text.contains(&"x".repeat(39)), "{text:?}");
+        }
+    }
+    assert_eq!(f.server.session().activity().clients, vec![shown.clone()]);
+    let lines = audit_lines(&f.audit_path);
+    assert!(!lines.is_empty());
+    for line in lines {
+        assert_eq!(line["client"], shown.as_str());
+    }
+}
+
+// ------------------------------------------- before the user's yes (#173)
+
+/// A chart with nothing a temporary ServiceAccount cannot create.
+#[cfg(unix)]
+const PLAIN_MANIFEST: &str = "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: infra\n";
+
+/// What a chart's template can make helm say: the cluster's data.
+#[cfg(unix)]
+const HELM_SAYS: &str = "Error: INSTALLATION FAILED: execution error at \
+     (infra/templates/x.yaml:1:3): {\"data\":{\"password\":\"aHVudGVyMi1vZi0xNzM=\"}}\n";
+
+#[cfg(unix)]
+impl VaultHelm {
+    /// `(command, the rest)` of every helm call: where it ran and with
+    /// which archive.
+    fn places(&self) -> Vec<(String, String)> {
+        std::fs::read_to_string(self.root.path().join("places.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(command, rest)| (command.to_owned(), rest.to_owned()))
+            .collect()
+    }
+
+    fn plain_chart(&self) {
+        std::fs::write(self.root.path().join("manifest.yaml"), PLAIN_MANIFEST).unwrap();
+        let mut release = infra_release(3);
+        release["manifest"] = json!(PLAIN_MANIFEST);
+        std::fs::write(self.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    }
+
+    async fn install(&self, preview: bool) -> crate::server::CallOutcome {
+        self.server
+            .call(
+                "agent",
+                "helm_install",
+                args(
+                    json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                            "namespace": NS, "preview": preview}),
+                ),
+            )
+            .await
+    }
+}
+
+/// A dry run that fails tells the agent that it failed, and nothing helm
+/// said: under the ServiceAccount before any window, and under the user's
+/// credentials after the first one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_dry_run_passes_on_nothing_helm_said() {
+    for plain in [true, false] {
+        let f = VaultHelm::start(true, "").await;
+        if plain {
+            f.plain_chart();
+        }
+        std::fs::write(f.root.path().join("dry-run-fails"), HELM_SAYS).unwrap();
+        let failed = f.install(false).await;
+        assert!(failed.is_error);
+        assert!(
+            failed.text.contains("server-side dry run failed"),
+            "{}",
+            failed.text
+        );
+        for hidden in [
+            "aHVudGVyMi1vZi0xNzM",
+            "password",
+            "execution error",
+            "x.yaml",
+        ] {
+            assert!(!failed.text.contains(hidden), "{}", failed.text);
+        }
+        assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
+        assert_eq!(f.windows().len(), usize::from(!plain));
+        f.assert_clean(&failed.text);
+    }
+}
+
+/// The one failure told apart is helm's whole message about a taken name.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_says_when_the_release_name_is_taken() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    std::fs::write(
+        f.root.path().join("dry-run-fails"),
+        "Error: INSTALLATION FAILED: cannot re-use a name that is still in use\n",
+    )
+    .unwrap();
+    let failed = f.install(false).await;
+    assert!(failed.text.contains("exists in the namespace already"));
+    // The same words inside a longer message are the chart's.
+    std::fs::write(
+        f.root.path().join("dry-run-fails"),
+        "Error: INSTALLATION FAILED: execution error at (x.yaml:1:3): Error: INSTALLATION \
+         FAILED: cannot re-use a name that is still in use\n",
+    )
+    .unwrap();
+    let failed = f.install(false).await;
+    assert!(
+        failed.text.contains("server-side dry run failed"),
+        "{}",
+        failed.text
+    );
+}
+
+/// A preview of a chart the ServiceAccount could install is `helm
+/// template` too: no dry run, nothing with the release storage's rights.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preview_is_a_render_and_never_a_dry_run() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n");
+    f.plain_chart();
+    let preview = f.install(true).await;
+    assert!(!preview.is_error, "{}", preview.text);
+    let answer: Value = serde_json::from_str(&preview.text).unwrap();
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap()
+            .contains("without the cluster"),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["summary"]["added"],
+        json!([{"object": "ConfigMap infra"}]),
+        "{answer}"
+    );
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(f.renders().is_empty());
+    assert!(f.windows().is_empty());
+    let commands: Vec<String> = f.places().into_iter().map(|(command, _)| command).collect();
+    assert_eq!(commands, ["pull", "template"]);
+}
+
+/// In a client-only namespace helm has only the user's credentials: the
+/// dry run waits for the first window, and a no runs nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_client_only_dry_run_waits_for_the_user() {
+    use crate::helm_tools::HelmCredentials;
+    let refused = VaultHelm::start_in(true, false, "").await;
+    let outcome = refused.install(false).await;
+    assert!(outcome.is_error);
+    assert!(refused.calls().is_empty(), "{:?}", refused.calls());
+    assert_eq!(refused.windows().len(), 1);
+    assert_eq!(refused.windows()[0].0, HelmCredentials::AskUser);
+
+    let f = VaultHelm::start_in(true, true, "").await;
+    let preview = f.install(true).await;
+    assert!(!preview.is_error, "{}", preview.text);
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(f.windows().is_empty());
+
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let credentials: Vec<HelmCredentials> = f.windows().iter().map(|window| window.0).collect();
+    assert_eq!(
+        credentials,
+        [HelmCredentials::AskUser, HelmCredentials::User]
+    );
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (asked, details, _) = &windows[0];
+        assert!(asked.identity.contains("user"), "{}", asked.identity);
+        assert!(asked.user_objects.is_empty());
+        assert!(details.contains("helm template"), "{details}");
+        assert!(details.contains("dry run"), "{details}");
+    }
+    assert_eq!(f.calls().len(), 2, "{:?}", f.calls());
+    assert!(f.calls()[0].starts_with("install dry "), "{:?}", f.calls());
+}
+
+// ------------------------------------------- one archive for a call (#174)
+
+/// The chart is fetched once; the render, the dry run and the install read
+/// that archive by its path, and helm runs in an empty directory of a
+/// private one. The answer and the audit log say how the release compares
+/// with the dry run.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_step_of_a_call_reads_the_chart_fetched_once() {
+    let f = VaultHelm::start(true, "").await;
+    f.lookup_chart("kind: Secret\n");
+    f.plain_chart();
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let places = f.places();
+    let commands: Vec<&str> = places.iter().map(|(command, _)| command.as_str()).collect();
+    assert_eq!(commands, ["pull", "template", "install", "install"]);
+    assert!(
+        places
+            .iter()
+            .all(|(_, place)| place.ends_with("above=drwx------ files=0")),
+        "{places:?}"
+    );
+    let archives: Vec<&str> = places[1..]
+        .iter()
+        .map(|(_, place)| place.split(' ').next().unwrap())
+        .collect();
+    assert!(archives[0].starts_with("chart="), "{places:?}");
+    assert!(archives.iter().all(|archive| *archive == archives[0]));
+
+    let answer: Value = serde_json::from_str(&installed.text).unwrap();
+    assert_eq!(
+        answer["chartArchive"]["sha256"].as_str().map(str::len),
+        Some(64),
+        "{answer}"
+    );
+    // The release in the fake storage has a ClusterRole the dry run of this
+    // test did not: the answer and the audit log name it.
+    let compared = &answer["comparedWithDryRun"];
+    assert_eq!(compared["sameObjects"], false, "{answer}");
+    assert_eq!(
+        compared["notInDryRun"],
+        json!(["ClusterRole infra-reader"]),
+        "{answer}"
+    );
+    assert_eq!(compared["missing"], json!([]), "{answer}");
+    let audit = audit_lines(&f.audit_path);
+    let line = audit.last().unwrap();
+    assert_eq!(
+        line["change"]["chartSha256"], answer["chartArchive"]["sha256"],
+        "{line}"
+    );
+    assert_eq!(
+        line["change"]["comparedWithDryRun"]["notInDryRun"],
+        json!(["ClusterRole infra-reader"]),
+        "{line}"
+    );
+    f.assert_clean(&installed.text);
+}
+
+/// The release helm wrote has what the dry run showed: the answer says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_release_like_its_dry_run_is_reported_as_such() {
+    let f = VaultHelm::start(true, "").await;
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let answer: Value = serde_json::from_str(&installed.text).unwrap();
+    assert_eq!(
+        answer["comparedWithDryRun"]["sameObjects"], true,
+        "{answer}"
+    );
+    assert_eq!(answer["comparedWithDryRun"]["changed"], json!([]));
+    let audit = audit_lines(&f.audit_path);
+    assert_eq!(
+        audit.last().unwrap()["change"]["comparedWithDryRun"]["sameObjects"],
+        true
+    );
+}
+
+/// A chart that cannot be fetched ends the call before anything renders.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chart_that_cannot_be_fetched_ends_the_call() {
+    let f = VaultHelm::start(true, "").await;
+    std::fs::write(f.root.path().join("no-chart"), "").unwrap();
+    let failed = f.install(false).await;
+    assert!(failed.is_error);
+    assert!(
+        failed.text.contains("could not be fetched"),
+        "{}",
+        failed.text
+    );
+    assert!(!failed.text.contains("hunter2"), "{}", failed.text);
+    let commands: Vec<String> = f.places().into_iter().map(|(command, _)| command).collect();
+    assert_eq!(commands, ["pull"]);
+    assert!(f.windows().is_empty());
+}
+
+// ------------------------------- what the Helm window and findings see (#179)
+
+/// A render with a document that gives no certain object ends the call
+/// before anybody is asked and before helm touches the cluster.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_render_with_an_unnamed_document_ends_the_call_before_anyone_is_asked() {
+    for client_only in [false, true] {
+        let f = VaultHelm::start_in(client_only, true, "").await;
+        f.plain_chart();
+        std::fs::write(
+            f.root.path().join("manifest.yaml"),
+            format!(
+                "{PLAIN_MANIFEST}---\napiVersion: batch/v1\nkind: Job\nmetadata:\n  \
+                 generateName: text-of-the-chart-\n"
+            ),
+        )
+        .unwrap();
+        for preview in [true, false] {
+            let refused = f.install(preview).await;
+            assert!(refused.is_error, "{}", refused.text);
+            for part in ["document 2,", "generateName is not a name", "nothing ran"] {
+                assert!(refused.text.contains(part), "{part}: {}", refused.text);
+            }
+            assert!(
+                !refused.text.contains("text-of-the-chart"),
+                "{}",
+                refused.text
+            );
+        }
+        assert!(f.windows().is_empty());
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+    }
+}
+
+/// The same in a dry run that shows more than the render did: refused
+/// without the document's number, and nothing is installed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_with_a_document_read_two_ways_installs_nothing() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    let mut release = infra_release(3);
+    release["manifest"] = json!(format!(
+        "{PLAIN_MANIFEST}---\napiVersion: v1\nkind: ConfigMap\nkind: ClusterRoleBinding\n\
+         metadata:\n  name: text-of-the-chart\n"
+    ));
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let refused = f.install(false).await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused
+            .text
+            .contains("the server-side dry run has a document"),
+        "{}",
+        refused.text
+    );
+    for hidden in ["document 2", "text-of-the-chart", "ClusterRoleBinding"] {
+        assert!(!refused.text.contains(hidden), "{}", refused.text);
+    }
+    assert!(f.windows().is_empty());
+    assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
+    assert!(f.calls()[0].starts_with("install dry "), "{:?}", f.calls());
+}
+
+/// The objects inside a `kind: List` are in the window as any other: the
+/// cluster-scoped one asks for the user's credentials and is ticked.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_objects_of_a_list_reach_the_window() {
+    use crate::helm_tools::HelmCredentials;
+    const LIST: &str = "---\napiVersion: v1\nkind: List\nitems:\n\
+         - apiVersion: rbac.authorization.k8s.io/v1\n  kind: ClusterRoleBinding\n  metadata:\n    \
+         name: in-a-list\n- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: infra\n";
+    let f = VaultHelm::start(true, "").await;
+    std::fs::write(f.root.path().join("manifest.yaml"), LIST).unwrap();
+    let mut release = infra_release(3);
+    release["manifest"] = json!(LIST);
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (asked, _, _) = &windows[0];
+    assert_eq!(asked.credentials, HelmCredentials::AskUser);
+    assert_eq!(asked.user_objects, ["ClusterRoleBinding in-a-list"]);
+    let (change, _, _) = &windows[1];
+    assert_eq!(
+        change.objects,
+        [
+            "ClusterRoleBinding in-a-list (cluster-scoped)",
+            "ConfigMap infra"
+        ]
+    );
+    assert_eq!(
+        change.cluster_objects,
+        ["ClusterRoleBinding in-a-list (cluster-scoped)"]
+    );
+}
+
+#[cfg(unix)]
+fn hook_json(command: &str) -> Value {
+    json!({
+        "name": "infra-migrate", "kind": "Job", "path": "infra/templates/migrate.yaml",
+        "events": ["pre-upgrade", "pre-rollback"], "weight": 0, "delete_policies": [],
+        "manifest": format!(
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: infra-migrate\n  annotations:\n    \
+             helm.sh/hook: pre-upgrade,pre-rollback\nspec:\n  template:\n    spec:\n      \
+             containers:\n      - name: run\n        image: busybox\n        \
+             command: [sh, -c, \"{command}\"]\n"
+        ),
+    })
+}
+
+/// An upgrade that changes only a hook: the window has the hook's diff
+/// under its heading and does not say that nothing changes. The hook is
+/// the session's own afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_upgrade_that_changes_only_a_hook_shows_it() {
+    use crate::helm_tools::{HOOKS_HEADING, ONLY_HOOKS};
+    let f = VaultHelm::start(true, "").await;
+    let mut release = infra_release(3);
+    release["hooks"] = json!([hook_json("echo from-the-new-chart")]);
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let session = f.server.session().clone();
+    assert!(!session.changed_in(NS));
+    let upgraded = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!upgraded.is_error, "{}", upgraded.text);
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (change, details, _) = windows.last().unwrap();
+        assert!(details.starts_with(ONLY_HOOKS), "{details}");
+        assert!(details.contains(HOOKS_HEADING), "{details}");
+        assert!(
+            details
+                .lines()
+                .any(|line| line.starts_with('+') && line.contains("echo from-the-new-chart")),
+            "{details}"
+        );
+        assert!(!details.contains("changes no object"), "{details}");
+        assert!(
+            change
+                .objects
+                .iter()
+                .any(|object| object == "Job infra-migrate"),
+            "{:?}",
+            change.objects
+        );
+    }
+    // Only what the upgrade creates or changes is the session's own.
+    assert!(session.was_changed(NS, "Job", "infra-migrate"));
+    assert!(!session.was_changed(NS, "ConfigMap", "infra"));
+    // The window's text went nowhere else.
+    assert!(
+        !upgraded.text.contains("from-the-new-chart"),
+        "{}",
+        upgraded.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("from-the-new-chart"), "{audit}");
+
+    // An upgrade that changes nothing says so.
+    std::fs::write(
+        f.root.path().join("dry-run.json"),
+        infra_release(3).to_string(),
+    )
+    .unwrap();
+    let same = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(!same.is_error, "{}", same.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (_, details, _) = windows.last().unwrap();
+    assert_eq!(details, "The dry run changes no object and no hook.");
+}
+
+/// The values the agent sends are in the window as they are, and masked
+/// in its answer and in the audit log; what an install creates is the
+/// session's own.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_window_shows_sent_values_and_an_install_is_the_sessions_own() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    let session = f.server.session().clone();
+    let installed = f
+        .server
+        .call(
+            "agent",
+            "helm_install",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS,
+                        "values": "auth:\n  password: sent-by-the-agent\nreplicas: 2\n"}),
+            ),
+        )
+        .await;
+    assert!(!installed.is_error, "{}", installed.text);
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        assert_eq!(windows.len(), 1);
+        let (change, _, _) = &windows[0];
+        assert!(
+            change.values.contains("password: sent-by-the-agent"),
+            "{}",
+            change.values
+        );
+    }
+    assert!(
+        !installed.text.contains("sent-by-the-agent"),
+        "{}",
+        installed.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("sent-by-the-agent"), "{audit}");
+    assert!(session.was_changed(NS, "ConfigMap", "infra"));
+
+    // A patch: its value is shown, the release's own stay masked.
+    let upgraded = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS,
+                        "valuesPatch": "auth:\n  apiToken: patched-by-the-agent\n"})),
+        )
+        .await;
+    assert!(!upgraded.is_error, "{}", upgraded.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (change, _, _) = windows.last().unwrap();
+    for text in [&change.values, &change.values_diff] {
+        assert!(text.contains("apiToken: patched-by-the-agent"), "{text}");
+    }
+    assert!(
+        !upgraded.text.contains("patched-by-the-agent"),
+        "{}",
+        upgraded.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("patched-by-the-agent"), "{audit}");
+}
+
+/// The future of a call stays small: every tool's own future is on the
+/// heap ([`tools::run`]), so what a tool keeps while it runs is not part of
+/// it. It was about 20 KiB with the tools inline and is about 1 KiB.
+#[tokio::test]
+async fn the_future_of_a_call_does_not_hold_the_tools() {
+    let f = fixture(Profile::Debug, permissive(), true).await;
+    let call = f.server.call("agent", "session_info", Map::new());
+    let size = std::mem::size_of_val(&call);
+    assert!(size <= 4 * 1024, "the future of a call takes {size} bytes");
+}
+
+/// Tool calls fit a thread with half the stack tokio gives its workers
+/// (2 MiB), in an unoptimized build as well. With the tools inline in the
+/// dispatch every call took over 1 MiB there, whatever the tool; now the
+/// deepest of these takes about 0.4 MiB. A call that needs more ends the
+/// test run with "has overflowed its stack".
+#[test]
+fn tool_calls_fit_half_of_a_worker_threads_stack() {
+    let calls = [
+        ("list_kinds", json!({})),
+        ("list_resources", json!({"kind": "Deployment"})),
+        (
+            "describe_resource",
+            json!({"kind": "Deployment", "name": "web"}),
+        ),
+        ("get_logs", json!({"pod": "web-0"})),
+        (
+            "scale",
+            json!({"kind": "Deployment", "name": "web", "replicas": 3}),
+        ),
+        (
+            "port_forward_start",
+            json!({"target": "pod/web-0", "port": 8080}),
+        ),
+        ("helm_list_releases", json!({})),
+        ("list_secrets", json!({})),
+        ("get_topology", json!({})),
+    ];
+    let thread = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let f = fixture(Profile::Debug, permissive(), true).await;
+                for (tool, arguments) in calls {
+                    // What a call answers is checked elsewhere: here it
+                    // only has to come back.
+                    let _ = f.server.call("agent", tool, args(arguments)).await;
+                }
+            });
+        })
+        .unwrap();
+    thread.join().unwrap();
 }

@@ -16,6 +16,7 @@ use std::borrow::Cow;
 
 use kubach_core::apply::yaml;
 use kubach_core::secrets::mask::{LAST_APPLIED, VALUE_FIELDS, is_secret_value, mask_named_values};
+use kube::api::{ApiResource, DynamicObject};
 use serde_json::Value;
 
 pub use kubach_core::redact::mask_text;
@@ -33,6 +34,81 @@ pub fn mask_object(value: &mut Value) {
         placeholder(size)
     });
     mask_secrets(value);
+}
+
+/// An object that went through [`mask_object`]; there is no other way to
+/// get one, so code that takes it cannot see an unmasked value.
+pub(crate) struct Masked(Value);
+
+impl Masked {
+    /// `object` of the kind `api`, masked. Masking goes by `kind`, and the
+    /// items of a list answer have none: without it a ConfigMap's values
+    /// would pass unmasked. So the kind the call resolved is always set.
+    pub(crate) fn object(object: &DynamicObject, api: &ApiResource) -> Self {
+        let mut value = serde_json::to_value(object).unwrap_or(Value::Null);
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("apiVersion".into(), api.api_version.clone().into());
+            fields.insert("kind".into(), api.kind.clone().into());
+        }
+        mask_object(&mut value);
+        Self(value)
+    }
+
+    pub(crate) fn value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// The object plugins render for the agent: [`Masked::object`] as a
+/// `DynamicObject`, so a table cell or a details line is built from the same
+/// masked object `get_resource` shows.
+///
+/// Plugins decode `data`, `binaryData` and `stringData` into typed objects
+/// and report the size of each value, which a `*** (N bytes)` placeholder
+/// would break. A masked value there becomes a filler of the same size and
+/// encoding instead; nothing of the value is left in it.
+pub(crate) fn plugin_view(object: &DynamicObject, api: &ApiResource) -> DynamicObject {
+    let Masked(mut value) = Masked::object(object, api);
+    let secret = is_secret_value(&value);
+    for field in ["data", "binaryData", "stringData"] {
+        let base64 = field == "binaryData" || (secret && field == "data");
+        let Some(Value::Object(entries)) = value.get_mut(field) else {
+            continue;
+        };
+        for (key, entry) in entries {
+            let Some(Value::String(raw)) = object.data.get(field).and_then(|f| f.get(key)) else {
+                continue;
+            };
+            if entry.as_str() != Some(raw) {
+                *entry = Value::String(filler(raw, base64));
+            }
+        }
+    }
+    serde_json::from_value(value).unwrap_or_else(|_| DynamicObject {
+        types: None,
+        metadata: kube::api::ObjectMeta {
+            name: object.metadata.name.clone(),
+            namespace: object.metadata.namespace.clone(),
+            ..Default::default()
+        },
+        data: Value::Object(Default::default()),
+    })
+}
+
+/// A string of the size of `raw` that holds none of it: zero bytes in
+/// base64, or asterisks.
+fn filler(raw: &str, base64: bool) -> String {
+    if !base64 {
+        return "*".repeat(raw.len());
+    }
+    let size = decoded_len(raw.trim());
+    let mut out = "AAAA".repeat(size / 3);
+    out.push_str(match size % 3 {
+        1 => "AA==",
+        2 => "AAA=",
+        _ => "",
+    });
+    out
 }
 
 /// `*** (N bytes)`.
@@ -391,6 +467,75 @@ data:
         let mut args = json!({"yaml": "{{{"});
         mask_audit_args(&mut args);
         assert_eq!(args["yaml"], "<unparsed YAML, 3 bytes>");
+    }
+
+    fn dynamic(value: Value) -> DynamicObject {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn api(group: &str, version: &str, kind: &str) -> ApiResource {
+        ApiResource::from_gvk(&kube::api::GroupVersionKind::gvk(group, version, kind))
+    }
+
+    #[test]
+    fn plugin_view_keeps_sizes_and_drops_values() {
+        // No `kind`, like an item of a list answer.
+        let secret = dynamic(json!({
+            "metadata": {"name": "db", "annotations": {LAST_APPLIED: "{\"data\":{\"pw\":\"aHVudGVyMg==\"}}"}},
+            "data": {"pw": "aHVudGVyMg==", "one": "YQ==", "two": "YWI=", "empty": ""},
+            "stringData": {"plain": "Zx9-plain"},
+        }));
+        let view = plugin_view(&secret, &api("", "v1", "Secret"));
+        assert_eq!(
+            view.data["data"],
+            json!({"pw": "AAAAAAAAAA==", "one": "AA==", "two": "AAA=", "empty": ""})
+        );
+        assert_eq!(view.data["stringData"]["plain"], "*********");
+        assert_eq!(view.metadata.annotations, Some(Default::default()));
+        assert_eq!(view.types.unwrap().kind, "Secret");
+
+        let config = dynamic(json!({
+            "metadata": {"name": "app"},
+            "data": {"DB_PASS": "hunter2", "DB_HOST": "db"},
+            "binaryData": {"tls.key": "aHVudGVyMg==", "logo": "aWNvbg=="},
+        }));
+        let view = plugin_view(&config, &api("", "v1", "ConfigMap"));
+        assert_eq!(
+            view.data["data"],
+            json!({"DB_PASS": "*******", "DB_HOST": "db"})
+        );
+        assert_eq!(
+            view.data["binaryData"],
+            json!({"tls.key": "AAAAAAAAAA==", "logo": "aWNvbg=="})
+        );
+    }
+
+    #[test]
+    fn plugin_view_masks_like_the_object() {
+        let deployment = dynamic(json!({
+            "metadata": {"name": "web", "managedFields": [{}], "annotations": {
+                LAST_APPLIED: "{\"env\":[{\"name\":\"DB_PASSWORD\",\"value\":\"s3cr3t-env\"}]}",
+                "example.com/api-token": "ghp_annotation",
+            }},
+            "spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                {"name": "DB_PASSWORD", "value": "s3cr3t-env"},
+                {"name": "LOG_LEVEL", "value": "debug"},
+            ]}]}}},
+        }));
+        let kind = api("apps", "v1", "Deployment");
+        let view = serde_json::to_value(plugin_view(&deployment, &kind)).unwrap();
+        assert_eq!(&view, Masked::object(&deployment, &kind).value());
+        // A nested object under `data` is not a value to fill.
+        let revision = dynamic(json!({
+            "metadata": {"name": "web-1"},
+            "data": {"spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                {"name": "DB_PASSWORD", "value": "s3cr3t-env"},
+            ]}]}}}},
+        }));
+        let kind = api("apps", "v1", "ControllerRevision");
+        let view = serde_json::to_value(plugin_view(&revision, &kind)).unwrap();
+        assert_eq!(&view, Masked::object(&revision, &kind).value());
+        assert!(!view.to_string().contains("s3cr3t-env"));
     }
 
     #[test]

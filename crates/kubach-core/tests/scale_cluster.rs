@@ -48,7 +48,7 @@ fn step(delta: i32, allow_zero: bool) -> ActionParams {
 
 async fn replicas(deploys: &Api<Deployment>) -> i32 {
     let deploy = deploys.get("stepper").await.unwrap();
-    deploy.spec.unwrap().replicas.unwrap()
+    deploy.spec.replicas.unwrap()
 }
 
 #[tokio::test]

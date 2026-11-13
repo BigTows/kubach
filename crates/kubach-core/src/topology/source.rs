@@ -192,6 +192,11 @@ impl TopologyInput {
         self.objects.get(&kind).map_or(&[], |objects| objects)
     }
 
+    /// The list of `kind` as it was set (shared with the cache).
+    pub(super) fn list(&self, kind: SourceKind) -> Option<&Objects> {
+        self.objects.get(&kind)
+    }
+
     pub fn is_complete(&self, kind: SourceKind) -> bool {
         self.complete.contains(&kind)
     }

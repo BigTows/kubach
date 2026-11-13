@@ -40,8 +40,8 @@ const CONTEXT: &str = "SelectableLines";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("secondary-c", CopySelection, Some(CONTEXT)),
-        KeyBinding::new("secondary-a", SelectAllLines, Some(CONTEXT)),
+        KeyBinding::new(crate::secondary!("c"), CopySelection, Some(CONTEXT)),
+        KeyBinding::new(crate::secondary!("a"), SelectAllLines, Some(CONTEXT)),
         KeyBinding::new("escape", ClearSelection, Some(CONTEXT)),
     ]);
 }
@@ -269,6 +269,8 @@ pub struct LineSelector {
     focus: FocusHandle,
     dragging: bool,
     auto_scroll: AutoScroll,
+    /// The same for the horizontal axis, in views that scroll sideways.
+    auto_scroll_x: AutoScroll,
 }
 
 impl LineSelector {
@@ -280,6 +282,7 @@ impl LineSelector {
             focus: cx.focus_handle(),
             dragging: false,
             auto_scroll: AutoScroll::default(),
+            auto_scroll_x: AutoScroll::default(),
         }
     }
 
@@ -308,6 +311,7 @@ impl LineSelector {
         self.selection = None;
         self.dragging = false;
         self.auto_scroll.stop();
+        self.auto_scroll_x.stop();
     }
 
     /// Clips the selection to lines from `first` on; see
@@ -361,6 +365,19 @@ impl LineSelector {
         })
     }
 
+    /// Width of the widest text among the rows painted last frame (single
+    /// line rows); read it before [`begin_frame`](Self::begin_frame).
+    pub fn painted_width(&self) -> Option<Pixels> {
+        self.rows
+            .borrow()
+            .iter()
+            .filter_map(|row| {
+                let end = row.layout.position_for_index(row.layout.len())?;
+                Some(end.x - row.layout.bounds().left())
+            })
+            .max_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)))
+    }
+
     /// Forgets the rows of the previous frame; call at the start of the
     /// view's `render`.
     pub fn begin_frame(&self) {
@@ -410,6 +427,10 @@ pub trait SelectableLines: Render + Sized {
     fn line_text(&self, line: u64) -> Option<String>;
     /// Scrolls by `delta` (positive: down) while a drag is past an edge.
     fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>);
+    /// Scrolls sideways by `delta` (positive: towards the line ends) while a
+    /// drag is past the left or right edge; views that do not scroll
+    /// sideways ignore it.
+    fn scroll_sideways_by(&mut self, _delta: Pixels, _cx: &mut Context<Self>) {}
     /// Called after the selection changed.
     fn selection_changed(&mut self, _cx: &mut Context<Self>) {}
 }
@@ -539,6 +560,20 @@ fn drag<V: SelectableLines>(view: &mut V, event: &MouseMoveEvent, cx: &mut Conte
                 extend_to(view, position, cx);
             }
         });
+    // The same ramp along the horizontal axis.
+    let sideways = Bounds::new(
+        point(px(0.), viewport.left()),
+        size(px(0.), viewport.size.width),
+    );
+    let delta = AutoScroll::compute_delta(event.position.x, sideways);
+    view.line_selector_mut()
+        .auto_scroll_x
+        .set(delta, cx, |delta, view: &mut V, cx| {
+            view.scroll_sideways_by(delta, cx);
+            if let Some(position) = view.line_selector().auto_scroll.last_drag_position {
+                extend_to(view, position, cx);
+            }
+        });
     extend_to(view, event.position, cx);
 }
 
@@ -567,6 +602,7 @@ fn release<V: SelectableLines>(view: &mut V, cx: &mut Context<V>) {
     }
     selector.dragging = false;
     selector.auto_scroll.stop();
+    selector.auto_scroll_x.stop();
     // A click without a drag only places nothing; drop the empty selection.
     if selector
         .selection

@@ -9,6 +9,7 @@ mod analysis;
 mod assist;
 mod configmap;
 mod presets;
+mod registries;
 mod review;
 mod secret;
 mod tabs;
@@ -88,7 +89,7 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalHub(hub));
     tabs::init(cx);
     cx.bind_keys([
-        KeyBinding::new("secondary-s", ReviewChanges, Some(KEY_CONTEXT)),
+        KeyBinding::new(kubach_ui::secondary!("s"), ReviewChanges, Some(KEY_CONTEXT)),
         KeyBinding::new(
             "ctrl-space",
             ShowCompletions,
@@ -587,6 +588,9 @@ impl YamlEditor {
 
     /// (Re)loads the edited object from the cluster, replacing the text.
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_if_closed(cx) {
+            return;
+        }
         let Target::Existing {
             kind,
             name,
@@ -680,6 +684,10 @@ impl YamlEditor {
 
     /// Fetches schemas not yet known; each arrival rechecks the text.
     fn fetch_schemas(&mut self, kinds: &[GroupVersionKind], cx: &mut Context<Self>) {
+        // Nothing is asked of a context whose session was closed.
+        if self.session_closed(cx) {
+            return;
+        }
         for gvk in kinds {
             if !self.schemas.borrow_mut().start(gvk) {
                 continue;

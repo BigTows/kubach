@@ -20,8 +20,10 @@ use kube::{Client, Config};
 use serde::{Deserialize, Serialize};
 
 use crate::access::{Access, Raises};
+use crate::confirm::WaitingCalls;
 use crate::forwards::{SessionForwards, StopReason};
-use crate::grants::{Grant, GrantState, Grants};
+use crate::grants::{CustomRight, Grant, GrantState, Grants};
+use crate::helm_preview::PreviewStore;
 use crate::identity::{self, Identity, IdentityError, TemporaryServiceAccount};
 use crate::policy::{NamespaceModes, Policy};
 use crate::remember::{Remembered, RememberedSet};
@@ -136,6 +138,9 @@ pub struct Session {
     /// Chart sources (`oci://…` repositories) the user allowed or refused
     /// for this session (#418).
     chart_sources: Mutex<HashMap<String, bool>>,
+    /// The user's answer about opening every namespace for `allNamespaces`
+    /// calls (#107); `None` until asked.
+    all_namespaces: Mutex<Option<bool>>,
     closed: AtomicBool,
     activity: Mutex<Activity>,
     /// The user's answers so far; empty at the start.
@@ -143,6 +148,8 @@ pub struct Session {
     /// One question to the user at a time per session, so two calls do not
     /// ask for the same right twice.
     ask: tokio::sync::Mutex<()>,
+    /// Calls waiting for the user's answer right now (#116).
+    waiting: WaitingCalls,
     /// Orders grant changes with the identities and Role patches that
     /// mirror them.
     role: tokio::sync::Mutex<()>,
@@ -150,11 +157,20 @@ pub struct Session {
     /// session, as `(namespace, kind, name)`: reading the logs of their pods
     /// is confirmed (#190).
     changed: Mutex<HashSet<ChangedObject>>,
+    /// How many times each Secret key was compared in this session, see
+    /// [`MAX_COMPARISONS_PER_KEY`].
+    compared: Mutex<HashMap<SecretKey, u32>>,
+    /// Secrets written through this session (entered by the user, copied),
+    /// as `(namespace, name)`: they are not compared (#179).
+    written_secrets: Mutex<HashSet<(String, String)>>,
     /// The agent's port-forwards (#17); they end with the session.
     forwards: SessionForwards,
     /// Kinds of change per namespace the user said not to ask about again
     /// in this session (#30). Only in memory.
     remembered: Mutex<RememberedSet>,
+    /// Helm previews the agent may still page through (#115). Only in
+    /// memory, masked, bounded.
+    helm_previews: Mutex<PreviewStore>,
     /// This session, for tasks that must not keep it alive.
     me: Weak<Session>,
 }
@@ -171,8 +187,22 @@ pub enum HelmAccess {
     User,
 }
 
+/// How long a call waits for a patched Role to take effect, at most.
+const ROLE_SETTLE_TRIES: usize = 30;
+const ROLE_SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// `(namespace, kind, name)` of an object the agent applied.
 pub type ChangedObject = (String, String, String);
+
+/// `(namespace, name, key)` of a Secret key.
+pub type SecretKey = (String, String, String);
+
+/// Most times one Secret key takes part in `compare_secret_values` in a
+/// session (#179). A comparison answers one yes-or-no question about the
+/// value, so the number of answers about one value is kept small: ten
+/// covers finding which of a handful of Secrets hold the same value, and
+/// is in the range of attempts a login form allows before it locks.
+pub const MAX_COMPARISONS_PER_KEY: u32 = 10;
 
 /// Who used a session and how much, for the sessions screen.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -217,14 +247,19 @@ impl Session {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         });
         spawn_ttl_guard(Arc::downgrade(&session), session.scope.deadline());
@@ -251,20 +286,30 @@ impl Session {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         })
     }
 
     pub fn id(&self) -> &str {
         &self.scope.id
+    }
+
+    /// Calls waiting for the user's answer right now (#116).
+    pub fn waiting(&self) -> &WaitingCalls {
+        &self.waiting
     }
 
     pub fn scope(&self) -> &SessionScope {
@@ -394,6 +439,18 @@ impl Session {
 
     pub fn catalog(&self) -> &ApiCatalog {
         &self.catalog
+    }
+
+    /// The kinds the cluster serves now. [`Self::catalog`] is as old as the
+    /// session; whoever decides by a kind that is not in it asks again
+    /// (#179). A session made from prepared parts has only its own list.
+    pub async fn current_catalog(
+        &self,
+    ) -> Result<ApiCatalog, kubach_core::discovery::DiscoveryError> {
+        if self.test_rbac.is_some() {
+            return Ok(self.catalog.clone());
+        }
+        ApiCatalog::discover(&self.user_client).await
     }
 
     /// `server-side limits are off: …` when the context asked for a
@@ -531,6 +588,44 @@ impl Session {
         ))
     }
 
+    /// Records that Secret `name` in `namespace` is written through this
+    /// session.
+    pub(crate) fn note_secret_written(&self, namespace: &str, name: &str) {
+        sync::lock(&self.written_secrets).insert((namespace.to_owned(), name.to_owned()));
+    }
+
+    /// Whether Secret `name` in `namespace` was written through this
+    /// session.
+    pub(crate) fn secret_written(&self, namespace: &str, name: &str) -> bool {
+        sync::lock(&self.written_secrets).contains(&(namespace.to_owned(), name.to_owned()))
+    }
+
+    /// Counts one comparison of `first` with `second`, unless either was
+    /// compared [`MAX_COMPARISONS_PER_KEY`] times already: then nothing is
+    /// counted and that key is returned.
+    pub(crate) fn count_comparison(
+        &self,
+        first: &SecretKey,
+        second: &SecretKey,
+    ) -> Result<(), SecretKey> {
+        let mut compared = sync::lock(&self.compared);
+        let full =
+            |key: &SecretKey| compared.get(key).copied().unwrap_or(0) >= MAX_COMPARISONS_PER_KEY;
+        if let Some(key) = [first, second].into_iter().find(|key| full(key)) {
+            return Err(key.clone());
+        }
+        *compared.entry(first.clone()).or_default() += 1;
+        if second != first {
+            *compared.entry(second.clone()).or_default() += 1;
+        }
+        Ok(())
+    }
+
+    /// Helm previews kept for paging (#115).
+    pub(crate) fn helm_previews(&self) -> &Mutex<PreviewStore> {
+        &self.helm_previews
+    }
+
     /// The user's answers so far.
     pub fn grants(&self) -> Grants {
         sync::lock(&self.grants).clone()
@@ -648,6 +743,17 @@ impl Session {
 
     /// The user's answer about chart source `source` in this session, if
     /// asked (#418).
+    pub fn all_namespaces_answer(&self) -> Option<bool> {
+        *sync::lock(&self.all_namespaces)
+    }
+
+    /// Remembers the user's answer about `allNamespaces` until the session
+    /// ends (#107). A no keeps single-namespace calls working: it is about
+    /// opening namespaces in bulk, not about any one of them.
+    pub fn set_all_namespaces_answer(&self, allowed: bool) {
+        *sync::lock(&self.all_namespaces) = Some(allowed);
+    }
+
     pub fn chart_source(&self, source: &str) -> Option<bool> {
         sync::lock(&self.chart_sources).get(source).copied()
     }
@@ -666,6 +772,13 @@ impl Session {
                     .ok_or_else(|| SessionError::NotInSession(namespace.to_owned()))?,
                 base,
             ),
+            #[cfg(test)]
+            Identities::Fixed(Identity::TemporaryServiceAccount(_)) => {
+                return Ok(HelmAccess::Token {
+                    kubeconfig: "apiVersion: v1\nkind: Config\n".to_owned(),
+                    token: "fake-sa-token".to_owned(),
+                });
+            }
             #[cfg(test)]
             Identities::Fixed(_) => return Ok(HelmAccess::User),
         };
@@ -834,6 +947,57 @@ impl Session {
         &self.forwards
     }
 
+    /// Before a call on a custom resource in `namespace` (#103): a
+    /// temporary ServiceAccount's Role gets what the call uses, and the
+    /// call waits until the API server applies it. If the patch fails,
+    /// nothing is recorded and the error is returned.
+    pub(crate) async fn allow_custom_rights(
+        &self,
+        namespace: &str,
+        rights: &[CustomRight],
+    ) -> Result<(), SessionError> {
+        {
+            let _role = self.role.lock().await;
+            if !self.is_active() {
+                return Err(SessionError::Ended);
+            }
+            let mut next = self.grants();
+            if !next.add_custom_rights(namespace, rights) {
+                return Ok(());
+            }
+            self.sync_namespace(&next, namespace).await?;
+            *sync::lock(&self.grants) = next;
+        }
+        self.settle_rights(namespace, rights).await;
+        Ok(())
+    }
+
+    /// Waits, for a moment at most, until the namespace's temporary
+    /// ServiceAccount has `rights`: the API server's authorizer learns of a
+    /// patched Role a little later, and the call comes right after it. A
+    /// review that fails ends the wait: the call itself tells.
+    async fn settle_rights(&self, namespace: &str, rights: &[CustomRight]) {
+        let Some(boundary) = self.boundary(namespace) else {
+            return;
+        };
+        if boundary.identity.mode() != SessionMode::TemporaryServiceAccount {
+            return;
+        }
+        let client = boundary.identity.client();
+        for right in rights {
+            let access = ResourceAccess::new(&right.verb, &right.group, &right.resource)
+                .in_namespace(namespace);
+            for _ in 0..ROLE_SETTLE_TRIES {
+                match can_i(&client, &access).await {
+                    Ok(decision) if !decision.allowed => {
+                        tokio::time::sleep(ROLE_SETTLE_PAUSE).await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
     /// Before a port-forward in `namespace` starts (#17): a temporary
     /// ServiceAccount's Role gets `pods/portforward` there. If the patch
     /// fails, nothing is recorded and the error is returned.
@@ -906,6 +1070,7 @@ impl Session {
             return Ok(());
         }
         self.forget_remembered();
+        sync::lock(&self.helm_previews).clear();
         self.forwards.stop_all(StopReason::SessionEnded);
         let boundaries: Vec<Arc<Boundary>> =
             sync::lock(&self.boundaries).values().cloned().collect();
@@ -1187,14 +1352,19 @@ mod tests {
             rbac: Mutex::default(),
             raises: Mutex::default(),
             chart_sources: Mutex::default(),
+            all_namespaces: Mutex::default(),
             closed: AtomicBool::new(false),
             activity: Mutex::default(),
             grants: Mutex::default(),
             ask: tokio::sync::Mutex::new(()),
+            waiting: WaitingCalls::default(),
             role: tokio::sync::Mutex::new(()),
             changed: Mutex::default(),
+            compared: Mutex::default(),
+            written_secrets: Mutex::default(),
             forwards,
             remembered: Mutex::default(),
+            helm_previews: Mutex::default(),
             me: me.clone(),
         })
     }

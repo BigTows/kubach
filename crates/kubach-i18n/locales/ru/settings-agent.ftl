@@ -85,6 +85,8 @@ settings-session-no-grants = Права пока не выданы.
 settings-session-remembered = Без вопросов: { $list }
 # $action: agent-action-*, $namespace: где.
 settings-session-remembered-item = { $action } в { $namespace }
+# $command: точная команда, $node: нода.
+settings-session-remembered-command = { $command } на ноде { $node }
 settings-ask-again = Снова спрашивать
 settings-boundary-client-only = ограничения только в Kubach
 settings-boundary-impersonation = ограничения в Kubach и API-сервере (impersonation)
@@ -108,3 +110,7 @@ settings-audit-recent = Последние вызовы
 settings-audit-file = Сначала новые. Файл: { $path }
 settings-audit-no-folder = В ОС нет папки настроек: ничего не записывается.
 settings-audit-show-file = Показать файл
+
+settings-group-agent-notifications = Уведомления
+settings-agent-system-notifications = Уведомлять о запросах агентов
+settings-agent-system-notifications-description = Системное уведомление, когда агент ждёт вашего ответа, а окно Kubach скрыто или не в фокусе.

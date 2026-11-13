@@ -12,6 +12,7 @@ agent-notice-reveal-off = Revealing Secrets is off
 agent-notice-refused = Agent refused
 # What the agent asked, in English.
 agent-notice-text = { $text }
+agent-system-notification-body = { $client } is waiting for your answer in Kubach (context { $context }).
 # $summary is what the agent asked, in English.
 agent-notice-mcp-off = { $summary }: AI agent access is off for this context.
 agent-notice-session-only = Allowed for this session only
@@ -23,6 +24,7 @@ agent-title-read = Allow the agent to read?
 agent-title-reveal = Reveal a Secret to the agent?
 agent-title-modify = Allow the agent to make changes?
 agent-title-exec = Run the agent's command?
+agent-title-node-command = Run the agent's command on the node?
 agent-title-port-forward = Open the agent's port-forward?
 agent-title-access = Give the agent more access?
 agent-title-helm-install = Install the agent's Helm release?
@@ -31,6 +33,9 @@ agent-title-helm-rollback = Roll back the Helm release?
 agent-title-helm-uninstall = Uninstall the Helm release?
 agent-title-chart-source = Allow a chart source?
 agent-title-use-context = Let the agent work in this context?
+agent-title-namespaces = Let the agent read more namespaces?
+agent-title-batch-scale = Scale these objects?
+agent-title-batch-restart = Restart these objects?
 agent-title-call = Approve the agent's change?
 agent-title-secret-create = Enter values for a new Secret
 agent-title-secret-update = Change a Secret
@@ -47,6 +52,8 @@ agent-command-header =
         [one] { $count } argument, { $bytes } bytes · ␣ marks a space, \n a line break, \u{"{"}…{"}"} an invisible character
        *[other] { $count } arguments, { $bytes } bytes · ␣ marks a space, \n a line break, \u{"{"}…{"}"} an invisible character
     }
+agent-batch-objects = Objects that will change: { $count }
+agent-batch-left-out = Not included, will not change: { $count }
 agent-no-longer-pending = This request is no longer pending.
 agent-dangerous-title = Escapes the namespace boundary or reads Secrets
 # $message is what a finding does, $path where; both in English.
@@ -73,6 +80,7 @@ agent-field-agent = Agent
 agent-client-unverified = name reported by the client, not verified
 agent-field-context = Context
 agent-field-namespace = Namespace
+agent-field-node = Node
 agent-field-right = Right
 agent-field-release = Release
 agent-field-chart = Chart
@@ -87,13 +95,32 @@ agent-access-secrets = Secrets (metadata and checks)
 agent-access-crds = custom resources
 agent-access-nodes = nodes (read with your credentials)
 agent-tool-session = { $tool } · session { $session }
-agent-helm-values = Values (sensitive keys masked)
+agent-helm-values = Values (sent by the agent in this call: as is; the release's sensitive ones: masked)
 agent-helm-values-show = Show all values
-agent-helm-values-diff = Values changes (sensitive values masked)
+agent-helm-values-diff = Values changes (sent by the agent in this call: as is; the release's sensitive ones: masked)
 agent-helm-objects = Objects
+agent-diff-size =
+    { $count ->
+        [one] { $count } line, { $size } · the whole diff, scroll to read it
+       *[other] { $count } lines, { $size } · the whole diff, scroll to read it
+    }
+# $shown and $total are sizes: 8.0 MB.
+agent-diff-cut-title = The diff below is cut: { $shown } of { $total } shown
+agent-diff-cut-hidden =
+    { $count ->
+        [one] { $count } more line ({ $size }) is not shown. Approving allows those changes too.
+       *[other] { $count } more lines ({ $size }) are not shown. Approving allows those changes too.
+    }
+agent-diff-cut-objects = Changes not shown in full: { $objects }
+agent-diff-cut-more-objects =
+    { $count ->
+        [one] …and { $count } more object
+       *[other] …and { $count } more objects
+    }
 agent-helm-as-user-title = Run this helm call with your credentials?
 agent-helm-as-user-warning = This helm call will run with your credentials from kubeconfig, not the session's temporary ServiceAccount. Only your own RBAC limits it, and only this one call.
 agent-helm-as-user-objects = The ServiceAccount cannot create or delete these cluster-scoped objects, RBAC and objects in other namespaces of the chart:
+agent-helm-dry-run-own-warning = In this namespace the session has no identity of its own: helm runs with your credentials from kubeconfig. The server-side dry run executes the chart's templates with them and its result is shown in the next window. Nothing changes until you approve that one.
 agent-helm-as-user-show-all = Show all objects
 agent-helm-as-user-tick = Run this helm call with my kubeconfig credentials
 agent-helm-dry-run-as-user = Dry run with my credentials
@@ -109,6 +136,11 @@ agent-action-port-forward = port-forwards
 agent-action-helm-install = Helm installs
 agent-action-helm-upgrade = Helm upgrades
 agent-action-helm-rollback = Helm rollbacks
+agent-action-node-host-read = commands on node hosts
+# A read-only command on a node's host (#106).
+agent-node-command-title = Runs on the node itself, with your credentials
+agent-node-command-warning = The command runs on the host of the node through a temporary privileged pod, created with your kubeconfig credentials and deleted when the command ends. The host holds the data of every namespace on the node. The output is cut and masked before the agent sees it; masking is a best effort.
+agent-remember-node-command = Don't ask again until the session ends: exactly this command on node { $node }
 agent-always = Allow by default
 agent-always-note = Raises the minimal access in Settings → Security of { $context } for good, with a note of when and from which session. “Reset to read” there takes it back.
 agent-limits-off = Server-side limits are off

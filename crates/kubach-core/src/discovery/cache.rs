@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::ApiCatalog;
+use crate::disk_cache::Uncached;
 
 /// Bumped when the stored format changes; older files are ignored.
 const FORMAT: u32 = 1;
@@ -26,19 +27,30 @@ pub fn dir() -> Option<PathBuf> {
     crate::disk_cache::dir().map(|dir| dir.join("discovery"))
 }
 
-/// File of the catalog of `context` at `server` in `dir`. The name is a
-/// hash: context names may hold any character, and the server is part of
-/// the key so a context pointed at another cluster starts afresh.
+/// File of the catalog of `context` at `server` in `dir`. The name is the
+/// [tag](crate::disk_cache::context_tag) of the context and a hash of the
+/// server, so a context pointed at another cluster starts afresh.
 pub fn path(dir: &Path, context: &str, server: &str) -> PathBuf {
-    let mut hash = Sha256::new();
-    hash.update(context.as_bytes());
-    hash.update([0]);
-    hash.update(server.as_bytes());
-    let name: String = hash.finalize()[..16]
+    let server: String = Sha256::digest(server.as_bytes())[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    dir.join(format!("{name}.json"))
+    dir.join(crate::disk_cache::file_name(
+        context,
+        &format!("{server}.json"),
+    ))
+}
+
+/// Where the catalog of `context` at `server` is kept in the config
+/// directory; `None` for a context that is not cached
+/// ([`disk_cache::uncached`](crate::disk_cache::uncached)) or without a
+/// config directory.
+pub fn file(context: &str, server: &str) -> Option<PathBuf> {
+    file_in(&dir()?, crate::disk_cache::uncached(), context, server)
+}
+
+fn file_in(dir: &Path, uncached: &Uncached, context: &str, server: &str) -> Option<PathBuf> {
+    (!uncached.contains(context)).then(|| path(dir, context, server))
 }
 
 /// The stored catalog, or `None` if there is none or it can't be used.
@@ -51,20 +63,12 @@ pub fn load(path: &Path) -> Option<ApiCatalog> {
 /// Writes `catalog` to `path` through a temporary file, so a reader never
 /// sees half of it.
 pub fn store(path: &Path, catalog: &ApiCatalog) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::other("no cache directory"))?;
-    std::fs::create_dir_all(dir)?;
     let stored = Stored {
         format: FORMAT,
         catalog: catalog.clone(),
     };
     let json = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::settings::write_atomic(path, &json)
 }
 
 #[cfg(test)]
@@ -72,7 +76,10 @@ mod tests {
     use kube::api::ApiResource;
     use kube::discovery::{ApiCapabilities, Scope};
 
-    use super::{ApiCatalog, load, path, store};
+    use std::collections::BTreeSet;
+
+    use super::{ApiCatalog, file_in, load, path, store};
+    use crate::disk_cache::{Uncached, context_tag};
 
     fn catalog() -> ApiCatalog {
         let pods = ApiResource {
@@ -117,6 +124,19 @@ mod tests {
         // Separator: ("ab", "c") and ("a", "bc") differ.
         assert_ne!(path(dir, "ab", "c"), path(dir, "a", "bc"));
         assert_eq!(a.parent(), Some(dir));
+    }
+
+    #[test]
+    fn a_context_that_is_not_cached_has_no_file() {
+        let dir = std::path::Path::new("/cache");
+        let uncached = Uncached::default();
+        uncached.set(BTreeSet::from(["from-vault".to_owned()]));
+        assert_eq!(file_in(dir, &uncached, "from-vault", "https://a"), None);
+        let file = file_in(dir, &uncached, "from-file", "https://a").unwrap();
+        assert_eq!(file, path(dir, "from-file", "https://a"));
+        // The files of a context are found by its name alone.
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(&format!("{}-", context_tag("from-file"))));
     }
 
     #[test]

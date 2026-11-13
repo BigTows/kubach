@@ -5,7 +5,8 @@
 //!   `Impersonate-Extra-kubach.io/session`. Nothing is created.
 //! - **Temporary ServiceAccount**: `kubach-mcp-<session>` with a Role that
 //!   holds exactly the rights the user granted so far (empty at the start,
-//!   patched on every grant and revocation, #227) and a RoleBinding (owned by the SA, so deleting the SA removes
+//!   patched on every grant and revocation, #227, and on the first call on
+//!   each custom resource, #103) and a RoleBinding (owned by the SA, so deleting the SA removes
 //!   everything), and a short-lived token from `TokenRequest`, refreshed in
 //!   memory.
 //! - **Client only**: the user's credentials.
@@ -97,6 +98,10 @@ pub fn impersonation_config(
     let mut config = session_config(base, session_id)?;
     config.auth_info.impersonate = Some(user.to_owned());
     config.auth_info.impersonate_groups = (!groups.is_empty()).then(|| groups.to_vec());
+    // kube sends these too: `as-uid` and `as-user-extra` of the kubeconfig
+    // describe its own identity, not the session's.
+    config.auth_info.impersonate_uid = None;
+    config.auth_info.impersonate_user_extra = None;
     if with_session_extra {
         config
             .headers
@@ -219,6 +224,19 @@ pub struct TemporaryServiceAccount {
 }
 
 impl TemporaryServiceAccount {
+    /// An account that exists only in the test, on `client`. Its only caller
+    /// is a test with a fake `helm` script, which is Unix only.
+    #[cfg(all(test, unix))]
+    pub(crate) fn fake(client: Client, namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            name: "kubach-mcp-test".to_owned(),
+            user_client: client.clone(),
+            client: Arc::new(RwLock::new(client)),
+            refresher: Mutex::new(None),
+        }
+    }
+
     /// Creates SA, Role and RoleBinding as the user and fetches a token.
     /// Partially created objects are deleted on failure.
     pub async fn create(
@@ -462,6 +480,7 @@ async fn request_token(
     let seconds = token_seconds(remaining);
     let request = TokenRequest {
         spec: Some(TokenRequestSpec {
+            attestations: None,
             audiences: None,
             expiration_seconds: Some(seconds),
             bound_object_ref: None,
@@ -601,6 +620,17 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == SESSION_EXTRA_HEADER)
         );
+    }
+
+    #[test]
+    fn impersonation_drops_the_uid_and_extra_of_the_kubeconfig() {
+        let mut user = base();
+        user.auth_info.impersonate_uid = Some("1000".into());
+        user.auth_info.impersonate_user_extra =
+            Some([("team".to_owned(), vec!["ops".to_owned()])].into());
+        let config = impersonation_config(&user, "abc", "u", &[], false).unwrap();
+        assert!(config.auth_info.impersonate_uid.is_none());
+        assert!(config.auth_info.impersonate_user_extra.is_none());
     }
 
     #[test]

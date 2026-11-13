@@ -12,6 +12,7 @@
 
 pub mod checks;
 pub mod clipboard;
+pub mod docker;
 pub mod edit;
 pub mod generate;
 pub mod mask;
@@ -28,6 +29,7 @@ use kube::api::{Api, Patch, PatchParams, PostParams};
 
 use crate::rbac::{self, ResourceAccess};
 pub use clipboard::{CLIPBOARD_TTL, ClearTrigger, ClipboardGuard};
+pub use docker::{DockerConfig, Registry, RegistryEdit, RegistrySecret};
 pub use edit::{KeyChange, NewSecret, ReviewLine, SecretPatch, validate_key, validate_name};
 pub use typed::{RegistryLogin, Summary, TypedKind};
 pub use value::{Decoded, SecretBytes, describe_binary, describe_size};

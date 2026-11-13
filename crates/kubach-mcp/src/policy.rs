@@ -16,23 +16,25 @@
 //!
 //! Namespaces (#401): a session pinned at launch keeps to its namespaces;
 //! otherwise the agent names any valid namespace, as many as it needs.
-//! Cluster-scoped resources and all-namespace calls stay refused; only
-//! [`Request::ListNamespaces`] reads namespace names.
+//! Cluster-scoped resources stay refused; only [`Request::ListNamespaces`]
+//! reads namespace names. `allNamespaces` is never one cluster-wide call:
+//! [`Policy::all_namespaces_plan`] names the namespaces, and each is read as
+//! its own [`Request`] (#107).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use kubach_core::apply::{self, ResolvedManifest};
 use kubach_core::discovery::{ApiCatalog, ResourceKind};
-use kubach_core::secrets::mask::is_core_secret;
+use kubach_core::secrets::mask::{is_core_secret, is_sensitive_name};
 use kubach_core::workload_pods::Workload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::access::{Access, Raises};
-use crate::grants::{Grant, GrantState, Grants};
+use crate::grants::{CustomRight, Grant, GrantState, Grants};
 use crate::names;
-use crate::rules::{is_readable, is_writable};
+use crate::rules::{CUSTOM_APPLY_VERBS, CUSTOM_READ_VERBS, is_readable, is_writable};
 use crate::scope::{SessionMode, SessionScope};
 use crate::secret_write::{self, CREATE_TYPES, MAX_KEYS, SecretOp};
 use crate::settings::Profile;
@@ -41,6 +43,8 @@ use crate::settings::Profile;
 pub const MAX_APPLY_BYTES: usize = 512 * 1024;
 /// Most documents in one `apply`.
 pub const MAX_APPLY_DOCUMENTS: usize = 20;
+/// Longest label or field selector, in bytes.
+const MAX_SELECTOR_BYTES: usize = 1024;
 /// Most namespaces in one topology request: each may need its own read
 /// right, and a call asks for at most three.
 pub const MAX_TOPOLOGY_NAMESPACES: usize = 3;
@@ -53,6 +57,8 @@ pub const MAX_EXEC_ARG_BYTES: usize = 2048;
 pub const MAX_EXEC_COMMAND_BYTES: usize = 4096;
 /// Longest image reference of a debug container (#64).
 pub const MAX_IMAGE_REF_BYTES: usize = 512;
+/// Longest `timeoutSeconds` of a node drain (#105).
+pub const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 3600;
 /// Lowest local port an agent's port-forward may take (#17): well-known
 /// ports stay with the system and the user.
 pub const MIN_FORWARD_LOCAL_PORT: u16 = 1024;
@@ -104,8 +110,12 @@ pub enum Request {
     List {
         kind: KindRef,
         namespace: Option<String>,
+        /// Every namespace the session may read (#107): this request only
+        /// clears the kind and selectors, and each namespace is then
+        /// checked as a request of its own.
         all_namespaces: bool,
         label_selector: Option<String>,
+        field_selector: Option<String>,
     },
     /// `get` and `describe`.
     Get {
@@ -116,6 +126,8 @@ pub enum Request {
     Events {
         namespace: Option<String>,
         object: Option<(KindRef, String)>,
+        /// As in [`Request::List`] (#107).
+        all_namespaces: bool,
     },
     /// `get_logs`: exactly one of a pod, a workload (kind + name) or a
     /// label selector picks the pods.
@@ -244,6 +256,30 @@ pub enum Request {
     Nodes {
         name: Option<String>,
     },
+    /// `cordon_node` and `uncordon_node` (#105). Like every write on a
+    /// node: the user's credentials for this one call, confirmed each time,
+    /// and never in a session pinned to namespaces.
+    NodeCordon {
+        name: String,
+        cordon: bool,
+    },
+    /// `drain_node` (#105): cordon, then evict the node's pods, those of
+    /// `pod_selector` when given. A `preview` only reads, so it needs no
+    /// more than reading nodes.
+    NodeDrain {
+        name: String,
+        pod_selector: Option<String>,
+        timeout_seconds: Option<u64>,
+        preview: bool,
+    },
+    /// `node_host_read` (#106): one read-only program of a fixed list, with
+    /// checked arguments, run on the node's host through a temporary
+    /// privileged pod. The user's credentials for this one call, confirmed
+    /// with the exact command, and never in a session pinned to namespaces.
+    NodeHost {
+        name: String,
+        command: Vec<String>,
+    },
     /// Helm releases of a namespace: list, history and values. Needs
     /// access to Secrets, where Helm stores them (#53).
     HelmRead {
@@ -269,7 +305,10 @@ impl Request {
             | Self::SecretWrite { .. }
             | Self::SecretCopy { .. }
             | Self::SecretDelete { .. }
+            | Self::NodeCordon { .. }
+            | Self::NodeHost { .. }
             | Self::HelmChange { .. } => true,
+            Self::NodeDrain { preview, .. } => !preview,
             _ => false,
         }
     }
@@ -449,6 +488,19 @@ impl From<SessionMode> for NamespaceModes {
     }
 }
 
+/// Where an `allNamespaces` call may read (#107).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamespacePlan {
+    /// Read right away: granted already, or pinned at launch.
+    pub readable: Vec<String>,
+    /// Known, but the session has not opened them yet. Opening one sets up
+    /// its identity, so one call never does that for a whole cluster
+    /// without the user's yes.
+    pub unopened: Vec<String>,
+    /// Refused or revoked: never read.
+    pub refused: Vec<String>,
+}
+
 /// The policy of one session.
 pub struct Policy<'a> {
     scope: &'a SessionScope,
@@ -533,7 +585,18 @@ impl<'a> Policy<'a> {
             | Request::SecretCompare { .. }
             | Request::SecretReveal { .. }
             | Request::HelmRead { .. } => need(Profile::ReadOnly, true),
-            Request::Nodes { .. } => Some(Access {
+            Request::Nodes { .. } | Request::NodeDrain { preview: true, .. } => Some(Access {
+                nodes: true,
+                ..Access::NONE
+            }),
+            Request::NodeCordon { .. } | Request::NodeDrain { .. } => Some(Access {
+                profile: Profile::Deploy,
+                nodes: true,
+                ..Access::NONE
+            }),
+            // Runs a program, like exec, but on a node.
+            Request::NodeHost { .. } => Some(Access {
+                profile: Profile::Debug,
                 nodes: true,
                 ..Access::NONE
             }),
@@ -560,11 +623,12 @@ impl<'a> Policy<'a> {
                 ),
             ));
         }
+        let asked = missing.asked();
         let (code, message) = if self.raises.is_refused(missing) {
             (
                 DenialCode::AccessRefused,
                 format!(
-                    "{what} needs {missing}; the user did not allow it on {context} in this \
+                    "{what} needs {asked}; the user did not allow it on {context} in this \
                      session and is not asked again"
                 ),
             )
@@ -572,7 +636,7 @@ impl<'a> Policy<'a> {
             (
                 DenialCode::NeedsAccess,
                 format!(
-                    "{what} needs {missing}, beyond this session's access ({have}); the user has \
+                    "{what} needs {asked}, beyond this session's access ({have}); the user has \
                      to allow it in Kubach"
                 ),
             )
@@ -604,11 +668,23 @@ impl<'a> Policy<'a> {
     pub fn required_grants(&self, request: &Request, allowed: &Allowed) -> Vec<Grant> {
         let read = Grant::read(allowed.namespace.clone());
         let mut needed = match request {
+            // Each namespace is checked on its own afterwards (#107).
+            Request::List {
+                all_namespaces: true,
+                ..
+            }
+            | Request::Events {
+                all_namespaces: true,
+                ..
+            } => Vec::new(),
             Request::Info
             | Request::ListKinds
             | Request::ListNamespaces
             | Request::HelmCharts
-            | Request::Nodes { .. } => Vec::new(),
+            | Request::Nodes { .. }
+            | Request::NodeCordon { .. }
+            | Request::NodeHost { .. }
+            | Request::NodeDrain { .. } => Vec::new(),
             Request::HelmRead { .. } => vec![read],
             Request::List { .. }
             | Request::Get { .. }
@@ -670,6 +746,51 @@ impl<'a> Policy<'a> {
         needed
     }
 
+    /// What reading `kind` uses beyond the built-in allowlist (#103).
+    pub fn read_rights(kind: &ResourceKind) -> Vec<CustomRight> {
+        let api = &kind.api;
+        if is_core_secret(&api.group, &api.kind) || is_readable(&api.group, &api.plural) {
+            return Vec::new();
+        }
+        verbs_on(kind, CUSTOM_READ_VERBS)
+    }
+
+    /// What `request`, once allowed, uses on kinds beyond the built-in
+    /// lists (#103): a temporary ServiceAccount's Role has to name them.
+    /// Scaling and restarting have no custom kinds to act on: the generic
+    /// plugin only deletes, after reading the object.
+    pub fn custom_rights(request: &Request, allowed: &Allowed) -> Vec<CustomRight> {
+        let writes = |kind: &ResourceKind, verbs: &[&str]| {
+            let mut rights = Self::read_rights(kind);
+            if !is_writable(&kind.api.group, &kind.api.plural) {
+                rights.extend(verbs_on(kind, verbs));
+            }
+            rights
+        };
+        match request {
+            // Set up namespace by namespace (#107).
+            Request::List {
+                all_namespaces: true,
+                ..
+            } => Vec::new(),
+            Request::List { .. }
+            | Request::Get { .. }
+            | Request::Scale { .. }
+            | Request::Restart { .. } => allowed.kind.iter().flat_map(Self::read_rights).collect(),
+            Request::Delete { .. } => allowed
+                .kind
+                .iter()
+                .flat_map(|kind| writes(kind, &["delete"]))
+                .collect(),
+            Request::Apply { .. } => allowed
+                .manifests
+                .iter()
+                .flat_map(|manifest| writes(&manifest.kind, CUSTOM_APPLY_VERBS))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The right a change in `namespace` needs: `modify(ns)` when the API
     /// server enforces the boundary, else reading it (client only: every
     /// change is confirmed on its own).
@@ -710,6 +831,47 @@ impl<'a> Policy<'a> {
                 }
                 Ok(allowed)
             }
+            Request::NodeCordon { name, .. } => {
+                let mut allowed = self.node_write()?;
+                allowed.name = Some(object_name(name)?);
+                Ok(allowed)
+            }
+            Request::NodeHost { name, .. } => {
+                let mut allowed = self.node_call(
+                    "a command on a node's host reads what every namespace on it left there",
+                )?;
+                allowed.name = Some(object_name(name)?);
+                Ok(allowed)
+            }
+            Request::NodeDrain {
+                name,
+                pod_selector,
+                timeout_seconds,
+                preview,
+            } => {
+                let mut allowed = if *preview {
+                    self.allowed(String::new())
+                } else {
+                    self.node_write()?
+                };
+                allowed.name = Some(object_name(name)?);
+                if let Some(selector) = pod_selector {
+                    if selector.trim().is_empty() {
+                        return Err(Denial::new(
+                            DenialCode::InvalidInput,
+                            "podSelector must not be empty",
+                        ));
+                    }
+                    check_selector(selector)?;
+                }
+                if timeout_seconds.is_some_and(|t| !(1..=MAX_DRAIN_TIMEOUT_SECONDS).contains(&t)) {
+                    return Err(Denial::new(
+                        DenialCode::InvalidInput,
+                        format!("timeoutSeconds must be 1 to {MAX_DRAIN_TIMEOUT_SECONDS}"),
+                    ));
+                }
+                Ok(allowed)
+            }
             Request::HelmChange { namespace, release } => {
                 let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
                 kubach_core::helm::cli::check_release_name(release)
@@ -723,17 +885,15 @@ impl<'a> Policy<'a> {
                 namespace,
                 all_namespaces,
                 label_selector,
+                field_selector,
             } => {
-                if *all_namespaces {
-                    return Err(Denial::new(
-                        DenialCode::Namespace,
-                        "listing across all namespaces is not allowed in this session",
-                    ));
-                }
                 if let Some(selector) = label_selector {
                     check_selector(selector)?;
                 }
-                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+                if let Some(selector) = field_selector {
+                    check_field_selector(selector)?;
+                }
+                let mut allowed = self.target(namespace.as_deref(), *all_namespaces)?;
                 allowed.kind = Some(self.read_kind(kind)?);
                 Ok(allowed)
             }
@@ -747,8 +907,12 @@ impl<'a> Policy<'a> {
                 allowed.name = Some(object_name(name)?);
                 Ok(allowed)
             }
-            Request::Events { namespace, object } => {
-                let mut allowed = self.allowed(self.namespace(namespace.as_deref())?);
+            Request::Events {
+                namespace,
+                object,
+                all_namespaces,
+            } => {
+                let mut allowed = self.target(namespace.as_deref(), *all_namespaces)?;
                 if let Some((kind, name)) = object {
                     allowed.kind = Some(self.read_kind(kind)?);
                     allowed.name = Some(object_name(name)?);
@@ -1059,6 +1223,31 @@ impl<'a> Policy<'a> {
         }
     }
 
+    /// A write on a node (#105): about no namespace, so the identity of
+    /// none applies, and confirmed each time. It reaches beyond any
+    /// namespace, so a session pinned to some never makes it.
+    fn node_write(&self) -> Result<Allowed, Denial> {
+        self.node_call("a change to a node reaches every namespace on it")
+    }
+
+    /// A call on a node with the user's credentials, confirmed each time;
+    /// `why` says what keeps it out of a session pinned to namespaces.
+    fn node_call(&self, why: &str) -> Result<Allowed, Denial> {
+        if self.scope.pinned() {
+            return Err(Denial::new(
+                DenialCode::ClusterScoped,
+                format!(
+                    "this session is limited to namespace(s) {}, and {why}. Start kubach mcp \
+                     without --namespace to do this",
+                    self.scope.namespaces.join(", ")
+                ),
+            ));
+        }
+        let mut allowed = self.allowed(String::new());
+        allowed.confirmation = Confirmation::Required;
+        Ok(allowed)
+    }
+
     fn allowed(&self, namespace: String) -> Allowed {
         Allowed {
             namespace,
@@ -1121,6 +1310,13 @@ impl<'a> Policy<'a> {
             Request::SecretReveal { .. } => "revealing a Secret",
             Request::HelmRead { .. } => "reading Helm releases (Helm keeps them in Secrets)",
             Request::Nodes { .. } => "reading nodes (cluster-scoped, with the user's credentials)",
+            Request::NodeDrain { preview: true, .. } => "a drain preview (reads nodes and pods)",
+            Request::NodeCordon { .. } | Request::NodeDrain { .. } => {
+                "changing a node (cluster-scoped, with the user's credentials)"
+            }
+            Request::NodeHost { .. } => {
+                "running a read-only command on a node's host (with the user's credentials)"
+            }
             Request::HelmChange { .. } => "a Helm change",
             _ => "changing resources",
         };
@@ -1182,6 +1378,49 @@ impl<'a> Policy<'a> {
             ));
         }
         Ok(namespace.to_owned())
+    }
+
+    /// The plan of a call on one namespace or, with `all_namespaces`, of
+    /// one that names none: its namespace stays empty.
+    fn target(&self, namespace: Option<&str>, all_namespaces: bool) -> Result<Allowed, Denial> {
+        if !all_namespaces {
+            return Ok(self.allowed(self.namespace(namespace)?));
+        }
+        if namespace.is_some() {
+            return Err(Denial::new(
+                DenialCode::InvalidInput,
+                "give either namespace or allNamespaces, not both",
+            ));
+        }
+        Ok(self.allowed(String::new()))
+    }
+
+    /// Sorts the namespaces of an `allNamespaces` call (#107). A pinned
+    /// session keeps to its namespaces whatever is `known`; otherwise
+    /// `known` adds to the ones the session reads already. A revoked
+    /// namespace is refused here, whichever way it was found.
+    pub fn all_namespaces_plan(&self, known: &[String]) -> NamespacePlan {
+        let mut names: Vec<String> = self.namespaces_in_use();
+        if !self.scope.pinned() {
+            names.extend(known.iter().cloned());
+            names.extend(self.grants.entries().into_iter().filter_map(|entry| {
+                matches!(entry.grant, Grant::Read { .. })
+                    .then(|| entry.grant.namespace().to_owned())
+            }));
+        }
+        names.sort();
+        names.dedup();
+        let mut plan = NamespacePlan::default();
+        for name in names {
+            match self.grants.state(&Grant::read(name.clone())) {
+                Some(GrantState::Denied) => plan.refused.push(name),
+                Some(GrantState::Granted) => plan.readable.push(name),
+                None if self.scope.pinned() => plan.readable.push(name),
+                None if names::is_dns_label(&name) => plan.unopened.push(name),
+                None => {}
+            }
+        }
+        plan
     }
 
     /// A kind the agent may read: served, namespaced, not a Secret, and in
@@ -1453,6 +1692,13 @@ pub(crate) fn is_identity(group: &str, kind: &str) -> bool {
         || group == "admissionregistration.k8s.io"
 }
 
+fn verbs_on(kind: &ResourceKind, verbs: &[&str]) -> Vec<CustomRight> {
+    verbs
+        .iter()
+        .map(|verb| CustomRight::new(&kind.api.group, &kind.api.plural, verb))
+        .collect()
+}
+
 fn ensure_writable(group: &str, kind: &str) -> Result<(), Denial> {
     let identity = is_identity(group, kind);
     if is_core_secret(group, kind) {
@@ -1592,11 +1838,69 @@ fn check_image(image: &str) -> Result<(), Denial> {
 }
 
 fn check_selector(selector: &str) -> Result<(), Denial> {
-    if selector.len() > 1024 || selector.chars().any(char::is_control) {
+    if selector.len() > MAX_SELECTOR_BYTES || selector.chars().any(char::is_control) {
         return Err(Denial::new(
             DenialCode::InvalidInput,
             "invalid label selector",
         ));
+    }
+    Ok(())
+}
+
+/// A `fieldSelector` as the API server reads it: `field=value`,
+/// `field==value` or `field!=value`, comma-separated. A namespace is chosen
+/// with `namespace`, not here. A field that may hold a credential is
+/// refused: selecting on it would tell a guess from a miss, for a value
+/// masking keeps from the agent (a custom resource's `selectableFields`).
+fn check_field_selector(selector: &str) -> Result<(), Denial> {
+    let invalid = |why: &str| {
+        Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "invalid fieldSelector {selector:?}: {why}. Expected field=value, field==value \
+                 or field!=value, comma-separated, for example spec.nodeName=node-1"
+            ),
+        )
+    };
+    if selector.len() > MAX_SELECTOR_BYTES {
+        return Err(invalid("it is too long"));
+    }
+    let field_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+    };
+    for term in selector.split(',') {
+        let (field, value) = term
+            .split_once("!=")
+            .or_else(|| term.split_once("=="))
+            .or_else(|| term.split_once('='))
+            .ok_or_else(|| invalid("a term has no operator"))?;
+        if !field.split('.').all(field_part) {
+            return Err(invalid("a field name is malformed"));
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !"=!,\\".contains(c))
+        {
+            return Err(invalid("a value has characters a selector cannot carry"));
+        }
+        if field.eq_ignore_ascii_case("metadata.namespace") {
+            return Err(Denial::new(
+                DenialCode::Namespace,
+                "fieldSelector cannot choose a namespace: pass `namespace` or `allNamespaces`",
+            ));
+        }
+        if is_sensitive_name(field) {
+            return Err(Denial::new(
+                DenialCode::Secret,
+                format!(
+                    "fieldSelector cannot select on {field}: the name says it may hold a \
+                     credential, and matching on it would reveal a masked value"
+                ),
+            ));
+        }
     }
     Ok(())
 }

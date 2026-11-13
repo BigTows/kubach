@@ -14,6 +14,7 @@ mod builtin_glyphs;
 mod ime;
 mod input;
 mod palette;
+mod redraw;
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -34,6 +35,7 @@ pub use input::{
     InputMode, KeyAction, encode_keystroke, encode_paste, encode_text, route_keystroke,
 };
 pub use palette::TerminalPalette;
+use redraw::RedrawThrottle;
 
 /// Key context of a focused terminal.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
@@ -149,6 +151,10 @@ pub struct TerminalView {
     title: Option<SharedString>,
     clipboard: ClipboardPolicy,
     ime: Composition,
+    /// Output redraws at most once per [`redraw::REDRAW_INTERVAL`].
+    redraw: RedrawThrottle,
+    /// Runs while output is being coalesced.
+    _redraw: Option<Task<()>>,
     _focus_subscriptions: [Subscription; 2],
 }
 
@@ -189,6 +195,8 @@ impl TerminalView {
             title: None,
             clipboard: ClipboardPolicy::default(),
             ime: Composition::default(),
+            redraw: RedrawThrottle::default(),
+            _redraw: None,
             _focus_subscriptions: subscriptions,
         }
     }
@@ -217,11 +225,33 @@ impl TerminalView {
         self.focus.focus(window, cx);
     }
 
-    /// Processes program output.
+    /// Processes program output. The emulator takes it at once (replies to
+    /// its queries are not delayed); the redraw is at once after a quiet
+    /// [`redraw::REDRAW_INTERVAL`], else when the running interval ends.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.parser.advance(&mut self.term, bytes);
         self.flush_events(cx);
+        if !self.redraw.output() {
+            return;
+        }
         cx.notify();
+        self._redraw = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(redraw::REDRAW_INTERVAL)
+                    .await;
+                let more = this.update(cx, |this, cx| {
+                    let more = this.redraw.interval_elapsed();
+                    if more {
+                        cx.notify();
+                    }
+                    more
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     /// The visible screen as text, trailing blanks trimmed (for tests and
@@ -449,7 +479,7 @@ impl TerminalView {
         }
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.scroll_remainder += event.delta.pixel_delta(self.cell.height).y;
         let lines = (self.scroll_remainder.as_f32() / self.cell.height.as_f32()).trunc() as i32;
         if lines == 0 {
@@ -1091,7 +1121,7 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .child(
                 canvas(
                     {

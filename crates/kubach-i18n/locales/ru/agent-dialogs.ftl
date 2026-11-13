@@ -11,6 +11,7 @@ agent-security-settings = Настройки безопасности
 agent-notice-reveal-off = Показ Secrets выключен
 agent-notice-refused = Агенту отказано
 agent-notice-text = { $text }
+agent-system-notification-body = { $client } ждёт вашего ответа в Kubach (контекст { $context }).
 agent-notice-mcp-off = { $summary }: доступ ИИ-агентов к этому контексту выключен.
 agent-notice-session-only = Разрешено только на эту сессию
 agent-notice-session-only-text = Файл настроек нельзя записать, поэтому доступ действует только до конца сессии.
@@ -21,6 +22,7 @@ agent-title-read = Разрешить агенту чтение?
 agent-title-reveal = Показать агенту Secret?
 agent-title-modify = Разрешить агенту изменения?
 agent-title-exec = Выполнить команду агента?
+agent-title-node-command = Выполнить команду агента на ноде?
 agent-title-port-forward = Открыть port-forward агента?
 agent-title-access = Дать агенту больше доступа?
 agent-title-helm-install = Установить релиз Helm агента?
@@ -29,6 +31,9 @@ agent-title-helm-rollback = Откатить релиз Helm?
 agent-title-helm-uninstall = Удалить релиз Helm?
 agent-title-chart-source = Разрешить источник чартов?
 agent-title-use-context = Разрешить агенту работать в этом контексте?
+agent-title-namespaces = Разрешить агенту читать другие namespace?
+agent-title-batch-scale = Масштабировать эти объекты?
+agent-title-batch-restart = Перезапустить эти объекты?
 agent-title-call = Одобрить изменение агента?
 agent-title-secret-create = Введите значения нового Secret
 agent-title-secret-update = Изменение Secret
@@ -45,6 +50,8 @@ agent-command-header =
         [many] { $count } аргументов, байт: { $bytes } · ␣ — пробел, \n — перевод строки, \u{"{"}…{"}"} — невидимый символ
        *[other] { $count } аргумента, байт: { $bytes } · ␣ — пробел, \n — перевод строки, \u{"{"}…{"}"} — невидимый символ
     }
+agent-batch-objects = Изменятся объекты: { $count }
+agent-batch-left-out = Не войдут и не изменятся: { $count }
 agent-no-longer-pending = Этот запрос больше не ждёт ответа.
 agent-dangerous-title = Выходит за границу namespace или читает Secrets
 agent-dangerous-line = { $message } — { $path }
@@ -70,6 +77,7 @@ agent-field-agent = Агент
 agent-client-unverified = имя сообщает клиент, не проверено
 agent-field-context = Контекст
 agent-field-namespace = Namespace
+agent-field-node = Нода
 agent-field-right = Право
 agent-field-release = Релиз
 agent-field-chart = Чарт
@@ -84,13 +92,37 @@ agent-access-secrets = Secret (метаданные и проверки)
 agent-access-crds = пользовательские ресурсы
 agent-access-nodes = ноды (чтение с вашими учётными данными)
 agent-tool-session = { $tool } · сессия { $session }
-agent-helm-values = Values (чувствительные ключи скрыты)
+agent-helm-values = Values (присланные агентом в этом вызове — как есть; чувствительные из релиза скрыты)
 agent-helm-values-show = Показать все values
-agent-helm-values-diff = Изменения values (чувствительные значения скрыты)
+agent-helm-values-diff = Изменения values (присланные агентом в этом вызове — как есть; чувствительные из релиза скрыты)
 agent-helm-objects = Объекты
+agent-diff-size =
+    { $count ->
+        [one] { $count } строка, { $size } · diff целиком, прокрутите, чтобы прочитать
+        [few] { $count } строки, { $size } · diff целиком, прокрутите, чтобы прочитать
+        [many] { $count } строк, { $size } · diff целиком, прокрутите, чтобы прочитать
+       *[other] { $count } строки, { $size } · diff целиком, прокрутите, чтобы прочитать
+    }
+agent-diff-cut-title = Diff ниже обрезан: показано { $shown } из { $total }
+agent-diff-cut-hidden =
+    { $count ->
+        [one] Ещё { $count } строка ({ $size }) не показана. Одобрение разрешает и эти изменения.
+        [few] Ещё { $count } строки ({ $size }) не показаны. Одобрение разрешает и эти изменения.
+        [many] Ещё { $count } строк ({ $size }) не показано. Одобрение разрешает и эти изменения.
+       *[other] Ещё { $count } строки ({ $size }) не показаны. Одобрение разрешает и эти изменения.
+    }
+agent-diff-cut-objects = Изменения показаны не полностью: { $objects }
+agent-diff-cut-more-objects =
+    { $count ->
+        [one] …и ещё { $count } объект
+        [few] …и ещё { $count } объекта
+        [many] …и ещё { $count } объектов
+       *[other] …и ещё { $count } объекта
+    }
 agent-helm-as-user-title = Выполнить этот вызов helm от ваших учётных данных?
 agent-helm-as-user-warning = Этот вызов helm выполнится от ваших учётных данных из kubeconfig, а не от временного ServiceAccount сессии. Ограничивает его только ваш RBAC, и только этот один вызов.
 agent-helm-as-user-objects = ServiceAccount не может создать или удалить эти объекты уровня кластера, RBAC и объекты в других namespace чарта:
+agent-helm-dry-run-own-warning = В этом namespace у сессии нет своей идентичности: helm работает от ваших учётных данных из kubeconfig. Серверный dry-run выполнит шаблоны чарта от них, а результат будет в следующем окне. Пока вы не одобрите его, ничего не изменится.
 agent-helm-as-user-show-all = Показать все объекты
 agent-helm-as-user-tick = Выполнить этот вызов helm от моих учётных данных из kubeconfig
 agent-helm-dry-run-as-user = Пробный запуск от моих учётных данных
@@ -106,6 +138,11 @@ agent-action-port-forward = port-forward
 agent-action-helm-install = установка Helm-релизов
 agent-action-helm-upgrade = обновление Helm-релизов
 agent-action-helm-rollback = откат Helm-релизов
+agent-action-node-host-read = команды на хостах нод
+# Команда только на чтение на хосте ноды (#106).
+agent-node-command-title = Выполняется на самой ноде, от ваших учётных данных
+agent-node-command-warning = Команда выполняется на хосте ноды через временный привилегированный под: он создаётся от ваших учётных данных из kubeconfig и удаляется, когда команда завершится. На хосте лежат данные всех namespace этой ноды. Вывод обрезается и маскируется до того, как его увидит агент; маскировка не гарантирует, что секретов в нём нет.
+agent-remember-node-command = Не спрашивать до конца сессии: именно эта команда на ноде { $node }
 agent-always = Разрешать по умолчанию
 agent-always-note = Повышает минимальный доступ в Настройки → Security для { $context } насовсем, с отметкой, когда и из какой сессии. Вернуть можно там же кнопкой «Сбросить до чтения».
 agent-limits-off = Серверные ограничения выключены

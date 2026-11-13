@@ -95,7 +95,9 @@ impl ResourceDetails {
                         Source::List(kind) => namespace::count(&client, &kind, &namespace)
                             .await
                             .map_err(|error| match error {
-                                kube::Error::Api(status) if status.is_forbidden() => {
+                                kube::Error::Api(status)
+                                    if kubach_core::api_status::is_forbidden(&status) =>
+                                {
                                     t!("namespace-no-permission")
                                 }
                                 other => other.to_string(),

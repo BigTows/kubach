@@ -1,6 +1,8 @@
 //! API discovery and dynamic access to any resource kind, including CRDs.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt as _};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -10,6 +12,10 @@ use kube::discovery::{ApiCapabilities, Discovery, Scope, verbs};
 use kube::runtime::watcher;
 use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
+
+use crate::cache::WatchError;
+use crate::cache::outage::{self, Outage};
 
 pub mod cache;
 
@@ -246,16 +252,87 @@ pub async fn list_table(
 }
 
 /// Yields once every time a CRD is added, changed or removed, so discovery
-/// can be refreshed. The initial listing does not count as a change.
+/// can be refreshed. The initial listing does not count as a change; a
+/// listing repeated later (the watch lost its place) does, as changes in
+/// between were missed.
+///
+/// A failed list or watch is retried with the backoff of resource watches
+/// ([`outage`]): after 1 s, doubled up to 30 s. The stream ends when the
+/// API server refuses access (HTTP 403: the user may not list CRDs) or has
+/// no CRD API (404): asking again gives the same answer, so the caller goes
+/// on without change notifications until the next connection.
 pub fn crd_changes(client: &Client) -> impl Stream<Item = ()> + Send + use<> {
+    crd_changes_retrying(client, outage::RETRY_MIN)
+}
+
+/// [`crd_changes`] with `retry` as the first retry delay.
+fn crd_changes_retrying(client: &Client, retry: Duration) -> impl Stream<Item = ()> + Send + use<> {
     // Metadata only: full CRDs carry large OpenAPI schemas.
     let api = Api::<PartialObjectMeta<CustomResourceDefinition>>::all(client.clone());
-    watcher::watcher(api, watcher::Config::default()).filter_map(|event| async move {
-        match event {
-            Ok(watcher::Event::Apply(_) | watcher::Event::Delete(_)) => Some(()),
-            _ => None,
+    changes(watcher::watcher(api, watcher::Config::default()), retry)
+}
+
+/// Turns watch `events` into change notifications (see [`crd_changes`]),
+/// waiting before it polls `events` again after an error: the watcher
+/// retries as soon as it is polled.
+fn changes<K: Send>(
+    events: impl Stream<Item = Result<watcher::Event<K>, watcher::Error>> + Send,
+    retry: Duration,
+) -> impl Stream<Item = ()> + Send {
+    struct State<S> {
+        events: Pin<Box<S>>,
+        outage: Option<Outage>,
+        listed: bool,
+    }
+    let state = State {
+        events: Box::pin(events),
+        outage: None,
+        listed: false,
+    };
+    futures::stream::unfold(state, move |mut state| async move {
+        loop {
+            match state.events.next().await? {
+                Ok(watcher::Event::Apply(_) | watcher::Event::Delete(_)) => {
+                    state.outage = None;
+                    return Some(((), state));
+                }
+                Ok(watcher::Event::InitDone) => {
+                    state.outage = None;
+                    if std::mem::replace(&mut state.listed, true) {
+                        return Some(((), state));
+                    }
+                }
+                Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
+                Err(error) => {
+                    if is_refusal(&error) {
+                        return None;
+                    }
+                    let error = WatchError::from_watcher(&error);
+                    let outage = match &mut state.outage {
+                        Some(outage) => {
+                            outage.fail(error);
+                            outage
+                        }
+                        None => state.outage.insert(Outage::new(Instant::now(), error)),
+                    };
+                    tokio::time::sleep(outage.retry_delay(retry)).await;
+                }
+            }
         }
     })
+}
+
+/// The API server answered a list or watch with 403 or 404: a retry would
+/// get the same answer.
+fn is_refusal(error: &watcher::Error) -> bool {
+    let status = match error {
+        watcher::Error::InitialListFailed(kube::Error::Api(status))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(status))
+        | watcher::Error::WatchFailed(kube::Error::Api(status))
+        | watcher::Error::WatchError(status) => status,
+        _ => return false,
+    };
+    crate::api_status::is_forbidden(status) || crate::api_status::is_not_found(status)
 }
 
 #[cfg(test)]
@@ -410,5 +487,137 @@ mod tests {
             DynamicObject::url_path(&pod.api, Some("web")),
             "/api/v1/namespaces/web/pods"
         );
+    }
+}
+
+#[cfg(test)]
+mod crd_watch_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use futures::{FutureExt as _, StreamExt as _};
+    use http::{Request, Response};
+    use kube::Client;
+    use kube::client::Body;
+    use kube::core::Status;
+    use kube::runtime::watcher::{self, Event};
+    use serde_json::json;
+
+    use super::{changes, crd_changes_retrying};
+
+    /// First retry delay in these tests; later ones double.
+    const RETRY: Duration = Duration::from_millis(20);
+
+    /// How long a test lets the watch retry.
+    const WINDOW: Duration = Duration::from_millis(400);
+
+    /// Delays 20, 40, 80, 160 ms fit into [`WINDOW`]: the first request and
+    /// four retries, the fifth retry would come at 620 ms.
+    const MAX_REQUESTS: usize = 5;
+
+    /// A client answering every request with the API error `code`, or with a
+    /// connection error when there is none, counting requests.
+    fn failing(code: Option<u16>) -> (Client, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let service = tower::service_fn(move |_request: Request<Body>| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let Some(code) = code else {
+                    return Err(std::io::Error::other("connection refused"));
+                };
+                let status = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                    "code": code, "message": "refused"});
+                Ok(Response::builder()
+                    .status(code)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&status).unwrap()))
+                    .unwrap())
+            }
+        });
+        (Client::new(service, "default"), requests)
+    }
+
+    /// Requests sent in [`WINDOW`] by a CRD watch that never gets an answer
+    /// other than `code`.
+    async fn requests_while_failing(code: Option<u16>) -> usize {
+        let (client, requests) = failing(code);
+        let mut changes = std::pin::pin!(crd_changes_retrying(&client, RETRY));
+        let waited = tokio::time::timeout(WINDOW, changes.next()).await;
+        assert!(waited.is_err(), "the watch keeps retrying: {waited:?}");
+        requests.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn stops_when_listing_crds_is_forbidden_or_unknown() {
+        for code in [403, 404] {
+            let (client, requests) = failing(Some(code));
+            let mut changes = std::pin::pin!(crd_changes_retrying(&client, RETRY));
+            let end = tokio::time::timeout(Duration::from_secs(10), changes.next()).await;
+            assert_eq!(end, Ok(None), "HTTP {code}");
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "HTTP {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backs_off_while_the_api_answers_with_an_error() {
+        for code in [401, 500] {
+            let requests = requests_while_failing(Some(code)).await;
+            assert!(
+                (2..=MAX_REQUESTS).contains(&requests),
+                "HTTP {code}: {requests} requests"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backs_off_while_the_connection_fails() {
+        let requests = requests_while_failing(None).await;
+        assert!(
+            (2..=MAX_REQUESTS).contains(&requests),
+            "{requests} requests"
+        );
+    }
+
+    fn gone() -> watcher::Error {
+        watcher::Error::WatchError(Box::new(
+            Status::failure("too old resource version", "Expired").with_code(410),
+        ))
+    }
+
+    #[tokio::test]
+    async fn reports_changes_and_a_repeated_listing() {
+        let events: Vec<Result<Event<u8>, watcher::Error>> = vec![
+            Ok(Event::Init),
+            Ok(Event::InitApply(1)),
+            Ok(Event::InitDone),
+            Ok(Event::Apply(2)),
+            Ok(Event::Delete(1)),
+            Err(gone()),
+            Ok(Event::Init),
+            Ok(Event::InitApply(2)),
+            Ok(Event::InitDone),
+        ];
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut changes = std::pin::pin!(changes(rx, RETRY));
+        let send = |count: usize, events: &mut std::vec::IntoIter<_>| {
+            for event in events.take(count) {
+                tx.unbounded_send(event).unwrap();
+            }
+        };
+        let mut events = events.into_iter();
+
+        // The first listing is not a change.
+        send(3, &mut events);
+        assert_eq!(changes.next().now_or_never(), None);
+        // Apply and Delete are.
+        send(2, &mut events);
+        assert_eq!(changes.next().await, Some(()));
+        assert_eq!(changes.next().await, Some(()));
+        // The watch lost its place and listed again: one change.
+        send(4, &mut events);
+        assert_eq!(changes.next().await, Some(()));
+        assert_eq!(changes.next().now_or_never(), None);
     }
 }

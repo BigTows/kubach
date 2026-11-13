@@ -59,8 +59,51 @@ pub(crate) fn helm_env(settings: &settings::Settings, in_file: bool) -> kubach_m
         kubeconfig: in_file.then(|| {
             kubach_core::helm::cli::kubeconfig_files(&settings.clusters.resolved_kubeconfig_paths())
         }),
+        vault: None,
         paths: kubach_core::helm::repo::HelmPaths::from_env(),
     }
+}
+
+/// The Prometheus of `context` for the agent's `top_nodes` where there is no
+/// metrics-server (#112): the choice of Settings → Clusters → Prometheus
+/// and the remembered search (ADR 0009), read from the files on every call,
+/// so it works the same in `kubach mcp` and in the app.
+pub(crate) fn prometheus_plan(context: &str) -> kubach_core::metrics::prometheus::source::Plan {
+    let settings = settings::default_path()
+        .map(|path| settings::load(&path).settings)
+        .unwrap_or_default();
+    let state = kubach_core::state::default_path().map(|path| kubach_core::state::load(&path));
+    kubach_core::metrics::prometheus::source::Plan::of(
+        &settings.clusters.prometheus_source(context),
+        settings.clusters.prometheus(context),
+        state.as_ref().and_then(|state| state.prometheus(context)),
+    )
+}
+
+/// Where the pods of the agent's `node_host_read` go and what they run
+/// (#106): the node shell namespace and image of Settings → General →
+/// Terminal, read from the file on every call.
+pub(crate) fn node_shell_pod() -> kubach_mcp::NodeShellPod {
+    let general = settings::default_path()
+        .map(|path| settings::load(&path).settings)
+        .unwrap_or_default()
+        .general;
+    kubach_mcp::NodeShellPod {
+        namespace: general.node_shell_namespace().to_owned(),
+        image: general.node_shell_image().to_owned(),
+    }
+}
+
+/// `context` of the vault for a helm call the user allows under their
+/// credentials (#113): that one context only, written to a file just for
+/// that call, in the folder of the local terminal's temporary kubeconfigs
+/// (ADR 0015), which is cleared at quit and, after a crash, at the next
+/// start.
+fn vault_kubeconfig(contexts: &Contexts, context: &str) -> Option<kubach_mcp::VaultKubeconfig> {
+    Some(kubach_mcp::VaultKubeconfig::new(
+        contexts.single_context(context, None)?,
+        kubach_core::kubeconfig::temp::dir()?,
+    ))
 }
 
 /// Audit log of every MCP call, in the config directory (JSON lines).
@@ -578,6 +621,9 @@ fn read_audit_tail(path: &Path) -> std::io::Result<Vec<AuditRow>> {
 pub struct AgentState {
     dir: Option<PathBuf>,
     token: Option<String>,
+    /// The bridge key in the file while the server listens; the file goes
+    /// when the server stops.
+    bridge_key: Option<String>,
     shared: SharedServer,
     endpoint: Option<HttpEndpoint>,
     status: ServerStatus,
@@ -600,6 +646,8 @@ pub struct AgentState {
     next_pending: u64,
     /// The pending confirmation the main window shows.
     shown: Option<u64>,
+    /// What the system notification about pending confirmations knows of.
+    system_notice: confirm_dialog::SystemNotice,
     /// Notices for the main window, oldest first.
     notices: VecDeque<Notice>,
     /// Errors of taking back a right, for the sessions screen.
@@ -685,6 +733,7 @@ impl AgentState {
         // Sessions run by the app end with the app (ADR 0005); a temporary
         // ServiceAccount is deleted on the way out.
         cx.on_app_quit(|this, _| {
+            this.forget_bridge_key();
             let mut sessions = this.hosted.drain();
             sessions.extend(this.session.take());
             this.shared.set(None);
@@ -702,6 +751,7 @@ impl AgentState {
         let mut this = Self {
             dir,
             token: None,
+            bridge_key: None,
             shared,
             endpoint: None,
             status: ServerStatus::Off,
@@ -720,6 +770,7 @@ impl AgentState {
             pending: VecDeque::new(),
             next_pending: 0,
             shown: None,
+            system_notice: confirm_dialog::SystemNotice::default(),
             notices: VecDeque::new(),
             grant_error: None,
             audit,
@@ -892,10 +943,18 @@ impl AgentState {
         self.restart(wanted, cx);
     }
 
+    /// Removes the bridge key file this app wrote: its server stops.
+    fn forget_bridge_key(&mut self) {
+        if let (Some(dir), Some(key)) = (&self.dir, self.bridge_key.take()) {
+            bridge::remove_bridge_key(dir, &key);
+        }
+    }
+
     fn restart(&mut self, wanted: Option<u16>, cx: &mut Context<Self>) {
         self.wanted = wanted;
         self.generation += 1;
         self._start = None;
+        self.forget_bridge_key();
         if let Some(endpoint) = self.endpoint.take() {
             // Detached: the old server must finish shutting down (and free
             // its port) although nothing waits for it.
@@ -921,17 +980,11 @@ impl AgentState {
                 return;
             }
         };
-        // The bridge's own token, new on every start: never shown, never
-        // given to HTTP agents (#191).
-        let bridge_token = match bridge::regenerate_bridge_token(&dir) {
-            Ok(token) => token,
-            Err(error) => {
-                self.status =
-                    ServerStatus::Failed(format!("cannot store the bridge token: {error}").into());
-                cx.notify();
-                return;
-            }
-        };
+        // The bridge's own key, new on every start: never shown, never
+        // sent, never given to HTTP agents (#191). It reaches the file
+        // once this server listens, so an app that could not take the
+        // port leaves the file of the one that holds it alone.
+        let bridge_key = bridge::random_token();
         self.token = Some(token.clone());
         self.status = ServerStatus::Starting;
         let handler: Arc<dyn BridgeHandler> = Arc::new(AppBridge {
@@ -940,16 +993,14 @@ impl AgentState {
             hosted: self.hosted.clone(),
         });
         let shared = self.shared.clone();
+        let key = bridge_key.clone();
         let task = runtime::spawn(async move {
             kubach_mcp::serve_shared_http(
                 shared,
                 HttpOptions {
                     port,
                     token,
-                    bridge: Some(BridgeOptions {
-                        handler,
-                        token: bridge_token,
-                    }),
+                    bridge: Some(BridgeOptions { handler, key }),
                 },
             )
             .await
@@ -964,10 +1015,21 @@ impl AgentState {
                 };
                 match result {
                     Ok(endpoint) if this.generation == generation => {
-                        this.status = ServerStatus::Running {
-                            url: endpoint.url(),
-                        };
-                        this.endpoint = Some(endpoint);
+                        match bridge::store_bridge_key(&dir, &bridge_key) {
+                            Ok(()) => {
+                                this.bridge_key = Some(bridge_key);
+                                this.status = ServerStatus::Running {
+                                    url: endpoint.url(),
+                                };
+                                this.endpoint = Some(endpoint);
+                            }
+                            Err(error) => {
+                                this.status = ServerStatus::Failed(
+                                    format!("cannot store the bridge key: {error}").into(),
+                                );
+                                runtime::spawn_detached(endpoint.shutdown());
+                            }
+                        }
                     }
                     Ok(endpoint) => {
                         // Detached: a server started for an older request
@@ -1112,7 +1174,10 @@ impl AgentState {
             profile: Profile::Deploy,
             ttl: None,
         };
-        let helm = helm_env(&app_settings, !in_vault);
+        let mut helm = helm_env(&app_settings, !in_vault);
+        if in_vault {
+            helm.vault = vault_kubeconfig(&contexts, &context);
+        }
         let question = ConfirmationRequest {
             kind: RequestKind::UseContext {
                 server_url,
@@ -1136,6 +1201,7 @@ impl AgentState {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
         let confirmer = self.confirmer.clone();
         let task = runtime::spawn(async move {
@@ -1180,6 +1246,8 @@ impl AgentState {
                             this.audit.clone(),
                         );
                         server.set_helm(helm);
+                        server.set_prometheus(Arc::new(prometheus_plan));
+                        server.set_node_shell(Arc::new(node_shell_pod));
                         // The agent's forwards show on the "Port
                         // forwards" screen (#17).
                         if let Some(forwards) = crate::dock::forwards(cx) {
@@ -1267,10 +1335,12 @@ impl AgentState {
         };
         let confirmer: Arc<dyn Confirmer> = Arc::new(self.confirmer.clone());
         let audit = self.audit.clone();
-        // A vault context is in no kubeconfig file: Helm works there only
-        // under a server-side identity.
-        let helm =
-            AppSettings::try_global(cx).map(|settings| helm_env(settings.read(cx).get(), false));
+        // A vault context is in no kubeconfig file: Helm works there under
+        // a server-side identity, or for one call the user allows (#113).
+        let helm = AppSettings::try_global(cx).map(|settings| kubach_mcp::HelmEnv {
+            vault: vault_kubeconfig(&contexts, &plan.spec.context),
+            ..helm_env(settings.read(cx).get(), false)
+        });
         let pid = request.pid;
         // The agent's forwards run here and show on the "Port forwards"
         // screen (#17).
@@ -1289,6 +1359,8 @@ impl AgentState {
                     .await
                     .map_err(|error| error.to_string())?;
                 let server = McpServer::new(session.clone(), confirmer.clone(), audit);
+                server.set_prometheus(Arc::new(prometheus_plan));
+                server.set_node_shell(Arc::new(node_shell_pod));
                 if let Some(helm) = helm {
                     server.set_helm(helm);
                 }
@@ -1745,6 +1817,7 @@ pub fn remembered_action_label(action: kubach_mcp::RememberedAction) -> String {
         RememberedAction::HelmInstall => t!("agent-action-helm-install"),
         RememberedAction::HelmUpgrade => t!("agent-action-helm-upgrade"),
         RememberedAction::HelmRollback => t!("agent-action-helm-rollback"),
+        RememberedAction::NodeHostRead => t!("agent-action-node-host-read"),
     }
 }
 
@@ -1855,6 +1928,7 @@ mod tests {
         session.remembered = vec![kubach_mcp::Remembered {
             action: kubach_mcp::RememberedAction::Scale,
             namespace: "web".into(),
+            exact: None,
         }];
         let reply = app.heartbeat(session.clone(), "mine").unwrap();
         assert!(!reply.forget_remembered);
@@ -1924,6 +1998,14 @@ users:
 - name: dev
   user: { token: secret-token }
 "#;
+
+    #[test]
+    fn helm_gets_a_vault_context_only_if_it_is_known() {
+        let contexts = kubach_core::Contexts::from_yaml(KUBECONFIG).unwrap();
+        let vault = super::vault_kubeconfig(&contexts, "dev").unwrap();
+        assert!(!format!("{vault:?}").contains("secret-token"));
+        assert!(super::vault_kubeconfig(&contexts, "missing").is_none());
+    }
 
     #[test]
     fn the_agent_may_choose_only_allowed_contexts() {

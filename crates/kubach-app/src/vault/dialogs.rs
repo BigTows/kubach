@@ -1341,6 +1341,161 @@ impl Render for PasswordForm {
     }
 }
 
+/// A way into the vault without its password, which the settings turn
+/// off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Remembered {
+    /// The key kept in the system keychain.
+    Keychain,
+    /// Touch ID / Windows Hello.
+    Biometric,
+}
+
+/// Asks for the vault password and turns `what` off: the vault is encrypted
+/// again with a new key, which is wrapped for the password.
+pub(super) fn turn_off(what: Remembered, window: &mut Window, cx: &mut App) {
+    let Some(vault) = global(cx) else {
+        return;
+    };
+    if !vault.read(cx).is_unlocked() {
+        let then: AfterUnlock = Rc::new(move |window, cx| turn_off(what, window, cx));
+        prompt_unlock(Some(then), window, cx);
+        return;
+    }
+    let form = cx.new(|cx| TurnOffForm::new(vault, what, window, cx));
+    let focus = form.read(cx).password.clone();
+    focus.update(cx, |input, cx| input.focus(window, cx));
+    let title = match what {
+        Remembered::Keychain => t!("vault-keychain-off-title"),
+        Remembered::Biometric => t!("vault-biometric-off-title", method = biometric::METHOD_NAME),
+    };
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog.title(title.clone()).w(px(420.)).child(form.clone())
+    });
+}
+
+struct TurnOffForm {
+    vault: Entity<VaultState>,
+    what: Remembered,
+    password: Entity<InputState>,
+    error: Option<SharedString>,
+    busy: bool,
+    _subscription: Subscription,
+    _task: Option<Task<()>>,
+}
+
+impl TurnOffForm {
+    fn new(
+        vault: Entity<VaultState>,
+        what: Remembered,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let password = masked(t!("vault-password"), window, cx);
+        let subscription = cx.subscribe_in(&password, window, |this, _, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.submit(window, cx);
+            }
+        });
+        Self {
+            vault,
+            what,
+            password,
+            error: None,
+            busy: false,
+            _subscription: subscription,
+            _task: None,
+        }
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let password = Zeroizing::new(self.password.read(cx).value().to_string());
+        if password.is_empty() {
+            self.error = Some(t!("vault-enter-password").into());
+            cx.notify();
+            return;
+        }
+        let what = self.what;
+        let task = self.vault.update(cx, |vault, cx| match what {
+            Remembered::Keychain => vault.disable_keychain(password, cx),
+            Remembered::Biometric => vault.disable_biometric(password, cx),
+        });
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match result {
+                    Ok(()) => window.close_dialog(cx),
+                    Err(error) => {
+                        this.error = Some(error);
+                        this.password
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+}
+
+impl Render for TurnOffForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = match self.what {
+            Remembered::Keychain => t!("vault-keychain-off-text"),
+            Remembered::Biometric => {
+                t!("vault-biometric-off-text", method = biometric::METHOD_NAME)
+            }
+        };
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text),
+            )
+            .child(Input::new(&self.password).small())
+            .children(error_line(&self.error, cx))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("vault-turn-off-cancel")
+                            .ghost()
+                            .small()
+                            .label(t!("vault-cancel"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("vault-turn-off-ok")
+                            .primary()
+                            .small()
+                            .label(if self.busy {
+                                t!("vault-encrypting")
+                            } else {
+                                t!("vault-turn-off")
+                            })
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+    }
+}
+
 /// Deletes the vault after an explicit warning.
 pub fn confirm_reset(window: &mut Window, cx: &mut App) {
     let count = global(cx)

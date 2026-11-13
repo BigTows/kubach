@@ -116,6 +116,19 @@ impl Access {
         })
     }
 
+    /// This access as a request: only what is asked for beyond what the
+    /// session has (see [`Access::missing`]). Unlike [`fmt::Display`], which
+    /// describes an access as a whole, it never names reading built-in
+    /// resources: every session has that already (#148).
+    pub fn asked(self) -> String {
+        let parts = self.parts();
+        if parts.is_empty() {
+            self.to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
     /// The parts of this request, for the dialog and the agent.
     pub fn parts(self) -> Vec<String> {
         let mut parts = Vec::new();
@@ -141,6 +154,8 @@ impl Access {
     }
 }
 
+/// An access as a whole: what a session or a context has. A request for
+/// more is worded by [`Access::asked`].
 impl fmt::Display for Access {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let parts = self.parts();
@@ -207,6 +222,28 @@ mod tests {
             }
             .to_string(),
             "reading built-in resources, Secret metadata and checks (no values)"
+        );
+        // As a request, only what is asked for (#148).
+        let crds = Access {
+            crds: true,
+            ..Access::NONE
+        };
+        assert_eq!(crds.asked(), "custom resources (CRDs)");
+        assert_eq!(
+            crds.to_string(),
+            "reading built-in resources, custom resources (CRDs)"
+        );
+        assert_eq!(
+            Access {
+                nodes: true,
+                ..Access::profile(Profile::Deploy)
+            }
+            .asked(),
+            Access {
+                nodes: true,
+                ..Access::profile(Profile::Deploy)
+            }
+            .to_string()
         );
     }
 

@@ -7,8 +7,9 @@
 //!   server, `Host` validation against DNS rebinding and `Origin` rejection
 //!   so that web pages in a local browser cannot call it.
 //! - The **bridge** for `kubach mcp` processes on the same listener, under
-//!   its own token (#191): the MCP token, which HTTP agents hold, opens
-//!   only [`MCP_PATH`], the bridge token only [`BRIDGE_PATH`].
+//!   its own key (#191): the MCP token, which HTTP agents hold, opens only
+//!   [`MCP_PATH`]; [`BRIDGE_PATH`] takes requests proven with the bridge
+//!   key ([`crate::handshake`]).
 //! - The app's endpoint watches whether its agents are still connected
 //!   ([`crate::presence`], #34) and stops the session's port-forwards once
 //!   they are gone.
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use rmcp::ServerHandler;
 
 use crate::bridge::{self, BRIDGE_PATH, BridgeHandler, random_token};
+use crate::handshake::{self, Gate, same as token_matches};
 use crate::presence::{DISCONNECT_GRACE, Presence, SESSION_HEADER};
 use crate::server::McpServer;
 use crate::shared::SharedServer;
@@ -96,23 +98,17 @@ impl HttpEndpoint {
     }
 }
 
-/// Constant-time comparison, so the token cannot be guessed byte by byte.
-fn token_matches(given: &[u8], expected: &[u8]) -> bool {
-    given.len() == expected.len()
-        && given
-            .iter()
-            .zip(expected)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
-}
-
 /// Largest request body read before a refusal is sent.
 const REFUSED_BODY_LIMIT: usize = 64 * 1024;
 
 /// Answers `status` after reading the request body (up to a limit): closing
 /// with the body unread resets the connection, and the client sees a reset
 /// instead of the refusal.
-async fn refuse(request: Request, status: StatusCode, message: &'static str) -> Response {
+pub(crate) async fn refuse(
+    request: Request,
+    status: StatusCode,
+    message: &'static str,
+) -> Response {
     let _ = axum::body::to_bytes(request.into_body(), REFUSED_BODY_LIMIT).await;
     (status, message).into_response()
 }
@@ -170,8 +166,9 @@ pub struct HttpOptions {
 /// The bridge for `kubach mcp` processes.
 pub struct BridgeOptions {
     pub handler: Arc<dyn BridgeHandler>,
-    /// Bearer token of the bridge; must differ from the MCP token.
-    pub token: String,
+    /// The bridge key ([`bridge::BRIDGE_KEY_FILE`]); must differ from the
+    /// MCP token.
+    pub key: String,
 }
 
 /// Serves whatever session `server` currently holds, plus the bridge.
@@ -285,9 +282,9 @@ where
         .with_cancellation_token(cancel.child_token());
     let service: StreamableHttpService<S, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), session_manager(), config);
-    if bridge.as_ref().is_some_and(|bridge| bridge.token == token) {
+    if bridge.as_ref().is_some_and(|bridge| bridge.key == token) {
         return Err(TransportError::Init(
-            "the bridge needs a token of its own".into(),
+            "the bridge needs a key of its own".into(),
         ));
     }
     // Each token opens only its own routes.
@@ -299,16 +296,21 @@ where
         ));
     }
     let mut router = router.layer(middleware::from_fn_with_state(token.clone(), require_token));
-    if let Some(BridgeOptions {
-        handler,
-        token: bridge_token,
-    }) = bridge
-    {
+    if let Some(BridgeOptions { handler, key }) = bridge {
+        let gate = Arc::new(Gate::new(key));
         router = router.nest(
             BRIDGE_PATH,
             bridge::router(handler)
-                .layer(middleware::from_fn_with_state(addr.port(), local_only))
-                .layer(middleware::from_fn_with_state(bridge_token, require_token)),
+                .layer(middleware::from_fn_with_state(
+                    gate.clone(),
+                    handshake::verified,
+                ))
+                // The hello carries no proof: it is how the proofs start.
+                .route(
+                    handshake::HELLO_PATH,
+                    axum::routing::post(handshake::hello_route).with_state(gate),
+                )
+                .layer(middleware::from_fn_with_state(addr.port(), local_only)),
         );
     }
 
@@ -426,8 +428,10 @@ mod token_tests {
         }
     }
 
+    /// The process did not get as far as asking: the app's proof did not
+    /// hold under its key.
     fn unauthorized<T: std::fmt::Debug>(result: Result<T, BridgeError>) -> bool {
-        matches!(result, Err(BridgeError::Status { status: 401, .. }))
+        matches!(result, Err(BridgeError::Unverified { .. }))
     }
 
     /// Status of a bare `POST /mcp` with `token`.
@@ -470,7 +474,7 @@ mod token_tests {
                 token: mcp_token.clone(),
                 bridge: Some(BridgeOptions {
                     handler: app.clone(),
-                    token: bridge_token.clone(),
+                    key: bridge_token.clone(),
                 }),
             },
         )
@@ -492,13 +496,57 @@ mod token_tests {
         ));
         assert_eq!(app.calls.load(Ordering::SeqCst), 0);
 
-        // The bridge token reaches the bridge, not MCP.
+        // The bridge key reaches the bridge, not MCP.
         let launcher = BridgeClient::new(port, bridge_token.clone());
         assert!(launcher.heartbeat(&session(), "k").await.is_ok());
         assert_eq!(app.calls.load(Ordering::SeqCst), 1);
         assert_eq!(mcp_status(port, &bridge_token).await, 401);
         assert_ne!(mcp_status(port, &mcp_token).await, 401);
 
+        endpoint.shutdown().await;
+    }
+
+    /// A Helm change's whole diff fits the bridge (#137): axum's own bound
+    /// of 2 MB would deny the call instead.
+    #[tokio::test]
+    async fn a_confirmation_with_a_large_diff_passes_the_bridge() {
+        let app = Arc::new(Counting::default());
+        let bridge_token = "b".repeat(64);
+        let endpoint = serve_shared_http(
+            SharedServer::new(),
+            HttpOptions {
+                port: 0,
+                token: "m".repeat(64),
+                bridge: Some(BridgeOptions {
+                    handler: app.clone(),
+                    key: bridge_token.clone(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let request = ConfirmationRequest {
+            kind: Default::default(),
+            session_id: "s".into(),
+            context: "minikube".into(),
+            client: "agent".into(),
+            tool: "helm_upgrade".into(),
+            namespace: "web".into(),
+            summary: "upgrade".into(),
+            details: "+  line: \"of a diff\"\n".repeat(crate::MAX_CONFIRM_DIFF_BYTES / 22),
+            dangerous: Vec::new(),
+            mode: SessionMode::ClientOnly,
+            allow_remember: false,
+            diff_cut: None,
+        };
+        assert!(request.details.len() > 8_000_000);
+        let launcher = BridgeClient::new(endpoint.addr.port(), bridge_token);
+        assert_eq!(
+            launcher.confirm(&request).await.ok(),
+            Some(ConfirmationDecision::Denied { reason: None }),
+            "the app was asked and answered"
+        );
+        assert_eq!(app.calls.load(Ordering::SeqCst), 1);
         endpoint.shutdown().await;
     }
 
@@ -512,7 +560,7 @@ mod token_tests {
                 token: token.clone(),
                 bridge: Some(BridgeOptions {
                     handler: Arc::new(Counting::default()),
-                    token,
+                    key: token,
                 }),
             },
         )

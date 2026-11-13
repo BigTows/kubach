@@ -1,6 +1,7 @@
 //! Kubernetes domain logic for Kubach. Kept free of UI dependencies.
 
 pub mod ansi;
+pub mod api_status;
 pub mod apply;
 pub mod cache;
 pub mod cloud;
@@ -26,6 +27,8 @@ pub mod list_cache;
 pub mod metrics;
 pub mod names;
 pub mod namespace;
+#[cfg(feature = "perf")]
+pub mod perf;
 pub mod plugin;
 pub mod probe;
 pub mod process;

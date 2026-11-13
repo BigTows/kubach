@@ -207,6 +207,18 @@ editor-secret-user-placeholder = 用户
 editor-secret-password-placeholder = 密码或令牌
 editor-secret-optional = 可选
 editor-secret-edit-hint = 未改动的键不会发送。加载值以编辑，或不加载直接替换。值以纯文本输入；由 Kubach 负责编码。
+editor-registry-kind = 镜像仓库
+editor-registry-load = 加载镜像仓库
+editor-registry-replace-tooltip = 重新输入镜像仓库而不加载当前值
+editor-registry-as-json = 以 JSON 编辑
+editor-registry-as-json-tooltip = 以文本编辑整个 docker config，包括表单未显示的字段
+editor-registry-fallback = 该值不是 Kubach 能按镜像仓库显示的 docker config；将作为普通值编辑。
+editor-registry-add = 添加镜像仓库
+editor-registry-remove = 删除此镜像仓库
+editor-registry-none = 没有镜像仓库。
+editor-registry-server-placeholder = 镜像仓库地址，例如 ghcr.io
+editor-registry-password-binary = 不是文本；输入新密码以替换
+editor-registry-hint = 用户或密码变化时，Kubach 会自行写入 auth（user:password 的 base64）。docker config 的其他字段保持不变。
 
 ## Secret 值（详情面板）
 
@@ -229,12 +241,13 @@ editor-secret-summary-tls = TLS 证书
 editor-secret-summary-basic-auth = 基本认证
 editor-secret-summary-what-tls = 只读取 tls.crt；从不获取私钥。
 editor-secret-summary-what-basic-auth = 只读取用户名，不读取密码。
-editor-secret-summary-what-registry = 显示镜像仓库和用户名，从不显示密码。
+editor-secret-summary-what-registry = 显示镜像仓库、用户名和邮箱。密码与其他值一样保持隐藏，直到你选择显示。
 editor-secret-show-summary = 显示摘要
 editor-secret-tls-key-hidden = tls.key — 已隐藏
 editor-secret-value-hidden = 已隐藏
 editor-secret-password-set = 已设置（已隐藏）
 editor-secret-password-none = 无
+editor-secret-registry-gone = Secret 中的镜像仓库 { $registry } 已没有此值
 editor-cert-not-yet-valid = 尚未生效
 editor-cert-expired = 已于 { $days } 天前过期
 editor-cert-expires = { $days } 天后过期

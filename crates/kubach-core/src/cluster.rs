@@ -281,6 +281,16 @@ impl Contexts {
         kubeconfig::temp::single_context(&self.kubeconfig, context, namespace)
     }
 
+    /// `context` alone for a tool that reads it from a file, with `dir`
+    /// for the temporary files ([`kubeconfig::temp::ContextKubeconfig`]).
+    pub fn context_kubeconfig(
+        &self,
+        context: &str,
+        dir: PathBuf,
+    ) -> Option<kubeconfig::temp::ContextKubeconfig> {
+        kubeconfig::temp::ContextKubeconfig::of(&self.kubeconfig, context, dir)
+    }
+
     pub fn list(&self) -> &[ContextInfo] {
         &self.contexts
     }
@@ -326,7 +336,10 @@ impl Contexts {
         };
         let mut kubeconfig = self.kubeconfig.clone();
         crate::env::kubeconfig_vars(&mut kubeconfig, env);
-        Ok(Config::from_custom_kubeconfig(kubeconfig, &options).await?)
+        let proxy = take_proxy_url(&mut kubeconfig, context, |name| std::env::var(name).ok())?;
+        let mut config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
+        config.proxy_url = proxy;
+        Ok(config)
     }
 
     /// Builds a client for `context` and checks the API server answers.
@@ -397,9 +410,109 @@ pub enum ConnectionState {
     Error(String),
 }
 
+/// The proxy of `context`'s cluster: its `proxy-url`, otherwise `HTTPS_PROXY`
+/// or `https_proxy` from `var`. The `proxy-url` is taken out of `kubeconfig`.
+///
+/// kube 5 compares `NO_PROXY` with the address of the proxy, not of the API
+/// server: `proxy-url: socks5://127.0.0.1:1080` with `NO_PROXY=127.0.0.1`
+/// would silently connect directly, and a list it does not parse, such as
+/// `localhost,`, would fail the context. So the proxy is chosen here, and
+/// kube sees it only when it comes from its own `HTTPS_PROXY`.
+fn take_proxy_url(
+    kubeconfig: &mut Kubeconfig,
+    context: &str,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<http::Uri>, KubeconfigError> {
+    let cluster_name = kubeconfig
+        .contexts
+        .iter()
+        .find(|named| named.name == context)
+        .and_then(|named| named.context.as_ref())
+        .map(|context| context.cluster.clone());
+    let cluster = kubeconfig
+        .clusters
+        .iter_mut()
+        .find(|named| Some(&named.name) == cluster_name.as_ref())
+        .and_then(|named| named.cluster.as_mut());
+    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
+    nonempty(cluster.and_then(|cluster| cluster.proxy_url.take()))
+        .or_else(|| nonempty(var("HTTPS_PROXY")))
+        .or_else(|| nonempty(var("https_proxy")))
+        .map(|proxy| proxy.parse().map_err(KubeconfigError::ParseProxyUrl))
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROXIED: &str = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: tunnel
+    cluster:
+      server: "https://10.0.0.1:6443"
+      proxy-url: "socks5://127.0.0.1:1080"
+  - name: direct
+    cluster: { server: "https://10.0.0.2:6443" }
+contexts:
+  - name: tunnel
+    context: { cluster: tunnel }
+  - name: direct
+    context: { cluster: direct }
+"#;
+
+    #[test]
+    fn the_proxy_url_of_the_cluster_comes_before_the_environment() {
+        let mut kubeconfig = Kubeconfig::from_yaml(PROXIED).unwrap();
+        let var = |_: &str| Some("http://env:3128".to_owned());
+        let proxy = take_proxy_url(&mut kubeconfig, "tunnel", var).unwrap();
+        assert_eq!(proxy.unwrap().to_string(), "socks5://127.0.0.1:1080/");
+        let cluster = kubeconfig.clusters[0].cluster.as_ref().unwrap();
+        assert!(cluster.proxy_url.is_none());
+    }
+
+    #[test]
+    fn a_cluster_without_a_proxy_url_uses_the_environment() {
+        let mut kubeconfig = Kubeconfig::from_yaml(PROXIED).unwrap();
+        let lower = |name: &str| (name == "https_proxy").then(|| "http://env:3128".to_owned());
+        let proxy = take_proxy_url(&mut kubeconfig, "direct", lower).unwrap();
+        assert_eq!(proxy.unwrap().to_string(), "http://env:3128/");
+        assert!(
+            take_proxy_url(&mut kubeconfig, "direct", |_| None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            kubeconfig.clusters[0]
+                .cluster
+                .as_ref()
+                .unwrap()
+                .proxy_url
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_broken_proxy_url_is_an_error() {
+        let mut kubeconfig = Kubeconfig::from_yaml(PROXIED).unwrap();
+        let var = |_: &str| Some("http://not a url".to_owned());
+        assert!(matches!(
+            take_proxy_url(&mut kubeconfig, "direct", var),
+            Err(KubeconfigError::ParseProxyUrl(_))
+        ));
+    }
+
+    /// `NO_PROXY` in the process environment changes nothing for a proxy of
+    /// the kubeconfig (run with `NO_PROXY=127.0.0.1,` to see it).
+    #[tokio::test]
+    async fn the_kubeconfig_proxy_survives_no_proxy() {
+        let contexts = Contexts::from_kubeconfig(Kubeconfig::from_yaml(PROXIED).unwrap());
+        let config = contexts.config_with_env("tunnel", &[]).await.unwrap();
+        let proxy = config.proxy_url.unwrap();
+        assert_eq!(proxy.to_string(), "socks5://127.0.0.1:1080/");
+    }
 
     const KUBECONFIG: &str = r#"
 apiVersion: v1

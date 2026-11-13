@@ -8,6 +8,9 @@
 # Needs nfpm and appimagetool in PATH (CI downloads them). The packages
 # don't bundle libraries: build on the oldest glibc they should run on
 # (CI uses Ubuntu 22.04, glibc 2.35).
+#
+# APPIMAGE_RUNTIME: the type2 runtime file to put into the AppImage. Without
+# it appimagetool downloads the latest runtime build itself.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +50,8 @@ ln -s usr/bin/kubach "$appdir/AppRun"
 cp "$icons/dev.kubach.app.desktop" "$appdir/"
 cp "$icons/kubach-512.png" "$appdir/dev.kubach.app.png"
 ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 \
-    appimagetool --no-appstream "$appdir" "$dist/Kubach-$version-$arch.AppImage"
+    appimagetool --no-appstream ${APPIMAGE_RUNTIME:+--runtime-file "$APPIMAGE_RUNTIME"} \
+        "$appdir" "$dist/Kubach-$version-$arch.AppImage"
 
 for packager in deb rpm archlinux; do
     (cd "$stage" && ARCH="$nfpm_arch" VERSION="$version" \

@@ -76,7 +76,7 @@ impl RefTarget {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct SpecRef {
     pub target: RefTarget,
     pub name: String,

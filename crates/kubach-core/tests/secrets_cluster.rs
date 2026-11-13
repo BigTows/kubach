@@ -192,3 +192,117 @@ async fn secrets_round_trip() {
 
     cleanup(&client, &ns, &names).await;
 }
+
+/// A docker config edited the way the registry form does it (#139): the
+/// value is fetched, registries are changed, and the whole key goes back in
+/// a patch. Fields the form does not know stay in the cluster's copy. The
+/// namespace is created when missing, and then removed again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn docker_config_registries_round_trip() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use k8s_openapi::api::core::v1::Namespace;
+    use kubach_core::secrets::{DockerConfig, RegistryEdit, RegistrySecret};
+    use kube::api::PostParams;
+    use serde_json::{Value, json};
+
+    let (client, ns) = client().await;
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    let namespace: Namespace = serde_json::from_value(json!({"metadata": {"name": ns}})).unwrap();
+    let created_namespace = namespaces
+        .create(&PostParams::default(), &namespace)
+        .await
+        .is_ok();
+    let name = "kubach-registries";
+    cleanup(&client, &ns, &[name]).await;
+
+    let source = json!({
+        "auths": {
+            "ghcr.io": {
+                "username": "bot", "password": "fake-pw", "email": "bot@example.com",
+                "auth": STANDARD.encode("bot:fake-pw"), "identitytoken": "fake-token"
+            },
+            "old.example.com": {"auth": STANDARD.encode("alice:fake-old")}
+        },
+        "credHelpers": {"aws.example.com": "ecr-login"}
+    });
+    let api: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let secret: Secret = serde_json::from_value(json!({
+        "metadata": {"name": name},
+        "type": "kubernetes.io/dockerconfigjson",
+        "stringData": {".dockerconfigjson": serde_json::to_string_pretty(&source).unwrap()}
+    }))
+    .unwrap();
+    api.create(&PostParams::default(), &secret).await.unwrap();
+
+    let kind = TypedKind::DockerConfigJson;
+    let key = kind.source_keys()[0];
+    let revealed = secrets::reveal(&client, &ns, name, &[key]).await.unwrap();
+    let config = DockerConfig::of_kind(kind, revealed.values[key].expose())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        config
+            .secret("old.example.com", RegistrySecret::Password)
+            .unwrap()
+            .text(),
+        Some("fake-old")
+    );
+    let mut edits: Vec<RegistryEdit> = config
+        .registries()
+        .into_iter()
+        .map(|registry| RegistryEdit {
+            original: Some(registry.server.clone()),
+            registry,
+        })
+        .collect();
+    // Nothing changed: nothing to send.
+    assert_eq!(config.with_registries(&edits).unwrap(), config);
+    // New password for one, the other removed, a third added.
+    edits[0].registry.password = SecretBytes::from("fake-new");
+    edits.remove(1);
+    edits.push(RegistryEdit {
+        original: None,
+        registry: kubach_core::secrets::Registry {
+            server: "registry.example.com".into(),
+            username: "carol".into(),
+            email: String::new(),
+            password: SecretBytes::from("fake-carol"),
+        },
+    });
+    let edited = config.with_registries(&edits).unwrap();
+    let mut patch = SecretPatch::new(
+        revealed.info.keys.iter().map(|(k, _)| k.clone()),
+        revealed.info.resource_version.clone(),
+    );
+    patch.set(key, edited.to_bytes());
+    secrets::apply_patch(&client, &ns, name, &patch)
+        .await
+        .unwrap();
+
+    let after = secrets::reveal(&client, &ns, name, &[key]).await.unwrap();
+    assert_eq!(after.info.typed_kind(), Some(kind));
+    let stored: Value = serde_json::from_slice(after.values[key].expose()).unwrap();
+    assert_eq!(
+        stored,
+        json!({
+            "auths": {
+                "ghcr.io": {
+                    "username": "bot", "password": "fake-new", "email": "bot@example.com",
+                    "auth": STANDARD.encode("bot:fake-new"), "identitytoken": "fake-token"
+                },
+                "registry.example.com": {
+                    "username": "carol", "password": "fake-carol",
+                    "auth": STANDARD.encode("carol:fake-carol")
+                }
+            },
+            "credHelpers": {"aws.example.com": "ecr-login"}
+        })
+    );
+
+    cleanup(&client, &ns, &[name]).await;
+    if created_namespace {
+        namespaces.delete(&ns, &DeleteParams::default()).await.ok();
+    }
+}

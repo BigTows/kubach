@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# `RowsProbe`, the rows of a table without a window, for the stands of
+# `docs/perf.md`. Never in release builds.
+perf = []
+
 [dependencies]
 alacritty_terminal.workspace = true
 gpui-kit.workspace = true
@@ -13,9 +18,13 @@ jiff.workspace = true
 kubach-i18n.workspace = true
 resvg = { workspace = true, features = ["text", "system-fonts"] }
 serde_json.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
+
+[dev-dependencies]
+kubach-ui = { workspace = true, features = ["perf"] }
 
 [[example]]
 name = "gallery"

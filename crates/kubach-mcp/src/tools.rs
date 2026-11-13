@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +15,12 @@ use k8s_openapi::api::core::v1::{Event, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::jiff::Timestamp;
-use kubach_core::apply::{self as core_apply, ApplyOptions, yaml_diff};
+use kubach_core::apply::{self as core_apply, ApplyOptions};
 use kubach_core::discovery::{self, ApiCatalog, ResourceKind};
 use kubach_core::plugin::builtin::action;
-use kubach_core::plugin::{ActionId, ActionKind, ActionParams, Cell, PluginRegistry, format_age};
+use kubach_core::plugin::{
+    ActionId, ActionKind, ActionParams, Cell, PluginRegistry, ResourcePlugin, format_age,
+};
 use kubach_core::rbac::ResourceAccess;
 use kubach_core::secrets::mask::is_core_secret;
 use kubach_core::streams::exec_capture;
@@ -27,18 +30,25 @@ use kube::{Client, ResourceExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
+use crate::all_namespaces;
+use crate::apply_diff::ApplyDiff;
+use crate::audit::DecidedBy;
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, RequestKind, ask};
-use crate::grants::Grant;
-use crate::helm_tools;
-use crate::masking::{mask_object, mask_text, truncate};
+use crate::event_tools::{EventFilter, list_events};
+use crate::fields::Fields;
+use crate::grants::{CustomRight, Grant};
+use crate::helm_tools::{self, DiffCut, MAX_CONFIRM_DIFF_BYTES};
+use crate::log_level::{Level, LevelCounts};
+use crate::masking::{Masked, mask_object, mask_text, plugin_view, truncate};
 use crate::policy::{
     Allowed, Confirmation, Denial, DenialCode, Finding, KindRef, Policy, Request, is_identity,
     service_account_changes, walk_fields,
 };
 use crate::remember::{RememberNote, rememberable};
-use crate::scope::NamespaceSource;
+use crate::scope::{NamespaceSource, SessionMode};
 use crate::secret_tools;
 use crate::secret_write;
 use crate::session::{Session, SessionError};
@@ -160,8 +170,17 @@ pub(crate) struct Ctx<'a> {
     pub accesses: std::sync::Mutex<Vec<AccessDecision>>,
     /// The user's `helm`, for the Helm tools (#418).
     pub helm: Option<std::sync::Arc<crate::helm_tools::HelmEnv>>,
+    /// The context's Prometheus, for `top_nodes` without metrics-server
+    /// (#112).
+    pub prometheus: Option<crate::node_tools::PrometheusPlan>,
+    /// Where node shell pods go and what they run, for `node_host_read`
+    /// (#106).
+    pub node_shell: Option<crate::node_host::NodeShellPrefs>,
     /// Live phases of a long call (helm), for MCP progress notifications.
     pub progress: Option<Progress>,
+    /// Fires when the agent cancels the call or goes away: waits stop then
+    /// (#109). Other tools do not look at it.
+    pub cancel: CancellationToken,
     /// The namespace the call acts in once the policy allowed it, for the
     /// identity in the audit log.
     pub namespace: std::sync::Mutex<Option<String>>,
@@ -171,6 +190,23 @@ pub(crate) struct Ctx<'a> {
     /// Whether the change ran on an earlier "don't ask again" or the user
     /// ticked it now (#30), for the audit log and the agent.
     pub remembered: std::sync::Mutex<Option<RememberNote>>,
+    /// Writes one object of a batch to the audit log at once (#108): the
+    /// call's own line comes last and says little about each of them.
+    pub audit_object: &'a (dyn Fn(ObjectAudit) + Send + Sync),
+}
+
+/// What happened to one object of a batch, for the audit log (#108).
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectAudit {
+    /// The object: kind, namespace, name, UID, replicas.
+    pub args: Value,
+    pub namespace: String,
+    pub decided_by: DecidedBy,
+    pub allowed: bool,
+    pub reason: Option<String>,
+    /// `ok`, `unchanged`, `left-out`, `rejected`, `not-touched`, `error` or
+    /// an HTTP status code.
+    pub result: String,
 }
 
 /// One answer for a right, as the audit log records it: never a value.
@@ -219,10 +255,11 @@ struct ListArgs {
     api_version: Option<String>,
     namespace: Option<String>,
     label_selector: Option<String>,
+    field_selector: Option<String>,
     limit: Option<u32>,
-    /// Accepted only to be refused explicitly.
     #[serde(default)]
     all_namespaces: bool,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +269,16 @@ struct ObjectArgs {
     api_version: Option<String>,
     name: String,
     namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetArgs {
+    kind: String,
+    api_version: Option<String>,
+    name: String,
+    namespace: Option<String>,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +299,12 @@ struct EventsArgs {
     api_version: Option<String>,
     name: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    all_namespaces: bool,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    reason: Option<String>,
+    since_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +323,8 @@ struct LogsArgs {
     filter: Option<String>,
     #[serde(default)]
     regex: bool,
+    /// Only lines at this level or above, whatever their format (#117).
+    min_level: Option<String>,
     namespace: Option<String>,
     tail_lines: Option<i64>,
     since_seconds: Option<i64>,
@@ -345,6 +400,8 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     for _ in 0..=MAX_GRANTS_PER_CALL {
         match ctx.session.policy().check(request) {
             Ok(allowed) => {
+                let rights = Policy::custom_rights(request, &allowed);
+                open_custom_rights(ctx, &allowed.namespace, rights).await?;
                 if !allowed.namespace.is_empty() {
                     *sync::lock(&ctx.namespace) = Some(allowed.namespace.clone());
                 }
@@ -372,6 +429,93 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, request: &Request) -> Result<Allowe
     Err(ToolError::Failed(
         "this call needs too many rights at once".into(),
     ))
+}
+
+/// Sets up what a call uses on custom resources in `namespace` (#103): the
+/// policy allowed it, and a temporary ServiceAccount's Role has to follow,
+/// or the API server refuses the call. The user's own RBAC bounds it, so a
+/// missing right is said here. An impersonated identity has the rights the
+/// administrator gave it, whatever the user's are.
+pub(crate) async fn open_custom_rights(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    rights: Vec<CustomRight>,
+) -> Result<(), ToolError> {
+    if rights.is_empty() {
+        return Ok(());
+    }
+    let known = ctx.session.grants();
+    let new: Vec<CustomRight> = rights
+        .into_iter()
+        .filter(|right| !known.has_custom_right(namespace, right))
+        .collect();
+    if new.is_empty() || ctx.session.mode_in(namespace) == SessionMode::Impersonation {
+        return Ok(());
+    }
+    for right in &new {
+        ensure_rbac(
+            ctx,
+            namespace,
+            &[(&right.verb, &right.group, &right.resource)],
+        )
+        .await?;
+    }
+    ctx.session
+        .allow_custom_rights(namespace, &new)
+        .await
+        .map_err(|error| {
+            ToolError::Failed(format!(
+                "custom resources are allowed in this session, but Kubach could not extend the \
+                 session's rights in namespace {namespace}: {error}"
+            ))
+        })
+}
+
+/// A 403 from reading under the session's identity, as a reason the agent
+/// can act on: whose rights are short and who can change that (#103).
+pub(crate) fn explain_forbidden(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    verb: &str,
+    error: ToolError,
+) -> ToolError {
+    if !matches!(
+        error,
+        ToolError::Api {
+            code: Some(403),
+            ..
+        }
+    ) {
+        return error;
+    }
+    let namespace = &allowed.namespace;
+    let api = &kind_of(allowed).api;
+    let full = if api.group.is_empty() {
+        api.plural.clone()
+    } else {
+        format!("{}.{}", api.plural, api.group)
+    };
+    let why = match ctx.session.mode_in(namespace) {
+        SessionMode::ClientOnly => "your Kubernetes account has no such right".to_owned(),
+        SessionMode::Impersonation => format!(
+            "the identity prepared for Kubach ({}) has no such right; only the cluster \
+             administrator can extend it",
+            ctx.session.describe_identity(Some(namespace))
+        ),
+        SessionMode::TemporaryServiceAccount => {
+            "the session's temporary ServiceAccount does not have it yet; try once more, and if \
+             this repeats, the user's own rights have probably changed"
+                .to_owned()
+        }
+    };
+    Denial::new(
+        DenialCode::Rbac,
+        format!(
+            "the API server does not let this session {verb} {full} in namespace {namespace}: \
+             {why}. Asking the user again will not help: Kubach cannot grant RBAC rights"
+        ),
+    )
+    .into()
 }
 
 /// What the user is asked, in one line.
@@ -445,6 +589,7 @@ async fn ask_grant(ctx: &Ctx<'_>, request: &Request, grant: Grant) -> Result<(),
         dangerous: Vec::new(),
         mode: ctx.session.mode_in(grant.namespace()),
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &request).await;
     if !ctx.session.is_active() {
@@ -551,6 +696,8 @@ pub(crate) async fn ask_access_now(
 ) -> Result<(), ToolError> {
     let scope = ctx.session.scope();
     let current = ctx.session.access();
+    // Only what is asked for; `current` names what the session has.
+    let asked = raise.asked();
     let namespace = namespace
         .map(str::to_owned)
         .or_else(|| ctx.session.policy().namespace(None).ok())
@@ -572,7 +719,7 @@ pub(crate) async fn ask_access_now(
         tool: ctx.tool.to_owned(),
         namespace: namespace.clone(),
         summary: format!(
-            "{} asks for {raise} on {}{place}",
+            "{} asks for {asked} on {}{place}",
             ctx.client_name, scope.context
         ),
         details: format!(
@@ -589,6 +736,7 @@ pub(crate) async fn ask_access_now(
             ctx.session.mode_in(&namespace)
         },
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &question).await;
     if !ctx.session.is_active() {
@@ -613,7 +761,7 @@ pub(crate) async fn ask_access_now(
             let always = decision == ConfirmationDecision::ApprovedAlways;
             if let Err(error) = ctx.session.decide_access(raise, true, always).await {
                 let message = format!(
-                    "the user allowed {raise}, but Kubach could not raise the session's access: \
+                    "the user allowed {asked}, but Kubach could not raise the session's access: \
                      {error}"
                 );
                 record("error", Some(message.clone()));
@@ -626,7 +774,7 @@ pub(crate) async fn ask_access_now(
             let _ = ctx.session.decide_access(raise, false, false).await;
             record("refused", reason.clone());
             Err(ToolError::Rejected(Some(format!(
-                "the user did not allow {raise} on {} in this session{}; Kubach does not ask \
+                "the user did not allow {asked} on {} in this session{}; Kubach does not ask \
                  again in this session",
                 scope.context,
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
@@ -635,7 +783,7 @@ pub(crate) async fn ask_access_now(
         ConfirmationDecision::Denied { reason } => {
             record("no-answer", reason.clone());
             Err(ToolError::Rejected(Some(format!(
-                "no answer from the user about {raise}{}",
+                "no answer from the user about {asked}{}",
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
             ))))
         }
@@ -706,46 +854,101 @@ async fn tell_reveal_blocked(ctx: &Ctx<'_>, request: &Request) {
         details: String::new(),
         dangerous: Vec::new(),
         allow_remember: false,
+        diff_cut: None,
     };
     let _ = tokio::time::timeout(Duration::from_secs(10), ctx.confirmer.confirm(&notice)).await;
 }
 
 // ------------------------------------------------------------- dispatch
 
+/// One tool's call, on the heap.
+type ToolCall<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>>;
+
+/// Puts the future `call` makes on the heap.
+///
+/// Out of line on purpose: an unoptimized build makes the future on the
+/// stack before moving it, and here that stack is given back on return. In
+/// [`run`] it would be reserved for every tool at once.
+#[inline(never)]
+fn boxed<'a, F>(call: impl FnOnce() -> F) -> ToolCall<'a>
+where
+    F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'a,
+{
+    Box::pin(call())
+}
+
 /// Runs one tool call.
-pub(crate) async fn run(
-    ctx: &Ctx<'_>,
-    tool: &str,
-    args: &Map<String, Value>,
+///
+/// Every tool runs as its own boxed future: this function then holds one
+/// pointer, whatever the tools keep while they run, and polling it takes
+/// the stack of the one tool called. With the tools inline, an unoptimized
+/// build reserved stack for all of them at once, on every call: about
+/// 0.9 MiB of a thread's 2 MiB.
+pub(crate) async fn run<'a>(
+    ctx: &'a Ctx<'_>,
+    tool: &'a str,
+    args: &'a Map<String, Value>,
 ) -> Result<ToolOutput, ToolError> {
-    match tool {
-        "session_info" => {
+    let call: ToolCall<'_> = match tool {
+        "session_info" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::Info).await?;
             Ok(ToolOutput::read(session_info(ctx.session)))
-        }
-        "list_kinds" => {
+        }),
+        "list_kinds" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::ListKinds).await?;
             Ok(ToolOutput::read(list_kinds(ctx.session)))
-        }
-        "list_namespaces" => {
+        }),
+        "list_namespaces" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::ListNamespaces).await?;
             Ok(ToolOutput::read(list_namespaces(ctx.session).await))
-        }
-        "list_resources" => {
+        }),
+        "list_resources" => boxed(move || async move {
             let a: ListArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
             let request = Request::List {
                 kind: kind_ref(a.kind, a.api_version),
                 namespace: a.namespace,
                 all_namespaces: a.all_namespaces,
                 label_selector: a.label_selector.clone(),
+                field_selector: a.field_selector.clone(),
             };
             let allowed = authorize(ctx, &request).await?;
-            list_resources(ctx, &allowed, a.label_selector.as_deref(), a.limit).await
-        }
-        "get_resource" | "describe_resource" => {
+            if a.all_namespaces {
+                return all_namespaces::list_resources(
+                    ctx,
+                    &allowed,
+                    &request,
+                    a.limit,
+                    fields.as_ref(),
+                )
+                .await;
+            }
+            let selectors = Selectors {
+                label: a.label_selector.as_deref(),
+                field: a.field_selector.as_deref(),
+            };
+            list_resources(ctx, &allowed, selectors, a.limit, fields.as_ref())
+                .await
+                .map_err(|error| explain_selector(error, selectors.field))
+                .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
+        }),
+        "get_resource" => boxed(move || async move {
+            let a: GetArgs = parse(args)?;
+            let fields = Fields::parse(a.fields.as_deref())?;
+            let request = Request::Get {
+                kind: kind_ref(a.kind, a.api_version),
+                name: a.name,
+                namespace: a.namespace,
+            };
+            let allowed = authorize(ctx, &request).await?;
+            get_resource(ctx, &allowed, fields.as_ref())
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+        }),
+        "describe_resource" => boxed(move || async move {
             let a: ObjectArgs = parse(args)?;
             let request = Request::Get {
                 kind: kind_ref(a.kind, a.api_version),
@@ -753,14 +956,13 @@ pub(crate) async fn run(
                 namespace: a.namespace,
             };
             let allowed = authorize(ctx, &request).await?;
-            if tool == "get_resource" {
-                get_resource(ctx, &allowed).await
-            } else {
-                describe_resource(ctx, &allowed).await
-            }
-        }
-        "list_events" => {
+            describe_resource(ctx, &allowed)
+                .await
+                .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
+        }),
+        "list_events" => boxed(move || async move {
             let a: EventsArgs = parse(args)?;
+            let filter = EventFilter::new(a.event_type, a.reason, a.since_seconds)?;
             let object = match (a.kind, a.name) {
                 (Some(kind), Some(name)) => Some((kind_ref(kind, a.api_version), name)),
                 (None, None) => None,
@@ -775,13 +977,18 @@ pub(crate) async fn run(
             let request = Request::Events {
                 namespace: a.namespace,
                 object,
+                all_namespaces: a.all_namespaces,
             };
             let allowed = authorize(ctx, &request).await?;
+            let limit = a.limit.unwrap_or(50).min(200);
+            if a.all_namespaces {
+                return all_namespaces::list_events(ctx, &request, &filter, limit).await;
+            }
             ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
-            let events = list_events(ctx, &allowed, a.limit.unwrap_or(50).min(200)).await?;
+            let events = list_events(ctx, &allowed, &filter, limit).await?;
             Ok(ToolOutput::read(events))
-        }
-        "get_logs" => {
+        }),
+        "get_logs" => boxed(move || async move {
             let a: LogsArgs = parse(args)?;
             let workload = match (&a.kind, &a.name, &a.api_version) {
                 (Some(kind), Some(name), _) => {
@@ -804,6 +1011,7 @@ pub(crate) async fn run(
                 .into());
             }
             let filter = line_filter(a.filter.as_deref(), a.regex)?;
+            let min_level = min_level(a.min_level.as_deref())?;
             let request = Request::Logs {
                 pod: a.pod.clone(),
                 workload,
@@ -822,9 +1030,9 @@ pub(crate) async fn run(
                 rights.push(("get", kind.api.group.as_str(), kind.api.plural.as_str()));
             }
             ensure_rbac(ctx, &allowed.namespace, &rights).await?;
-            get_logs(ctx, &allowed, &a, filter.as_ref()).await
-        }
-        "top_pods" => {
+            get_logs(ctx, &allowed, &a, filter.as_ref(), min_level).await
+        }),
+        "top_pods" => boxed(move || async move {
             let a: NamespaceArgs = parse(args)?;
             let request = Request::Top {
                 namespace: a.namespace,
@@ -837,23 +1045,59 @@ pub(crate) async fn run(
             )
             .await?;
             top_pods(ctx, &allowed).await
+        }),
+        "get_topology" => {
+            boxed(move || async move { topology_tools::get_topology(ctx, args).await })
         }
-        "get_topology" => topology_tools::get_topology(ctx, args).await,
-        "list_nodes" => crate::node_tools::list_nodes(ctx, args).await,
-        "describe_node" => crate::node_tools::describe_node(ctx, args).await,
-        "top_nodes" => crate::node_tools::top_nodes(ctx, args).await,
-        "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
-        "helm_search_charts" => helm_tools::search(ctx, args).await,
-        "helm_show_values" => helm_tools::show_values(ctx, args).await,
-        "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
-        "helm_release_history" => helm_tools::history(ctx, args).await,
-        "helm_get_values" => helm_tools::get_values(ctx, args).await,
-        "helm_install" => helm_tools::install(ctx, args).await,
-        "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
-        "helm_rollback" => helm_tools::rollback(ctx, args).await,
-        "helm_uninstall" => helm_tools::uninstall(ctx, args).await,
-        "can_reach" => topology_tools::can_reach(ctx, args).await,
-        "apply_manifest" => {
+        "list_nodes" => {
+            boxed(move || async move { crate::node_tools::list_nodes(ctx, args).await })
+        }
+        "describe_node" => {
+            boxed(move || async move { crate::node_tools::describe_node(ctx, args).await })
+        }
+        "top_nodes" => boxed(move || async move { crate::node_tools::top_nodes(ctx, args).await }),
+        "cordon_node" => {
+            boxed(
+                move || async move { crate::node_maintenance::cordon_node(ctx, args, true).await },
+            )
+        }
+        "uncordon_node" => {
+            boxed(
+                move || async move { crate::node_maintenance::cordon_node(ctx, args, false).await },
+            )
+        }
+        "drain_node" => {
+            boxed(move || async move { crate::node_maintenance::drain_node(ctx, args).await })
+        }
+        "node_host_read" => {
+            boxed(move || async move { crate::node_host::node_host_read(ctx, args).await })
+        }
+        "wait_for_rollout" => {
+            boxed(move || async move { crate::rollout_tools::wait_for_rollout(ctx, args).await })
+        }
+        "wait_for_condition" => {
+            boxed(move || async move { crate::wait_tools::wait_for_condition(ctx, args).await })
+        }
+        "helm_search_charts" => boxed(move || async move { helm_tools::search(ctx, args).await }),
+        "helm_show_values" => {
+            boxed(move || async move { helm_tools::show_values(ctx, args).await })
+        }
+        "helm_list_releases" => {
+            boxed(move || async move { helm_tools::list_releases(ctx, args).await })
+        }
+        "helm_release_history" => {
+            boxed(move || async move { helm_tools::history(ctx, args).await })
+        }
+        "helm_get_values" => boxed(move || async move { helm_tools::get_values(ctx, args).await }),
+        "helm_install" => boxed(move || async move { helm_tools::install(ctx, args).await }),
+        "helm_upgrade" => boxed(move || async move { helm_tools::upgrade(ctx, args).await }),
+        "helm_rollback" => boxed(move || async move { helm_tools::rollback(ctx, args).await }),
+        "helm_uninstall" => boxed(move || async move { helm_tools::uninstall(ctx, args).await }),
+        "helm_preview_diff" => {
+            boxed(move || async move { crate::helm_preview::preview_diff(ctx, args).await })
+        }
+        "can_reach" => boxed(move || async move { topology_tools::can_reach(ctx, args).await }),
+        "apply_manifest" => boxed(move || async move {
             let a: ApplyArgs = parse(args)?;
             let dry_run = a.dry_run.unwrap_or(true);
             let request = Request::Apply {
@@ -863,8 +1107,12 @@ pub(crate) async fn run(
             };
             let allowed = authorize(ctx, &request).await?;
             apply_manifest(ctx, &allowed, dry_run).await
+        }),
+        "scale_batch" => boxed(move || async move { crate::batch_tools::scale(ctx, args).await }),
+        "rollout_restart_batch" => {
+            boxed(move || async move { crate::batch_tools::restart(ctx, args).await })
         }
-        "scale" => {
+        "scale" => boxed(move || async move {
             let a: ScaleArgs = parse(args)?;
             let request = Request::Scale {
                 kind: kind_ref(a.kind, a.api_version),
@@ -885,8 +1133,8 @@ pub(crate) async fn run(
             params.insert(action::REPLICAS.into(), json!(a.replicas));
             let summary = format!("to {} replicas", a.replicas);
             run_action(ctx, &allowed, "scale", action::SCALE, &params, &summary).await
-        }
-        "rollout_restart" | "delete_resource" => {
+        }),
+        "rollout_restart" | "delete_resource" => boxed(move || async move {
             let a: ObjectArgs = parse(args)?;
             let kind = kind_ref(a.kind, a.api_version);
             let request = if tool == "rollout_restart" {
@@ -921,8 +1169,8 @@ pub(crate) async fn run(
                 action::DELETE
             };
             run_action(ctx, &allowed, tool, id, &ActionParams::new(), "").await
-        }
-        "exec" => {
+        }),
+        "exec" => boxed(move || async move {
             let a: ExecArgs = parse(args)?;
             let request = Request::Exec {
                 pod: a.pod,
@@ -937,12 +1185,16 @@ pub(crate) async fn run(
                 .unwrap_or(DEFAULT_EXEC_TIMEOUT)
                 .clamp(1, MAX_EXEC_TIMEOUT);
             exec(ctx, &allowed, a.container.as_deref(), &a.command, timeout).await
+        }),
+        "debug_container" => {
+            boxed(move || async move { crate::debug_tools::debug_container(ctx, args).await })
         }
-        "debug_container" => crate::debug_tools::debug_container(ctx, args).await,
-        "port_forward_start" => crate::forwards::start(ctx, args).await,
-        "port_forward_list" => crate::forwards::list(ctx, args).await,
-        "port_forward_stop" => crate::forwards::stop(ctx, args).await,
-        "list_secrets" => {
+        "port_forward_start" => {
+            boxed(move || async move { crate::forwards::start(ctx, args).await })
+        }
+        "port_forward_list" => boxed(move || async move { crate::forwards::list(ctx, args).await }),
+        "port_forward_stop" => boxed(move || async move { crate::forwards::stop(ctx, args).await }),
+        "list_secrets" => boxed(move || async move {
             let a: SecretListArgs = parse(args)?;
             let request = Request::SecretList {
                 namespace: a.namespace,
@@ -952,8 +1204,8 @@ pub(crate) async fn run(
             secret_tools::list(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "check_secret" => {
+        }),
+        "check_secret" => boxed(move || async move {
             let a: SecretArgs = parse(args)?;
             let request = Request::SecretCheck {
                 namespace: a.namespace,
@@ -964,8 +1216,8 @@ pub(crate) async fn run(
             secret_tools::check(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "compare_secret_values" => {
+        }),
+        "compare_secret_values" => boxed(move || async move {
             let a: CompareArgs = parse(args)?;
             let request = Request::SecretCompare {
                 namespace: a.namespace,
@@ -979,8 +1231,8 @@ pub(crate) async fn run(
             secret_tools::compare(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "get_secret_value" => {
+        }),
+        "get_secret_value" => boxed(move || async move {
             let a: SecretArgs = parse(args)?;
             let request = Request::SecretReveal {
                 namespace: a.namespace,
@@ -991,8 +1243,8 @@ pub(crate) async fn run(
             secret_tools::reveal(ctx, &allowed)
                 .await
                 .map(ToolOutput::confirmed)
-        }
-        "request_secret_input" => {
+        }),
+        "request_secret_input" => boxed(move || async move {
             let a: secret_write::InputArgs = parse(args)?;
             let request = Request::SecretWrite {
                 namespace: a.namespace,
@@ -1010,8 +1262,8 @@ pub(crate) async fn run(
             };
             ensure_rbac(ctx, &allowed.namespace, &[(verb, "", "secrets")]).await?;
             secret_write::input(ctx, &allowed, args).await
-        }
-        "copy_secret" => {
+        }),
+        "copy_secret" => boxed(move || async move {
             let a: secret_write::CopyArgs = parse(args)?;
             let request = Request::SecretCopy {
                 namespace: a.namespace,
@@ -1027,8 +1279,8 @@ pub(crate) async fn run(
                 .map_or(allowed.namespace.clone(), |to| to.namespace.clone());
             ensure_rbac(ctx, &target, &[("create", "", "secrets")]).await?;
             secret_write::copy(ctx, &allowed, args).await
-        }
-        "delete_secret" => {
+        }),
+        "delete_secret" => boxed(move || async move {
             let a: secret_write::DeleteArgs = parse(args)?;
             let request = Request::SecretDelete {
                 namespace: a.namespace,
@@ -1038,11 +1290,12 @@ pub(crate) async fn run(
             let allowed = authorize(ctx, &request).await?;
             ensure_rbac(ctx, &allowed.namespace, &[("delete", "", "secrets")]).await?;
             secret_write::delete(ctx, &allowed, args).await
-        }
-        other => {
+        }),
+        other => boxed(move || async move {
             Err(Denial::new(DenialCode::InvalidInput, format!("unknown tool `{other}`")).into())
-        }
-    }
+        }),
+    };
+    call.await
 }
 
 // ------------------------------------------------------------- helpers
@@ -1057,7 +1310,7 @@ fn name_of(allowed: &Allowed) -> &str {
 
 /// Defense in depth: objects returned by a namespaced endpoint must be in
 /// that namespace.
-fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
+pub(crate) fn ensure_namespace(obj: &DynamicObject, namespace: &str) -> Result<(), ToolError> {
     if obj.metadata.namespace.as_deref() == Some(namespace) {
         Ok(())
     } else {
@@ -1158,6 +1411,9 @@ fn session_info(session: &Session) -> String {
             "hidden on this context"
         },
         "boundaries": boundaries,
+        "waitingForUser": session.waiting().list(),
+        "waitingForUserMeaning": "Calls of this session waiting for the user's answer in the \
+            Kubach window right now; a slow call not listed here is not waiting for the user.",
         "expiresAt": scope.expires_at.to_string(),
         "grants": session.grants().entries(),
         "notAskedAgain": session.remembered(),
@@ -1180,6 +1436,48 @@ fn session_info(session: &Session) -> String {
 /// context, each with its source. Either way with what the session may do
 /// in each.
 async fn list_namespaces(session: &Session) -> String {
+    let KnownNamespaces {
+        found,
+        complete,
+        note,
+    } = known_namespaces(session).await;
+    let grants = session.grants();
+    let policy = session.policy();
+    let namespaces: Vec<Value> = found
+        .into_iter()
+        .map(|(name, source)| {
+            let access = match grants.state(&Grant::read(name.clone())) {
+                Some(crate::grants::GrantState::Granted) => "allowed",
+                Some(crate::grants::GrantState::Denied) => "refused",
+                None if policy.namespace(Some(&name)).is_ok() => "available",
+                None => "not-in-this-session",
+            };
+            json!({"name": name, "source": source, "access": access})
+        })
+        .collect();
+    let out = json!({
+        "namespaces": namespaces,
+        "complete": complete,
+        "note": note,
+        "howToUse": "Pass `namespace` to a tool: reading built-in resources needs no question, \
+            in as many namespaces as you need. list_resources and list_events also take \
+            `allNamespaces: true`.",
+    });
+    serde_json::to_string_pretty(&out).unwrap_or_default()
+}
+
+/// The namespaces Kubach knows for this session.
+pub(crate) struct KnownNamespaces {
+    /// With where each was found.
+    pub found: Vec<(String, NamespaceSource)>,
+    /// `false`: other namespaces may exist, and `note` says why.
+    pub complete: bool,
+    pub note: String,
+}
+
+/// The pinned namespaces, else the cluster's as the user may list them,
+/// else what Kubach knows of (#401). Names only.
+pub(crate) async fn known_namespaces(session: &Session) -> KnownNamespaces {
     use k8s_openapi::api::core::v1::Namespace;
     let scope = session.scope();
     let mut found: Vec<(String, NamespaceSource)> = Vec::new();
@@ -1238,28 +1536,11 @@ async fn list_namespaces(session: &Session) -> String {
             }
         }
     };
-    let grants = session.grants();
-    let policy = session.policy();
-    let namespaces: Vec<Value> = found
-        .into_iter()
-        .map(|(name, source)| {
-            let access = match grants.state(&Grant::read(name.clone())) {
-                Some(crate::grants::GrantState::Granted) => "allowed",
-                Some(crate::grants::GrantState::Denied) => "refused",
-                None if policy.namespace(Some(&name)).is_ok() => "available",
-                None => "not-in-this-session",
-            };
-            json!({"name": name, "source": source, "access": access})
-        })
-        .collect();
-    let out = json!({
-        "namespaces": namespaces,
-        "complete": complete,
-        "note": note,
-        "howToUse": "Pass `namespace` to a tool: reading built-in resources needs no question, \
-            in as many namespaces as you need.",
-    });
-    serde_json::to_string_pretty(&out).unwrap_or_default()
+    KnownNamespaces {
+        found,
+        complete,
+        note,
+    }
 }
 
 /// How many custom resource kinds `list_kinds` shows at most.
@@ -1342,76 +1623,176 @@ fn kinds_table(policy: &Policy<'_>, catalog: &ApiCatalog) -> String {
     out
 }
 
-async fn list_resources(
+/// The selectors of a `list_resources` call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Selectors<'a> {
+    pub label: Option<&'a str>,
+    pub field: Option<&'a str>,
+}
+
+/// The rows of one namespace, without the heading: table lines or, with
+/// `fields`, one YAML document each.
+pub(crate) struct Rows {
+    pub lines: Vec<String>,
+    /// The answer was cut by its `limit`: the server has more items.
+    pub more: bool,
+}
+
+/// The table heading of `kind`.
+pub(crate) fn table_heading(ctx: &Ctx<'_>, kind: &ResourceKind) -> String {
+    ctx.registry
+        .plugin_for_resource(&kind.api)
+        .columns()
+        .iter()
+        .map(|c| c.title.to_uppercase())
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// One table line of `obj`: the cells of its plugin, from the masked object
+/// ([`plugin_view`]), so a cell holds nothing `get_resource` would hide.
+pub(crate) fn table_row(
+    plugin: &dyn ResourcePlugin,
+    obj: &DynamicObject,
+    api: &ApiResource,
+    now: Timestamp,
+) -> String {
+    plugin
+        .cells(&plugin_view(obj, api))
+        .iter()
+        .map(|c| render_cell(c, now))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Reads one namespace under its identity: the one way `list_resources`
+/// reaches the API, whether for one namespace or many.
+pub(crate) async fn read_rows(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
-    label_selector: Option<&str>,
+    selectors: Selectors<'_>,
     limit: Option<u32>,
-) -> Result<ToolOutput, ToolError> {
+    fields: Option<&Fields>,
+) -> Result<Rows, ToolError> {
     let kind = kind_of(allowed);
     let client = ctx.session.client_in(&allowed.namespace)?;
     let api = discovery::api(&client, kind, Some(&allowed.namespace));
     let mut params = ListParams::default().limit(limit.unwrap_or(100).clamp(1, MAX_LIST_ITEMS));
-    if let Some(selector) = label_selector {
+    if let Some(selector) = selectors.label {
         params = params.labels(selector);
+    }
+    if let Some(selector) = selectors.field {
+        params = params.fields(selector);
     }
     let list = api.list(&params).await?;
     let plugin = ctx.registry.plugin_for_resource(&kind.api);
-    let columns = plugin.columns();
     let now = Timestamp::now();
-    let mut out = columns
+    let lines = list
+        .items
         .iter()
-        .map(|c| c.title.to_uppercase())
-        .collect::<Vec<_>>()
-        .join("\t");
-    out.push('\n');
-    let mut shown = 0;
-    for obj in &list.items {
-        if ensure_namespace(obj, &allowed.namespace).is_err() {
-            continue;
-        }
-        let cells: Vec<String> = plugin
-            .cells(obj)
-            .iter()
-            .map(|c| render_cell(c, now))
-            .collect();
-        out.push_str(&cells.join("\t"));
+        .filter(|obj| ensure_namespace(obj, &allowed.namespace).is_ok())
+        .map(|obj| match fields {
+            Some(fields) => fields.row(&Masked::object(obj, &kind.api)),
+            None => table_row(plugin.as_ref(), obj, &kind.api, now),
+        })
+        .collect();
+    Ok(Rows {
+        lines,
+        more: has_more(&list.metadata),
+    })
+}
+
+/// A selector the API server turned down, as bad input rather than an API
+/// failure: only a few fields of a kind can be selected on, and which is
+/// up to the server.
+pub(crate) fn explain_selector(error: ToolError, field_selector: Option<&str>) -> ToolError {
+    match (&error, field_selector) {
+        (
+            ToolError::Api {
+                code: Some(400),
+                message,
+            },
+            Some(selector),
+        ) => Denial::new(
+            DenialCode::InvalidInput,
+            format!(
+                "the API server does not accept fieldSelector {selector:?} on this kind: \
+                 {message}. A kind selects on few fields: metadata.name on all of them, and \
+                 for Pods also spec.nodeName and status.phase, for example"
+            ),
+        )
+        .into(),
+        _ => error,
+    }
+}
+
+async fn list_resources(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    selectors: Selectors<'_>,
+    limit: Option<u32>,
+    fields: Option<&Fields>,
+) -> Result<ToolOutput, ToolError> {
+    let kind = kind_of(allowed);
+    let rows = read_rows(ctx, allowed, selectors, limit, fields).await?;
+    let mut out = String::new();
+    if fields.is_none() {
+        out = table_heading(ctx, kind);
         out.push('\n');
-        shown += 1;
+    }
+    for line in &rows.lines {
+        out.push_str(line);
+        out.push('\n');
     }
     let _ = write!(
         out,
-        "({shown} {} in {})",
-        kind.api.plural, allowed.namespace
+        "({} {} in {})",
+        rows.lines.len(),
+        kind.api.plural,
+        allowed.namespace
     );
-    if has_more(&list.metadata) {
-        out.push_str(" — more items exist; raise `limit` or narrow `labelSelector`");
+    if rows.more {
+        out.push_str(
+            " — more items exist; raise `limit` or narrow `labelSelector` or `fieldSelector`",
+        );
     }
     Ok(ToolOutput::read(finish(&out)))
 }
 
 /// A list answer cut by its `limit`: the server has more items.
-fn has_more(metadata: &ListMeta) -> bool {
+pub(crate) fn has_more(metadata: &ListMeta) -> bool {
     metadata.continue_.as_deref().is_some_and(|c| !c.is_empty())
 }
 
-async fn get_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
+async fn get_resource(
+    ctx: &Ctx<'_>,
+    allowed: &Allowed,
+    fields: Option<&Fields>,
+) -> Result<ToolOutput, ToolError> {
     let obj = fetch(&ctx.session.client_in(&allowed.namespace)?, allowed).await?;
-    Ok(ToolOutput::read(finish(&core_apply::to_yaml(
-        &masked_value(&obj),
-    ))))
+    let text = match fields {
+        Some(fields) => fields.document(&Masked::object(&obj, &kind_of(allowed).api)),
+        None => core_apply::to_yaml(&masked_value(&obj)),
+    };
+    Ok(ToolOutput::read(finish(&text)))
 }
 
-async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
-    let client = ctx.session.client_in(&allowed.namespace)?;
-    let obj = fetch(&client, allowed).await?;
-    let kind = kind_of(allowed);
-    let plugin = ctx.registry.plugin_for_resource(&kind.api);
-    let health = plugin.health(&obj);
+/// What `describe_resource` says about `obj` before its events: health,
+/// the details of its plugin and its relations. Everything is built from
+/// the masked object ([`plugin_view`]), the one `get_resource` shows.
+pub(crate) fn describe_text(
+    registry: &PluginRegistry,
+    api: &ApiResource,
+    namespace: &str,
+    obj: &DynamicObject,
+) -> String {
+    let plugin = registry.plugin_for_resource(api);
+    let obj = &plugin_view(obj, api);
+    let health = plugin.health(obj);
     let mut out = format!(
         "{} {}/{}\nHealth: {:?}{}\n",
-        kind.api.kind,
-        allowed.namespace,
+        api.kind,
+        namespace,
         obj.name_any(),
         health.status,
         if health.message.is_empty() {
@@ -1420,13 +1801,13 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             format!(" ({})", health.message)
         }
     );
-    for section in plugin.details(&obj) {
+    for section in plugin.details(obj) {
         let _ = writeln!(out, "\n{}:", section.title);
         for line in section.text_lines() {
             let _ = writeln!(out, "  {line}");
         }
     }
-    let relations = plugin.relations(&obj);
+    let relations = plugin.relations(obj);
     if !relations.is_empty() {
         out.push_str("\nRelations:\n");
         for relation in relations {
@@ -1437,78 +1818,62 @@ async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutpu
             );
         }
     }
-    for relation in plugin.selector_relations(&obj) {
+    for relation in plugin.selector_relations(obj) {
         let _ = writeln!(
             out,
             "  {:?} {} with {}",
             relation.kind, relation.target_kind, relation.label_selector
         );
     }
-    let events = list_events(ctx, allowed, 20)
+    out
+}
+
+async fn describe_resource(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<ToolOutput, ToolError> {
+    let client = ctx.session.client_in(&allowed.namespace)?;
+    let obj = fetch(&client, allowed).await?;
+    let mut out = describe_text(
+        ctx.registry,
+        &kind_of(allowed).api,
+        &allowed.namespace,
+        &obj,
+    );
+    let events = list_events(ctx, allowed, &EventFilter::default(), 20)
         .await
         .unwrap_or_else(|e| e.message());
     let _ = write!(out, "\nEvents:\n{events}");
     Ok(ToolOutput::read(finish(&out)))
 }
 
-async fn list_events(ctx: &Ctx<'_>, allowed: &Allowed, limit: usize) -> Result<String, ToolError> {
-    let api: Api<Event> = Api::namespaced(
-        ctx.session.client_in(&allowed.namespace)?,
-        &allowed.namespace,
-    );
-    let mut params = ListParams::default().limit(MAX_LIST_ITEMS);
-    if let (Some(kind), Some(name)) = (&allowed.kind, &allowed.name) {
-        params = params.fields(&format!(
-            "involvedObject.kind={},involvedObject.name={name}",
-            kind.api.kind
-        ));
-    }
-    let list = api.list(&params).await?;
-    let more = has_more(&list.metadata);
-    let mut events = list.items;
-    let when = |e: &Event| {
-        e.last_timestamp
-            .as_ref()
-            .map(|t| t.0)
-            .or(e.event_time.as_ref().map(|t| t.0))
-            .or(e.metadata.creation_timestamp.as_ref().map(|t| t.0))
-    };
-    events.sort_by_key(when);
-    let now = Timestamp::now();
-    let skip = events.len().saturating_sub(limit);
-    let mut out = String::new();
-    for event in events.iter().skip(skip) {
-        if event.metadata.namespace.as_deref() != Some(allowed.namespace.as_str()) {
-            continue;
-        }
-        let age = when(event)
-            .map(|t| format_age(now.as_second() - t.as_second()))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "{age}\t{}\t{}\t{}/{}\t{}{}",
-            event.type_.as_deref().unwrap_or(""),
-            event.reason.as_deref().unwrap_or(""),
-            event.involved_object.kind.as_deref().unwrap_or(""),
-            event.involved_object.name.as_deref().unwrap_or(""),
-            event.message.as_deref().unwrap_or("").trim(),
-            event
-                .count
-                .filter(|c| *c > 1)
-                .map(|c| format!(" (x{c})"))
-                .unwrap_or_default(),
-        );
-    }
-    if out.is_empty() {
-        out.push_str("(no events)\n");
-    }
-    if more {
-        let _ = writeln!(
-            out,
-            "(only {MAX_LIST_ITEMS} events were read; more exist and newer ones may be missing)"
-        );
-    }
-    Ok(finish(&out))
+/// When an event last happened.
+pub(crate) fn event_time(event: &Event) -> Option<Timestamp> {
+    event
+        .series
+        .as_ref()
+        .and_then(|series| series.last_observed_time.as_ref())
+        .map(|t| t.0)
+        .or(event.last_timestamp.as_ref().map(|t| t.0))
+        .or(event.event_time.as_ref().map(|t| t.0))
+        .or(event.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// One event as a line of `list_events`, without its line break.
+pub(crate) fn event_line(event: &Event, now: Timestamp) -> String {
+    let age = event_time(event)
+        .map(|t| format_age(now.as_second() - t.as_second()))
+        .unwrap_or_default();
+    format!(
+        "{age}\t{}\t{}\t{}/{}\t{}{}",
+        event.type_.as_deref().unwrap_or(""),
+        event.reason.as_deref().unwrap_or(""),
+        event.involved_object.kind.as_deref().unwrap_or(""),
+        event.involved_object.name.as_deref().unwrap_or(""),
+        event.message.as_deref().unwrap_or("").trim(),
+        event
+            .count
+            .filter(|c| *c > 1)
+            .map(|c| format!(" (x{c})"))
+            .unwrap_or_default(),
+    )
 }
 
 /// At most this many pods per `get_logs` call, and streams (pod and
@@ -1787,11 +2152,27 @@ fn log_streams(pods: &[Pod], args: &LogsArgs, notes: &mut Vec<String>) -> Vec<Lo
     streams
 }
 
+/// The `minLevel` of `get_logs`.
+fn min_level(name: Option<&str>) -> Result<Option<Level>, ToolError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    match Level::parse(name) {
+        Some(level) => Ok(Some(level)),
+        None => Err(Denial::new(
+            DenialCode::InvalidInput,
+            format!("minLevel must be one of {}", Level::NAMES),
+        )
+        .into()),
+    }
+}
+
 async fn get_logs(
     ctx: &Ctx<'_>,
     allowed: &Allowed,
     args: &LogsArgs,
     filter: Option<&LineFilter>,
+    min_level: Option<Level>,
 ) -> Result<ToolOutput, ToolError> {
     let api: Api<Pod> = Api::namespaced(
         ctx.session.client_in(&allowed.namespace)?,
@@ -1877,6 +2258,7 @@ async fn get_logs(
     let prefixed = streams.len() > 1;
     let mut body = String::new();
     let mut matched = 0usize;
+    let mut levels = LevelCounts::default();
     for (index, stream) in streams.iter().enumerate() {
         if body.len() > MAX_OUTPUT_BYTES {
             let left: Vec<String> = streams[index..].iter().map(LogStream::label).collect();
@@ -1902,11 +2284,14 @@ async fn get_logs(
         // Masked before filtering: the filter must not probe what masking
         // hides.
         let masked = mask_text(&logs);
-        if !prefixed && filter.is_none() {
+        if !prefixed && filter.is_none() && min_level.is_none() {
             body.push_str(&masked);
             continue;
         }
         for line in masked.lines() {
+            if min_level.is_some_and(|min| !levels.admit(line, min)) {
+                continue;
+            }
             if filter.is_some_and(|f| !f.matches(line)) {
                 continue;
             }
@@ -1918,7 +2303,11 @@ async fn get_logs(
             body.push('\n');
         }
     }
-    if filter.is_some() && matched == 0 && !streams.is_empty() {
+    if let Some(min) = min_level {
+        if !streams.is_empty() {
+            notes.push(levels.note(min, matched, filter.is_some()));
+        }
+    } else if filter.is_some() && matched == 0 && !streams.is_empty() {
         notes.push("(no line matched the filter)".to_owned());
     }
     let text = if notes.is_empty() {
@@ -2104,6 +2493,22 @@ pub(crate) async fn confirm_as(
     details: String,
     dangerous: Vec<Finding>,
 ) -> Result<(), ToolError> {
+    confirm_cut(ctx, kind, allowed, tool, summary, details, None, dangerous).await
+}
+
+/// [`confirm_as`] for `details` that are a diff Kubach may have cut:
+/// `diff_cut` is what it leaves out.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_cut(
+    ctx: &Ctx<'_>,
+    kind: RequestKind,
+    allowed: &Allowed,
+    tool: &str,
+    summary: String,
+    details: String,
+    diff_cut: Option<DiffCut>,
+    dangerous: Vec<Finding>,
+) -> Result<(), ToolError> {
     debug_assert_eq!(allowed.confirmation, Confirmation::Required);
     let request = ConfirmationRequest {
         kind,
@@ -2117,6 +2522,7 @@ pub(crate) async fn confirm_as(
         dangerous,
         mode: ctx.session.mode_in(&allowed.namespace),
         allow_remember: false,
+        diff_cut: diff_cut.map(Box::new),
     };
     approve_change(
         ctx,
@@ -2197,14 +2603,12 @@ async fn apply_manifest(
     };
     // Always dry-run first, under the session identity: the diff and RBAC
     // errors the user sees are the real ones.
-    let mut diffs = String::new();
+    let mut diffs = ApplyDiff::default();
     let mut findings = allowed.findings.clone();
     for manifest in &allowed.manifests {
         let outcome = core_apply::apply(&client, manifest, &options)
             .await
             .map_err(apply_error)?;
-        let before = outcome.before.as_ref().map(masked_value);
-        let after = masked_value(&outcome.after);
         let raw_before = outcome
             .before
             .as_ref()
@@ -2225,22 +2629,16 @@ async fn apply_manifest(
             })
             .collect();
         findings.extend(changes);
-        let verb = if outcome.created() {
-            "create"
-        } else {
-            "update"
-        };
-        let _ = writeln!(diffs, "# {} ({verb})", manifest.label());
-        let diff = yaml_diff(before.as_ref(), &after);
-        diffs.push_str(if diff.is_empty() {
-            "(no changes)\n"
-        } else {
-            &diff
-        });
+        diffs.push(
+            &manifest.label(),
+            outcome.created(),
+            &manifest.value,
+            raw_before.as_ref(),
+            &raw_after,
+        );
     }
-    let diffs = finish(&diffs);
     if dry_run {
-        let mut out = format!("Dry run (nothing was changed):\n{diffs}");
+        let mut out = format!("Dry run (nothing was changed):\n{}", diffs.for_agent());
         if !findings.is_empty() {
             let _ = write!(
                 out,
@@ -2262,12 +2660,17 @@ async fn apply_manifest(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    confirm(
+    // The user sees what is written: the manifest's own values, and the
+    // whole diff or what it leaves out. None of it goes to the agent.
+    let diff = diffs.for_window(MAX_CONFIRM_DIFF_BYTES);
+    confirm_cut(
         ctx,
+        RequestKind::Call,
         allowed,
         "apply_manifest",
         summary,
-        diffs.clone(),
+        diff.text,
+        diff.cut,
         findings,
     )
     .await?;
@@ -2433,8 +2836,21 @@ pub(crate) async fn run_command(
     timeout: u64,
 ) -> Result<String, ToolError> {
     let client = ctx.session.client_in(namespace)?;
+    run_command_as(&client, namespace, pod, container, command, timeout).await
+}
+
+/// [`run_command`] with `client`: the session's identity, or the user's
+/// for a command on a node's host (#106).
+pub(crate) async fn run_command_as(
+    client: &Client,
+    namespace: &str,
+    pod: &str,
+    container: Option<&str>,
+    command: &[String],
+    timeout: u64,
+) -> Result<String, ToolError> {
     let run = exec_capture(
-        &client,
+        client,
         namespace,
         pod,
         container,
@@ -2478,6 +2894,203 @@ pub(crate) async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
+
+    /// Objects of several kinds with values that masking hides, each value
+    /// a distinct `canary-…` word, and what the rendered text must keep.
+    fn masked_fixtures() -> Vec<(ApiResource, Value, Vec<&'static str>)> {
+        let api = |group: &str, kind: &str| {
+            ApiResource::from_gvk(&kube::api::GroupVersionKind::gvk(group, "v1", kind))
+        };
+        let last_applied = |canary: &str| {
+            json!({
+                "data": {"DSN": canary, "plain": format!("{canary}-plain")},
+                "spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                    {"name": "DB_PASSWORD", "value": canary},
+                    {"name": "SIGNING_KEY", "value": format!("{canary}-signing")},
+                ]}]}}},
+            })
+            .to_string()
+        };
+        let metadata = |name: &str, canary: &str| {
+            json!({
+                "name": name, "namespace": "dev",
+                "labels": {"app": name},
+                "annotations": {
+                    LAST_APPLIED: last_applied(&format!("{canary}-applied")),
+                    "example.com/api-token": format!("{canary}-annotation"),
+                    "example.com/owner": "team-web",
+                },
+            })
+        };
+        let pod_spec = |canary: &str| {
+            json!({"containers": [{"name": "app", "image": "nginx:1.27", "env": [
+                {"name": "DB_PASS", "value": format!("{canary}-env")},
+                {"name": "AUTH", "value": format!("{canary}-auth")},
+                {"name": "LOG_LEVEL", "value": "debug"},
+            ]}]})
+        };
+        vec![
+            (
+                api("apps", "Deployment"),
+                json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": metadata("web", "canary-deploy"),
+                    "spec": {
+                        "replicas": 2,
+                        "selector": {"matchLabels": {"app": "web"}},
+                        "template": {
+                            "metadata": {"labels": {"app": "web"}, "annotations": {
+                                "example.com/db-password": "canary-deploy-template",
+                            }},
+                            "spec": pod_spec("canary-deploy"),
+                        },
+                    },
+                }),
+                vec![
+                    "Deployment dev/web",
+                    "example.com/owner: team-web",
+                    "nginx:1.27",
+                ],
+            ),
+            (
+                api("", "Pod"),
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": metadata("web-0", "canary-pod"),
+                    "spec": pod_spec("canary-pod"),
+                    "status": {"phase": "Running"},
+                }),
+                vec!["Pod dev/web-0", "nginx:1.27", "example.com/owner: team-web"],
+            ),
+            (
+                api("", "ConfigMap"),
+                json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": metadata("app", "canary-config"),
+                    "data": {"DSN": "canary-config-dsn", "DB_HOST": "db.local"},
+                    "binaryData": {"tls.key": "Y2FuYXJ5LWNvbmZpZy1iaW5hcnk="},
+                }),
+                // Sizes are those of the values, not of what replaced them.
+                vec!["DSN: 17 bytes", "DB_HOST: 8 bytes", "tls.key: 20 bytes"],
+            ),
+            (
+                api("", "Secret"),
+                json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": metadata("db", "canary-secret"),
+                    "type": "Opaque",
+                    "data": {"pw": "Y2FuYXJ5LXNlY3JldC1kYXRh"},
+                    "stringData": {"plain": "canary-secret-string"},
+                }),
+                vec!["Type: Opaque", "pw: 18 bytes", "plain: 20 bytes"],
+            ),
+            (
+                api("example.com", "Widget"),
+                json!({
+                    "apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": metadata("w1", "canary-widget"),
+                    "spec": {"env": [{"name": "API_TOKEN", "value": "canary-widget-env"}]},
+                    "status": {"conditions": [{"type": "Ready", "status": "True", "reason": "Ok"}]},
+                }),
+                vec![
+                    "Widget dev/w1",
+                    "Ready = True Ok",
+                    "example.com/owner: team-web",
+                ],
+            ),
+            (
+                api("", "Node"),
+                json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": metadata("n1", "canary-node"),
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }),
+                vec!["example.com/owner: team-web"],
+            ),
+        ]
+    }
+
+    /// Every `canary-…` word and base64 value of a fixture.
+    fn canaries(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                if let Ok(inner) = serde_json::from_str::<Value>(text)
+                    && !inner.is_string()
+                {
+                    canaries(&inner, out);
+                } else if text.starts_with("canary-") || text.starts_with("Y2FuYXJ5") {
+                    out.push(text.clone());
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| canaries(item, out)),
+            Value::Object(map) => map.values().for_each(|item| canaries(item, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn describe_and_table_show_no_more_than_get() {
+        let registry = PluginRegistry::with_builtins();
+        for (api, value, kept) in masked_fixtures() {
+            let obj: DynamicObject = serde_json::from_value(value.clone()).unwrap();
+            let get = finish(&core_apply::to_yaml(&masked_value(&obj)));
+            let describe = finish(&describe_text(&registry, &api, "dev", &obj));
+            let row = finish(&table_row(
+                registry.plugin_for_resource(&api).as_ref(),
+                &obj,
+                &api,
+                Timestamp::now(),
+            ));
+            let mut words = Vec::new();
+            canaries(&value, &mut words);
+            assert!(words.len() >= 5, "{}: {words:?}", api.kind);
+            let mut hidden = 0;
+            for word in &words {
+                if get.contains(word.as_str()) {
+                    continue;
+                }
+                hidden += 1;
+                assert!(!describe.contains(word.as_str()), "{word} in {describe}");
+                assert!(!row.contains(word.as_str()), "{word} in {row}");
+            }
+            assert!(hidden >= 4, "{}: get hides {hidden} of {words:?}", api.kind);
+            assert!(!describe.contains(LAST_APPLIED), "{describe}");
+            assert!(!describe.contains("managedFields"), "{describe}");
+            for text in kept {
+                assert!(describe.contains(text), "{text} not in {describe}");
+            }
+            assert!(row.starts_with(&obj.name_any()), "{row}");
+        }
+    }
+
+    #[test]
+    fn table_cells_survive_masking() {
+        let registry = PluginRegistry::with_builtins();
+        let row = |kind: &str| {
+            let (api, value, _) = masked_fixtures()
+                .into_iter()
+                .find(|(api, ..)| api.kind == kind)
+                .unwrap();
+            let obj: DynamicObject = serde_json::from_value(value).unwrap();
+            let plugin = registry.plugin_for_resource(&api);
+            let raw: Vec<String> = plugin
+                .cells(&obj)
+                .iter()
+                .map(|c| render_cell(c, Timestamp::UNIX_EPOCH))
+                .collect();
+            let row = table_row(plugin.as_ref(), &obj, &api, Timestamp::UNIX_EPOCH);
+            (raw.join("\t"), row)
+        };
+        // Masking changes no cell: counts, types and states stay.
+        for kind in ["Deployment", "Pod", "ConfigMap", "Secret", "Widget", "Node"] {
+            let (raw, masked) = row(kind);
+            assert_eq!(raw, masked, "{kind}");
+        }
+        assert!(row("Secret").1.contains("Opaque\t2"));
+        assert!(row("ConfigMap").1.contains("\t3\t"));
+    }
 
     #[test]
     fn cut_lists_are_noticed() {
@@ -2540,15 +3153,6 @@ mod tests {
         let mut args = Map::new();
         args.insert("kind".into(), json!("Pod"));
         args.insert("allNamespace".into(), json!(true));
-        assert!(matches!(
-            parse::<ListArgs>(&args),
-            Err(ToolError::Denied(_))
-        ));
-        args.remove("allNamespace");
-        args.insert(
-            "fieldSelector".into(),
-            json!("metadata.namespace=kube-system"),
-        );
         assert!(matches!(
             parse::<ListArgs>(&args),
             Err(ToolError::Denied(_))

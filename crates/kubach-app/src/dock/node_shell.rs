@@ -86,6 +86,8 @@ impl ShellPod {
     }
 }
 
+impl EventEmitter<super::TabChanged> for NodeShellTab {}
+
 pub struct NodeShellTab {
     cluster: Entity<Cluster>,
     /// Context the tab was opened in: the pod is created, reconnected to
@@ -101,6 +103,9 @@ pub struct NodeShellTab {
     size: (u16, u16),
     state: SessionState,
     generation: u64,
+    /// The pod and the session are on a context of the vault and end when
+    /// it locks.
+    vault: bool,
     _session: Option<Task<()>>,
     _subscription: Subscription,
     _settings: Option<Subscription>,
@@ -149,6 +154,7 @@ impl NodeShellTab {
             size,
             state: SessionState::Connecting(msg!("dock-node-creating")),
             generation: 0,
+            vault: false,
             _session: None,
             _subscription: subscription,
             _settings: settings,
@@ -187,8 +193,10 @@ impl NodeShellTab {
         self.pod.take()
     }
 
+    /// The dock's tab strip shows the state (and the title).
     fn set_state(&mut self, state: SessionState, cx: &mut Context<Self>) {
         self.state = state;
+        cx.emit(super::TabChanged);
         cx.notify();
     }
 
@@ -207,6 +215,22 @@ impl NodeShellTab {
         cx.notify();
     }
 
+    /// The vault locked: a shell on one of its contexts ends like a closed
+    /// tab's (deleting the pod is the last request of the tab's client),
+    /// and the tab stays to say why (ADR 0008).
+    pub fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.vault) {
+            return;
+        }
+        let held = self.state.is_live() || self.pod.is_some();
+        self.shutdown(cx);
+        if held {
+            let closed = msg!("dock-vault-locked");
+            self.note(&format!("[{closed}]"), cx);
+            self.set_state(SessionState::Exited(closed), cx);
+        }
+    }
+
     /// Connects: creates the pod when the tab has none (or it failed),
     /// waits for it and runs the shell.
     pub fn start(&mut self, cx: &mut Context<Self>) {
@@ -214,15 +238,19 @@ impl NodeShellTab {
         self.input = None;
         self.generation += 1;
         let generation = self.generation;
-        let client =
-            match action_context::tab_connection(self.cluster.read(cx), self.context.as_deref()) {
-                Ok(connection) => connection.client.clone(),
-                Err(error) => {
-                    self.note(&error, cx);
-                    self.set_state(SessionState::Failed(error), cx);
-                    return;
-                }
-            };
+        let tab_client =
+            action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx);
+        let client = match tab_client {
+            Ok(tab) => {
+                self.vault = tab.vault;
+                tab.client
+            }
+            Err(error) => {
+                self.note(&error, cx);
+                self.set_state(SessionState::Failed(error), cx);
+                return;
+            }
+        };
         let (namespace, image) = AppSettings::try_global(cx)
             .map(|settings| {
                 let general = &settings.read(cx).get().general;

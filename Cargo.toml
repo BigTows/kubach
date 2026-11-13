@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 # Versioning: YEAR.MONTH.INC (month without leading zero, INC resets every month)
-version = "2026.11.2"
+version = "2026.11.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/BigTows/kubach"
@@ -24,6 +24,8 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 # macOS only: CFString for the Touch ID prompt text (#80).
 core-foundation = "0.10.1"
+# Benchmarks of `docs/perf.md` (dev-dependency only): no plots, no rayon.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 dirs = "7.0.0"
 flate2 = "1.1.10"
 # Interface translations (ADR 0018): Fluent messages with CLDR plurals.
@@ -32,7 +34,9 @@ fluent-bundle = "0.16.0"
 fluent-syntax = "0.12.0"
 futures = "0.3.34"
 # tree-sitter-yaml: syntax highlighting in the YAML editor.
-gpui-kit = { version = "0.8.0", features = ["tree-sitter-yaml"] }
+gpui-kit = { version = "0.9.1", features = ["tree-sitter-yaml"] }
+# HMAC-SHA256 for the bridge handshake (ADR 0005). Already in the tree.
+hmac = "0.13.0"
 http = "1.5.0"
 # Streaming the body of tool downloads (#131). Already in the tree through kube.
 http-body-util = "0.1.5"
@@ -43,11 +47,11 @@ hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"
 # Local time of the point under the cursor in chart readouts (#376).
 # Already in the tree through k8s-openapi; adds the system time zone.
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
-k8s-openapi = { version = "0.28.0", features = ["latest"] }
+k8s-openapi = { version = "0.29.0", features = ["latest"] }
 # OS credential stores (Keychain, Credential Manager, Secret Service via zbus).
 keyring = "4.2.0"
 # http-proxy / socks5: HTTPS_PROXY for tool downloads (#131) and kubeconfig proxy-url.
-kube = { version = "4.2.0", features = ["runtime", "ws", "http-proxy", "socks5"] }
+kube = { version = "5.0.0", features = ["runtime", "ws", "http-proxy", "socks5"] }
 # Pixel size of downloaded chart icons from their header (#201). Already in
 # the tree through usvg.
 imagesize = "0.15.0"
@@ -108,6 +112,9 @@ resvg = { version = "0.49.0", default-features = false }
 usvg = { version = "0.49.0", default-features = false }
 # Language tags of the Fluent bundles (ADR 0018).
 unic-langid = "0.9.6"
+# Width of log lines in cells, to find the widest one without shaping every
+# line (#143). Already in the tree through gpui-component.
+unicode-width = "0.2.2"
 uuid = { version = "1.28.0", features = ["v4"] }
 # Windows only: Windows Hello key credentials for biometric unlock (#80).
 # Same version as gpui on Windows.
@@ -121,7 +128,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 # the tree on Linux through gpui.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 zeroize = { version = "1.9.1", features = ["derive", "serde"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2"] }
 
 # GPUI is far too slow unoptimized (scrolling stutters), so dependencies are
 # optimized even in dev builds; workspace crates stay fast to rebuild.

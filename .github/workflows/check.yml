@@ -6,6 +6,8 @@
 # branch with pull requests, so this keeps their cache warm. Only those
 # pushes save the cache: a pull request's cache is seen by that pull request
 # alone and would crowd develop's out of the 10 GB limit (#95).
+#
+# Actions are pinned to a commit; Dependabot moves the pins.
 name: Check
 
 on:
@@ -18,8 +20,8 @@ concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+# Each job states what it needs.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,13 +30,19 @@ jobs:
   check:
     name: Develop check
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/linux-deps
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-deps
+      # The action has no releases: the pin is a commit of its master branch.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo fmt --all --check

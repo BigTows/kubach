@@ -330,6 +330,15 @@ impl HelmUpgrade {
         let Ok(request) = self.request(cx) else {
             return;
         };
+        if HelmScreen::vault_locked(&self.target, cx) {
+            self.preview = Some(Preview {
+                request,
+                state: PreviewState::Failed(t!("vault-locked")),
+                _task: Task::ready(()),
+            });
+            cx.notify();
+            return;
+        }
         let helm = HelmScreen::helm_path(cx);
         let target = self.target.clone();
         let task_request = request.clone();

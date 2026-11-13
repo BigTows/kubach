@@ -360,10 +360,12 @@ pub enum ReviewFor {
 }
 
 /// Programs a kubeconfig runs on connect (exec plugins, auth-provider
-/// `cmd-path`) with their environment, and local files it reads, for the
-/// link and import previews. Variables that change how programs run and
-/// files outside the kubeconfig's folder are highlighted. `None` when there
-/// is nothing to show.
+/// `cmd-path`) with their environment, local files it reads, and cluster
+/// settings that change how the connection is made (no certificate check,
+/// a proxy, another TLS server name), for the link and import previews.
+/// Variables that change how programs run, files outside the kubeconfig's
+/// folder and a skipped certificate check are highlighted. `None` when
+/// there is nothing to show.
 pub fn review_section(
     id: &'static str,
     review: &ConfigReview,
@@ -467,6 +469,34 @@ pub fn review_section(
         section = section
             .child(Alert::warning((id, 1usize), message).small())
             .child(div().flex().flex_col().gap_2().pl_1().children(files));
+    }
+    if !review.connection.is_empty() {
+        let settings = review.connection.iter().map(|setting| {
+            let insecure = setting.disables_verification();
+            let owner = t!(
+                "kubeconfig-review-connection-setting",
+                cluster = setting.cluster.as_str(),
+                key = setting.key()
+            );
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if insecure { danger } else { muted })
+                        .child(owner),
+                )
+                .child(
+                    line()
+                        .when(insecure, |line| line.text_color(danger))
+                        .child(setting.value()),
+                )
+        });
+        section = section
+            .child(Alert::warning((id, 2usize), t!("kubeconfig-review-connection")).small())
+            .child(div().flex().flex_col().gap_2().pl_1().children(settings));
     }
     Some(section)
 }

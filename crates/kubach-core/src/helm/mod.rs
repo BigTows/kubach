@@ -17,6 +17,7 @@ pub mod codec;
 pub mod diagnose;
 pub mod diff;
 pub mod live;
+pub mod lookup;
 pub mod manifest;
 pub mod oci;
 pub mod progress;
@@ -35,7 +36,10 @@ pub use chart::StoredChart;
 pub use codec::{decode_chart, decode_release, encode_release, release_from_json};
 pub use diff::{RevisionDiff, diff_revisions, unified_diff};
 pub use live::{DriverChoice, DriverSource, ReleaseFeed};
-pub use manifest::{ManifestDiff, ManifestResource, diff_manifests, manifest_resources};
+pub use manifest::{
+    ManifestDiff, ManifestResource, UnreadDocument, diff_manifests, manifest_resources,
+    strict_documents, strict_resources,
+};
 pub use store::{Driver, ReleaseListing, Releases, StoredRevision};
 pub use values::{ComputedValues, check_values_yaml, coalesce_values, values_to_yaml};
 
@@ -57,6 +61,8 @@ pub enum HelmError {
     Base64(#[from] base64::DecodeError),
     #[error("release payload is not valid gzip: {0}")]
     Gzip(#[source] std::io::Error),
+    #[error("release payload unpacks to more than {limit} bytes")]
+    TooLarge { limit: u64 },
     #[error("release payload is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// Storage objects could not be watched or read (the watch retries).
@@ -69,7 +75,7 @@ impl HelmError {
     pub fn is_forbidden(&self) -> bool {
         match self {
             Self::Api(error) => {
-                matches!(error.as_ref(), kube::Error::Api(status) if status.is_forbidden())
+                matches!(error.as_ref(), kube::Error::Api(status) if crate::api_status::is_forbidden(status))
             }
             Self::Unavailable { forbidden, .. } => *forbidden,
             _ => false,
@@ -297,6 +303,9 @@ mod tests {
     fn detects_forbidden_api_errors() {
         assert!(api_error(403).is_forbidden());
         assert!(!api_error(404).is_forbidden());
+        let no_reason: kube::core::Status =
+            serde_json::from_value(serde_json::json!({"code": 403})).unwrap();
+        assert!(HelmError::from(kube::Error::Api(Box::new(no_reason))).is_forbidden());
         assert!(!HelmError::MissingPayload("x".into()).is_forbidden());
     }
 }

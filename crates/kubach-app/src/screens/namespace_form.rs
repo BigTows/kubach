@@ -46,7 +46,7 @@ pub fn open(cluster: Entity<Cluster>, window: &mut Window, cx: &mut App) {
 /// Readable reason for a failed create.
 fn describe(error: &kube::Error) -> String {
     match error {
-        kube::Error::Api(status) if status.is_forbidden() => {
+        kube::Error::Api(status) if kubach_core::api_status::is_forbidden(status) => {
             t!("editor-namespace-forbidden", message = &status.message)
         }
         kube::Error::Api(status) if !status.message.is_empty() => status.message.clone(),

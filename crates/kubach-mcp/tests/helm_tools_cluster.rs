@@ -18,6 +18,11 @@
 //! and uninstalled with it. Its cluster-scoped objects are deleted at the
 //! end whatever happens; run it with `KUBACH_TEST_NAMESPACE=kubach-test-18`.
 //!
+//! `a_vault_context_runs_a_chart_with_crds_as_the_user` (#113) is the same
+//! flow with the context given as a vault context is: no kubeconfig file,
+//! only a temporary one while helm runs; run it with
+//! `KUBACH_TEST_NAMESPACE=kubach-test-113`.
+//!
 //! `objects_in_another_namespace_run_as_the_user_only_with_consent` (#21)
 //! puts cert-manager's leader election Role into a second namespace
 //! (`<namespace>-b`); run it with `KUBACH_TEST_NAMESPACE=kubach-test-21`. It
@@ -27,6 +32,12 @@
 //! with `valuesPatch` and reads its values masked; run it with
 //! `KUBACH_TEST_NAMESPACE=kubach-test-22`. It creates and deletes the
 //! namespace itself.
+//!
+//! `a_preview_reads_lookup_under_the_service_account` (#114) previews a chart
+//! with `lookup` and a ClusterRole, before and after the session is given
+//! the namespace's Secrets (#173); run it with
+//! `KUBACH_TEST_NAMESPACE=kubach-test-114`. It creates and deletes the
+//! namespace and needs no registry.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,7 +56,7 @@ use kubach_core::plugin::BoxFuture;
 use kubach_mcp::{
     ConfirmationDecision, ConfirmationRequest, Confirmer, HelmAction, HelmCredentials, HelmEnv,
     McpServer, Profile, RequestKind, ScriptedConfirmer, SecurityPolicy, Session, SessionSpec,
-    USER_IDENTITY,
+    USER_IDENTITY, VaultKubeconfig,
 };
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -109,6 +120,7 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let user = Client::try_from(base.clone()).unwrap();
@@ -129,8 +141,9 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     )
     .await;
 
-    // A preview: the dry run's objects and diff for the agent, no change
-    // confirmed and nothing installed (#68).
+    // A preview: the chart's objects and diff for the agent, rendered
+    // without the cluster, no change confirmed and nothing installed (#68,
+    // #173).
     let preview = call(
         &server,
         "helm_install",
@@ -146,17 +159,26 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
     .await;
     assert_eq!(preview["preview"], true, "{preview}");
     assert!(
-        preview["objects"].to_string().contains("Deployment"),
+        preview["summary"]["added"]
+            .to_string()
+            .contains("Deployment"),
         "{preview}"
     );
+    let diff = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": preview["fullDiff"]["previewId"], "kind": "Deployment"}),
+    )
+    .await;
     assert!(
-        preview["diff"]
+        diff["diff"]
             .as_str()
             .unwrap_or_default()
             .contains("kind: Deployment"),
-        "{preview}"
+        "{diff}"
     );
     assert!(!preview.to_string().contains("s3cret-value"), "{preview}");
+    assert!(!diff.to_string().contains("s3cret-value"), "{diff}");
     assert!(
         !confirmer
             .requests()
@@ -208,7 +230,16 @@ async fn the_agent_installs_upgrades_rolls_back_and_uninstalls() {
         unreachable!()
     };
     assert_eq!(helm.action, HelmAction::Install);
-    assert!(!helm.values.contains("s3cret-value"), "{}", helm.values);
+    // The window shows the value the agent sent (#179); its answer does not.
+    assert!(
+        helm.values.contains("password: s3cret-value"),
+        "{}",
+        helm.values
+    );
+    assert!(
+        !installed.to_string().contains("s3cret-value"),
+        "{installed}"
+    );
     assert!(
         helm.identity.starts_with("serviceaccount:"),
         "{}",
@@ -399,7 +430,28 @@ async fn crds_gone(user: &Client, release: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a cluster, helm and quay.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
 async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
+    chart_with_crds(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster, helm and quay.io (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_vault_context_runs_a_chart_with_crds_as_the_user() {
+    chart_with_crds(true).await;
+}
+
+async fn chart_with_crds(in_vault: bool) {
     let (base, context, namespace) = config().await;
+    let kubeconfigs = tempfile::tempdir().unwrap();
+    let helm = HelmEnv {
+        binary: kubach_core::settings::find_on_path("helm"),
+        kubeconfig: (!in_vault).then(|| kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: in_vault.then(|| {
+            let all = Kubeconfig::read().unwrap();
+            let single = kubach_core::kubeconfig::temp::single_context(&all, &context, None);
+            VaultKubeconfig::new(single.unwrap(), kubeconfigs.path().to_owned())
+        }),
+        paths: HelmPaths::from_env(),
+    };
     let user = Client::try_from(base.clone()).unwrap();
     let crds: Api<CustomResourceDefinition> = Api::all(user.clone());
     assert!(
@@ -430,7 +482,7 @@ async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(cert_manager_flow(base, context, flow_namespace))
+            .block_on(cert_manager_flow(base, context, flow_namespace, helm))
     });
     let outcome = tokio::task::spawn_blocking(move || flow.join())
         .await
@@ -446,9 +498,11 @@ async fn a_chart_with_crds_runs_as_the_user_only_with_consent() {
         std::panic::resume_unwind(panic);
     }
     assert!(gone, "the CRDs of the release are still there");
+    let left = std::fs::read_dir(kubeconfigs.path()).unwrap().count();
+    assert_eq!(left, 0, "a temporary kubeconfig stayed on disk");
 }
 
-async fn cert_manager_flow(base: Config, context: String, namespace: String) {
+async fn cert_manager_flow(base: Config, context: String, namespace: String, helm: HelmEnv) {
     let policy = SecurityPolicy {
         mcp_enabled: true,
         temporary_objects: true,
@@ -468,11 +522,7 @@ async fn cert_manager_flow(base: Config, context: String, namespace: String) {
         requests: Mutex::default(),
     });
     let server = McpServer::new(session.clone(), confirmer.clone(), None);
-    server.set_helm(HelmEnv {
-        binary: kubach_core::settings::find_on_path("helm"),
-        kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
-        paths: HelmPaths::from_env(),
-    });
+    server.set_helm(helm);
     let values = format!(
         "crds:\n  enabled: true\n  keep: false\nglobal:\n  leaderElection:\n    namespace: \
          {namespace}\nstartupapicheck:\n  enabled: false\n"
@@ -725,6 +775,7 @@ async fn other_namespace_flow(base: Config, context: String, namespace: String, 
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let user = Client::try_from(base.clone()).unwrap();
@@ -868,6 +919,7 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     server.set_helm(HelmEnv {
         binary: kubach_core::settings::find_on_path("helm"),
         kubeconfig: Some(kubach_core::helm::cli::kubeconfig_files(&[])),
+        vault: None,
         paths: HelmPaths::from_env(),
     });
     let secret = "s3cret-value-22";
@@ -925,6 +977,65 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
     );
     assert_eq!(confirmer.requests().len(), before);
 
+    // Its preview: a summary with the changed values and objects, the full
+    // diff by object (#115).
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({
+            "release": PATCH_RELEASE,
+            "namespace": namespace,
+            "valuesPatch": "replicaCount: 2\nextra:\n  password: another-secret-value\n",
+            "preview": true,
+        }),
+    )
+    .await;
+    let summary = &preview["summary"];
+    assert_eq!(
+        summary["values"],
+        json!([
+            {"path": "extra.password", "change": "changed",
+             "old": format!("*** ({} bytes)", secret.len()), "new": "*** (20 bytes)"},
+            {"path": "replicaCount", "change": "changed", "old": 1, "new": 2},
+        ]),
+        "{preview}"
+    );
+    assert!(
+        summary["changed"].to_string().contains("Deployment"),
+        "{preview}"
+    );
+    let id = &preview["fullDiff"]["previewId"];
+    let values = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": id, "kind": "Values"}),
+    )
+    .await;
+    assert!(
+        values["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+replicaCount: 2"),
+        "{values}"
+    );
+    let objects = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": id, "kind": "Deployment"}),
+    )
+    .await;
+    assert!(
+        objects["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replicas"),
+        "{objects}"
+    );
+    for text in [preview.to_string(), values.to_string(), objects.to_string()] {
+        assert!(!text.contains(secret), "the preview leaks");
+        assert!(!text.contains("another-secret-value"), "the preview leaks");
+    }
+
     // The patch: only the named keys change.
     let upgraded = call(
         &server,
@@ -970,5 +1081,262 @@ async fn values_patch_flow(base: Config, context: String, namespace: String) {
         json!({"release": PATCH_RELEASE, "namespace": namespace}),
     )
     .await;
+    session.close().await.unwrap();
+}
+
+const LOOKUP_RELEASE: &str = "kubach-lookup";
+const LOOKUP_ROLE: &str = "kubach-test-114-reader";
+
+/// A chart that keeps what it generated through `lookup`, and has a
+/// ClusterRole, so its dry run needs the user's credentials. With
+/// `clusterLookup` it reads a Namespace too, which no temporary
+/// ServiceAccount may.
+fn write_lookup_chart(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(
+        dir.join("Chart.yaml"),
+        "apiVersion: v2\nname: keeper\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("values.yaml"), "clusterLookup: false\n").unwrap();
+    std::fs::write(
+        dir.join("templates/kept.yaml"),
+        r#"{{- $old := lookup "v1" "ConfigMap" .Release.Namespace "keeper-id" }}
+{{- $key := lookup "v1" "Secret" .Release.Namespace "keeper-tls" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keeper-id
+data:
+  id: {{ if $old }}{{ $old.data.id }}{{ else }}{{ uuidv4 }}{{ end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keeper-tls
+data:
+  tls.key: {{ if $key }}{{ index $key.data "tls.key" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("templates/cluster.yaml"),
+        format!(
+            r#"{{{{- if .Values.clusterLookup }}}}
+{{{{- $ns := lookup "v1" "Namespace" "" "default" }}}}
+{{{{- end }}}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {LOOKUP_ROLE}
+rules: []
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A preview of a chart with `lookup` that needs the user's credentials
+/// (#114): `lookup` reads the namespace under the temporary ServiceAccount,
+/// and what the ServiceAccount cannot read leaves marks, not an error. Run
+/// it with `KUBACH_TEST_NAMESPACE=kubach-test-114`. The namespace and the
+/// ClusterRole are deleted at the start and at the end whatever happens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster and helm (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE)"]
+async fn a_preview_reads_lookup_under_the_service_account() {
+    let (base, context, namespace) = config().await;
+    let user = Client::try_from(base.clone()).unwrap();
+    let namespaces: Api<Namespace> = Api::all(user.clone());
+    let cluster_roles: Api<ClusterRole> = Api::all(user.clone());
+    let _ = cluster_roles
+        .delete(LOOKUP_ROLE, &DeleteParams::default())
+        .await;
+    assert!(drop_namespaces(&namespaces, &[&namespace]).await);
+    let object: Namespace =
+        serde_json::from_value(json!({"metadata": {"name": namespace}})).unwrap();
+    namespaces
+        .create(&Default::default(), &object)
+        .await
+        .unwrap();
+    let flow_namespace = namespace.clone();
+    let flow = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(lookup_flow(base, context, flow_namespace))
+    });
+    let outcome = tokio::task::spawn_blocking(move || flow.join())
+        .await
+        .unwrap();
+    let _ = cluster_roles
+        .delete(LOOKUP_ROLE, &DeleteParams::default())
+        .await;
+    let dropped = drop_namespaces(&namespaces, &[&namespace]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(dropped, "the test's namespace is still there");
+}
+
+async fn lookup_flow(base: Config, context: String, namespace: String) {
+    use kubach_core::helm::Driver;
+    use kubach_core::helm::Sensitive;
+    use kubach_core::helm::cli::{self as helm_cli, HelmTarget, InstallRequest, SecretEnv};
+
+    let binary = kubach_core::settings::find_on_path("helm");
+    let chart = tempfile::tempdir().unwrap();
+    write_lookup_chart(chart.path());
+    // The release as the test's user: its chart is kept in the release,
+    // which an upgrade without `chart` takes.
+    let target = HelmTarget {
+        context: context.clone(),
+        kubeconfig: helm_cli::kubeconfig_files(&[]),
+        namespace: namespace.clone(),
+        driver: Driver::Secret,
+        secret_env: SecretEnv::default(),
+        memory: None,
+        working_dir: None,
+    };
+    helm_cli::install(
+        binary.as_deref(),
+        &target,
+        &InstallRequest {
+            release: LOOKUP_RELEASE.into(),
+            chart: chart.path().display().to_string(),
+            version: None,
+            values: Sensitive::new(String::new()),
+            create_namespace: false,
+        },
+        false,
+        Duration::from_secs(120),
+    )
+    .await
+    .unwrap();
+
+    let policy = SecurityPolicy {
+        mcp_enabled: true,
+        temporary_objects: true,
+        ..SecurityPolicy::default()
+    };
+    let spec = SessionSpec {
+        context,
+        server_url: base.cluster_url.to_string(),
+        namespaces: Vec::new(),
+        profile: Profile::Deploy,
+        ttl: Some(Duration::from_secs(900)),
+        hints: Vec::new(),
+    };
+    let session = Session::start(&base, &spec, &policy).await.unwrap();
+    let confirmer = Arc::new(ScriptedConfirmer::approving());
+    let server = McpServer::new(session.clone(), confirmer.clone(), None);
+    server.set_helm(HelmEnv {
+        binary,
+        kubeconfig: Some(helm_cli::kubeconfig_files(&[])),
+        vault: None,
+        paths: HelmPaths::from_env(),
+    });
+    let user = Client::try_from(base.clone()).unwrap();
+    let roles: Api<Role> = Api::namespaced(user.clone(), &namespace);
+    let role = format!("kubach-mcp-{}", session.id());
+
+    let secret_rules = |rules: &[k8s_openapi::api::rbac::v1::PolicyRule]| {
+        rules.iter().any(|rule| {
+            rule.resources
+                .iter()
+                .flatten()
+                .any(|resource| resource == "secrets")
+        })
+    };
+    // The chart's lookup reads a Secret, which this session was not given:
+    // the render under the ServiceAccount fails, its objects are marked,
+    // and the Role gets no Secrets for it (#173).
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert!(
+        preview["lookup"]["objects"]
+            .to_string()
+            .contains("Secret keeper-tls"),
+        "{preview}"
+    );
+    let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
+    assert!(!secret_rules(&rules), "{rules:?}");
+
+    // The user gives the session the namespace's Secrets (as list_secrets
+    // asks): now what the release has is read, the generated id and key
+    // stay, and the diff has no false change.
+    call(&server, "list_secrets", json!({"namespace": namespace})).await;
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "read", "{preview}");
+    assert!(
+        !preview["summary"]["secretKeys"]
+            .to_string()
+            .contains("tls.key"),
+        "{preview}"
+    );
+    let page = call(
+        &server,
+        "helm_preview_diff",
+        json!({"previewId": preview["fullDiff"]["previewId"]}),
+    )
+    .await;
+    let diff = page["diff"].as_str().unwrap_or_default();
+    assert!(!diff.contains("id:"), "{diff}");
+    assert!(!diff.contains("tls.key"), "{diff}");
+    assert!(
+        preview["needsTheUsersAttention"]
+            .to_string()
+            .contains("ClusterRole"),
+        "{preview}"
+    );
+
+    // The Secrets it read are the ones the session was given.
+    let rules = roles.get(&role).await.unwrap().rules.unwrap_or_default();
+    assert!(secret_rules(&rules), "{rules:?}");
+
+    // A lookup the ServiceAccount cannot do: the render without the cluster,
+    // with its marks.
+    let preview = call(
+        &server,
+        "helm_upgrade",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace, "preview": true,
+               "valuesPatch": "clusterLookup: true\n"}),
+    )
+    .await;
+    assert_eq!(preview["lookup"]["status"], "unavailable", "{preview}");
+    assert_eq!(
+        preview["lookup"]["objects"],
+        json!([
+            "Secret keeper-tls",
+            "ConfigMap keeper-id",
+            "ClusterRole kubach-test-114-reader"
+        ]),
+        "{preview}"
+    );
+    assert_eq!(preview["lookup"]["wholePreview"], false, "{preview}");
+
+    // Nobody was asked for either preview, and nothing changed.
+    assert!(helm_changes(&confirmer.requests()).is_empty());
+    let revisions = call(
+        &server,
+        "helm_release_history",
+        json!({"release": LOOKUP_RELEASE, "namespace": namespace}),
+    )
+    .await;
+    assert_eq!(
+        revisions.to_string().matches("\"revision\"").count(),
+        1,
+        "{revisions}"
+    );
     session.close().await.unwrap();
 }

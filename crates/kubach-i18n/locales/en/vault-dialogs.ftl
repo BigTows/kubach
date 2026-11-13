@@ -123,6 +123,11 @@ vault-enter-new-password = Enter a password
 vault-password-changed = Vault password changed
 vault-password-text = Everything in the vault is encrypted again with a new key.
 vault-change = Change
+vault-keychain-off-title = Stop remembering in the system keychain
+vault-keychain-off-text = Enter the vault password. Everything in the vault is encrypted again with a new key, so the key that was kept in the system keychain no longer opens it.
+vault-biometric-off-title = Turn off unlocking with { $method }
+vault-biometric-off-text = Enter the vault password. Everything in the vault is encrypted again with a new key, so the { $method } key no longer opens it.
+vault-turn-off = Turn off
 vault-reset-title = Reset the vault?
 vault-reset-description =
     { $count ->

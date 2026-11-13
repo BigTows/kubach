@@ -17,6 +17,10 @@
 //! A blocked pod stops the drain before anything is evicted, as in kubectl;
 //! the node stays cordoned. A PodDisruptionBudget refusal is retried with
 //! backoff until the timeout.
+//!
+//! The agent's `drain_node` (#105) plans with [`eviction_plan`], never
+//! force and never a direct delete, and removes exactly the pods the user
+//! approved with [`remove_pods`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -234,7 +238,8 @@ fn is_finished(pod: &Pod) -> bool {
     )
 }
 
-fn has_empty_dir(pod: &Pod) -> bool {
+/// Whether the pod has `emptyDir` volumes, whose data its eviction loses.
+pub fn has_empty_dir(pod: &Pod) -> bool {
     pod.spec
         .as_ref()
         .and_then(|spec| spec.volumes.as_ref())
@@ -270,8 +275,32 @@ pub fn verdict(pod: &Pod, options: &DrainOptions) -> Verdict {
     Verdict::Evict
 }
 
+/// [`verdict`] for a drain that only goes through the Eviction API: a
+/// finished pod with a controller is evicted instead of deleted, one
+/// without stays, like every pod nothing recreates.
+pub fn eviction_verdict(pod: &Pod, options: &DrainOptions) -> Verdict {
+    match verdict(pod, options) {
+        Verdict::Delete if controller_kind(pod).is_none() => Verdict::Block(Block::NoController),
+        Verdict::Delete => Verdict::Evict,
+        other => other,
+    }
+}
+
 /// The drain of `pods` (the node's) with `options`, sorted by pod.
 pub fn plan(pods: &[Pod], options: &DrainOptions) -> DrainPlan {
+    plan_with(pods, options, verdict)
+}
+
+/// [`plan`] by [`eviction_verdict`].
+pub fn eviction_plan(pods: &[Pod], options: &DrainOptions) -> DrainPlan {
+    plan_with(pods, options, eviction_verdict)
+}
+
+fn plan_with(
+    pods: &[Pod],
+    options: &DrainOptions,
+    verdict: fn(&Pod, &DrainOptions) -> Verdict,
+) -> DrainPlan {
     let mut pods: Vec<(PodKey, Verdict)> = pods
         .iter()
         .filter(|pod| {
@@ -331,10 +360,20 @@ pub async fn node_pods(
 
 /// Marks `node` unschedulable (`kubectl cordon`).
 pub async fn cordon(client: &Client, node: &str) -> Result<(), kube::Error> {
+    set_cordoned(client, node, true, &PatchParams::default()).await
+}
+
+/// Marks `node` unschedulable or schedulable again (`kubectl cordon` and
+/// `uncordon`).
+pub async fn set_cordoned(
+    client: &Client,
+    node: &str,
+    cordon: bool,
+    params: &PatchParams,
+) -> Result<(), kube::Error> {
     let api: Api<Node> = Api::all(client.clone());
-    let patch = crate::plugin::builtin::cordon_patch(true);
-    api.patch(node, &PatchParams::default(), &Patch::Strategic(patch))
-        .await?;
+    let patch = crate::plugin::builtin::cordon_patch(cordon);
+    api.patch(node, params, &Patch::Strategic(patch)).await?;
     Ok(())
 }
 
@@ -367,9 +406,10 @@ fn failure(object: String, reason: Message) -> BulkFailure {
 /// A failure of the whole drain (cordon or listing), before any pod:
 /// `what` makes the reason from the API server's error.
 fn whole_failure(node: &str, what: fn(Message) -> Message, error: &kube::Error) -> DrainReport {
-    let forbidden = matches!(error, kube::Error::Api(status) if status.is_forbidden());
+    let forbidden =
+        matches!(error, kube::Error::Api(status) if crate::api_status::is_forbidden(status));
     let reason = what(match error {
-        kube::Error::Api(status) if status.is_forbidden() => {
+        kube::Error::Api(status) if crate::api_status::is_forbidden(status) => {
             msg!("action-error-forbidden", error = &status.message)
         }
         kube::Error::Api(status) => error_text(&status.message),
@@ -437,6 +477,25 @@ pub async fn drain(
     }
     let work: Vec<(PodKey, Verdict)> = plan.removed().cloned().collect();
     on_event(DrainEvent::Planned { total: work.len() });
+    let left = deadline.saturating_duration_since(Instant::now());
+    let summary = remove_pods(&client, work, left, cancel, || {
+        on_event(DrainEvent::PodDone);
+    })
+    .await;
+    DrainReport { summary, skipped }
+}
+
+/// Removes exactly `work` (from a plan), each pod by its UID: a pod that
+/// came later under the same name is left alone. `timeout` covers budget
+/// retries and waiting for the pods to go; `on_done` runs per pod.
+pub async fn remove_pods(
+    client: &Client,
+    work: Vec<(PodKey, Verdict)>,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    mut on_done: impl FnMut(),
+) -> BulkSummary {
+    let deadline = Instant::now() + timeout;
     let results = run_bounded(
         work,
         CONCURRENCY,
@@ -445,7 +504,7 @@ pub async fn drain(
             let cancel = cancel.clone();
             async move { remove_pod(&client, &key, verdict, deadline, &cancel).await }
         },
-        |_, _| on_event(DrainEvent::PodDone),
+        |_, _| on_done(),
     )
     .await;
     let mut summary = BulkSummary::default();
@@ -456,7 +515,7 @@ pub async fn drain(
         }
     }
     summary.failures.sort_by(|a, b| a.object.cmp(&b.object));
-    DrainReport { summary, skipped }
+    summary
 }
 
 /// Evicts (retrying PDB refusals with backoff) or deletes one pod, then
@@ -589,6 +648,11 @@ pub fn selector_matches(selector: &LabelSelector, labels: &BTreeMap<String, Stri
 /// The refusal a budget covering `pod` gives now (it allows no
 /// disruption), from its status: `needs 2 healthy pods and has 2`.
 pub fn budget_refusal(budget: &PodDisruptionBudget, pod: &Pod) -> Option<EvictError> {
+    // The API server evicts these whatever the budgets say.
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    if matches!(phase, Some("Succeeded" | "Failed" | "Pending")) {
+        return None;
+    }
     let spec = budget.spec.as_ref()?;
     let selector = spec.selector.as_ref()?;
     if !selector_matches(selector, pod.labels()) {
@@ -635,7 +699,7 @@ async fn pause(duration: Duration, cancel: &AtomicBool) -> bool {
 
 fn kube_reason(error: &kube::Error) -> Message {
     match error {
-        kube::Error::Api(status) if status.is_forbidden() => {
+        kube::Error::Api(status) if crate::api_status::is_forbidden(status) => {
             msg!("action-error-forbidden", error = &status.message)
         }
         kube::Error::Api(status) if !status.message.is_empty() => error_text(&status.message),
@@ -823,6 +887,24 @@ mod tests {
     }
 
     #[test]
+    fn eviction_plans_never_delete_and_leave_bare_finished_pods() {
+        let opts = DrainOptions::default();
+        let mut done = owned_by("Job");
+        merge(&mut done, json!({"status": {"phase": "Succeeded"}}));
+        let done = pod("job-1", done);
+        assert_eq!(verdict(&done, &opts), Verdict::Delete);
+        assert_eq!(eviction_verdict(&done, &opts), Verdict::Evict);
+        let bare = pod("job-2", json!({"status": {"phase": "Failed"}}));
+        assert_eq!(verdict(&bare, &opts), Verdict::Delete);
+        assert_eq!(
+            eviction_verdict(&bare, &opts),
+            Verdict::Block(Block::NoController)
+        );
+        let plan = eviction_plan(&[done, bare], &opts);
+        assert!(plan.pods.iter().all(|(_, v)| *v != Verdict::Delete));
+    }
+
+    #[test]
     fn commands_and_notes() {
         let mut opts = DrainOptions::default();
         assert_eq!(
@@ -882,6 +964,12 @@ mod tests {
         assert!(budget_refusal(&budget(0, json!({"matchLabels": {"app": "db"}})), &web).is_none());
         // An empty selector covers every pod of the namespace.
         assert!(budget_refusal(&budget(0, json!({})), &web).is_some());
+        // Budgets guard running pods only.
+        let finished = pod(
+            "web-2",
+            json!({"metadata": {"labels": {"app": "web"}}, "status": {"phase": "Failed"}}),
+        );
+        assert!(budget_refusal(&budget(0, json!({})), &finished).is_none());
 
         let exprs = |op: &str, values: Value| -> LabelSelector {
             serde_json::from_value(json!({"matchExpressions": [

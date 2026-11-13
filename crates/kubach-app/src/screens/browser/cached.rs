@@ -20,10 +20,21 @@ pub(super) struct DiskLists {
 }
 
 impl DiskLists {
-    /// `None` without a config directory.
-    pub fn new() -> Option<Self> {
+    /// `None` without a config directory. Lists still waiting to be stored
+    /// are stored when the app quits (for as long as the quit waits: a
+    /// write that is cut short leaves the previous file).
+    pub fn new(cx: &mut Context<ResourceBrowser>) -> Option<Self> {
         let cache = ListCache::in_config_dir()?;
         let writer = ListWriter::new(cache.clone());
+        cx.on_app_quit(|this, _| {
+            let stored = this.disk.as_ref().map(|disk| disk.writer.flushed());
+            async move {
+                if let Some(stored) = stored {
+                    stored.await.ok();
+                }
+            }
+        })
+        .detach();
         Some(Self { cache, writer })
     }
 }
@@ -108,7 +119,12 @@ impl ResourceBrowser {
     }
 
     /// Starts reading the cached list for a live view that is still loading.
+    /// Called for every new view: the lists of the view it replaced will
+    /// not change here any more, so they are stored now.
     pub(super) fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some(disk) = &self.disk {
+            disk.writer.flush();
+        }
         let Some(view) = &self.view else {
             return;
         };
@@ -138,8 +154,10 @@ impl ResourceBrowser {
     }
 
     /// Stores the loaded watches of the view, one entry per namespace (or
-    /// one for all namespaces). Called on every change: the writer stores
-    /// at most once per `WRITE_DELAY`.
+    /// one for all namespaces). Called on every change: the writer stores a
+    /// list soon after it is first loaded, then at most once per
+    /// `WRITE_INTERVAL`, and skips the list it has stored already. Nothing
+    /// is queued for a context that is not cached (one of the vault).
     pub(super) fn save_to_cache(&self) {
         let (Some(disk), Some(view)) = (&self.disk, &self.view) else {
             return;

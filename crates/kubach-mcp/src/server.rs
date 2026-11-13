@@ -14,13 +14,18 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::Access;
 use crate::audit::{AuditEntry, AuditLog, DecidedBy};
-use crate::confirm::Confirmer;
+use crate::confirm::{AnnouncingConfirmer, Confirmer};
+use crate::event_tools::MAX_SINCE_SECONDS;
 use crate::grants::Grant;
 use crate::helm_tools::HelmEnv;
 use crate::masking::mask_audit_args;
+use crate::names::{UNKNOWN_CLIENT, clean_client_name};
+use crate::node_host::NodeShellPrefs;
+use crate::node_tools::PrometheusPlan;
 use crate::rules::writes_secrets;
 use crate::session::Session;
 use crate::settings::Profile;
@@ -40,6 +45,12 @@ struct Inner {
     audit: Option<Arc<AuditLog>>,
     /// The user's `helm` (#418); without it the Helm tools are not offered.
     helm: std::sync::RwLock<Option<Arc<HelmEnv>>>,
+    /// The Prometheus the user chose for a context (#112); without it
+    /// `top_nodes` needs metrics-server.
+    prometheus: std::sync::RwLock<Option<PrometheusPlan>>,
+    /// Namespace and image of node shell pods from the user's settings,
+    /// for `node_host_read` (#106); the defaults without it.
+    node_shell: std::sync::RwLock<Option<NodeShellPrefs>>,
 }
 
 /// Outcome of one call, as the agent sees it.
@@ -69,6 +80,8 @@ impl McpServer {
                 confirmer,
                 audit,
                 helm: std::sync::RwLock::new(None),
+                prometheus: std::sync::RwLock::new(None),
+                node_shell: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -76,6 +89,19 @@ impl McpServer {
     /// Offers the Helm tools with the user's `helm` (#418).
     pub fn set_helm(&self, env: HelmEnv) {
         *sync::write(&self.inner.helm) = Some(Arc::new(env));
+    }
+
+    /// Lets `top_nodes` answer from the context's Prometheus where there is
+    /// no metrics-server (#112): `plan` reads the user's choice for a
+    /// context (ADR 0009).
+    pub fn set_prometheus(&self, plan: PrometheusPlan) {
+        *sync::write(&self.inner.prometheus) = Some(plan);
+    }
+
+    /// Puts the pods of `node_host_read` where the user's node shells go
+    /// (#106): `prefs` reads Settings → General → Terminal.
+    pub fn set_node_shell(&self, prefs: NodeShellPrefs) {
+        *sync::write(&self.inner.node_shell) = Some(prefs);
     }
 
     /// Runs the session's port-forwards in `manager`: the app's, so they
@@ -113,6 +139,8 @@ impl McpServer {
                         .find("metrics.k8s.io", "PodMetrics")
                         .is_some(),
                     "get_secret_value" => scope.policy.reveal_allowed(),
+                    // Refused in a pinned session; drain_node still previews.
+                    "cordon_node" | "uncordon_node" | "node_host_read" => !scope.pinned(),
                     _ => true,
                 };
                 let needed = tool_access(spec.name);
@@ -122,13 +150,14 @@ impl McpServer {
                 let note = needed
                     .and_then(|needed| have.missing(needed))
                     .map(|missing| {
+                        let asked = missing.asked();
                         let each = if confirms_each_call(spec.name) {
                             " Allowing it approves no call: each one is still confirmed."
                         } else {
                             ""
                         };
                         format!(
-                            " Requires your approval in Kubach: this needs {missing}, beyond this \
+                            " Requires your approval in Kubach: this needs {asked}, beyond this \
                          session's access ({have}); the first call asks the user to allow it \
                          (for this session or by default on this cluster).{each}"
                         )
@@ -152,21 +181,53 @@ impl McpServer {
         args: Map<String, Value>,
         progress: Option<tools::Progress>,
     ) -> CallOutcome {
+        self.call_cancellable(client, tool, args, progress, CancellationToken::new())
+            .await
+    }
+
+    /// [`McpServer::call_with_progress`] for a call `cancel` can stop: rmcp
+    /// lets a cancelled call run on, only the tool can end it (#109). It
+    /// ends as any call does, with its audit line.
+    pub(crate) async fn call_cancellable(
+        &self,
+        client: &str,
+        tool: &str,
+        args: Map<String, Value>,
+        progress: Option<tools::Progress>,
+        cancel: CancellationToken,
+    ) -> CallOutcome {
         let started = Instant::now();
+        // A name that did not come through `client_name` (a relayed call)
+        // is cleaned as well.
+        let client = &clean_client_name(client);
         self.inner.session.note_call(client);
+        let confirmer = AnnouncingConfirmer {
+            confirmer: self.inner.confirmer.as_ref(),
+            waiting: self.inner.session.waiting(),
+            progress: progress.as_ref(),
+        };
+        let audit_object = |object: tools::ObjectAudit| {
+            if let Some(audit) = &self.inner.audit {
+                let _ = audit.record(&self.object_entry(client, tool, object));
+            }
+        };
         let ctx = Ctx {
             session: &self.inner.session,
             registry: &self.inner.registry,
-            confirmer: self.inner.confirmer.as_ref(),
+            confirmer: &confirmer,
             client_name: client,
             tool,
             decisions: std::sync::Mutex::new(Vec::new()),
             accesses: std::sync::Mutex::new(Vec::new()),
             helm: self.helm(),
-            progress,
+            prometheus: sync::read(&self.inner.prometheus).clone(),
+            node_shell: sync::read(&self.inner.node_shell).clone(),
+            progress: progress.clone(),
+            cancel,
             namespace: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(None),
             remembered: std::sync::Mutex::new(None),
+            audit_object: &audit_object,
         };
         let result = tools::run(&ctx, tool, &args).await;
         let decisions = sync::into_inner(ctx.decisions);
@@ -282,6 +343,28 @@ impl McpServer {
         Ok(())
     }
 
+    /// The audit line of one object of a batch (#108).
+    fn object_entry(&self, client: &str, tool: &str, object: tools::ObjectAudit) -> AuditEntry {
+        AuditEntry {
+            time: Timestamp::now().to_string(),
+            session: self.inner.session.id().to_owned(),
+            client: client.to_owned(),
+            tool: tool.to_owned(),
+            args: object.args,
+            change: None,
+            decided_by: object.decided_by,
+            remembered: None,
+            allowed: object.allowed,
+            reason: object.reason,
+            identity: self
+                .inner
+                .session
+                .describe_identity(Some(&object.namespace)),
+            result: object.result,
+            duration_ms: 0,
+        }
+    }
+
     /// The audit line of one answer for a right.
     fn grant_entry(&self, client: &str, tool: &str, decision: &GrantDecision) -> AuditEntry {
         AuditEntry {
@@ -376,7 +459,9 @@ impl McpServer {
             )
         } else {
             "Pass `namespace` to the tools; list_namespaces shows the namespaces Kubach knows \
-             of. Any namespace works, as many as you need."
+             of. Any namespace works, as many as you need. For a question about all of them, \
+             pass allNamespaces to list_resources or list_events instead of calling namespace \
+             by namespace, and read the coverage note: it says what was left out."
                 .to_owned()
         };
         let more = " Tools beyond your access are marked \"Requires your approval in Kubach\": \
@@ -388,7 +473,9 @@ impl McpServer {
              helm_release_history and helm_get_values (a release's values, secrets masked) read \
              Helm's storage Secrets, so they need access to Secrets like list_secrets; \
              helm_install, helm_upgrade, helm_rollback and helm_uninstall run a server-side dry \
-             run that the user approves in Kubach. To change a few values of a release, pass \
+             run that the user approves in Kubach. With preview, helm_install and helm_upgrade \
+             answer with a summary and helm_preview_diff pages the full diff of that render. To \
+             change a few values of a release, pass \
              only them to helm_upgrade as valuesPatch: Kubach merges it into the release's \
              values (values replaces them all). A chart with \
              cluster-scoped objects (CRDs, ClusterRoles, webhooks), RBAC or objects in other \
@@ -400,9 +487,12 @@ impl McpServer {
         format!(
             "Kubach gives you access to Kubernetes namespaces of context {}. Your access: \
              {access}. Access says which tools you may call without asking for more; it \
-             approves no change. {CONFIRMED}{more}{helm} {namespaces} Cluster-scoped resources \
+             approves no change. {CONFIRMED}{more} {WAITS}{helm} {namespaces} Cluster-scoped resources \
              and calls across all namespaces are not available, except nodes: list_nodes, \
-             describe_node and top_nodes read them (they need access to nodes). For images \
+             describe_node and top_nodes read them (they need access to nodes), and \
+             cordon_node, uncordon_node and drain_node change them with the user's credentials \
+             (they need access to nodes and changes; drain_node with preview shows the pods \
+             first). For images \
              without a shell (distroless) use debug_container, then exec into it. \
              {secrets}{writes} Call \
              `session_info` for details.",
@@ -432,35 +522,14 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let client = client_name(&context);
-        // Live phases of a long call as MCP progress notifications, when
-        // the client asked for them with a progress token.
-        let progress: Option<tools::Progress> = request
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get_progress_token())
-            .map(|token| {
-                let peer = context.peer.clone();
-                let step = Arc::new(std::sync::atomic::AtomicU32::new(0));
-                Arc::new(move |phase: String| {
-                    let peer = peer.clone();
-                    let token = token.clone();
-                    let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    tokio::spawn(async move {
-                        let _ = peer
-                            .notify_progress(
-                                rmcp::model::ProgressNotificationParam::new(token, f64::from(n))
-                                    .with_message(phase),
-                            )
-                            .await;
-                    });
-                }) as tools::Progress
-            });
+        let progress = progress_of(&context);
         let outcome = self
-            .call_with_progress(
+            .call_cancellable(
                 &client,
                 &request.name,
                 request.arguments.unwrap_or_default(),
                 progress,
+                context.ct.clone(),
             )
             .await;
         let content = vec![ContentBlock::text(outcome.text)];
@@ -473,11 +542,35 @@ impl ServerHandler for McpServer {
     }
 }
 
-/// The MCP client's self-reported name (for the audit log only; it is not
-/// authenticated).
+/// Live phases of a call and waits for the user (#116) as MCP progress
+/// notifications, when the client asked for them with a progress token.
+pub(crate) fn progress_of(context: &RequestContext<RoleServer>) -> Option<tools::Progress> {
+    // rmcp hands `_meta` to the handler here, not in the request's params.
+    let token = context.meta.get_progress_token()?;
+    let peer = context.peer.clone();
+    let step = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    Some(Arc::new(move |phase: String| {
+        let peer = peer.clone();
+        let token = token.clone();
+        let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            let _ = peer
+                .notify_progress(
+                    rmcp::model::ProgressNotificationParam::new(token, f64::from(n))
+                        .with_message(phase),
+                )
+                .await;
+        });
+    }))
+}
+
+/// The MCP client's self-reported name, for showing only: it is not
+/// authenticated. The client writes it, so it is cleaned here, once, for
+/// everything that shows or records it: windows, notifications, the
+/// sessions list, the audit log ([`clean_client_name`]).
 pub(crate) fn client_name(context: &RequestContext<RoleServer>) -> String {
     if let Some(info) = context.peer.peer_info() {
-        return info.client_info.name.clone();
+        return clean_client_name(&info.client_info.name);
     }
     serde_json::to_value(&context.meta)
         .ok()
@@ -485,9 +578,9 @@ pub(crate) fn client_name(context: &RequestContext<RoleServer>) -> String {
             meta.get("io.modelcontextprotocol/clientInfo")?
                 .get("name")?
                 .as_str()
-                .map(str::to_owned)
+                .map(clean_client_name)
         })
-        .unwrap_or_else(|| "unknown".into())
+        .unwrap_or_else(|| UNKNOWN_CLIENT.into())
 }
 
 // ------------------------------------------------------------- tool catalog
@@ -506,18 +599,33 @@ struct ToolSpec {
 /// [`Confirmation::Required`](crate::policy::Confirmation::Required), and
 /// only what [`rememberable`](crate::remember::rememberable) allows may
 /// skip the window after "don't ask again".
-const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets), \
+const CONFIRMED: &str = "Every change (apply, scale, restarts, deletions, Helm, Secrets, nodes), \
      command in a container and port-forward (port_forward_start, on 127.0.0.1 of the user's \
      machine) is previewed and confirmed by the user one by one, even within your access. The \
      user may tick \"don't ask again\" for one kind of change in one namespace for this session \
-     (not for deletions or Secrets); the result of such a call then says it was approved that \
-     way.";
+     (not for deletions, Secrets or changes to nodes), or for one exact node_host_read command \
+     on one node; the result of such a call then says it was approved that way. For many objects use scale_batch and rollout_restart_batch: one window lists them all.";
+
+/// Whether a call of `tool` ends when it is cancelled. A relayed call of
+/// any other tool runs on as before, a change above all.
+pub(crate) fn stops_on_cancel(tool: &str) -> bool {
+    tool == "wait_for_condition"
+}
+
+/// What the agent is told about calls waiting for the user (#116): only
+/// clients that send a progress token get a notification.
+pub(crate) const WAITS: &str = "A call that needs the user's answer waits for it in the Kubach \
+     window, for at most 5 minutes, and may look stuck: Kubach says so in a progress notification \
+     if your client asks for those, and session_info lists such calls under waitingForUser at any \
+     time. Tell the user to look at the Kubach window instead of repeating the call.";
 
 /// Whether every real call of tool `name` is confirmed by the user (a dry
 /// run of `apply_manifest` is not).
 fn confirms_each_call(name: &str) -> bool {
-    matches!(name, "exec" | "debug_container" | "port_forward_start")
-        || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
+    matches!(
+        name,
+        "exec" | "debug_container" | "port_forward_start" | "node_host_read"
+    ) || tool_access(name).is_some_and(|needed| needed.profile == Profile::Deploy)
 }
 
 /// What a tool needs of the access, where the user may raise it (#15).
@@ -535,8 +643,17 @@ fn tool_access(name: &str) -> Option<Access> {
         "get_logs" | "exec" | "debug_container" | "port_forward_start" => {
             need(Profile::Debug, false)
         }
-        "apply_manifest" | "scale" | "rollout_restart" | "delete_resource" | "helm_install"
-        | "helm_upgrade" | "helm_rollback" | "helm_uninstall" => need(Profile::Deploy, false),
+        "apply_manifest"
+        | "scale"
+        | "scale_batch"
+        | "rollout_restart"
+        | "rollout_restart_batch"
+        | "delete_resource"
+        | "helm_install"
+        | "helm_upgrade"
+        | "helm_rollback"
+        | "helm_uninstall"
+        | "helm_preview_diff" => need(Profile::Deploy, false),
         "request_secret_input" | "copy_secret" | "delete_secret" => need(Profile::Deploy, true),
         "list_secrets"
         | "check_secret"
@@ -546,6 +663,16 @@ fn tool_access(name: &str) -> Option<Access> {
         | "helm_release_history"
         | "helm_get_values" => need(Profile::ReadOnly, true),
         "list_nodes" | "describe_node" | "top_nodes" => Some(Access {
+            nodes: true,
+            ..Access::NONE
+        }),
+        "cordon_node" | "uncordon_node" | "drain_node" => Some(Access {
+            profile: Profile::Deploy,
+            nodes: true,
+            ..Access::NONE
+        }),
+        "node_host_read" => Some(Access {
+            profile: Profile::Debug,
             nodes: true,
             ..Access::NONE
         }),
@@ -580,6 +707,24 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
     })
 }
 
+/// The `fields` argument of `get_resource` and `list_resources` (#110).
+fn fields_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 32,
+        "description": "Only these fields of each object, masked as in the whole object; \
+                        metadata.name and metadata.namespace are always kept. A path is keys \
+                        joined by dots, with [N] or [*] for list items and ['key'] for a key \
+                        with dots or slashes: spec.strategy.type, \
+                        spec.template.spec.containers[*].image, \
+                        metadata.labels['app.kubernetes.io/name']. Paths that match nothing in \
+                        an object are listed under fieldsNotFound in it; a malformed path is an \
+                        error",
+    })
+}
+
 fn kind_props(extra: Value) -> Value {
     let mut props = json!({
         "kind": {"type": "string", "description": "Kind or plural resource, e.g. Deployment or deployments"},
@@ -592,10 +737,33 @@ fn kind_props(extra: Value) -> Value {
     props
 }
 
+/// What `scale_batch` and `rollout_restart_batch` take (#108): `object` is
+/// one item of `objects`, `extra` the tool's own arguments.
+fn batch_props(object: Value, extra: Value) -> Value {
+    let mut props = kind_props(json!({
+        "objects": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": crate::batch_tools::MAX_OBJECTS,
+            "description": "The objects to change; kind and namespace default to the top-level ones. Not with labelSelector",
+            "items": object_schema(object, &["name"]),
+        },
+        "labelSelector": {"type": "string", "description": "Instead of objects: every object of `kind` that matches, found before the user is asked"},
+        "namespaces": {"type": "array", "items": {"type": "string"}, "description": "With labelSelector: several namespaces instead of `namespace`"},
+        "allNamespaces": {"type": "boolean", "description": "With labelSelector: every namespace this session may read, as in list_resources"},
+    }));
+    if let (Some(props), Value::Object(extra)) = (props.as_object_mut(), extra) {
+        props.extend(extra);
+    }
+    props
+}
+
 /// How helm_install and helm_upgrade describe `preview` (#68).
-const PREVIEW_HELP: &str = "Only show what would change: the server-side dry run's objects and \
-     masked manifest diff (and values diff), without asking the user or changing anything. Call \
-     again without preview to do it";
+const PREVIEW_HELP: &str = "Only show what would change, as a short summary of a helm template \
+     render (no server-side dry run: that runs when you call without preview): objects added, \
+     changed and removed, image changes, changed ConfigMap and Secret keys and changed values, \
+     secrets masked, without asking the user or changing anything. helm_preview_diff gives the \
+     full diff by previewId. Call again without preview to do it";
 
 /// How tools describe their `namespace` argument (#401).
 const NAMESPACE_HELP: &str = "Namespace to act in; may be left out once the session has exactly \
@@ -635,11 +803,20 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_resources",
-            description: "List resources of a kind in the session namespace, as a table.",
+            description: "List resources of a kind in a namespace, as a table; with fields, as one \
+                          YAML document per object, holding only those fields. With allNamespaces \
+                          true: in every namespace this session may read, one by one under each \
+                          namespace's identity, not cluster-wide. The answer starts with its \
+                          coverage: which namespaces were read and which were not, and why; a \
+                          PARTIAL answer is not the whole cluster. Namespaces the session has \
+                          not opened yet are asked about once, in one question to the user.",
             schema: object_schema(
                 kind_props(json!({
                     "labelSelector": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "fieldSelector": {"type": "string", "description": "field=value, field==value or field!=value, comma-separated, e.g. spec.nodeName=node-1 or status.phase=Running. Fields depend on the kind; not metadata.namespace"},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most items, per namespace with allNamespaces"},
+                    "fields": fields_schema(),
                 })),
                 &["kind"],
             ),
@@ -648,9 +825,10 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_resource",
-            description: "One resource as YAML (Secret values and last-applied-configuration masked).",
+            description: "One resource as YAML (Secret values and last-applied-configuration \
+                          masked); with fields, only those fields.",
             schema: object_schema(
-                kind_props(json!({"name": {"type": "string"}})),
+                kind_props(json!({"name": {"type": "string"}, "fields": fields_schema()})),
                 &["kind", "name"],
             ),
             read_only: true,
@@ -668,11 +846,21 @@ fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_events",
-            description: "Recent events in the namespace, optionally for one object (kind + name).",
+            description: "Recent events in a namespace, optionally for one object (kind + name). \
+                          With allNamespaces true: in every namespace this session may read, \
+                          the newest across them, with the same coverage note as \
+                          list_resources. type and reason filter on the API server, before any \
+                          limit. sinceSeconds cannot: events are read page by page up to a \
+                          bound (5000 per namespace), the newest kept, and the first line says \
+                          whether the window was fully covered or cut.",
             schema: object_schema(
                 kind_props(json!({
                     "name": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "allNamespaces": {"type": "boolean", "description": "Every namespace this session may read; not with namespace"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most events, in all with allNamespaces"},
+                    "type": {"type": "string", "enum": ["Normal", "Warning"]},
+                    "reason": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9._:/-]+$", "description": "One event reason, e.g. BackOff"},
+                    "sinceSeconds": {"type": "integer", "minimum": 1, "maximum": MAX_SINCE_SECONDS, "description": "Only events last seen in this many seconds; API servers keep events about an hour by default"},
                 })),
                 &[],
             ),
@@ -686,7 +874,10 @@ fn catalog() -> Vec<ToolSpec> {
                           StatefulSet, DaemonSet, ReplicaSet, Job, CronJob), or labelSelector; \
                           at most 10 pods and 20 containers per call. With several streams \
                           each line starts with [pod/container]; notes on top say what was \
-                          left out.",
+                          left out. minLevel filters by level across log formats (logfmt/slog, \
+                          JSON, klog); a note then gives the lines read, those with a recognized \
+                          level and those matched, so an empty result can be told from a format \
+                          it doesn't know.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -699,6 +890,7 @@ fn catalog() -> Vec<ToolSpec> {
                         "allContainers": {"type": "boolean", "description": "Every container, init containers included"},
                         "filter": {"type": "string", "description": "Only lines containing this text (applied after masking)"},
                         "regex": {"type": "boolean", "description": "filter is a regular expression"},
+                        "minLevel": {"type": "string", "enum": ["trace", "debug", "info", "warn", "error", "fatal"], "description": "Only lines at this level or above, among the lines read (tailLines), together with filter. Recognizes logfmt/slog (level=error), JSON (level, severity, lvl; pino/bunyan numbers) and klog (E1103 ...). Lines without a recognized level, stack trace lines included, are excluded and counted in a note"},
                         "tailLines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Per container"},
                         "sinceSeconds": {"type": "integer", "minimum": 1},
                         "previous": {"type": "boolean"},
@@ -743,10 +935,82 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "top_nodes",
             description: "CPU and memory used per node, and as % of allocatable, like kubectl \
-                          top nodes (needs metrics-server).",
+                          top nodes. From metrics-server; without it, from the Prometheus set \
+                          for the context in Kubach.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
+        },
+        ToolSpec {
+            name: "node_host_read",
+            description: "Read-only diagnostics of a node's host, which the Kubernetes API does \
+                          not show: the kernel log (AppArmor and seccomp denials, OOM kills), \
+                          the journal of kubelet and the container runtime, files such as \
+                          /proc/<pid>/stack, /proc/<pid>/attr/current or a config under /etc. \
+                          Runs one program — dmesg, journalctl, cat, head, tail, ls or ps — \
+                          with your args, without a shell: no pipes, redirects or globs, and \
+                          only reading options (nothing that follows, pages or writes); files \
+                          by absolute path. journalctl gets --no-pager and -n 500 unless you \
+                          pass -n. Output is cut after 64 KiB from the start and masked, so \
+                          narrow it (journalctl -k -n 200 --since ..., tail -n). Runs with the \
+                          user's credentials through a temporary privileged pod, after they \
+                          confirm the exact command; they may allow that exact command on that \
+                          node for the rest of the session. Not in a session pinned to \
+                          namespaces.",
+            schema: object_schema(
+                json!({
+                    "node": {"type": "string"},
+                    "command": {
+                        "type": "string",
+                        "enum": ["dmesg", "journalctl", "cat", "head", "tail", "ls", "ps"],
+                    },
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 120},
+                }),
+                &["node", "command"],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "cordon_node",
+            description: "Marks a node unschedulable, like kubectl cordon: running pods stay. \
+                          Runs with the user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "uncordon_node",
+            description: "Makes a node schedulable again, like kubectl uncordon. Runs with the \
+                          user's credentials after they confirm this call.",
+            schema: object_schema(json!({"name": {"type": "string"}}), &["name"]),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "drain_node",
+            description: "Cordons a node and evicts its pods through the Eviction API, so \
+                          PodDisruptionBudgets hold: a pod they block is retried until the \
+                          timeout. Runs with the user's credentials after they confirm the node \
+                          and every pod. There is no force: pods without a controller are \
+                          reported and left in place. DaemonSet pods without ignoreDaemonsets \
+                          and pods with emptyDir data without deleteEmptyDirData stop the call \
+                          before anything changes. The node stays cordoned afterwards. Pods of \
+                          namespaces this session may not read are only counted.",
+            schema: object_schema(
+                json!({
+                    "name": {"type": "string"},
+                    "ignoreDaemonsets": {"type": "boolean", "description": "Leave DaemonSet pods on the node instead of stopping. Default false"},
+                    "deleteEmptyDirData": {"type": "boolean", "description": "Evict pods with emptyDir volumes too; their data is lost. Default false"},
+                    "podSelector": {"type": "string", "description": "Only pods with these labels, e.g. app=web. The whole node is cordoned all the same"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "For evictions, budget retries and waiting for the pods to go. Default 300"},
+                    "preview": {"type": "boolean", "description": "Only show which pods would be evicted, are blocked by a PodDisruptionBudget or have no controller, without asking the user or changing anything. Call again without preview to do it"},
+                }),
+                &["name"],
+            ),
+            read_only: false,
+            destructive: true,
         },
         ToolSpec {
             name: "get_topology",
@@ -857,6 +1121,59 @@ fn catalog() -> Vec<ToolSpec> {
             destructive: false,
         },
         ToolSpec {
+            name: "scale_batch",
+            description: "Scale many Deployments, StatefulSets or ReplicaSets at once: a list of \
+                          objects or a labelSelector, in one or several namespaces. Kubach finds \
+                          the objects first, the user approves them in one window with old and \
+                          new replicas, and only those objects are changed, by UID: one that \
+                          appears later is reported, not touched. Objects that fail or are left \
+                          out are named and do not stop the others. The result gives each \
+                          object's original replicas and the arguments that roll the batch back.",
+            schema: object_schema(
+                batch_props(
+                    json!({
+                        "kind": {"type": "string"},
+                        "apiVersion": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "name": {"type": "string"},
+                        "replicas": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "For this object, instead of the top-level replicas"},
+                    }),
+                    json!({
+                        "replicas": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "For every object that names none"},
+                    }),
+                ),
+                &[],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "rollout_restart_batch",
+            description: "Rollout restart of many Deployments, StatefulSets or DaemonSets at \
+                          once: a list of objects or a labelSelector, in one or several \
+                          namespaces. Kubach finds the objects first, the user approves them in \
+                          one window, and only those objects are restarted, by UID: one that \
+                          appears later is reported, not touched. Objects that fail or are left \
+                          out are named and do not stop the others. The call returns once the \
+                          restarts are sent; use wait_for_rollout to see them finish.",
+            schema: object_schema(
+                batch_props(
+                    json!({
+                        "kind": {"type": "string"},
+                        "apiVersion": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "name": {"type": "string"},
+                    }),
+                    json!({
+                        "concurrency": {"type": "integer", "minimum": 1, "maximum": crate::batch_tools::MAX_CONCURRENCY, "description": "Restarts sent at the same time, default 4. It paces the requests, not the rollouts: they go on after the call"},
+                    }),
+                ),
+                &[],
+            ),
+            read_only: false,
+            destructive: false,
+        },
+        ToolSpec {
             name: "wait_for_rollout",
             description: "Wait until a Deployment, StatefulSet or DaemonSet has rolled out, like \
                           kubectl rollout status --timeout: after scale, rollout_restart, \
@@ -870,6 +1187,30 @@ fn catalog() -> Vec<ToolSpec> {
                     "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
                 })),
                 &["kind", "name"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
+            name: "wait_for_condition",
+            description: "Wait until an object has a status condition, appears or goes away, \
+                          like kubectl wait, instead of polling get_resource. Pick objects by \
+                          exactly one of name and labelSelector. With labelSelector, a status \
+                          condition is met when every matching object has it and at least one \
+                          matches, exists when at least one matches, deleted when none matches \
+                          (also when none did from the start). Returns when met, or at the \
+                          timeout (default 120s, at most 600s) with the final state: what was \
+                          found, and the objects that do not meet it and why. A read that is \
+                          not allowed fails at once. The first call on a custom resource asks \
+                          the user, as list_resources and get_resource do.",
+            schema: object_schema(
+                kind_props(json!({
+                    "name": {"type": "string", "description": "One object; it need not exist yet"},
+                    "labelSelector": {"type": "string", "description": "All objects it matches, e.g. app=web. Met means: for a status condition all of them and at least one, for exists at least one, for deleted none"},
+                    "condition": {"type": "string", "description": "A status condition as Type=Status (Ready=True, Available=False; Status is True, False or Unknown), exists (the object appears) or deleted (it goes away). A status condition about an older generation of the object does not count"},
+                    "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                })),
+                &["kind", "condition"],
             ),
             read_only: true,
             destructive: false,
@@ -1046,10 +1387,13 @@ fn catalog() -> Vec<ToolSpec> {
             name: "helm_search_charts",
             description: "Search Helm charts of the repositories added in Kubach (like helm search \
                           repo), or list the versions of an oci:// chart (`oci`); the user is \
-                          asked once to allow a registry not added in Kubach.",
+                          asked once to allow a registry not added in Kubach. A query never \
+                          finds oci:// charts. An empty result says why (`reason`, `note`), \
+                          which repositories were searched (`searched`) and which have no \
+                          loaded index (`withoutIndex`).",
             schema: object_schema(
                 json!({
-                    "query": {"type": "string", "description": "Part of repo/chart, a description or a keyword; empty lists all"},
+                    "query": {"type": "string", "description": "One substring of repo/chart, a description or a keyword; empty lists all"},
                     "oci": {"type": "string", "description": "oci://registry/path of one chart, instead of query"},
                     "versions": {"type": "boolean", "default": false, "description": "Every version, not only the latest"},
                     "devel": {"type": "boolean", "default": false, "description": "Include pre-releases"},
@@ -1183,6 +1527,24 @@ fn catalog() -> Vec<ToolSpec> {
             destructive: true,
         },
         ToolSpec {
+            name: "helm_preview_diff",
+            description: "The full masked diff of a helm_install or helm_upgrade preview, by \
+                          previewId, object by object. Nothing is rendered again: all pages \
+                          come from the render of that preview, kept for this session (its \
+                          last few previews). Secret values stay masked.",
+            schema: object_schema(
+                json!({
+                    "previewId": {"type": "string", "description": "fullDiff.previewId of the preview"},
+                    "kind": {"type": "string", "description": "Only objects of this kind, e.g. Deployment; Values is the values diff"},
+                    "name": {"type": "string", "description": "Only objects whose name contains this"},
+                    "page": {"type": "integer", "minimum": 1, "default": 1, "description": "Page of the filtered diff"},
+                }),
+                &["previewId"],
+            ),
+            read_only: true,
+            destructive: false,
+        },
+        ToolSpec {
             name: "helm_rollback",
             description: "Roll a release back to an earlier revision (see helm_release_history); \
                           the user sees the diff and approves. Cluster-scoped objects, RBAC or \
@@ -1234,7 +1596,8 @@ fn catalog() -> Vec<ToolSpec> {
                           the user's approval. Returns the forward's id and 127.0.0.1:<port>; \
                           the forward ends with the session, or when you disconnect from Kubach \
                           (over HTTP: close the MCP session, or two minutes without an open \
-                          connection or a request).",
+                          stream or a request, once no connection runs through the forward). \
+                          port_forward_list tells why a forward closed.",
             schema: object_schema(
                 {
                     let mut p = json!({
@@ -1257,7 +1620,8 @@ fn catalog() -> Vec<ToolSpec> {
         ToolSpec {
             name: "port_forward_list",
             description: "Port-forwards of this session: target, ports, local address, state and \
-                          last error.",
+                          last error, then the last closed ones (state closed) with reason, \
+                          detail and closedAt.",
             schema: object_schema(json!({}), &[]),
             read_only: true,
             destructive: false,
@@ -1325,4 +1689,16 @@ fn catalog() -> Vec<ToolSpec> {
 }
 
 #[cfg(test)]
+mod all_namespaces_tests;
+#[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
+mod crd_access_tests;
+#[cfg(test)]
+mod event_filter_tests;
+#[cfg(test)]
+mod fields_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_tests;

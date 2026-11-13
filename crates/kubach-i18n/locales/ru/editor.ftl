@@ -243,6 +243,18 @@ editor-secret-user-placeholder = пользователь
 editor-secret-password-placeholder = пароль или токен
 editor-secret-optional = необязательно
 editor-secret-edit-hint = Ключи, которые вы не трогали, не отправляются. Загрузите значение, чтобы изменить его, или замените без загрузки. Значения вводятся обычным текстом; Kubach кодирует их сам.
+editor-registry-kind = Реестры
+editor-registry-load = Загрузить реестры
+editor-registry-replace-tooltip = Ввести реестры заново, не загружая текущие
+editor-registry-as-json = Править как JSON
+editor-registry-as-json-tooltip = Править весь docker config как текст, включая поля, которых нет в форме
+editor-registry-fallback = Это значение не docker config, который Kubach может показать как реестры; оно редактируется как обычное значение.
+editor-registry-add = Добавить реестр
+editor-registry-remove = Удалить этот реестр
+editor-registry-none = Реестров нет.
+editor-registry-server-placeholder = адрес реестра, например ghcr.io
+editor-registry-password-binary = не текст; введите новый пароль, чтобы заменить его
+editor-registry-hint = Поле auth (base64 от user:password) Kubach записывает сам, когда меняется пользователь или пароль. Остальные поля docker config сохраняются как есть.
 
 ## Значения Secret (панель деталей)
 
@@ -265,12 +277,13 @@ editor-secret-summary-tls = TLS-сертификат
 editor-secret-summary-basic-auth = Базовая аутентификация
 editor-secret-summary-what-tls = Читается только tls.crt; закрытый ключ никогда не загружается.
 editor-secret-summary-what-basic-auth = Читается только имя пользователя, без пароля.
-editor-secret-summary-what-registry = Показывает реестры и имена пользователей, но не пароли.
+editor-secret-summary-what-registry = Показывает реестры, имена пользователей и почту. Пароли скрыты, пока вы их не покажете, как и любые другие значения.
 editor-secret-show-summary = Показать сводку
 editor-secret-tls-key-hidden = tls.key — скрыт
 editor-secret-value-hidden = скрыт
 editor-secret-password-set = задан (скрыт)
 editor-secret-password-none = нет
+editor-secret-registry-gone = У реестра { $registry } в секрете больше нет этого значения
 editor-cert-not-yet-valid = ещё не действует
 editor-cert-expired =
     { $days ->
