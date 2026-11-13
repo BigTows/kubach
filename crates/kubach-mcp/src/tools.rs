@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -860,29 +861,51 @@ async fn tell_reveal_blocked(ctx: &Ctx<'_>, request: &Request) {
 
 // ------------------------------------------------------------- dispatch
 
+/// One tool's call, on the heap.
+type ToolCall<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>>;
+
+/// Puts the future `call` makes on the heap.
+///
+/// Out of line on purpose: an unoptimized build makes the future on the
+/// stack before moving it, and here that stack is given back on return. In
+/// [`run`] it would be reserved for every tool at once.
+#[inline(never)]
+fn boxed<'a, F>(call: impl FnOnce() -> F) -> ToolCall<'a>
+where
+    F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'a,
+{
+    Box::pin(call())
+}
+
 /// Runs one tool call.
-pub(crate) async fn run(
-    ctx: &Ctx<'_>,
-    tool: &str,
-    args: &Map<String, Value>,
+///
+/// Every tool runs as its own boxed future: this function then holds one
+/// pointer, whatever the tools keep while they run, and polling it takes
+/// the stack of the one tool called. With the tools inline, an unoptimized
+/// build reserved stack for all of them at once, on every call: about
+/// 0.9 MiB of a thread's 2 MiB.
+pub(crate) async fn run<'a>(
+    ctx: &'a Ctx<'_>,
+    tool: &'a str,
+    args: &'a Map<String, Value>,
 ) -> Result<ToolOutput, ToolError> {
-    match tool {
-        "session_info" => {
+    let call: ToolCall<'_> = match tool {
+        "session_info" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::Info).await?;
             Ok(ToolOutput::read(session_info(ctx.session)))
-        }
-        "list_kinds" => {
+        }),
+        "list_kinds" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::ListKinds).await?;
             Ok(ToolOutput::read(list_kinds(ctx.session)))
-        }
-        "list_namespaces" => {
+        }),
+        "list_namespaces" => boxed(move || async move {
             parse::<NoArgs>(args)?;
             authorize(ctx, &Request::ListNamespaces).await?;
             Ok(ToolOutput::read(list_namespaces(ctx.session).await))
-        }
-        "list_resources" => {
+        }),
+        "list_resources" => boxed(move || async move {
             let a: ListArgs = parse(args)?;
             let fields = Fields::parse(a.fields.as_deref())?;
             let request = Request::List {
@@ -911,8 +934,8 @@ pub(crate) async fn run(
                 .await
                 .map_err(|error| explain_selector(error, selectors.field))
                 .map_err(|error| explain_forbidden(ctx, &allowed, "list", error))
-        }
-        "get_resource" => {
+        }),
+        "get_resource" => boxed(move || async move {
             let a: GetArgs = parse(args)?;
             let fields = Fields::parse(a.fields.as_deref())?;
             let request = Request::Get {
@@ -924,8 +947,8 @@ pub(crate) async fn run(
             get_resource(ctx, &allowed, fields.as_ref())
                 .await
                 .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
-        }
-        "describe_resource" => {
+        }),
+        "describe_resource" => boxed(move || async move {
             let a: ObjectArgs = parse(args)?;
             let request = Request::Get {
                 kind: kind_ref(a.kind, a.api_version),
@@ -936,8 +959,8 @@ pub(crate) async fn run(
             describe_resource(ctx, &allowed)
                 .await
                 .map_err(|error| explain_forbidden(ctx, &allowed, "get", error))
-        }
-        "list_events" => {
+        }),
+        "list_events" => boxed(move || async move {
             let a: EventsArgs = parse(args)?;
             let filter = EventFilter::new(a.event_type, a.reason, a.since_seconds)?;
             let object = match (a.kind, a.name) {
@@ -964,8 +987,8 @@ pub(crate) async fn run(
             ensure_rbac(ctx, &allowed.namespace, &[("list", "", "events")]).await?;
             let events = list_events(ctx, &allowed, &filter, limit).await?;
             Ok(ToolOutput::read(events))
-        }
-        "get_logs" => {
+        }),
+        "get_logs" => boxed(move || async move {
             let a: LogsArgs = parse(args)?;
             let workload = match (&a.kind, &a.name, &a.api_version) {
                 (Some(kind), Some(name), _) => {
@@ -1008,8 +1031,8 @@ pub(crate) async fn run(
             }
             ensure_rbac(ctx, &allowed.namespace, &rights).await?;
             get_logs(ctx, &allowed, &a, filter.as_ref(), min_level).await
-        }
-        "top_pods" => {
+        }),
+        "top_pods" => boxed(move || async move {
             let a: NamespaceArgs = parse(args)?;
             let request = Request::Top {
                 namespace: a.namespace,
@@ -1022,29 +1045,59 @@ pub(crate) async fn run(
             )
             .await?;
             top_pods(ctx, &allowed).await
+        }),
+        "get_topology" => {
+            boxed(move || async move { topology_tools::get_topology(ctx, args).await })
         }
-        "get_topology" => topology_tools::get_topology(ctx, args).await,
-        "list_nodes" => crate::node_tools::list_nodes(ctx, args).await,
-        "describe_node" => crate::node_tools::describe_node(ctx, args).await,
-        "top_nodes" => crate::node_tools::top_nodes(ctx, args).await,
-        "cordon_node" => crate::node_maintenance::cordon_node(ctx, args, true).await,
-        "uncordon_node" => crate::node_maintenance::cordon_node(ctx, args, false).await,
-        "drain_node" => crate::node_maintenance::drain_node(ctx, args).await,
-        "node_host_read" => crate::node_host::node_host_read(ctx, args).await,
-        "wait_for_rollout" => crate::rollout_tools::wait_for_rollout(ctx, args).await,
-        "wait_for_condition" => crate::wait_tools::wait_for_condition(ctx, args).await,
-        "helm_search_charts" => helm_tools::search(ctx, args).await,
-        "helm_show_values" => helm_tools::show_values(ctx, args).await,
-        "helm_list_releases" => helm_tools::list_releases(ctx, args).await,
-        "helm_release_history" => helm_tools::history(ctx, args).await,
-        "helm_get_values" => helm_tools::get_values(ctx, args).await,
-        "helm_install" => helm_tools::install(ctx, args).await,
-        "helm_upgrade" => helm_tools::upgrade(ctx, args).await,
-        "helm_rollback" => helm_tools::rollback(ctx, args).await,
-        "helm_uninstall" => helm_tools::uninstall(ctx, args).await,
-        "helm_preview_diff" => crate::helm_preview::preview_diff(ctx, args).await,
-        "can_reach" => topology_tools::can_reach(ctx, args).await,
-        "apply_manifest" => {
+        "list_nodes" => {
+            boxed(move || async move { crate::node_tools::list_nodes(ctx, args).await })
+        }
+        "describe_node" => {
+            boxed(move || async move { crate::node_tools::describe_node(ctx, args).await })
+        }
+        "top_nodes" => boxed(move || async move { crate::node_tools::top_nodes(ctx, args).await }),
+        "cordon_node" => {
+            boxed(
+                move || async move { crate::node_maintenance::cordon_node(ctx, args, true).await },
+            )
+        }
+        "uncordon_node" => {
+            boxed(
+                move || async move { crate::node_maintenance::cordon_node(ctx, args, false).await },
+            )
+        }
+        "drain_node" => {
+            boxed(move || async move { crate::node_maintenance::drain_node(ctx, args).await })
+        }
+        "node_host_read" => {
+            boxed(move || async move { crate::node_host::node_host_read(ctx, args).await })
+        }
+        "wait_for_rollout" => {
+            boxed(move || async move { crate::rollout_tools::wait_for_rollout(ctx, args).await })
+        }
+        "wait_for_condition" => {
+            boxed(move || async move { crate::wait_tools::wait_for_condition(ctx, args).await })
+        }
+        "helm_search_charts" => boxed(move || async move { helm_tools::search(ctx, args).await }),
+        "helm_show_values" => {
+            boxed(move || async move { helm_tools::show_values(ctx, args).await })
+        }
+        "helm_list_releases" => {
+            boxed(move || async move { helm_tools::list_releases(ctx, args).await })
+        }
+        "helm_release_history" => {
+            boxed(move || async move { helm_tools::history(ctx, args).await })
+        }
+        "helm_get_values" => boxed(move || async move { helm_tools::get_values(ctx, args).await }),
+        "helm_install" => boxed(move || async move { helm_tools::install(ctx, args).await }),
+        "helm_upgrade" => boxed(move || async move { helm_tools::upgrade(ctx, args).await }),
+        "helm_rollback" => boxed(move || async move { helm_tools::rollback(ctx, args).await }),
+        "helm_uninstall" => boxed(move || async move { helm_tools::uninstall(ctx, args).await }),
+        "helm_preview_diff" => {
+            boxed(move || async move { crate::helm_preview::preview_diff(ctx, args).await })
+        }
+        "can_reach" => boxed(move || async move { topology_tools::can_reach(ctx, args).await }),
+        "apply_manifest" => boxed(move || async move {
             let a: ApplyArgs = parse(args)?;
             let dry_run = a.dry_run.unwrap_or(true);
             let request = Request::Apply {
@@ -1054,10 +1107,12 @@ pub(crate) async fn run(
             };
             let allowed = authorize(ctx, &request).await?;
             apply_manifest(ctx, &allowed, dry_run).await
+        }),
+        "scale_batch" => boxed(move || async move { crate::batch_tools::scale(ctx, args).await }),
+        "rollout_restart_batch" => {
+            boxed(move || async move { crate::batch_tools::restart(ctx, args).await })
         }
-        "scale_batch" => crate::batch_tools::scale(ctx, args).await,
-        "rollout_restart_batch" => crate::batch_tools::restart(ctx, args).await,
-        "scale" => {
+        "scale" => boxed(move || async move {
             let a: ScaleArgs = parse(args)?;
             let request = Request::Scale {
                 kind: kind_ref(a.kind, a.api_version),
@@ -1078,8 +1133,8 @@ pub(crate) async fn run(
             params.insert(action::REPLICAS.into(), json!(a.replicas));
             let summary = format!("to {} replicas", a.replicas);
             run_action(ctx, &allowed, "scale", action::SCALE, &params, &summary).await
-        }
-        "rollout_restart" | "delete_resource" => {
+        }),
+        "rollout_restart" | "delete_resource" => boxed(move || async move {
             let a: ObjectArgs = parse(args)?;
             let kind = kind_ref(a.kind, a.api_version);
             let request = if tool == "rollout_restart" {
@@ -1114,8 +1169,8 @@ pub(crate) async fn run(
                 action::DELETE
             };
             run_action(ctx, &allowed, tool, id, &ActionParams::new(), "").await
-        }
-        "exec" => {
+        }),
+        "exec" => boxed(move || async move {
             let a: ExecArgs = parse(args)?;
             let request = Request::Exec {
                 pod: a.pod,
@@ -1130,12 +1185,16 @@ pub(crate) async fn run(
                 .unwrap_or(DEFAULT_EXEC_TIMEOUT)
                 .clamp(1, MAX_EXEC_TIMEOUT);
             exec(ctx, &allowed, a.container.as_deref(), &a.command, timeout).await
+        }),
+        "debug_container" => {
+            boxed(move || async move { crate::debug_tools::debug_container(ctx, args).await })
         }
-        "debug_container" => crate::debug_tools::debug_container(ctx, args).await,
-        "port_forward_start" => crate::forwards::start(ctx, args).await,
-        "port_forward_list" => crate::forwards::list(ctx, args).await,
-        "port_forward_stop" => crate::forwards::stop(ctx, args).await,
-        "list_secrets" => {
+        "port_forward_start" => {
+            boxed(move || async move { crate::forwards::start(ctx, args).await })
+        }
+        "port_forward_list" => boxed(move || async move { crate::forwards::list(ctx, args).await }),
+        "port_forward_stop" => boxed(move || async move { crate::forwards::stop(ctx, args).await }),
+        "list_secrets" => boxed(move || async move {
             let a: SecretListArgs = parse(args)?;
             let request = Request::SecretList {
                 namespace: a.namespace,
@@ -1145,8 +1204,8 @@ pub(crate) async fn run(
             secret_tools::list(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "check_secret" => {
+        }),
+        "check_secret" => boxed(move || async move {
             let a: SecretArgs = parse(args)?;
             let request = Request::SecretCheck {
                 namespace: a.namespace,
@@ -1157,8 +1216,8 @@ pub(crate) async fn run(
             secret_tools::check(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "compare_secret_values" => {
+        }),
+        "compare_secret_values" => boxed(move || async move {
             let a: CompareArgs = parse(args)?;
             let request = Request::SecretCompare {
                 namespace: a.namespace,
@@ -1172,8 +1231,8 @@ pub(crate) async fn run(
             secret_tools::compare(ctx, &allowed)
                 .await
                 .map(ToolOutput::read)
-        }
-        "get_secret_value" => {
+        }),
+        "get_secret_value" => boxed(move || async move {
             let a: SecretArgs = parse(args)?;
             let request = Request::SecretReveal {
                 namespace: a.namespace,
@@ -1184,8 +1243,8 @@ pub(crate) async fn run(
             secret_tools::reveal(ctx, &allowed)
                 .await
                 .map(ToolOutput::confirmed)
-        }
-        "request_secret_input" => {
+        }),
+        "request_secret_input" => boxed(move || async move {
             let a: secret_write::InputArgs = parse(args)?;
             let request = Request::SecretWrite {
                 namespace: a.namespace,
@@ -1203,8 +1262,8 @@ pub(crate) async fn run(
             };
             ensure_rbac(ctx, &allowed.namespace, &[(verb, "", "secrets")]).await?;
             secret_write::input(ctx, &allowed, args).await
-        }
-        "copy_secret" => {
+        }),
+        "copy_secret" => boxed(move || async move {
             let a: secret_write::CopyArgs = parse(args)?;
             let request = Request::SecretCopy {
                 namespace: a.namespace,
@@ -1220,8 +1279,8 @@ pub(crate) async fn run(
                 .map_or(allowed.namespace.clone(), |to| to.namespace.clone());
             ensure_rbac(ctx, &target, &[("create", "", "secrets")]).await?;
             secret_write::copy(ctx, &allowed, args).await
-        }
-        "delete_secret" => {
+        }),
+        "delete_secret" => boxed(move || async move {
             let a: secret_write::DeleteArgs = parse(args)?;
             let request = Request::SecretDelete {
                 namespace: a.namespace,
@@ -1231,11 +1290,12 @@ pub(crate) async fn run(
             let allowed = authorize(ctx, &request).await?;
             ensure_rbac(ctx, &allowed.namespace, &[("delete", "", "secrets")]).await?;
             secret_write::delete(ctx, &allowed, args).await
-        }
-        other => {
+        }),
+        other => boxed(move || async move {
             Err(Denial::new(DenialCode::InvalidInput, format!("unknown tool `{other}`")).into())
-        }
-    }
+        }),
+    };
+    call.await
 }
 
 // ------------------------------------------------------------- helpers

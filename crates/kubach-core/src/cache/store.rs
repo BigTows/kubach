@@ -46,12 +46,12 @@ impl WatchError {
         };
         match status {
             Some(status) if !status.message.is_empty() => Self {
-                forbidden: status.is_forbidden(),
+                forbidden: crate::api_status::is_forbidden(status),
                 connection: false,
                 message: status.message.clone(),
             },
             Some(status) => Self {
-                forbidden: status.is_forbidden(),
+                forbidden: crate::api_status::is_forbidden(status),
                 connection: false,
                 message: error.to_string(),
             },
@@ -369,6 +369,34 @@ mod tests {
         // Unchanged objects are shared, not copied.
         assert!(Arc::ptr_eq(&first[0], &second[0]));
         assert_eq!(first.len(), 1);
+    }
+
+    /// A 403 that carries only the code, as a proxy in front of the API
+    /// server answers.
+    fn refused_without_a_reason(message: &str) -> kube::core::Status {
+        serde_json::from_value(json!({"code": 403, "message": message})).unwrap()
+    }
+
+    #[test]
+    fn a_403_without_a_reason_is_reported_as_forbidden() {
+        let errors = [
+            watcher::Error::InitialListFailed(kube::Error::Api(Box::new(
+                refused_without_a_reason("denied by the gateway"),
+            ))),
+            watcher::Error::WatchStartFailed(kube::Error::Api(Box::new(refused_without_a_reason(
+                "",
+            )))),
+            watcher::Error::WatchError(Box::new(refused_without_a_reason(""))),
+        ];
+        for error in &errors {
+            let error = WatchError::from_watcher(error);
+            assert!(error.forbidden, "{error:?}");
+            assert!(!error.connection, "{error:?}");
+        }
+        let server_error: kube::core::Status =
+            serde_json::from_value(json!({"code": 500, "message": "boom"})).unwrap();
+        let error = watcher::Error::WatchError(Box::new(server_error));
+        assert!(!WatchError::from_watcher(&error).forbidden);
     }
 
     #[test]

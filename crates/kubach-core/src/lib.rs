@@ -1,6 +1,7 @@
 //! Kubernetes domain logic for Kubach. Kept free of UI dependencies.
 
 pub mod ansi;
+pub mod api_status;
 pub mod apply;
 pub mod cache;
 pub mod cloud;
