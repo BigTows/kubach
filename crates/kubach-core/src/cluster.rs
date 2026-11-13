@@ -281,6 +281,16 @@ impl Contexts {
         kubeconfig::temp::single_context(&self.kubeconfig, context, namespace)
     }
 
+    /// `context` alone for a tool that reads it from a file, with `dir`
+    /// for the temporary files ([`kubeconfig::temp::ContextKubeconfig`]).
+    pub fn context_kubeconfig(
+        &self,
+        context: &str,
+        dir: PathBuf,
+    ) -> Option<kubeconfig::temp::ContextKubeconfig> {
+        kubeconfig::temp::ContextKubeconfig::of(&self.kubeconfig, context, dir)
+    }
+
     pub fn list(&self) -> &[ContextInfo] {
         &self.contexts
     }

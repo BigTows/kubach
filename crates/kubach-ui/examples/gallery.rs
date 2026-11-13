@@ -2600,13 +2600,13 @@ impl FakeLog {
         LogEntry::new(text)
             .spans(spans)
             .tag(PODS[pod], pod)
-            .timestamp(format!(
-                "2026-10-22T{:02}:{:02}:{:02}.{:03}Z",
-                (seconds / 3600) % 24,
-                (seconds / 60) % 60,
-                seconds % 60,
-                (n * 37) % 1000
-            ))
+            .timestamp(
+                // From 2026-10-22T00:00:00Z on.
+                jiff::Timestamp::from_millisecond(
+                    1_792_627_200_000 + (seconds as i64 % 86_400) * 1000 + (n as i64 * 37) % 1000,
+                )
+                .unwrap_or_default(),
+            )
     }
 }
 

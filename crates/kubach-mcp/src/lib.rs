@@ -24,6 +24,7 @@ pub mod bridge;
 pub mod confirm;
 pub mod forwards;
 pub mod grants;
+pub mod handshake;
 pub mod helm_tools;
 pub mod hosted;
 pub mod identity;

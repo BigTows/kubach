@@ -2,10 +2,12 @@
 //!
 //! An agent spawns `kubach mcp` as its own child process, so that process
 //! has no window to ask the user in. When the app runs with its HTTP server
-//! on, the launcher reaches it on `127.0.0.1` with the bridge's own bearer
-//! token (kept in [`BRIDGE_TOKEN_FILE`] in the config directory, readable
-//! only by the user). The MCP endpoint's token, which HTTP agents get, is
-//! not accepted here (#191). Over the bridge the launcher:
+//! on, the launcher reaches it on `127.0.0.1`. The two verify each other
+//! with the bridge key (kept in [`BRIDGE_KEY_FILE`] in the config
+//! directory, readable only by the user) before every request, and the key
+//! itself is never sent: see [`crate::handshake`]. The MCP endpoint's
+//! token, which HTTP agents get, opens nothing here (#191). Over the
+//! bridge the launcher:
 //!
 //! - asks the app to confirm mutating calls ([`BridgeConfirmer`]);
 //! - reports its session, so the app lists it and can revoke it
@@ -43,6 +45,10 @@ use rmcp::model::Tool;
 
 use kubach_core::secrets::value::wipe;
 
+use crate::handshake::{
+    self, DIGEST_HEADER, HELLO_PATH, Hello, HelloReply, NONCE_HEADER, PROOF_HEADER, PROTOCOL,
+};
+
 use crate::confirm::{ConfirmationDecision, ConfirmationRequest, Confirmer, WaitingCall};
 use crate::grants::{Grant, GrantEntry};
 use crate::hosted::{Gone, HostedSessions};
@@ -56,11 +62,16 @@ use crate::settings::Profile;
 /// Given to HTTP agents; the bridge does not accept it (#191).
 pub const TOKEN_FILE: &str = "mcp-token";
 
-/// Bearer token of the bridge, in the config directory, readable only by
-/// the user. Only `kubach mcp` reads it; it is never shown in the app nor
-/// given to HTTP agents, and the app replaces it every time its HTTP
-/// server starts.
-pub const BRIDGE_TOKEN_FILE: &str = "mcp-bridge-token";
+/// The key `kubach mcp` and the app verify each other with
+/// ([`crate::handshake`]), in the config directory, readable only by the
+/// user. Only `kubach mcp` reads it; it is never sent, shown in the app
+/// nor given to HTTP agents. The app writes a new one every time its HTTP
+/// server starts and removes the file when the server stops.
+pub const BRIDGE_KEY_FILE: &str = "mcp-bridge-key";
+
+/// Where Kubach kept the bridge's bearer token before the handshake. The
+/// app removes the file; nothing reads it.
+const LEGACY_BRIDGE_TOKEN_FILE: &str = "mcp-bridge-token";
 
 /// Path prefix of the bridge routes.
 pub const BRIDGE_PATH: &str = "/kubach/v1";
@@ -80,28 +91,31 @@ fn read_token_file(dir: &Path, name: &str) -> Option<String> {
     (token.len() >= 32 && token.bytes().all(|b| b.is_ascii_alphanumeric())).then(|| token.into())
 }
 
-/// Writes a fresh token to `dir/name` atomically: `0600` on Unix, a DACL
-/// with only the current user on Windows, in a `0700` folder.
-fn write_token_file(dir: &Path, name: &str) -> io::Result<String> {
+/// Writes `token` to `dir/name` atomically, in a `0700` folder. The file is
+/// created anew and private from the start: `0600` on Unix, a DACL with
+/// only the current user on Windows.
+fn write_token_file(dir: &Path, name: &str, token: &str) -> io::Result<()> {
     kubach_core::settings::create_private_dir(dir)?;
-    let token = random_token();
-    let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let temp = dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temp)?;
     let result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temp)?;
         kubach_core::kubeconfig::restrict_permissions(&temp)?;
         std::io::Write::write_all(&mut file, token.as_bytes())?;
         file.sync_all()?;
-        drop(file);
         std::fs::rename(&temp, dir.join(name))
     })();
     if result.is_err() {
         std::fs::remove_file(&temp).ok();
     }
-    result.map(|()| token)
+    result
 }
 
 /// The stored MCP HTTP token, if there is a valid one.
@@ -120,18 +134,32 @@ pub fn load_or_create_token(dir: &Path) -> io::Result<String> {
 /// Replaces the stored MCP HTTP token with a new one; agents configured
 /// with the old one stop working.
 pub fn regenerate_token(dir: &Path) -> io::Result<String> {
-    write_token_file(dir, TOKEN_FILE)
+    let token = random_token();
+    write_token_file(dir, TOKEN_FILE, &token).map(|()| token)
 }
 
-/// The bridge token the running app wrote, if there is a valid one.
-pub fn read_bridge_token(dir: &Path) -> Option<String> {
-    read_token_file(dir, BRIDGE_TOKEN_FILE)
+/// The bridge key in `dir`, if there is a valid one. A file left by an app
+/// that did not exit cleanly proves nothing by itself: the process on the
+/// port still has to show it holds the same key.
+pub fn read_bridge_key(dir: &Path) -> Option<String> {
+    read_token_file(dir, BRIDGE_KEY_FILE)
 }
 
-/// A new bridge token, replacing the stored one. `kubach mcp` processes
-/// read it again on every request, so they follow.
-pub fn regenerate_bridge_token(dir: &Path) -> io::Result<String> {
-    write_token_file(dir, BRIDGE_TOKEN_FILE)
+/// Stores `key` as the bridge key of the app whose server now listens.
+/// `kubach mcp` processes read the file again on every request, so they
+/// follow. Removes the file of the earlier bridge protocol.
+pub fn store_bridge_key(dir: &Path, key: &str) -> io::Result<()> {
+    write_token_file(dir, BRIDGE_KEY_FILE, key)?;
+    std::fs::remove_file(dir.join(LEGACY_BRIDGE_TOKEN_FILE)).ok();
+    Ok(())
+}
+
+/// Removes the bridge key file if it still holds `key`: the app's server
+/// stopped. A file another running app wrote since stays.
+pub fn remove_bridge_key(dir: &Path, key: &str) {
+    if read_bridge_key(dir).as_deref() == Some(key) {
+        std::fs::remove_file(dir.join(BRIDGE_KEY_FILE)).ok();
+    }
 }
 
 /// A session of a `kubach mcp` process, as the app lists it.
@@ -525,18 +553,100 @@ pub enum BridgeError {
     Status { status: u16, body: String },
     #[error("unexpected answer from the Kubach app: {0}")]
     Protocol(String),
+    /// The peer does not speak this version of the bridge.
+    #[error(
+        "the Kubach app on 127.0.0.1:{port} and this `kubach mcp` are different versions and \
+         cannot verify each other ({detail}). Update Kubach, then restart the app and the \
+         agent's MCP server (`kubach mcp`)"
+    )]
+    Incompatible { port: u16, detail: String },
+    /// The peer did not show the bridge key; nothing but a nonce was sent.
+    #[error(
+        "the process listening on 127.0.0.1:{port} did not prove it is the Kubach app this \
+         user started, so nothing was asked of it. Restart Kubach (Settings → AI agent → HTTP \
+         server), or free the port if another program holds it"
+    )]
+    Unverified { port: u16 },
+    /// An answer without the proof that it is the app's answer to this
+    /// request.
+    #[error(
+        "the answer from 127.0.0.1:{port} (HTTP {status}) carries no valid proof of the Kubach \
+         app for this request and was ignored"
+    )]
+    Unproven { port: u16, status: u16 },
+}
+
+/// Sends `head` and `body` to `127.0.0.1:<port>` and reads the answer to
+/// the end.
+pub(crate) async fn exchange(port: u16, head: &str, body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut response = Vec::new();
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.read_to_end(&mut response).await?;
+    Ok(response)
 }
 
 /// Talks to the app's bridge over loopback HTTP/1.1.
 #[derive(Clone, Debug)]
 pub struct BridgeClient {
     port: u16,
-    token: String,
+    /// The bridge key; proves, never sent.
+    key: String,
 }
 
 impl BridgeClient {
-    pub fn new(port: u16, token: String) -> Self {
-        Self { port, token }
+    pub fn new(port: u16, key: String) -> Self {
+        Self { port, key }
+    }
+
+    /// The first exchange: checks that the listener holds the key. Returns
+    /// this request's nonce and the app's.
+    async fn hello(&self) -> Result<(String, String), BridgeError> {
+        let port = self.port;
+        let nonce = random_token();
+        let hello = Hello {
+            version: PROTOCOL,
+            nonce: nonce.clone(),
+        };
+        let body = serde_json::to_vec(&hello).map_err(|e| BridgeError::Protocol(e.to_string()))?;
+        let head = format!(
+            "POST {BRIDGE_PATH}{HELLO_PATH} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n",
+            body.len()
+        );
+        let response = exchange(port, &head, &body)
+            .await
+            .map_err(BridgeError::Unreachable)?;
+        let Ok((status, _, body)) = split_response(&response) else {
+            return Err(BridgeError::Unverified { port });
+        };
+        if status != 200 {
+            return Err(BridgeError::Incompatible {
+                port,
+                detail: format!("the app answered HTTP {status} to the handshake"),
+            });
+        }
+        let Ok(reply) = serde_json::from_slice::<HelloReply>(&body) else {
+            return Err(BridgeError::Unverified { port });
+        };
+        if reply.version != PROTOCOL {
+            return Err(BridgeError::Incompatible {
+                port,
+                detail: format!(
+                    "the app speaks bridge protocol {}, this process {PROTOCOL}",
+                    reply.version
+                ),
+            });
+        }
+        let expected = handshake::app_proof(&self.key, &nonce, &reply.nonce);
+        if !handshake::valid_nonce(&reply.nonce)
+            || !handshake::same(reply.proof.as_bytes(), expected.as_bytes())
+        {
+            return Err(BridgeError::Unverified { port });
+        }
+        Ok((nonce, reply.nonce))
     }
 
     async fn post<T: DeserializeOwned>(
@@ -544,28 +654,38 @@ impl BridgeClient {
         path: &str,
         body: &impl Serialize,
     ) -> Result<Option<T>, BridgeError> {
+        let port = self.port;
         let body = serde_json::to_vec(body).map_err(|e| BridgeError::Protocol(e.to_string()))?;
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-            .await
-            .map_err(BridgeError::Unreachable)?;
+        // Nothing of the request leaves before the listener showed the key.
+        let (nonce, app_nonce) = self.hello().await?;
+        let digest = handshake::digest(&body);
+        let proof = handshake::request_proof(&self.key, &nonce, &app_nonce, path, &digest);
         let head = format!(
-            "POST {BRIDGE_PATH}{path} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\n\
-             authorization: Bearer {}\r\ncontent-type: application/json\r\n\
+            "POST {BRIDGE_PATH}{path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\
+             {NONCE_HEADER}: {app_nonce}\r\n{DIGEST_HEADER}: {digest}\r\n\
+             {PROOF_HEADER}: {proof}\r\ncontent-type: application/json\r\n\
              content-length: {}\r\nconnection: close\r\n\r\n",
-            self.port,
-            self.token,
             body.len()
         );
-        let mut response = Vec::new();
-        async {
-            stream.write_all(head.as_bytes()).await?;
-            stream.write_all(&body).await?;
-            stream.read_to_end(&mut response).await
-        }
-        .await
-        .map_err(BridgeError::Unreachable)?;
-        let parsed = split_response(&response).and_then(|(status, mut body)| {
-            let result = if !(200..300).contains(&status) {
+        let mut response = exchange(port, &head, &body)
+            .await
+            .map_err(BridgeError::Unreachable)?;
+        let parsed = split_response(&response).and_then(|(status, head, mut body)| {
+            // The status and the body count only as the app's answer to
+            // this very request.
+            let expected = handshake::answer_proof(
+                &self.key,
+                &nonce,
+                &app_nonce,
+                path,
+                status,
+                &handshake::digest(&body),
+            );
+            let proven = header(&head, PROOF_HEADER)
+                .is_some_and(|proof| handshake::same(proof.as_bytes(), expected.as_bytes()));
+            let result = if !proven {
+                Err(BridgeError::Unproven { port, status })
+            } else if !(200..300).contains(&status) {
                 Err(BridgeError::Status {
                     status,
                     body: String::from_utf8_lossy(&body).trim().to_owned(),
@@ -696,8 +816,17 @@ fn hosted_id(id: &str, key: &str) -> HostedId {
     }
 }
 
-/// Status code and (de-chunked) body of an HTTP/1.1 response.
-fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>), BridgeError> {
+/// Value of header `name` (lower case) in a lower-cased response head.
+pub(crate) fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim())
+    })
+}
+
+/// Status code, lower-cased head and (de-chunked) body of an HTTP/1.1
+/// response.
+pub(crate) fn split_response(response: &[u8]) -> Result<(u16, String, Vec<u8>), BridgeError> {
     let bad = || BridgeError::Protocol("malformed HTTP response".into());
     let split = response
         .windows(4)
@@ -712,7 +841,7 @@ fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>), BridgeError> {
         .and_then(|code| code.parse().ok())
         .ok_or_else(bad)?;
     if !head.contains("transfer-encoding: chunked") {
-        return Ok((status, body.to_vec()));
+        return Ok((status, head, body.to_vec()));
     }
     let mut out = Vec::new();
     let mut rest = body;
@@ -723,7 +852,7 @@ fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>), BridgeError> {
         let size = usize::from_str_radix(size_text, 16).map_err(|_| bad())?;
         rest = &rest[line_end + 2..];
         if size == 0 {
-            return Ok((status, out));
+            return Ok((status, head, out));
         }
         if rest.len() < size + 2 {
             return Err(bad());
@@ -803,15 +932,17 @@ mod tests {
         std::fs::write(dir.path().join(TOKEN_FILE), "short").unwrap();
         assert_eq!(read_token(dir.path()), None);
 
-        // The bridge has its own file, replaced on every start.
-        assert_eq!(read_bridge_token(dir.path()), None);
-        let bridge = regenerate_bridge_token(dir.path()).unwrap();
-        assert_eq!(read_bridge_token(dir.path()), Some(bridge.clone()));
-        assert_ne!(regenerate_bridge_token(dir.path()).unwrap(), bridge);
+        // The bridge has its own file, written when the server starts.
+        assert_eq!(read_bridge_key(dir.path()), None);
+        std::fs::write(dir.path().join(LEGACY_BRIDGE_TOKEN_FILE), "x".repeat(64)).unwrap();
+        let key = random_token();
+        store_bridge_key(dir.path(), &key).unwrap();
+        assert_eq!(read_bridge_key(dir.path()), Some(key.clone()));
+        assert!(!dir.path().join(LEGACY_BRIDGE_TOKEN_FILE).exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dir.path().join(BRIDGE_TOKEN_FILE))
+            let mode = std::fs::metadata(dir.path().join(BRIDGE_KEY_FILE))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -819,15 +950,37 @@ mod tests {
             let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
             assert_eq!(dir_mode & 0o077, 0);
         }
+        // No temporary file stays behind.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".tmp-")),
+            "{names:?}"
+        );
+
+        // The file goes with the server that wrote it, and only with it.
+        remove_bridge_key(dir.path(), &random_token());
+        assert_eq!(read_bridge_key(dir.path()), Some(key.clone()));
+        remove_bridge_key(dir.path(), &key);
+        assert_eq!(read_bridge_key(dir.path()), None);
+        // An unusable file counts as none.
+        std::fs::write(dir.path().join(BRIDGE_KEY_FILE), "short").unwrap();
+        assert_eq!(read_bridge_key(dir.path()), None);
     }
 
     #[test]
     fn parses_plain_and_chunked_responses() {
         let plain = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
-        assert_eq!(split_response(plain).unwrap(), (200, b"{}".to_vec()));
+        let (status, head, body) = split_response(plain).unwrap();
+        assert_eq!((status, body), (200, b"{}".to_vec()));
+        assert_eq!(header(&head, "content-length"), Some("2"));
+        assert_eq!(header(&head, PROOF_HEADER), None);
         let chunked =
             b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-        assert_eq!(split_response(chunked).unwrap(), (401, b"abcde".to_vec()));
+        let (status, _, body) = split_response(chunked).unwrap();
+        assert_eq!((status, body), (401, b"abcde".to_vec()));
         assert!(split_response(b"garbage").is_err());
     }
 

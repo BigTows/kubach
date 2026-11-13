@@ -81,6 +81,7 @@ async fn upgrade_and_uninstall() {
         namespace: namespace.clone(),
         driver: Driver::Secret,
         secret_env: Default::default(),
+        memory: None,
         working_dir: None,
     };
     let releases = Releases::new(client);
@@ -191,6 +192,146 @@ async fn upgrade_and_uninstall() {
     ));
 }
 
+/// #201: a context imported into the vault is in no kubeconfig file. Helm
+/// gets it alone, in a temporary kubeconfig that lives for one process, and
+/// nothing of it is left afterwards; once the vault is locked there is
+/// nothing to give helm.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a cluster (KUBACH_TEST_CONTEXT, KUBACH_TEST_NAMESPACE) and helm"]
+async fn a_vault_context_installs_upgrades_rolls_back_and_uninstalls() {
+    use kubach_core::Contexts;
+    use kubach_core::helm::cli::InstallRequest;
+    use kubach_core::vault::crypto::KdfParams;
+    use kubach_core::vault::{DerivedPassword, ImportPlan, LockedVault, Vault};
+
+    const VAULT_RELEASE: &str = "kubach-helm-vault-test";
+    let (client, context, namespace) = client().await;
+    let helm = find_on_path("helm").expect("helm on PATH");
+    let helm = Some(helm.as_path());
+
+    // The test context alone goes into a vault of the test, under a name
+    // no kubeconfig file has: helm can't find it anywhere else.
+    let imported_name = format!("kubach-vault-{context}");
+    let home = tempfile::tempdir().unwrap();
+    let vault_path = home.path().join("vault.json");
+    let own = Contexts::load()
+        .unwrap()
+        .single_context(&context, None)
+        .unwrap();
+    let mut plan = ImportPlan::from_kubeconfig(own, &Default::default());
+    plan.read_files();
+    plan.rename(0, &imported_name);
+    // A fresh password on every run.
+    let secret = uuid::Uuid::new_v4().to_string();
+    let password = DerivedPassword::derive(&secret, KdfParams::DEFAULT).unwrap();
+    let mut vault = Vault::create(&vault_path, Some(&password), None).unwrap();
+    vault.add("test", &plan, None).unwrap();
+    drop(vault);
+
+    let locked = LockedVault::read(&vault_path).unwrap().unwrap();
+    let temp = home.path().join("run").join("kubeconfig");
+    let from_locked = Contexts::load_all(Vec::new(), locked.imported()).unwrap();
+    assert!(cli::kubeconfig_of(&from_locked, &imported_name, &[], Some(temp.clone())).is_none());
+
+    let unlocked = locked.unlock_with_password(&secret).unwrap();
+    let contexts = Contexts::load_all(Vec::new(), unlocked.imported()).unwrap();
+    let (kubeconfig, memory) =
+        cli::kubeconfig_of(&contexts, &imported_name, &[], Some(temp.clone())).unwrap();
+    assert!(kubeconfig.is_empty());
+    assert!(memory.is_some());
+    let target = HelmTarget {
+        context: imported_name.clone(),
+        kubeconfig,
+        namespace: namespace.clone(),
+        driver: Driver::Secret,
+        secret_env: Default::default(),
+        memory,
+        working_dir: None,
+    };
+    let left = || std::fs::read_dir(&temp).map_or(0, Iterator::count);
+
+    let releases = Releases::new(client);
+    let charts = tempfile::tempdir().unwrap();
+    write_chart(charts.path());
+    let chart_path = charts.path().to_string_lossy().into_owned();
+    let uninstall = HelmCommand::uninstall(&target, VAULT_RELEASE, false);
+    // A leftover of an interrupted run.
+    cli::run(helm, &uninstall, TIMEOUT).await.ok();
+
+    let install = InstallRequest {
+        release: VAULT_RELEASE.into(),
+        chart: chart_path.clone(),
+        version: None,
+        values: Sensitive::new(String::new()),
+        create_namespace: false,
+    };
+    let UpgradeOutcome::Preview(preview) = cli::install(helm, &target, &install, true, TIMEOUT)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a preview");
+    };
+    assert!(preview.manifest.expose().contains("\"hello\""));
+    cli::install(helm, &target, &install, false, TIMEOUT)
+        .await
+        .unwrap();
+    let installed = releases.get(&namespace, VAULT_RELEASE, None).await.unwrap();
+    assert_eq!(installed.revision, 1);
+    assert_eq!(left(), 0);
+
+    let upgrade = UpgradeRequest {
+        release: VAULT_RELEASE.into(),
+        chart: UpgradeChart::Reference {
+            chart: chart_path,
+            version: None,
+        },
+        values: Sensitive::new("greeting: hi\n".into()),
+    };
+    cli::upgrade(helm, &target, &upgrade, false, TIMEOUT)
+        .await
+        .unwrap();
+    let upgraded = releases.get(&namespace, VAULT_RELEASE, None).await.unwrap();
+    assert_eq!(upgraded.revision, 2);
+    assert_eq!(
+        upgraded.user_values.expose(),
+        &serde_json::json!({"greeting": "hi"})
+    );
+
+    cli::run(
+        helm,
+        &HelmCommand::rollback(&target, VAULT_RELEASE, 1),
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let rolled_back = releases.get(&namespace, VAULT_RELEASE, None).await.unwrap();
+    assert_eq!(rolled_back.revision, 3);
+    assert_eq!(rolled_back.status, ReleaseStatus::Deployed);
+    assert_eq!(left(), 0);
+
+    // The same name with the user's files instead: helm does not know it.
+    let by_files = HelmTarget {
+        kubeconfig: cli::kubeconfig_files(&[]),
+        memory: None,
+        ..target.clone()
+    };
+    let error = cli::run(
+        helm,
+        &HelmCommand::rollback(&by_files, VAULT_RELEASE, 1),
+        TIMEOUT,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("does not exist"), "{error}");
+
+    cli::run(helm, &uninstall, TIMEOUT).await.unwrap();
+    assert!(matches!(
+        releases.history(&namespace, VAULT_RELEASE).await,
+        Err(HelmError::NotFound { .. })
+    ));
+    assert_eq!(left(), 0);
+}
+
 /// #292: with the namespaces unlisted, a `GET` decides `--create-namespace`;
 /// an install into a new namespace creates it, and the flag left on for a
 /// namespace that already exists (an unverified one) does not break helm.
@@ -221,6 +362,7 @@ async fn install_into_a_new_namespace_when_unlisted() {
         namespace: namespace.into(),
         driver: Driver::Secret,
         secret_env: Default::default(),
+        memory: None,
         working_dir: None,
     };
     let namespaces: Api<Namespace> = Api::all(client.clone());

@@ -35,6 +35,8 @@ fluent-syntax = "0.12.0"
 futures = "0.3.34"
 # tree-sitter-yaml: syntax highlighting in the YAML editor.
 gpui-kit = { version = "0.9.1", features = ["tree-sitter-yaml"] }
+# HMAC-SHA256 for the bridge handshake (ADR 0005). Already in the tree.
+hmac = "0.13.0"
 http = "1.5.0"
 # Streaming the body of tool downloads (#131). Already in the tree through kube.
 http-body-util = "0.1.5"
