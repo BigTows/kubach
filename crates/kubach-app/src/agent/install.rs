@@ -747,12 +747,15 @@ pub fn apply(plan: &Plan) -> Result<Option<PathBuf>, InstallError> {
     name.push(format!(".kubach-{}", std::process::id()));
     let temp = dir.join(name);
     let written = (|| {
-        fs::write(&temp, &plan.after)?;
+        use std::io::Write as _;
+        let mut file = create_private(&temp)?;
+        file.write_all(plan.after.as_bytes())?;
+        // An existing config keeps its permissions; a new one stays
+        // readable by the user only (it may hold other secrets later).
         if let Ok(meta) = fs::metadata(&target) {
-            fs::set_permissions(&temp, meta.permissions())?;
-        } else {
-            private(&temp)?;
+            file.set_permissions(meta.permissions())?;
         }
+        drop(file);
         fs::rename(&temp, &target)
     })();
     if let Err(error) = written {
@@ -762,16 +765,26 @@ pub fn apply(plan: &Plan) -> Result<Option<PathBuf>, InstallError> {
     Ok(backup)
 }
 
-/// A new config may hold other secrets later: readable by the user only.
-#[cfg(unix)]
-fn private(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn private(_path: &Path) -> io::Result<()> {
-    Ok(())
+/// Creates the temporary copy of a config at `path`, on Unix readable by
+/// the user only from the moment it exists (the config's contents are
+/// written into it before it gets the config's own permissions). A file
+/// left there by an interrupted write is replaced; the new file is always
+/// created by this call, never an existing one (or a link) reused.
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(path)?;
+            options.open(path)
+        }
+        other => other,
+    }
 }
 
 /// The entry to add by hand, for "Manual setup" and errors.
@@ -1078,6 +1091,67 @@ mod tests {
                 .is_symlink()
         );
         assert!(std::fs::read_to_string(&real).unwrap().contains("kubach"));
+    }
+
+    /// The temporary copy is private from its creation, whatever the
+    /// umask, and never an existing file or the target of a link.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_copy_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join(".mcp.json.kubach-1");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        drop(super::create_private(&temp).unwrap());
+        assert_eq!(mode(&temp), 0o600);
+
+        // A leftover readable by everyone is replaced, not reused.
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&temp, "old").unwrap();
+        drop(super::create_private(&temp).unwrap());
+        assert_eq!(mode(&temp), 0o600);
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), "");
+
+        // A link left in its place is removed; what it points to is not
+        // written.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "keep").unwrap();
+        std::fs::remove_file(&temp).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &temp).unwrap();
+        drop(super::create_private(&temp).unwrap());
+        assert!(!std::fs::symlink_metadata(&temp).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "keep");
+    }
+
+    /// An existing config keeps its permissions, a new one is private.
+    #[cfg(unix)]
+    #[test]
+    fn written_configs_keep_or_get_their_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let existing = env.config_path(Client::Cursor);
+        write(&existing, "{}\n");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        install(&env, Client::Cursor);
+        assert_eq!(mode(&existing), 0o640);
+
+        let new = env.config_path(Client::Codex);
+        install(&env, Client::Codex);
+        assert_eq!(mode(&new), 0o600);
+        // Nothing temporary is left next to the configs.
+        for path in [&existing, &new] {
+            let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".kubach-"))
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
     }
 
     #[test]
