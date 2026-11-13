@@ -303,11 +303,23 @@ pub fn pick_ready_pod(pods: &[Pod]) -> Option<&Pod> {
     })
 }
 
+/// Whether `pod` runs in its node's network namespace
+/// (`spec.hostNetwork`): a forward into it reaches the node's own ports,
+/// those bound to the node's `127.0.0.1` included.
+pub fn uses_host_network(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|spec| spec.host_network)
+        .unwrap_or(false)
+}
+
 /// Pod and pod port a forward of `requested` goes to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTarget {
     pub pod: String,
     pub port: u16,
+    /// See [`uses_host_network`].
+    pub host_network: bool,
 }
 
 /// The pod `source` forwards to now: the pod itself (must be running), or a
@@ -373,6 +385,7 @@ pub(crate) async fn resolve_in(
     Ok(ResolvedTarget {
         pod: pod.metadata.name.clone().unwrap_or_default(),
         port,
+        host_network: uses_host_network(&pod),
     })
 }
 

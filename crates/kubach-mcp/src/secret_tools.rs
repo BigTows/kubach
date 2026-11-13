@@ -25,8 +25,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::policy::Allowed;
+use crate::policy::{Allowed, Denial, DenialCode};
 use crate::secret_write::SecretUser;
+use crate::session::MAX_COMPARISONS_PER_KEY;
 use crate::tools::{Ctx, ToolError};
 
 /// Most Secrets listed at once.
@@ -34,14 +35,31 @@ const MAX_SECRETS: u32 = 500;
 /// Most bytes of values one reveal hands out.
 const MAX_REVEAL_BYTES: usize = 64 * 1024;
 
+/// How far back from the session's start a written Secret still counts as
+/// written in the session (#179): the start is this machine's clock, the
+/// times of a Secret are the API server's, and the two may differ.
+const WRITTEN_MARGIN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// A fetched Secret's values; wiped when dropped.
 struct Values {
     secret_type: String,
     data: BTreeMap<String, Vec<u8>>,
+    /// When the Secret was last created or changed, as the API server
+    /// recorded it: the latest of `creationTimestamp` and the times of
+    /// `managedFields`. `None` if the object carries neither.
+    written: Option<Timestamp>,
 }
 
 impl Values {
     fn of(mut secret: Secret) -> Self {
+        let created = secret.metadata.creation_timestamp.as_ref();
+        let managed = secret
+            .metadata
+            .managed_fields
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.time.as_ref());
+        let written = created.into_iter().chain(managed).map(|time| time.0).max();
         let data = secret
             .data
             .take()
@@ -54,7 +72,13 @@ impl Values {
                 .type_
                 .unwrap_or_else(|| typed::TYPE_OPAQUE.to_owned()),
             data,
+            written,
         }
+    }
+
+    /// Whether the Secret was created or changed at `since` or later.
+    fn written_since(&self, since: Timestamp) -> bool {
+        self.written.is_some_and(|written| written >= since)
     }
 }
 
@@ -434,7 +458,38 @@ pub(crate) async fn check(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<String, To
     Ok(json_text(&out))
 }
 
+/// Refuses a comparison with Secret `name` if it was written while the
+/// session runs: by the session itself (Secrets written through the user,
+/// copies), or by anyone, going by the times the API server recorded
+/// (that covers Helm releases and whatever else created or changed it).
+/// Only Secrets whose values were settled before the session are compared.
+fn ensure_not_written(
+    ctx: &Ctx<'_>,
+    namespace: &str,
+    name: &str,
+    values: &Values,
+) -> Result<(), ToolError> {
+    let started = ctx.session.scope().started_at;
+    let since = started.checked_sub(WRITTEN_MARGIN).unwrap_or(started);
+    if !ctx.session.secret_written(namespace, name) && !values.written_since(since) {
+        return Ok(());
+    }
+    Err(Denial::new(
+        DenialCode::Secret,
+        format!(
+            "Secret {namespace}/{name} was created or changed during this session (or within \
+             {} minutes before it began); compare_secret_values compares only Secrets that \
+             were not written while the session runs. The user can compare these values in \
+             Kubach.",
+            WRITTEN_MARGIN.as_secs() / 60
+        ),
+    )
+    .into())
+}
+
 /// `compare_secret_values`: whether two values in the cluster are equal.
+/// Not for a Secret written while the session runs ([`ensure_not_written`]),
+/// and at most [`MAX_COMPARISONS_PER_KEY`] times for one key in a session.
 pub(crate) async fn compare(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<String, ToolError> {
     let Some(other) = &allowed.other else {
         return Err(ToolError::Failed("nothing to compare with".into()));
@@ -453,11 +508,33 @@ pub(crate) async fn compare(ctx: &Ctx<'_>, allowed: &Allowed) -> Result<String, 
         &other.name,
     )
     .await?;
+    ensure_not_written(ctx, &allowed.namespace, name_of(allowed), &a)?;
+    ensure_not_written(ctx, &other.namespace, &other.name, &b)?;
     let (Some(left), Some(right)) = (a.data.get(key), b.data.get(&other.key)) else {
         return Err(ToolError::Failed(
             "one of the Secrets has no such key; list_secrets shows the keys".into(),
         ));
     };
+    let first = (
+        allowed.namespace.clone(),
+        name_of(allowed).to_owned(),
+        key.to_owned(),
+    );
+    let second = (
+        other.namespace.clone(),
+        other.name.clone(),
+        other.key.clone(),
+    );
+    if let Err((namespace, name, key)) = ctx.session.count_comparison(&first, &second) {
+        return Err(Denial::new(
+            DenialCode::Secret,
+            format!(
+                "{namespace}/{name}[{key}] was compared {MAX_COMPARISONS_PER_KEY} times in this \
+                 session, the most for one key. The user can compare further values in Kubach."
+            ),
+        )
+        .into());
+    }
     let equal = left == right;
     Ok(json_text(&json!({
         "first": format!("{}/{}[{key}]", allowed.namespace, name_of(allowed)),
@@ -526,6 +603,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_vec()))
                 .collect(),
+            written: None,
         }
     }
 
@@ -582,6 +660,36 @@ mod tests {
                 .any(|u| u["key"] == "user" && u["missing"] == true)
         );
         assert_eq!(out["missingSecrets"][0]["name"], "api");
+    }
+
+    #[test]
+    fn a_secret_is_written_when_it_was_created_or_last_changed() {
+        let secret = |metadata: Value| -> Values {
+            let mut object = json!({"type": "Opaque", "data": {"password": "aHVudGVyMg=="}});
+            object["metadata"] = metadata;
+            Values::of(serde_json::from_value(object).unwrap())
+        };
+        let at = |text: &str| text.parse::<Timestamp>().unwrap();
+        let since = at("2026-11-12T10:00:00Z");
+
+        let old = secret(json!({"name": "db", "creationTimestamp": "2026-01-01T00:00:00Z"}));
+        assert!(!old.written_since(since));
+        let created = secret(json!({"name": "db", "creationTimestamp": "2026-11-12T10:00:00Z"}));
+        assert!(created.written_since(since));
+        // Created long ago, changed since: the latest write counts,
+        // whoever made it.
+        let changed = secret(json!({
+            "name": "db", "creationTimestamp": "2026-01-01T00:00:00Z",
+            "managedFields": [
+                {"manager": "kubectl", "operation": "Update", "time": "2026-01-01T00:00:00Z"},
+                {"manager": "helm", "operation": "Update", "time": "2026-11-12T10:30:00Z"},
+            ],
+        }));
+        assert_eq!(changed.written, Some(at("2026-11-12T10:30:00Z")));
+        assert!(changed.written_since(since));
+        // The API server always sets a creation time; an object without
+        // one says nothing about when it was written.
+        assert!(!secret(json!({"name": "db"})).written_since(since));
     }
 
     #[test]

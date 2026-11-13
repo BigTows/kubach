@@ -24,7 +24,7 @@ pub use exec::{
 };
 pub use forward_target::{
     ForwardPort, ForwardSource, ResolvedTarget, TargetPod, TargetPort, fetch_source, is_pod_ready,
-    pick_ready_pod, short_kind, target_pod,
+    pick_ready_pod, short_kind, target_pod, uses_host_network,
 };
 pub use log_history::{
     HistoryRequest, HistoryState, INITIAL_TAIL_LINES, LogHistory, MAX_HISTORY_BYTES,
@@ -36,7 +36,7 @@ pub use logs::{
     sources_for_selector, stream_logs,
 };
 pub use port_forward::{
-    ForwardAgent, ForwardId, ForwardInfo, ForwardState, LocalPort, PortForwardManager,
+    ForwardAgent, ForwardId, ForwardInfo, ForwardState, HostNetwork, LocalPort, PortForwardManager,
     local_port_candidates,
 };
 

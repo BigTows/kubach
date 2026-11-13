@@ -845,6 +845,7 @@ mod tests {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
         let none = BridgeConfirmer::new(Box::new(|| None));
         let decision = none.confirm(&request).await;

@@ -51,6 +51,8 @@ pub fn title(context: Option<&str>, namespace: Option<&str>) -> String {
     }
 }
 
+impl EventEmitter<super::TabChanged> for LocalTerminalTab {}
+
 pub struct LocalTerminalTab {
     cluster: Entity<Cluster>,
     /// Kubach context the shell's `KUBECONFIG` has; `None` leaves the
@@ -132,8 +134,10 @@ impl LocalTerminalTab {
             .update(cx, |view, cx| view.feed(line.as_bytes(), cx));
     }
 
+    /// The dock's tab strip shows the state (and the title).
     fn set_state(&mut self, state: SessionState, cx: &mut Context<Self>) {
         self.state = state;
+        cx.emit(super::TabChanged);
         cx.notify();
     }
 

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::access::Access;
 use crate::grants::Grant;
-use crate::helm_tools::HelmChange;
+use crate::helm_tools::{DiffCut, HelmChange};
 use crate::policy::Finding;
 use crate::scope::SessionMode;
 use crate::secret_write::{SecretInput, SecretRequest};
@@ -189,6 +189,12 @@ pub struct ConfirmationRequest {
     /// [`rememberable`](crate::remember::rememberable), never in client-only
     /// mode (ADR 0005). The UI checks that function too.
     pub allow_remember: bool,
+    /// What the diff in `details` leaves out, when Kubach had to cut it
+    /// ([`MAX_CONFIRM_DIFF_BYTES`](crate::helm_tools::MAX_CONFIRM_DIFF_BYTES)).
+    /// The UI must say so above the diff. A Helm change carries its own in
+    /// [`HelmChange::diff_cut`]. Boxed: almost no request has one.
+    #[serde(default)]
+    pub diff_cut: Option<Box<DiffCut>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,6 +542,7 @@ mod tests {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         }
     }
 
@@ -562,8 +569,24 @@ mod tests {
         let object = json.as_object_mut().unwrap();
         object.remove("kind");
         object.remove("context");
+        object.remove("diff_cut");
         let parsed: ConfirmationRequest = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.kind, RequestKind::Call);
+        assert_eq!(parsed.diff_cut, None);
+        // What a cut diff leaves out travels with the request.
+        let cut = ConfirmationRequest {
+            diff_cut: Some(Box::new(DiffCut {
+                shown_bytes: 8,
+                total_bytes: 20,
+                hidden_lines: 3,
+                objects: vec!["ConfigMap web/app".into()],
+                more_objects: 1,
+            })),
+            ..request()
+        };
+        let back: ConfirmationRequest =
+            serde_json::from_str(&serde_json::to_string(&cut).unwrap()).unwrap();
+        assert_eq!(back, cut);
         let grant = ConfirmationRequest {
             kind: RequestKind::Grant {
                 grant: Grant::secret("web", "db"),

@@ -594,6 +594,7 @@ async fn ask_user(
         mode: ctx.session.mode_in(namespace),
         // Entering values is the confirmation of one write (#230).
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &request).await;
     if !ctx.session.is_active() {
@@ -735,6 +736,8 @@ pub(crate) async fn input(
         ))
     })?;
     let sizes: BTreeMap<&str, usize> = existing.iter().map(|k| (k.key.as_str(), k.size)).collect();
+    // Before the call: a failed answer may still have written it.
+    ctx.session.note_secret_written(namespace, name);
     if a.mode == SecretOp::Update {
         allow_on_server(ctx, namespace, name).await?;
         patch(
@@ -860,6 +863,7 @@ pub(crate) async fn copy(
         COPIED_FROM_ANNOTATION.to_owned(),
         format!("{from_ns}/{from}"),
     )]);
+    ctx.session.note_secret_written(&to.namespace, &to.name);
     create(
         &target,
         &to.namespace,

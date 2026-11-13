@@ -533,6 +533,7 @@ mod token_tests {
             dangerous: Vec::new(),
             mode: SessionMode::ClientOnly,
             allow_remember: false,
+            diff_cut: None,
         };
         assert!(request.details.len() > 8_000_000);
         let launcher = BridgeClient::new(endpoint.addr.port(), bridge_token);

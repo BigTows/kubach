@@ -329,6 +329,7 @@ async fn may_open(
         dangerous: Vec::new(),
         mode: session.mode(),
         allow_remember: false,
+        diff_cut: None,
     };
     let decision = ask(ctx.confirmer, &question).await;
     if !session.is_active() {

@@ -132,6 +132,7 @@ pub(super) fn consent_request(
         // to the vault's own credentials: warn as for the weakest one.
         mode: SessionMode::ClientOnly,
         allow_remember: false,
+        diff_cut: None,
     }
 }
 
