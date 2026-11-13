@@ -526,9 +526,11 @@ mod tests {
             answer_proof(key, c, a, "/confirm", 200, "d"),
             answer_proof(key, c, a, "/confirm", 403, "d")
         );
-        assert!(valid_nonce(&random_token()));
-        assert!(!valid_nonce("short"));
-        assert!(!valid_nonce(&"a\r\n".repeat(20)));
+        let nonce = random_token();
+        assert!(valid_nonce(&nonce));
+        // Too short, and with characters a header line must not carry.
+        assert!(!valid_nonce(&nonce[..5]));
+        assert!(!valid_nonce(&format!("{nonce}\r\n")));
     }
 
     #[tokio::test]
