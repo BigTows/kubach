@@ -5142,3 +5142,260 @@ async fn a_chart_that_cannot_be_fetched_ends_the_call() {
     assert_eq!(commands, ["pull"]);
     assert!(f.windows().is_empty());
 }
+
+// ------------------------------- what the Helm window and findings see (#179)
+
+/// A render with a document that gives no certain object ends the call
+/// before anybody is asked and before helm touches the cluster.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_render_with_an_unnamed_document_ends_the_call_before_anyone_is_asked() {
+    for client_only in [false, true] {
+        let f = VaultHelm::start_in(client_only, true, "").await;
+        f.plain_chart();
+        std::fs::write(
+            f.root.path().join("manifest.yaml"),
+            format!(
+                "{PLAIN_MANIFEST}---\napiVersion: batch/v1\nkind: Job\nmetadata:\n  \
+                 generateName: text-of-the-chart-\n"
+            ),
+        )
+        .unwrap();
+        for preview in [true, false] {
+            let refused = f.install(preview).await;
+            assert!(refused.is_error, "{}", refused.text);
+            for part in ["document 2,", "generateName is not a name", "nothing ran"] {
+                assert!(refused.text.contains(part), "{part}: {}", refused.text);
+            }
+            assert!(
+                !refused.text.contains("text-of-the-chart"),
+                "{}",
+                refused.text
+            );
+        }
+        assert!(f.windows().is_empty());
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+    }
+}
+
+/// The same in a dry run that shows more than the render did: refused
+/// without the document's number, and nothing is installed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_with_a_document_read_two_ways_installs_nothing() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    let mut release = infra_release(3);
+    release["manifest"] = json!(format!(
+        "{PLAIN_MANIFEST}---\napiVersion: v1\nkind: ConfigMap\nkind: ClusterRoleBinding\n\
+         metadata:\n  name: text-of-the-chart\n"
+    ));
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let refused = f.install(false).await;
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused
+            .text
+            .contains("the server-side dry run has a document"),
+        "{}",
+        refused.text
+    );
+    for hidden in ["document 2", "text-of-the-chart", "ClusterRoleBinding"] {
+        assert!(!refused.text.contains(hidden), "{}", refused.text);
+    }
+    assert!(f.windows().is_empty());
+    assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
+    assert!(f.calls()[0].starts_with("install dry "), "{:?}", f.calls());
+}
+
+/// The objects inside a `kind: List` are in the window as any other: the
+/// cluster-scoped one asks for the user's credentials and is ticked.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_objects_of_a_list_reach_the_window() {
+    use crate::helm_tools::HelmCredentials;
+    const LIST: &str = "---\napiVersion: v1\nkind: List\nitems:\n\
+         - apiVersion: rbac.authorization.k8s.io/v1\n  kind: ClusterRoleBinding\n  metadata:\n    \
+         name: in-a-list\n- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: infra\n";
+    let f = VaultHelm::start(true, "").await;
+    std::fs::write(f.root.path().join("manifest.yaml"), LIST).unwrap();
+    let mut release = infra_release(3);
+    release["manifest"] = json!(LIST);
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let installed = f.install(false).await;
+    assert!(!installed.is_error, "{}", installed.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (asked, _, _) = &windows[0];
+    assert_eq!(asked.credentials, HelmCredentials::AskUser);
+    assert_eq!(asked.user_objects, ["ClusterRoleBinding in-a-list"]);
+    let (change, _, _) = &windows[1];
+    assert_eq!(
+        change.objects,
+        [
+            "ClusterRoleBinding in-a-list (cluster-scoped)",
+            "ConfigMap infra"
+        ]
+    );
+    assert_eq!(
+        change.cluster_objects,
+        ["ClusterRoleBinding in-a-list (cluster-scoped)"]
+    );
+}
+
+#[cfg(unix)]
+fn hook_json(command: &str) -> Value {
+    json!({
+        "name": "infra-migrate", "kind": "Job", "path": "infra/templates/migrate.yaml",
+        "events": ["pre-upgrade", "pre-rollback"], "weight": 0, "delete_policies": [],
+        "manifest": format!(
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: infra-migrate\n  annotations:\n    \
+             helm.sh/hook: pre-upgrade,pre-rollback\nspec:\n  template:\n    spec:\n      \
+             containers:\n      - name: run\n        image: busybox\n        \
+             command: [sh, -c, \"{command}\"]\n"
+        ),
+    })
+}
+
+/// An upgrade that changes only a hook: the window has the hook's diff
+/// under its heading and does not say that nothing changes. The hook is
+/// the session's own afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_upgrade_that_changes_only_a_hook_shows_it() {
+    use crate::helm_tools::{HOOKS_HEADING, ONLY_HOOKS};
+    let f = VaultHelm::start(true, "").await;
+    let mut release = infra_release(3);
+    release["hooks"] = json!([hook_json("echo from-the-new-chart")]);
+    std::fs::write(f.root.path().join("dry-run.json"), release.to_string()).unwrap();
+    let session = f.server.session().clone();
+    assert!(!session.changed_in(NS));
+    let upgraded = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS}),
+            ),
+        )
+        .await;
+    assert!(!upgraded.is_error, "{}", upgraded.text);
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        let (change, details, _) = windows.last().unwrap();
+        assert!(details.starts_with(ONLY_HOOKS), "{details}");
+        assert!(details.contains(HOOKS_HEADING), "{details}");
+        assert!(
+            details
+                .lines()
+                .any(|line| line.starts_with('+') && line.contains("echo from-the-new-chart")),
+            "{details}"
+        );
+        assert!(!details.contains("changes no object"), "{details}");
+        assert!(
+            change
+                .objects
+                .iter()
+                .any(|object| object == "Job infra-migrate"),
+            "{:?}",
+            change.objects
+        );
+    }
+    // Only what the upgrade creates or changes is the session's own.
+    assert!(session.was_changed(NS, "Job", "infra-migrate"));
+    assert!(!session.was_changed(NS, "ConfigMap", "infra"));
+    // The window's text went nowhere else.
+    assert!(
+        !upgraded.text.contains("from-the-new-chart"),
+        "{}",
+        upgraded.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("from-the-new-chart"), "{audit}");
+
+    // An upgrade that changes nothing says so.
+    std::fs::write(
+        f.root.path().join("dry-run.json"),
+        infra_release(3).to_string(),
+    )
+    .unwrap();
+    let same = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS})),
+        )
+        .await;
+    assert!(!same.is_error, "{}", same.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (_, details, _) = windows.last().unwrap();
+    assert_eq!(details, "The dry run changes no object and no hook.");
+}
+
+/// The values the agent sends are in the window as they are, and masked
+/// in its answer and in the audit log; what an install creates is the
+/// session's own.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_window_shows_sent_values_and_an_install_is_the_sessions_own() {
+    let f = VaultHelm::start(true, "").await;
+    f.plain_chart();
+    let session = f.server.session().clone();
+    let installed = f
+        .server
+        .call(
+            "agent",
+            "helm_install",
+            args(
+                json!({"release": "infra", "chart": "oci://ghcr.io/example/infra",
+                        "namespace": NS,
+                        "values": "auth:\n  password: sent-by-the-agent\nreplicas: 2\n"}),
+            ),
+        )
+        .await;
+    assert!(!installed.is_error, "{}", installed.text);
+    {
+        let windows = f.confirmer.helm.lock().unwrap();
+        assert_eq!(windows.len(), 1);
+        let (change, _, _) = &windows[0];
+        assert!(
+            change.values.contains("password: sent-by-the-agent"),
+            "{}",
+            change.values
+        );
+    }
+    assert!(
+        !installed.text.contains("sent-by-the-agent"),
+        "{}",
+        installed.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("sent-by-the-agent"), "{audit}");
+    assert!(session.was_changed(NS, "ConfigMap", "infra"));
+
+    // A patch: its value is shown, the release's own stay masked.
+    let upgraded = f
+        .server
+        .call(
+            "agent",
+            "helm_upgrade",
+            args(json!({"release": "infra", "namespace": NS,
+                        "valuesPatch": "auth:\n  apiToken: patched-by-the-agent\n"})),
+        )
+        .await;
+    assert!(!upgraded.is_error, "{}", upgraded.text);
+    let windows = f.confirmer.helm.lock().unwrap();
+    let (change, _, _) = windows.last().unwrap();
+    for text in [&change.values, &change.values_diff] {
+        assert!(text.contains("apiToken: patched-by-the-agent"), "{text}");
+    }
+    assert!(
+        !upgraded.text.contains("patched-by-the-agent"),
+        "{}",
+        upgraded.text
+    );
+    let audit = std::fs::read_to_string(&f.audit_path).unwrap();
+    assert!(!audit.contains("patched-by-the-agent"), "{audit}");
+}
