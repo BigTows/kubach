@@ -581,7 +581,7 @@ mod tests {
                 token: "m".repeat(64),
                 bridge: Some(BridgeOptions {
                     handler: app,
-                    token: "b".repeat(64),
+                    key: "b".repeat(64),
                 }),
             },
         )

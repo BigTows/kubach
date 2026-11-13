@@ -98,6 +98,7 @@ async fn helm_line_compatibility() {
         namespace: namespace.clone(),
         driver,
         secret_env: Default::default(),
+        memory: None,
         working_dir: None,
     };
     let releases = Releases::new(client.clone());

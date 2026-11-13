@@ -438,14 +438,16 @@ pub(super) fn resolve(
 
 /// The running app's bridge, if its HTTP server is on. Read on every use,
 /// so starting the app or turning the server on later works. The bridge
-/// has its own token, which the app writes on every start (#191).
+/// has its own key, which the app writes on every start (#191); the
+/// process on the port has to prove it holds the same one before anything
+/// is asked of it (`kubach_mcp::handshake`).
 fn locate_app(dir: &Path) -> Option<BridgeClient> {
     let settings = settings::load(&dir.join(settings::SETTINGS_FILE)).settings;
     if !settings.agent.http_enabled {
         return None;
     }
-    let token = bridge::read_bridge_token(dir)?;
-    Some(BridgeClient::new(settings.agent.http_port, token))
+    let key = bridge::read_bridge_key(dir)?;
+    Some(BridgeClient::new(settings.agent.http_port, key))
 }
 
 /// Runs `kubach mcp` with `args` (after `mcp`).
@@ -1221,5 +1223,106 @@ users:
             vault_context(&named("prod-imported"), &settings, Some(&contexts), &[]),
             None
         );
+    }
+
+    /// The process and the app's server as they run, without windows: the
+    /// process finds the app by the settings and the key file, and asks
+    /// only an app that holds that key.
+    #[test]
+    fn the_process_asks_only_the_app_that_holds_the_key_file() {
+        use std::sync::Arc;
+
+        use kubach_core::plugin::BoxFuture;
+        use kubach_core::{runtime, settings};
+        use kubach_mcp::bridge::{
+            self, BridgeConfirmer, BridgeHandler, ExternalSession, HeartbeatReply, NO_APP,
+        };
+        use kubach_mcp::{
+            BridgeOptions, ConfirmationDecision, ConfirmationRequest, Confirmer as _, HttpOptions,
+            RequestKind, SessionMode, SharedServer, serve_shared_http,
+        };
+
+        use super::locate_app;
+
+        /// The user says yes to everything.
+        struct Yes;
+
+        impl BridgeHandler for Yes {
+            fn confirm(&self, _: ConfirmationRequest) -> BoxFuture<'static, ConfirmationDecision> {
+                Box::pin(async { ConfirmationDecision::Approved })
+            }
+
+            fn heartbeat(&self, _: ExternalSession, _: &str) -> Option<HeartbeatReply> {
+                Some(HeartbeatReply::default())
+            }
+
+            fn ended(&self, _: &str, _: &str) -> bool {
+                true
+            }
+        }
+
+        let key = bridge::random_token();
+        let options = HttpOptions {
+            port: 0,
+            token: bridge::random_token(),
+            bridge: Some(BridgeOptions {
+                handler: Arc::new(Yes),
+                key: key.clone(),
+            }),
+        };
+        let endpoint = futures::executor::block_on(runtime::spawn(serve_shared_http(
+            SharedServer::new(),
+            options,
+        )))
+        .unwrap()
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app_settings = Settings::default();
+        app_settings.agent.http_enabled = true;
+        app_settings.agent.http_port = endpoint.addr.port();
+        settings::save(&dir.path().join(settings::SETTINGS_FILE), &app_settings).unwrap();
+
+        let path = dir.path().to_owned();
+        let confirmer = Arc::new(BridgeConfirmer::new(Box::new(move || locate_app(&path))));
+        let ask = || {
+            let confirmer = confirmer.clone();
+            futures::executor::block_on(runtime::spawn(async move {
+                let request = ConfirmationRequest {
+                    kind: RequestKind::Call,
+                    context: "minikube".into(),
+                    session_id: "s".into(),
+                    client: "agent".into(),
+                    tool: "scale".into(),
+                    namespace: "web".into(),
+                    summary: "Scale".into(),
+                    details: String::new(),
+                    dangerous: Vec::new(),
+                    mode: SessionMode::ClientOnly,
+                    allow_remember: false,
+                    diff_cut: None,
+                };
+                confirmer.confirm(&request).await
+            }))
+            .unwrap()
+        };
+        let refusal = |decision: ConfirmationDecision| match decision {
+            ConfirmationDecision::Denied { reason } => reason.unwrap_or_default(),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        // No key file yet: there is no app to ask, though the port answers.
+        assert_eq!(refusal(ask()), NO_APP);
+        // A key file of an app that is gone: the listener holds another key.
+        bridge::store_bridge_key(dir.path(), &bridge::random_token()).unwrap();
+        assert!(refusal(ask()).contains("did not prove"));
+        // The file the listening app wrote.
+        bridge::store_bridge_key(dir.path(), &key).unwrap();
+        assert_eq!(ask(), ConfirmationDecision::Approved);
+        // The app's server stopped and took its file along.
+        bridge::remove_bridge_key(dir.path(), &key);
+        assert_eq!(refusal(ask()), NO_APP);
+
+        futures::executor::block_on(runtime::spawn(endpoint.shutdown())).unwrap();
     }
 }

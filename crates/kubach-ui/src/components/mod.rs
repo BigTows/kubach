@@ -91,8 +91,8 @@ pub use line_selection::{
 pub use loader::{ButtonLoading, linear, spinner};
 pub use loading_bar::{LOADING_BAR_HEIGHT, LoadingBar, segment_offset};
 pub use log_view::{
-    DEFAULT_LOG_CAPACITY, FollowState, LogBuffer, LogEntry, LogMatch, LogSearch, LogTag, LogView,
-    PushResult, find_matches, tag_color,
+    DEFAULT_LOG_BYTES, DEFAULT_LOG_CAPACITY, FollowState, LogBuffer, LogEntry, LogMatch, LogSearch,
+    LogTag, LogView, PushResult, ScanStep, find_matches, tag_color,
 };
 pub use log_view::{LogTopNotice, LogViewEvent};
 pub use logo::Logo;
