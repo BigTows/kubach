@@ -51,7 +51,7 @@ usvg.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 zip.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
