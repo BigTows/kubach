@@ -17,6 +17,7 @@ pub mod import;
 pub mod keychain;
 pub mod manual;
 pub mod screen_lock;
+pub mod system_idle;
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;

@@ -23,6 +23,7 @@ use kubach_core::secrets::ClearTrigger;
 use kubach_core::vault::biometric::{BiometricStore, SystemBiometricStore};
 use kubach_core::vault::keychain::{KeyStore, SystemKeyStore};
 use kubach_core::vault::screen_lock::ScreenLock;
+use kubach_core::vault::system_idle::SystemIdle;
 use kubach_core::vault::{
     self, Attempts, Availability, DerivedPassword, EntryInfo, Imported, KeyMode, LockedVault,
     UnlockMethod, Vault, VaultError,
@@ -38,7 +39,8 @@ pub use dialogs::{
 
 use crate::settings::AppSettings;
 
-/// How often the idle timer looks at the clock.
+/// How often the idle timer looks at the clock and asks the OS for the last
+/// input.
 const IDLE_CHECK: Duration = Duration::from_secs(10);
 
 /// How often the OS is asked whether the screen is locked, while the vault
@@ -57,10 +59,14 @@ fn locked_error() -> SharedString {
     t!("vault-locked").into()
 }
 
-/// The last user input on two clocks. The monotonic one stands still while
-/// the computer sleeps (macOS, Linux), so the wall clock is read as well;
-/// the wall clock can be set back, so it never shortens what the monotonic
-/// one measured.
+/// The last user input the app knows of, on two clocks. The monotonic one
+/// stands still while the computer sleeps (macOS, Linux), so the wall clock
+/// is read as well; the wall clock can be set back, so it never shortens
+/// what the monotonic one measured.
+///
+/// Input in the Kubach window lands here at once ([`touch`]); input
+/// anywhere else in the OS session is learned at each idle check from the
+/// OS counter ([`observe`](Self::observe)).
 #[derive(Clone, Copy, Debug)]
 struct Activity {
     at: Instant,
@@ -85,8 +91,39 @@ impl Activity {
         awake.max(elapsed)
     }
 
-    fn idle_now(&self) -> Duration {
-        self.idle(Instant::now(), SystemTime::now())
+    /// One idle check as of `now` / `wall`. `system` is the time since the
+    /// last input anywhere in the OS session, when the OS tells
+    /// ([`SystemIdle`]). Returns the time without input to hold against the
+    /// limit ([`idle_stretch`]) and moves the activity to the input the OS
+    /// reported, if that is news.
+    fn observe(&mut self, system: Option<Duration>, now: Instant, wall: SystemTime) -> Duration {
+        let known = self.idle(now, wall);
+        if let Some(ago) = system
+            && ago < known
+        {
+            *self = Self {
+                at: now.checked_sub(ago).unwrap_or(now),
+                wall: wall.checked_sub(ago).unwrap_or(wall),
+            };
+        }
+        idle_stretch(known, system)
+    }
+}
+
+/// The time without input an idle check holds against the limit. `known`
+/// is the time since the last input the app knew of, on its own clocks
+/// (sleep counted); `system` is what the OS says about the whole session.
+///
+/// - The OS can't tell, or reports nothing newer: `known`, as before.
+/// - The OS reports a later input: the longer of the stretch that input
+///   ended and the time since it. So input anywhere postpones the lock,
+///   but not input that came after the limit had already passed: the key
+///   that wakes the computer from a long sleep does not keep the vault
+///   open, whatever the OS counter did over the sleep.
+fn idle_stretch(known: Duration, system: Option<Duration>) -> Duration {
+    match system {
+        Some(ago) if ago < known => (known - ago).max(ago),
+        _ => known,
     }
 }
 
@@ -220,8 +257,9 @@ pub fn is_unlocked(cx: &App) -> bool {
     global(cx).is_some_and(|vault| vault.read(cx).is_unlocked())
 }
 
-/// Records user input, postponing the idle lock. Cheap; call on any click
-/// or key press.
+/// Records user input in the window, postponing the idle lock. Cheap; call
+/// on any click or key press. Input in other applications is picked up by
+/// the idle check itself; this covers an OS that can't report it.
 pub fn touch(cx: &mut App) {
     if let Some(vault) = global(cx) {
         vault.update(cx, |vault, _| vault.last_activity = Activity::now());
@@ -246,9 +284,27 @@ fn biometric_store() -> &'static dyn BiometricStore {
 impl VaultState {
     fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let idle = cx.spawn(async move |this, cx| {
+            let mut system = SystemIdle::new();
             loop {
                 cx.background_executor().timer(IDLE_CHECK).await;
-                if this.update(cx, |this, cx| this.lock_if_idle(cx)).is_err() {
+                let Ok(unlocked) = this.update(cx, |this, _| this.is_unlocked()) else {
+                    break;
+                };
+                if !unlocked {
+                    continue;
+                }
+                // Asked off the UI thread; the asker comes back for reuse.
+                let idle;
+                (system, idle) = cx
+                    .background_spawn(async move {
+                        let idle = system.idle().await;
+                        (system, idle)
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.lock_if_idle(idle, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -474,13 +530,21 @@ impl VaultState {
         self.busy.is_some()
     }
 
-    fn lock_if_idle(&mut self, cx: &mut Context<Self>) {
+    /// One idle check. `system` is the time since the last input anywhere
+    /// in the OS session, `None` when the OS can't tell: then only input in
+    /// the window counts.
+    fn lock_if_idle(&mut self, system: Option<Duration>, cx: &mut Context<Self>) {
+        if !self.is_unlocked() {
+            return;
+        }
+        // Read even with the timer off, so turning it on starts from the
+        // real last input.
+        let idle = self
+            .last_activity
+            .observe(system, Instant::now(), SystemTime::now());
         let lock_after = AppSettings::try_global(cx)
             .and_then(|settings| settings.read(cx).get().clusters.vault_lock_after());
-        if let Some(after) = lock_after
-            && self.is_unlocked()
-            && self.last_activity.idle_now() >= after
-        {
+        if lock_after.is_some_and(|after| idle >= after) {
             self.lock(cx);
         }
     }
@@ -799,7 +863,7 @@ fn notify_failure(task: Task<Result<(), SharedString>>, window: &mut Window, cx:
 mod tests {
     use std::time::Duration;
 
-    use super::{Activity, AfterLock, after_lock, lock_ends};
+    use super::{Activity, AfterLock, after_lock, idle_stretch, lock_ends};
 
     const MINUTE: Duration = Duration::from_secs(60);
 
@@ -825,6 +889,59 @@ mod tests {
             wall: last.wall,
         };
         assert_eq!(earlier.idle(last.at, last.wall), Duration::ZERO);
+    }
+
+    #[test]
+    fn input_anywhere_postpones_the_lock_but_not_after_the_limit() {
+        let limit = 60 * MINUTE;
+        // The OS can't tell: the time since input in the window.
+        assert_eq!(idle_stretch(50 * MINUTE, None), 50 * MINUTE);
+        // Nothing newer than what the app knows.
+        assert_eq!(idle_stretch(50 * MINUTE, Some(50 * MINUTE)), 50 * MINUTE);
+        assert_eq!(idle_stretch(50 * MINUTE, Some(70 * MINUTE)), 50 * MINUTE);
+        // Hours since input in the window, work in another application a
+        // moment ago: no lock.
+        assert!(idle_stretch(10 * MINUTE, Some(Duration::from_secs(3))) < limit);
+        // A long sleep ended by a key press: the limit passed before the
+        // key, so the vault locks although the OS counter is near zero.
+        assert!(idle_stretch(120 * MINUTE, Some(Duration::from_secs(3))) >= limit);
+        // A short sleep ended by a key press: no lock.
+        assert!(idle_stretch(20 * MINUTE, Some(Duration::from_secs(3))) < limit);
+        // Checks missed for long (a sleep the OS counter ran through, no
+        // key): the time since the reported input counts as well.
+        assert_eq!(idle_stretch(100 * MINUTE, Some(61 * MINUTE)), 61 * MINUTE);
+    }
+
+    #[test]
+    fn an_idle_check_moves_the_activity_to_the_reported_input() {
+        let start = Activity::now();
+        let limit = 60 * MINUTE;
+        let second = Duration::from_secs(1);
+
+        // 59 minutes of work in another application, checked along the
+        // way: each check learns of the input, the idle time stays short.
+        let mut activity = start;
+        for minute in 1..=59 {
+            let (now, wall) = (start.at + minute * MINUTE, start.wall + minute * MINUTE);
+            assert!(activity.observe(Some(second), now, wall) < limit);
+            assert_eq!(activity.idle(now, wall), second);
+        }
+        // Then nobody at the computer for an hour: the OS counter grows
+        // with the app's clocks and the limit is reached.
+        let (now, wall) = (start.at + 120 * MINUTE, start.wall + 120 * MINUTE);
+        assert!(activity.observe(Some(61 * MINUTE + second), now, wall) >= limit);
+
+        // The OS can't tell: the activity stays where the window put it.
+        let mut activity = start;
+        let (now, wall) = (start.at + 61 * MINUTE, start.wall + 61 * MINUTE);
+        assert_eq!(activity.observe(None, now, wall), 61 * MINUTE);
+        assert_eq!(activity.idle(now, wall), 61 * MINUTE);
+
+        // Asleep for two hours (the monotonic clock saw ten seconds), woken
+        // by a key: the check locks, sleep counts as idle time.
+        let mut activity = start;
+        let (now, wall) = (start.at + 10 * second, start.wall + 120 * MINUTE);
+        assert!(activity.observe(Some(second), now, wall) >= limit);
     }
 
     #[test]
