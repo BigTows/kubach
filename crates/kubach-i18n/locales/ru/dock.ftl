@@ -81,6 +81,24 @@ dock-logs-pause = Пауза
 dock-logs-follow = Следить
 dock-logs-copy = Скопировать все строки
 dock-logs-clear = Очистить
+dock-logs-download = Скачать логи в файл
+dock-logs-download-visible = То, что видно (строки этой вкладки)
+dock-logs-download-all = Всё (весь лог с сервера)
+# $file: имя записываемого файла.
+dock-logs-downloading = Сохранение { $file }
+# $size: 12.3 MB (уже отформатировано).
+dock-logs-download-saved = Сохранено: { $path } ({ $size })
+# $sources: «web-0/init: нет прав; web-1/app: больше не существует».
+dock-logs-download-skipped = Нет в файле: { $sources }
+dock-logs-download-skip-forbidden = нет прав
+dock-logs-download-skip-gone = больше не существует
+# $source: pod/контейнер.
+dock-logs-download-forbidden = Нет прав на чтение логов { $source }. Ничего не сохранено.
+dock-logs-download-gone = { $source } больше не существует. Ничего не сохранено.
+dock-logs-download-source-failed = Не удалось прочитать логи { $source }: { $error }. Ничего не сохранено.
+dock-logs-download-file-failed = Не удалось записать { $path }: { $error }. Ничего не сохранено.
+dock-logs-download-locked = Скачивание остановлено: хранилище заблокировано. Ничего не сохранено.
+dock-logs-download-dismiss = Скрыть
 
 ## Терминалы shell и отладки
 

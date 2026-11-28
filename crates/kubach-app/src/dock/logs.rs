@@ -1,13 +1,17 @@
 //! A dock tab streaming the logs of one pod or of every pod of a workload.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use futures::future::Either;
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -17,14 +21,15 @@ use gpui_kit::*;
 use kubach_core::ansi::{self, AnsiColor, AnsiStyle};
 use kubach_core::runtime;
 use kubach_core::streams::{
-    FetchedLines, HistoryRequest, HistoryState, INITIAL_TAIL_LINES, LogEvent, LogHistory, LogLine,
-    LogOptions, LogSource, MAX_HISTORY_BYTES, MAX_HISTORY_LINES, StreamError, fetch_history,
-    sources_for_selector, stream_logs,
+    FetchedLines, HistoryRequest, HistoryState, INITIAL_TAIL_LINES, LogDownloadError,
+    LogDownloadOptions, LogDownloadReport, LogEvent, LogHistory, LogLine, LogOptions, LogSource,
+    MAX_HISTORY_BYTES, MAX_HISTORY_LINES, SourceFailure, StreamError, download_logs, fetch_history,
+    log_file_name_now, save_log_text, sources_for_selector, stream_logs,
 };
 use kubach_i18n::t;
 use kubach_ui::{
-    DEFAULT_LOG_CAPACITY, LogEntry, LogTopNotice, LogView, LogViewEvent, SpanColor, SpanStyle,
-    StyledSpan,
+    DEFAULT_LOG_CAPACITY, DownloadProgress, LogEntry, LogTopNotice, LogView, LogViewEvent,
+    SpanColor, SpanStyle, StyledSpan, format_bytes,
 };
 
 use super::containers::{OnPick, fill_menu};
@@ -42,6 +47,64 @@ const BATCH_EVENTS: usize = 256;
 /// the pause wait in the stream (which merges them into fewer batches) and
 /// are shown together; a line after a quiet period is shown at once.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+/// Pause between redraws of the bytes a download has written.
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Saving the log of the tab to a file (#214): shown in a row under the
+/// toolbar until it is dismissed.
+enum Download {
+    Running {
+        path: PathBuf,
+        /// Bytes in the file so far.
+        written: Arc<AtomicU64>,
+        /// Reads from a context of the vault: ends when it locks.
+        vault: bool,
+        /// Dropping the task stops the download and removes its
+        /// unfinished file.
+        cancellable: bool,
+        _task: Task<()>,
+    },
+    Saved {
+        path: PathBuf,
+        bytes: u64,
+        /// Sources the file has nothing of, with the reason.
+        skipped: Vec<String>,
+    },
+    Failed(String),
+}
+
+/// Why the log of a source is not in a saved file, for the list of skipped
+/// sources.
+fn skip_reason(reason: &SourceFailure) -> String {
+    match reason {
+        SourceFailure::Forbidden => t!("dock-logs-download-skip-forbidden"),
+        SourceFailure::NotFound => t!("dock-logs-download-skip-gone"),
+        SourceFailure::Other(message) => message.clone(),
+    }
+}
+
+/// What the tab says about a download that saved nothing.
+fn download_error(error: &LogDownloadError, path: &std::path::Path) -> String {
+    match error {
+        LogDownloadError::Source { log, reason } => {
+            let source = log.label();
+            match reason {
+                SourceFailure::Forbidden => t!("dock-logs-download-forbidden", source = source),
+                SourceFailure::NotFound => t!("dock-logs-download-gone", source = source),
+                SourceFailure::Other(message) => t!(
+                    "dock-logs-download-source-failed",
+                    source = source,
+                    error = message.as_str()
+                ),
+            }
+        }
+        LogDownloadError::File(error) => t!(
+            "dock-logs-download-file-failed",
+            path = path.display().to_string(),
+            error = error.to_string()
+        ),
+    }
+}
 
 /// Where the stream is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,6 +284,8 @@ pub struct LogsTab {
     history_error: Option<String>,
     /// The stream runs on a context of the vault and ends when it locks.
     vault: bool,
+    /// The last download of the log to a file, running or finished.
+    download: Option<Download>,
     /// The lock closed a running stream: it starts again after the unlock.
     resume: Option<Resume>,
     _history_load: Option<Task<()>>,
@@ -291,6 +356,7 @@ impl LogsTab {
             history: None,
             history_error: None,
             vault: false,
+            download: None,
             resume: None,
             _history_load: None,
             _stream: None,
@@ -437,6 +503,7 @@ impl LogsTab {
     /// The vault locked: a stream on one of its contexts closes, the lines
     /// read so far stay, and the tab says why (ADR 0008).
     pub fn vault_locked(&mut self, cx: &mut Context<Self>) {
+        self.lock_download(cx);
         if !std::mem::take(&mut self.vault) {
             return;
         }
@@ -665,6 +732,288 @@ impl LogsTab {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
+    /// The name offered for a saved log: `<pod>_<container>_<time>.log`.
+    fn download_name(&self) -> String {
+        match &self.target {
+            LogTarget::Pod(pod) => log_file_name_now(&pod.name, self.container.as_deref()),
+            LogTarget::Selector { title, .. } => log_file_name_now(title, None),
+        }
+    }
+
+    /// Asks where to save, then saves the lines of the tab or, with
+    /// `everything`, the whole log from the server.
+    fn download(&mut self, everything: bool, cx: &mut Context<Self>) {
+        let directory = kubach_core::env::home_dir()
+            .map(|home| home.join("Downloads"))
+            .filter(|dir| dir.is_dir())
+            .or_else(kubach_core::env::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = cx.prompt_for_new_path(&directory, Some(&self.download_name()));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // Another one was started while the dialog was open.
+                if matches!(this.download, Some(Download::Running { .. })) {
+                    return;
+                }
+                if everything {
+                    this.save_everything(path, cx);
+                } else {
+                    this.save_visible(path, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Saves the lines the tab holds, as it shows them (source tags, and
+    /// timestamps when they are on). Search only highlights, so every
+    /// line is saved.
+    fn save_visible(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let text = self.view.read(cx).text();
+        let bytes = text.len() as u64;
+        let target = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let write_to = target.clone();
+            let saved = cx
+                .background_spawn(async move { save_log_text(&write_to, &text) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.download = Some(match saved {
+                    Ok(()) => Download::Saved {
+                        path: target,
+                        bytes,
+                        skipped: Vec::new(),
+                    },
+                    Err(error) => {
+                        Download::Failed(download_error(&LogDownloadError::File(error), &target))
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        });
+        self.download = Some(Download::Running {
+            path,
+            written: Arc::new(AtomicU64::new(bytes)),
+            vault: false,
+            cancellable: false,
+            _task: task,
+        });
+    }
+
+    /// Streams the whole log of the tab's sources from the server to
+    /// `path`, with the tab's choice of timestamps and of the previous
+    /// container instance.
+    fn save_everything(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let tab_client =
+            crate::action_context::tab_client(self.cluster.read(cx), self.context.as_deref(), cx);
+        let tab_client = match tab_client {
+            Ok(tab_client) => tab_client,
+            Err(error) => {
+                self.download = Some(Download::Failed(error));
+                return;
+            }
+        };
+        if self.sources.is_empty() {
+            self.download = Some(Download::Failed(t!("dock-logs-no-containers")));
+            return;
+        }
+        let sources: Vec<LogSource> = self
+            .sources
+            .iter()
+            .map(|source| LogSource::clone(source))
+            .collect();
+        let options = LogDownloadOptions {
+            previous: self.previous,
+            timestamps: self.view.read(cx).show_timestamps(),
+        };
+        let written = Arc::new(AtomicU64::new(0));
+        let mut work = runtime::spawn({
+            let (client, target, written) = (tab_client.client, path.clone(), written.clone());
+            async move { download_logs(&client, sources, options, &target, &written).await }
+        });
+        let target = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = loop {
+                let tick =
+                    std::pin::pin!(cx.background_executor().timer(DOWNLOAD_PROGRESS_INTERVAL));
+                match futures::future::select(&mut work, tick).await {
+                    Either::Left((result, _)) => break result,
+                    Either::Right(_) => {
+                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            };
+            let result = result.map_err(|error| error.to_string());
+            this.update(cx, |this, cx| this.download_finished(target, result, cx))
+                .ok();
+        });
+        self.download = Some(Download::Running {
+            path,
+            written,
+            vault: tab_client.vault,
+            cancellable: true,
+            _task: task,
+        });
+    }
+
+    fn download_finished(
+        &mut self,
+        path: PathBuf,
+        result: Result<Result<LogDownloadReport, LogDownloadError>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.download = Some(match result {
+            Ok(Ok(report)) => Download::Saved {
+                bytes: report.bytes,
+                skipped: report
+                    .skipped
+                    .iter()
+                    .map(|(source, reason)| format!("{}: {}", source.label(), skip_reason(reason)))
+                    .collect(),
+                path,
+            },
+            Ok(Err(error)) => Download::Failed(download_error(&error, &path)),
+            Err(error) => Download::Failed(error),
+        });
+        cx.notify();
+    }
+
+    /// The vault locked: a download reading from one of its contexts stops
+    /// and its unfinished file is removed (ADR 0008).
+    fn lock_download(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.download, Some(Download::Running { vault: true, .. })) {
+            self.download = Some(Download::Failed(t!("dock-logs-download-locked")));
+            cx.notify();
+        }
+    }
+
+    /// "Download" in the toolbar: the lines of the tab or the whole log.
+    fn render_download_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let tab = cx.entity().downgrade();
+        let running = matches!(self.download, Some(Download::Running { .. }));
+        // The whole log is read from the sources the stream found.
+        let no_sources = self.sources.is_empty();
+        Button::new("log-download")
+            .ghost()
+            .xsmall()
+            .icon(Lucide::Download)
+            .tooltip(t!("dock-logs-download"))
+            .disabled(running)
+            .dropdown_menu(move |menu: PopupMenu, _, _| {
+                [
+                    (t!("dock-logs-download-visible"), false, false),
+                    (t!("dock-logs-download-all"), true, no_sources),
+                ]
+                .into_iter()
+                .fold(menu, |menu, (label, everything, disabled)| {
+                    let tab = tab.clone();
+                    menu.item(PopupMenuItem::new(label).disabled(disabled).on_click(
+                        move |_, _, cx| {
+                            tab.update(cx, |tab, cx| tab.download(everything, cx)).ok();
+                        },
+                    ))
+                })
+            })
+    }
+
+    /// The row under the toolbar: progress of a running download with
+    /// "Cancel", or how the last one ended.
+    fn render_download(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let download = self.download.as_ref()?;
+        let theme = cx.theme();
+        let row = div()
+            .flex()
+            .items_start()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs();
+        let dismiss = || {
+            Button::new("log-download-dismiss")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .tooltip(t!("dock-logs-download-dismiss"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.download = None;
+                    cx.notify();
+                }))
+        };
+        let row = match download {
+            Download::Running {
+                path,
+                written,
+                cancellable,
+                ..
+            } => {
+                let file = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let progress = DownloadProgress::new(
+                    "log-download-progress",
+                    t!("dock-logs-downloading", file = file),
+                )
+                .bytes(written.load(Ordering::Relaxed), None);
+                let progress = if *cancellable {
+                    progress.on_cancel(cx.listener(|this, _, _, cx| {
+                        // Dropping the task removes the unfinished file.
+                        this.download = None;
+                        cx.notify();
+                    }))
+                } else {
+                    progress
+                };
+                row.child(div().flex_1().min_w_0().child(progress))
+            }
+            Download::Saved {
+                path,
+                bytes,
+                skipped,
+            } => row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(div().text_color(theme.muted_foreground).child(t!(
+                            "dock-logs-download-saved",
+                            path = path.display().to_string(),
+                            size = format_bytes(*bytes)
+                        )))
+                        .when(!skipped.is_empty(), |column| {
+                            column.child(div().text_color(theme.warning).child(t!(
+                                "dock-logs-download-skipped",
+                                sources = skipped.join("; ")
+                            )))
+                        }),
+                )
+                .child(dismiss()),
+            Download::Failed(error) => row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.danger)
+                        .child(error.clone()),
+                )
+                .child(dismiss()),
+        };
+        Some(row.into_any_element())
+    }
+
     fn render_container_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let LogTarget::Pod(pod) = &self.target else {
             return None;
@@ -694,6 +1043,7 @@ impl LogsTab {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let container_picker = self.render_container_picker(cx);
+        let download_button = self.render_download_button(cx);
         let theme = cx.theme();
         let view = self.view.read(cx);
         let (current, total) = view.match_position();
@@ -882,6 +1232,7 @@ impl LogsTab {
                         });
                     })),
             )
+            .child(download_button)
             .child(
                 Button::new("log-copy")
                     .ghost()
@@ -916,6 +1267,7 @@ impl Render for LogsTab {
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
+            .children(self.render_download(cx))
             .child(div().flex_1().min_h_0().child(self.view.clone()))
     }
 }

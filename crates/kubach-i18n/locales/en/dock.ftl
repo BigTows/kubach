@@ -86,6 +86,24 @@ dock-logs-pause = Pause
 dock-logs-follow = Follow
 dock-logs-copy = Copy all lines
 dock-logs-clear = Clear
+dock-logs-download = Download logs to a file
+dock-logs-download-visible = What is visible (lines in this tab)
+dock-logs-download-all = Everything (the whole log from the server)
+# $file: the name of the file being written.
+dock-logs-downloading = Saving { $file }
+# $size: 12.3 MB (already formatted).
+dock-logs-download-saved = Saved { $path } ({ $size })
+# $sources: "web-0/init: no permission; web-1/app: no longer exists".
+dock-logs-download-skipped = Not in the file: { $sources }
+dock-logs-download-skip-forbidden = no permission
+dock-logs-download-skip-gone = no longer exists
+# $source: pod/container.
+dock-logs-download-forbidden = No permission to read the logs of { $source }. Nothing was saved.
+dock-logs-download-gone = { $source } no longer exists. Nothing was saved.
+dock-logs-download-source-failed = Couldn't read the logs of { $source }: { $error }. Nothing was saved.
+dock-logs-download-file-failed = Couldn't write { $path }: { $error }. Nothing was saved.
+dock-logs-download-locked = Download stopped: the vault is locked. Nothing was saved.
+dock-logs-download-dismiss = Dismiss
 
 ## Shell and debug terminals
 

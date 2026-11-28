@@ -75,6 +75,24 @@ dock-logs-pause = 暂停
 dock-logs-follow = 跟随
 dock-logs-copy = 复制所有行
 dock-logs-clear = 清除
+dock-logs-download = 将日志下载到文件
+dock-logs-download-visible = 可见内容（此标签页中的行）
+dock-logs-download-all = 全部（来自服务器的完整日志）
+# $file：正在写入的文件名。
+dock-logs-downloading = 正在保存 { $file }
+# $size：12.3 MB（已格式化）。
+dock-logs-download-saved = 已保存 { $path }（{ $size }）
+# $sources：“web-0/init：没有权限；web-1/app：已不存在”。
+dock-logs-download-skipped = 文件中不包含：{ $sources }
+dock-logs-download-skip-forbidden = 没有权限
+dock-logs-download-skip-gone = 已不存在
+# $source：pod/容器。
+dock-logs-download-forbidden = 没有读取 { $source } 日志的权限。未保存任何内容。
+dock-logs-download-gone = { $source } 已不存在。未保存任何内容。
+dock-logs-download-source-failed = 无法读取 { $source } 的日志：{ $error }。未保存任何内容。
+dock-logs-download-file-failed = 无法写入 { $path }：{ $error }。未保存任何内容。
+dock-logs-download-locked = 下载已停止：保险库已锁定。未保存任何内容。
+dock-logs-download-dismiss = 关闭
 
 ## Shell 和调试终端
 
