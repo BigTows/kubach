@@ -158,6 +158,10 @@ pub struct Cluster {
     /// [`VaultState::revision`](crate::vault::VaultState::revision) the
     /// contexts were loaded with.
     vault_revision: u64,
+    /// The active context when the vault lock closed its connection: the
+    /// one to come back to after the unlock, unless the user picked another
+    /// meanwhile (#213). A name only.
+    dropped_by_lock: Option<String>,
     _vault: Option<Subscription>,
 }
 
@@ -205,17 +209,34 @@ impl Cluster {
             security,
             _settings: settings.map(|settings| cx.observe(&settings, Self::settings_changed)),
             vault_revision: crate::vault::global(cx).map_or(0, |vault| vault.read(cx).revision()),
+            dropped_by_lock: None,
             // Lock, unlock and imports change the imported contexts.
             _vault: crate::vault::global(cx).map(|vault| {
                 cx.observe(&vault, |this, vault, cx| {
                     // Locked: the connections of its contexts close at
                     // once, before the reload below is back (ADR 0008).
-                    if !vault.read(cx).is_unlocked() && this.close_imported() {
-                        cx.notify();
+                    if !vault.read(cx).is_unlocked() {
+                        if let Some(active) = this.active.as_deref()
+                            && this.is_imported(active)
+                        {
+                            this.dropped_by_lock = Some(active.to_owned());
+                        }
+                        if this.close_imported() {
+                            cx.notify();
+                        }
                     }
                     let revision = vault.read(cx).revision();
                     if revision != this.vault_revision {
                         this.vault_revision = revision;
+                        // Unlocked again: back to the context the lock took
+                        // away, once the reload below lists it.
+                        if let Some(back) = back_after_unlock(
+                            &mut this.dropped_by_lock,
+                            crate::vault::after_lock_now(cx),
+                            this.pending.is_some(),
+                        ) {
+                            this.pending = Some(back);
+                        }
                         // The active context renamed (#90): stay on it.
                         if let Some((old, new)) = vault.read(cx).renamed()
                             && this.active.as_deref() == Some(old)
@@ -493,7 +514,7 @@ impl Cluster {
         }
         match next {
             Next::Keep => {}
-            Next::Connect(name) => self.connect(name, cx),
+            Next::Connect(name) => self.switch_to(name, cx),
             Next::None => self.active = None,
         }
         cx.notify();
@@ -619,9 +640,17 @@ impl Cluster {
             .map_or(&NO_CATALOG, |session| &session.catalog)
     }
 
-    /// Switches to `name`, reusing its connection if it is still open (or
-    /// opening), otherwise connecting in the background.
+    /// Switches to `name` because the user picked it, reusing its
+    /// connection if it is still open (or opening), otherwise connecting in
+    /// the background. The context a vault lock took away is not come back
+    /// to after this.
     pub fn connect(&mut self, name: String, cx: &mut Context<Self>) {
+        self.dropped_by_lock = None;
+        self.switch_to(name, cx);
+    }
+
+    /// Makes `name` the active context and ensures its connection.
+    fn switch_to(&mut self, name: String, cx: &mut Context<Self>) {
         self.active = Some(name.clone());
         self.open(&name, false, cx);
     }
@@ -872,6 +901,26 @@ fn next_active(
     default.map_or(Next::None, Next::Connect)
 }
 
+/// The context to make active again after an unlock: the one the lock
+/// took away (`dropped`, taken once the vault is unlocked), unless a
+/// context is `picked` already and waits for the contexts to be read. A
+/// reset vault forgets it.
+fn back_after_unlock(
+    dropped: &mut Option<String>,
+    after: crate::vault::AfterLock,
+    picked: bool,
+) -> Option<String> {
+    use crate::vault::AfterLock;
+    match after {
+        AfterLock::Wait => None,
+        AfterLock::Resume => dropped.take().filter(|_| !picked),
+        AfterLock::Forget => {
+            *dropped = None;
+            None
+        }
+    }
+}
+
 /// Names of the contexts of the vault: those its entries list (known while
 /// it is locked, and before the contexts are read) and those `contexts`
 /// took from it.
@@ -898,7 +947,10 @@ mod tests {
     use kubach_core::settings::SecuritySettings;
     use kubach_core::vault::Imported;
 
-    use super::{Cluster, Next, RecentContexts, Session, next_active, vault_contexts};
+    use super::{
+        Cluster, Next, RecentContexts, Session, back_after_unlock, next_active, vault_contexts,
+    };
+    use crate::vault::AfterLock;
 
     fn kubeconfig(context: &str) -> String {
         format!(
@@ -946,8 +998,44 @@ mod tests {
             security: SecuritySettings::default(),
             _settings: None,
             vault_revision: 0,
+            dropped_by_lock: None,
             _vault: None,
         }
+    }
+
+    #[test]
+    fn an_unlock_returns_to_the_context_the_lock_took_away() {
+        // Locked: remembered, nothing to do yet.
+        let mut dropped = Some("from-vault".to_owned());
+        assert_eq!(
+            back_after_unlock(&mut dropped, AfterLock::Wait, false),
+            None
+        );
+        assert_eq!(dropped.as_deref(), Some("from-vault"));
+        // Unlocked: back to it, once.
+        assert_eq!(
+            back_after_unlock(&mut dropped, AfterLock::Resume, false),
+            Some("from-vault".to_owned())
+        );
+        assert_eq!(dropped, None);
+        assert_eq!(
+            back_after_unlock(&mut dropped, AfterLock::Resume, false),
+            None
+        );
+        // The user unlocked by picking another context: that one wins.
+        let mut dropped = Some("from-vault".to_owned());
+        assert_eq!(
+            back_after_unlock(&mut dropped, AfterLock::Resume, true),
+            None
+        );
+        assert_eq!(dropped, None);
+        // The vault was reset: forgotten.
+        let mut dropped = Some("from-vault".to_owned());
+        assert_eq!(
+            back_after_unlock(&mut dropped, AfterLock::Forget, false),
+            None
+        );
+        assert_eq!(dropped, None);
     }
 
     #[test]

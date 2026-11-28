@@ -115,6 +115,8 @@ dock-exit-failed = Ошибка
 dock-exit-failed-message = Ошибка: { $message }
 dock-exit-disconnected = Отключён
 dock-vault-locked = Закрыто: хранилище заблокировано
+dock-vault-reopen-cannot-connect = Не открыто заново после разблокировки: не удалось подключиться к контексту { $context }: { $error }
+dock-vault-reopen-disconnected = Не открыто заново после разблокировки: контекст { $context } отключён
 
 ## Локальный терминал
 
