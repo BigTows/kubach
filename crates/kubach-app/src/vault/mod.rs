@@ -97,6 +97,42 @@ pub fn lock_ends(imported: bool, unlocked: bool) -> bool {
     imported && !unlocked
 }
 
+/// What becomes of the work a lock ended (#213). Whoever ended it (a dock
+/// tab, the port-forwards, the connection of the active context) remembers
+/// that itself and asks here, on every change of the vault, what to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterLock {
+    /// Still locked: keep waiting.
+    Wait,
+    /// Unlocked again, in whatever way (password, Touch ID / Windows
+    /// Hello, the keychain): bring it back.
+    Resume,
+    /// The vault is gone (reset): its contexts are too, forget the work.
+    Forget,
+}
+
+/// [`AfterLock`] for a vault that `exists` (has a file, readable or not)
+/// and is `unlocked` or not.
+pub fn after_lock(exists: bool, unlocked: bool) -> AfterLock {
+    match (exists, unlocked) {
+        (false, _) => AfterLock::Forget,
+        (true, true) => AfterLock::Resume,
+        (true, false) => AfterLock::Wait,
+    }
+}
+
+/// [`after_lock`] for the vault as it is now.
+pub fn after_lock_now(cx: &App) -> AfterLock {
+    let Some(vault) = global(cx) else {
+        return AfterLock::Forget;
+    };
+    let vault = vault.read(cx);
+    after_lock(
+        !matches!(vault.status(), VaultStatus::Missing),
+        vault.is_unlocked(),
+    )
+}
+
 /// What the vault is doing in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Busy {
@@ -410,6 +446,8 @@ impl VaultState {
     /// copied Secret value still in the clipboard. Observers end what runs
     /// on the imported contexts: connections ([`Cluster`](crate::cluster::Cluster)),
     /// dock tabs and port-forwards ([`dock`](crate::dock)), agent sessions.
+    /// All but the agent sessions come back with the next unlock
+    /// ([`AfterLock`]).
     pub fn lock(&mut self, cx: &mut Context<Self>) {
         if let VaultStatus::Unlocked(vault) = &self.status {
             self.status = VaultStatus::Locked(vault.locked());
@@ -761,7 +799,7 @@ fn notify_failure(task: Task<Result<(), SharedString>>, window: &mut Window, cx:
 mod tests {
     use std::time::Duration;
 
-    use super::{Activity, lock_ends};
+    use super::{Activity, AfterLock, after_lock, lock_ends};
 
     const MINUTE: Duration = Duration::from_secs(60);
 
@@ -796,5 +834,14 @@ mod tests {
         // A kubeconfig file's context is untouched, locked or not.
         assert!(!lock_ends(false, false));
         assert!(!lock_ends(false, true));
+    }
+
+    #[test]
+    fn what_a_lock_ended_waits_for_the_unlock_and_goes_with_the_vault() {
+        assert_eq!(after_lock(true, false), AfterLock::Wait);
+        assert_eq!(after_lock(true, true), AfterLock::Resume);
+        // Reset: there is no vault to unlock any more.
+        assert_eq!(after_lock(false, false), AfterLock::Forget);
+        assert_eq!(after_lock(false, true), AfterLock::Forget);
     }
 }

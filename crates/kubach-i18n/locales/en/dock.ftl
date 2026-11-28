@@ -103,6 +103,8 @@ dock-exit-failed = Failed
 dock-exit-failed-message = Failed: { $message }
 dock-exit-disconnected = Disconnected
 dock-vault-locked = Closed: the vault is locked
+dock-vault-reopen-cannot-connect = Not reopened after the unlock: cannot connect to context { $context }: { $error }
+dock-vault-reopen-disconnected = Not reopened after the unlock: context { $context } was disconnected
 
 ## Local terminal
 
