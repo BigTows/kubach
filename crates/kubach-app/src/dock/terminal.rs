@@ -21,6 +21,7 @@ use kubach_i18n::{Message, msg, t};
 use kubach_ui::{ClipboardPolicy, TerminalEvent, TerminalView};
 
 use super::containers::{OnPick, fill_menu};
+use super::resume::{Next, Resume};
 use super::target::{ContainerMenu, PodRef, StreamRequest};
 use crate::action_context;
 use crate::cluster::Cluster;
@@ -200,6 +201,8 @@ pub struct TerminalTab {
     generation: u64,
     /// The session runs on a context of the vault and ends when it locks.
     vault: bool,
+    /// The lock ended a live session: it starts again after the unlock.
+    resume: Option<Resume>,
     _session: Option<Task<()>>,
     _subscription: Subscription,
     /// Follows the OSC 52 clipboard setting.
@@ -242,6 +245,7 @@ impl TerminalTab {
             no_shell: false,
             generation: 0,
             vault: false,
+            resume: None,
             _session: None,
             _subscription: subscription,
             _settings: settings,
@@ -346,6 +350,43 @@ impl TerminalTab {
             let closed = msg!("dock-vault-locked");
             self.note(&format!("[{closed}]"), cx);
             self.set_state(SessionState::Exited(closed), cx);
+            // A shell comes back after the unlock. A debug container does
+            // not: starting one adds a container to the pod for good, which
+            // the user is asked about (#346), so it stays theirs to start.
+            if self.kind == TerminalKind::Shell {
+                self.resume = Some(Resume::new(&self.cluster, cx, Self::resume));
+            }
+        }
+    }
+
+    /// The vault or the contexts changed after a lock ended the session:
+    /// once the vault is unlocked and the context connected again, a new
+    /// session starts in the same pod and container, below the old output
+    /// (#213).
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        let Some(resume) = &mut self.resume else {
+            return;
+        };
+        match resume.next(&self.cluster, self.context.as_deref(), cx) {
+            // Locked again while its context was connecting.
+            Next::Wait if self.state.is_live() => {
+                self.set_state(SessionState::Exited(msg!("dock-vault-locked")), cx)
+            }
+            Next::Wait => {}
+            Next::Connecting if !self.state.is_live() => {
+                self.set_state(SessionState::Connecting(msg!("dock-connecting")), cx)
+            }
+            Next::Connecting => {}
+            Next::Start => {
+                self.resume = None;
+                self.start(cx);
+            }
+            Next::Fail(error) => {
+                self.resume = None;
+                self.note(&error, cx);
+                self.set_state(SessionState::Failed(error), cx);
+            }
+            Next::Forget => self.resume = None,
         }
     }
 
@@ -381,6 +422,8 @@ impl TerminalTab {
         let client = match tab_client {
             Ok(tab) => {
                 self.vault = tab.vault;
+                // Connected by hand: nothing is left to bring back.
+                self.resume = None;
                 tab.client
             }
             Err(error) => {

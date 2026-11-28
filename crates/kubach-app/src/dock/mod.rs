@@ -21,6 +21,7 @@ mod forwards_screen;
 mod local_terminal;
 mod logs;
 mod node_shell;
+mod resume;
 mod target;
 mod terminal;
 
@@ -232,7 +233,9 @@ impl Dock {
     /// The vault locked (by hand, idle timer, screen lock): every tab on
     /// one of its contexts ends its stream or session and stays, saying
     /// why (ADR 0008). Each tab knows whether it is on such a context. A
-    /// new kind of tab has to be named here to compile.
+    /// new kind of tab has to be named here to compile. A tab the lock
+    /// ended remembers that and reconnects by itself after the unlock
+    /// ([`resume`]).
     fn vault_locked(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
             match &tab.view {
