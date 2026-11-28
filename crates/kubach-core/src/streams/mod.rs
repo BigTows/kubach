@@ -8,6 +8,7 @@
 pub mod debug;
 pub mod exec;
 pub mod forward_target;
+pub mod log_download;
 pub mod log_history;
 pub mod logs;
 pub mod node_shell;
@@ -25,6 +26,10 @@ pub use exec::{
 pub use forward_target::{
     ForwardPort, ForwardSource, ResolvedTarget, TargetPod, TargetPort, fetch_source, is_pod_ready,
     pick_ready_pod, short_kind, target_pod, uses_host_network,
+};
+pub use log_download::{
+    LogDownloadError, LogDownloadOptions, LogDownloadReport, PartialFile, SourceFailure,
+    download_logs, log_file_name, log_file_name_now, save_log_text,
 };
 pub use log_history::{
     HistoryRequest, HistoryState, INITIAL_TAIL_LINES, LogHistory, MAX_HISTORY_BYTES,
