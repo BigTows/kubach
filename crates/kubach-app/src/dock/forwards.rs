@@ -6,7 +6,10 @@
 //! stops or removes it.
 //!
 //! Forwards in a context of the vault stop when it locks (ADR 0008) and
-//! wait, like forwards of the last run, until it is unlocked.
+//! wait, like forwards of the last run, until it is unlocked: then their
+//! context is connected in the background and they start on the same local
+//! port (#213). One the user removes meanwhile is forgotten, and so are all
+//! of them when the vault is reset.
 //!
 //! A paused forward (#476) keeps its local port and forwards nothing; it
 //! stays remembered as paused and comes back paused on the next run.
@@ -30,6 +33,7 @@ use kube::Client;
 
 use crate::cluster::Cluster;
 use crate::state::StateStore;
+use crate::vault::AfterLock;
 
 /// Forward `127.0.0.1:local_port` to `port` of `source` (a Service port for
 /// Services, a pod port otherwise). `LocalPort::Exact(0)` takes a random
@@ -85,12 +89,16 @@ pub struct Restore {
     pub id: u64,
     pub saved: SavedForward,
     pub status: RestoreStatus,
+    /// Stopped by the vault lock in this run, not left from the last one:
+    /// gone for good when the vault is reset.
+    held: bool,
     _task: Option<Task<()>>,
 }
 
-/// What a waiting restore does next, given its context.
+/// What a waiting restore (or a dock tab the vault lock closed) does next,
+/// given its context.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Step {
+pub(super) enum Step {
     Wait {
         known: bool,
     },
@@ -106,7 +114,12 @@ enum Step {
 /// The next step for restores in a context: start once it is connected,
 /// connect it in the background once it is known (only once), wait for
 /// one that is not loaded (locked vault) or still connecting.
-fn restore_step(known: bool, state: &ConnectionState, connected: bool, requested: bool) -> Step {
+pub(super) fn restore_step(
+    known: bool,
+    state: &ConnectionState,
+    connected: bool,
+    requested: bool,
+) -> Step {
     if connected {
         return Step::Start;
     }
@@ -175,6 +188,16 @@ impl Forwards {
                     if !vault.read(cx).is_unlocked() {
                         this.vault_locked(cx);
                     }
+                    // Reset: the contexts of the forwards on hold are gone.
+                    if crate::vault::after_lock_now(cx) == AfterLock::Forget {
+                        let dropped = this.drop_held();
+                        if !dropped.is_empty() {
+                            for saved in &dropped {
+                                forget(saved, cx);
+                            }
+                            cx.notify();
+                        }
+                    }
                 })
             }),
             _watch: watch,
@@ -215,10 +238,21 @@ impl Forwards {
                 id: self.next_restore,
                 saved,
                 status: RestoreStatus::Waiting { known: false },
+                held: true,
                 _task: None,
             });
         }
         !ids.is_empty()
+    }
+
+    /// Takes the forwards a lock put on hold out of the list, started
+    /// again or not: the vault they waited for was reset.
+    fn drop_held(&mut self) -> Vec<SavedForward> {
+        let (held, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.restoring)
+            .into_iter()
+            .partition(|restore| restore.held);
+        self.restoring = kept;
+        held.into_iter().map(|restore| restore.saved).collect()
     }
 
     /// Whether `context` is in the vault of imported kubeconfigs.
@@ -401,6 +435,7 @@ impl Forwards {
                 id: self.next_restore,
                 saved,
                 status: RestoreStatus::Waiting { known: true },
+                held: false,
                 _task: None,
             });
         }
@@ -649,7 +684,7 @@ mod tests {
     use kubach_core::state::SavedForward;
     use kubach_core::streams::PortForwardManager;
 
-    use super::{Forwards, RestoreStatus, Step, remembered, restore_error, restore_step};
+    use super::{Forwards, Restore, RestoreStatus, Step, remembered, restore_error, restore_step};
 
     fn saved(context: &str, local_port: u16, paused: bool) -> SavedForward {
         SavedForward {
@@ -703,6 +738,22 @@ mod tests {
         // Nothing more to stop on the next notification of a locked vault.
         assert!(!forwards.hold_vault_forwards());
         assert_eq!(forwards.restoring().len(), 1);
+
+        // The vault is reset: the forward on hold goes, one left from the
+        // last run stays in the list.
+        forwards.restoring.push(Restore {
+            id: 6,
+            saved: saved("last-run", 18082, false),
+            status: RestoreStatus::Waiting { known: false },
+            held: false,
+            _task: None,
+        });
+        assert_eq!(forwards.drop_held(), vec![saved("from-vault", 18080, true)]);
+        let [left] = forwards.restoring() else {
+            panic!("the forward of the last run stays");
+        };
+        assert_eq!(left.id, 6);
+        assert!(forwards.drop_held().is_empty());
     }
 
     #[test]

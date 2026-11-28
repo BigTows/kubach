@@ -28,6 +28,7 @@ use kubach_ui::{
 };
 
 use super::containers::{OnPick, fill_menu};
+use super::resume::{Next, Resume};
 use super::target::{ContainerMenu, LogTarget};
 use crate::cluster::Cluster;
 
@@ -220,6 +221,8 @@ pub struct LogsTab {
     history_error: Option<String>,
     /// The stream runs on a context of the vault and ends when it locks.
     vault: bool,
+    /// The lock closed a running stream: it starts again after the unlock.
+    resume: Option<Resume>,
     _history_load: Option<Task<()>>,
     _stream: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -288,6 +291,7 @@ impl LogsTab {
             history: None,
             history_error: None,
             vault: false,
+            resume: None,
             _history_load: None,
             _stream: None,
             _subscriptions: subscriptions,
@@ -345,6 +349,8 @@ impl LogsTab {
         let client = match tab_client {
             Ok(tab) => {
                 self.vault = tab.vault;
+                // Started by hand: nothing is left to bring back.
+                self.resume = None;
                 tab.client
             }
             Err(error) => {
@@ -441,9 +447,46 @@ impl LogsTab {
                 view.set_placeholder(t!("dock-vault-locked"), cx)
             });
             self.set_state(LogsState::Locked, cx);
+            self.resume = Some(Resume::new(&self.cluster, cx, Self::resume));
         }
         self.update_top_notice(cx);
         cx.notify();
+    }
+
+    /// The vault or the contexts changed after a lock closed the stream:
+    /// once the vault is unlocked and the context connected again, the
+    /// stream starts over with the same target, container and
+    /// previous-logs choice (#213). The lines stay on screen until then.
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        let Some(resume) = &mut self.resume else {
+            return;
+        };
+        match resume.next(&self.cluster, self.context.as_deref(), cx) {
+            // Locked again while its context was connecting.
+            Next::Wait if self.state == LogsState::Starting => {
+                self.view.update(cx, |view, cx| {
+                    view.set_placeholder(t!("dock-vault-locked"), cx)
+                });
+                self.set_state(LogsState::Locked, cx);
+            }
+            Next::Wait => {}
+            Next::Connecting if self.state == LogsState::Locked => {
+                self.view.update(cx, |view, cx| {
+                    view.set_placeholder(t!("dock-connecting"), cx)
+                });
+                self.set_state(LogsState::Starting, cx);
+            }
+            Next::Connecting => {}
+            Next::Start => {
+                self.resume = None;
+                self.restart(cx);
+            }
+            Next::Fail(error) => {
+                self.resume = None;
+                self.fail(error, cx);
+            }
+            Next::Forget => self.resume = None,
+        }
     }
 
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {

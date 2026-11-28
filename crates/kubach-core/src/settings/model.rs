@@ -119,7 +119,7 @@ pub enum Language {
 pub const DEFAULT_KEEP_CONNECTED: u32 = 3;
 
 /// Default of [`Clusters::vault_lock_minutes`].
-pub const DEFAULT_VAULT_LOCK_MINUTES: u32 = 15;
+pub const DEFAULT_VAULT_LOCK_MINUTES: u32 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -140,8 +140,8 @@ pub struct Clusters {
     pub keep_connected: u32,
     /// Arrangement of the cluster hotbar.
     pub hotbar: HotbarPrefs,
-    /// Minutes without input after which the vault of imported kubeconfigs
-    /// locks itself (ADR 0008); 0 never locks.
+    /// Minutes without input anywhere on the computer after which the vault
+    /// of imported kubeconfigs locks itself (ADR 0008); 0 never locks.
     pub vault_lock_minutes: u32,
     /// Lock the vault when the OS screen locks.
     pub vault_lock_on_screen_lock: bool,

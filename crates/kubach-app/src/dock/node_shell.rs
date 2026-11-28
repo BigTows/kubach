@@ -19,6 +19,7 @@ use kubach_i18n::{msg, t};
 use kubach_ui::{TerminalEvent, TerminalView};
 use kube::Client;
 
+use super::resume::{Next, Resume};
 use super::terminal::{
     SessionState, TerminalInput, apply_clipboard_policy, describe_exit, forward_terminal_event,
 };
@@ -106,6 +107,9 @@ pub struct NodeShellTab {
     /// The pod and the session are on a context of the vault and end when
     /// it locks.
     vault: bool,
+    /// The lock ended a live shell: a new pod and shell start after the
+    /// unlock.
+    resume: Option<Resume>,
     _session: Option<Task<()>>,
     _subscription: Subscription,
     _settings: Option<Subscription>,
@@ -155,6 +159,7 @@ impl NodeShellTab {
             state: SessionState::Connecting(msg!("dock-node-creating")),
             generation: 0,
             vault: false,
+            resume: None,
             _session: None,
             _subscription: subscription,
             _settings: settings,
@@ -222,12 +227,46 @@ impl NodeShellTab {
         if !std::mem::take(&mut self.vault) {
             return;
         }
-        let held = self.state.is_live() || self.pod.is_some();
+        let live = self.state.is_live();
+        let held = live || self.pod.is_some();
         self.shutdown(cx);
         if held {
             let closed = msg!("dock-vault-locked");
             self.note(&format!("[{closed}]"), cx);
             self.set_state(SessionState::Exited(closed), cx);
+        }
+        if live {
+            self.resume = Some(Resume::new(&self.cluster, cx, Self::resume));
+        }
+    }
+
+    /// The vault or the contexts changed after a lock ended the shell:
+    /// once the vault is unlocked and the context connected again, a new
+    /// pod and shell start on the same node, below the old output (#213).
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        let Some(resume) = &mut self.resume else {
+            return;
+        };
+        match resume.next(&self.cluster, self.context.as_deref(), cx) {
+            // Locked again while its context was connecting.
+            Next::Wait if self.state.is_live() => {
+                self.set_state(SessionState::Exited(msg!("dock-vault-locked")), cx)
+            }
+            Next::Wait => {}
+            Next::Connecting if !self.state.is_live() => {
+                self.set_state(SessionState::Connecting(msg!("dock-connecting")), cx)
+            }
+            Next::Connecting => {}
+            Next::Start => {
+                self.resume = None;
+                self.start(cx);
+            }
+            Next::Fail(error) => {
+                self.resume = None;
+                self.note(&error, cx);
+                self.set_state(SessionState::Failed(error), cx);
+            }
+            Next::Forget => self.resume = None,
         }
     }
 
@@ -243,6 +282,8 @@ impl NodeShellTab {
         let client = match tab_client {
             Ok(tab) => {
                 self.vault = tab.vault;
+                // Connected by hand: nothing is left to bring back.
+                self.resume = None;
                 tab.client
             }
             Err(error) => {

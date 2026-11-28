@@ -96,6 +96,8 @@ dock-exit-failed = 失败
 dock-exit-failed-message = 失败：{ $message }
 dock-exit-disconnected = 已断开
 dock-vault-locked = 已关闭：保险库已锁定
+dock-vault-reopen-cannot-connect = 解锁后未重新打开：无法连接到上下文 { $context }：{ $error }
+dock-vault-reopen-disconnected = 解锁后未重新打开：上下文 { $context } 已断开
 
 ## 本地终端
 
