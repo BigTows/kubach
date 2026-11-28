@@ -18,6 +18,11 @@ dock-container = Container { $container }
 ## Tab strip
 
 dock-tab-close = Close
+# Right-click menu of a tab, after "Close".
+dock-tab-close-others = Close others
+dock-tab-close-right = Close tabs to the right
+dock-tab-close-left = Close tabs to the left
+dock-tab-close-all = Close all
 dock-collapse = Collapse
 dock-expand = Expand
 

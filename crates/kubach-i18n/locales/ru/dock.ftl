@@ -15,6 +15,11 @@ dock-container = Контейнер { $container }
 ## Полоса вкладок
 
 dock-tab-close = Закрыть
+# Меню вкладки по правому клику, после «Закрыть».
+dock-tab-close-others = Закрыть остальные
+dock-tab-close-right = Закрыть вкладки справа
+dock-tab-close-left = Закрыть вкладки слева
+dock-tab-close-all = Закрыть все
 dock-collapse = Свернуть
 dock-expand = Развернуть
 

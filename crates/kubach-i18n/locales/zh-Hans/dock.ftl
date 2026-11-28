@@ -15,6 +15,11 @@ dock-container = 容器 { $container }
 ## 标签栏
 
 dock-tab-close = 关闭
+# 标签页的右键菜单，位于“关闭”之后。
+dock-tab-close-others = 关闭其他标签页
+dock-tab-close-right = 关闭右侧标签页
+dock-tab-close-left = 关闭左侧标签页
+dock-tab-close-all = 关闭全部
 dock-collapse = 收起
 dock-expand = 展开
 

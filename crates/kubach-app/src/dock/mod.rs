@@ -12,6 +12,7 @@
 //! embedded cached, so a redraw of the tab strip or of the window around
 //! the dock reuses its last frame.
 
+mod close;
 mod containers;
 mod debug_confirm;
 mod entry;
@@ -25,7 +26,11 @@ mod resume;
 mod target;
 mod terminal;
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -40,6 +45,7 @@ pub use local_terminal::init;
 pub use node_shell::sweep as sweep_node_shells;
 pub use target::{StreamRequest, http_scheme};
 
+use self::close::{CloseCommand, tabs_to_close};
 use self::local_terminal::LocalTerminalTab;
 use self::logs::{LogsState, LogsTab};
 use self::node_shell::NodeShellTab;
@@ -376,6 +382,51 @@ impl Dock {
         cx.notify();
     }
 
+    /// Runs `command` of the menu opened on the tab `id` (#215): every tab
+    /// it names closes the way its close button closes it. Nothing happens
+    /// when that tab has gone since the menu opened.
+    fn close_by(&mut self, command: CloseCommand, id: u64, cx: &mut Context<Self>) {
+        for id in self.closed_by(command, id) {
+            self.close(id, cx);
+        }
+    }
+
+    /// Tabs that `command` of the menu opened on the tab `id` closes.
+    fn closed_by(&self, command: CloseCommand, id: u64) -> Vec<u64> {
+        let ids: Vec<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        match ids.iter().position(|tab| *tab == id) {
+            Some(index) => tabs_to_close(command, &ids, index),
+            None => Vec::new(),
+        }
+    }
+
+    /// Right-click menu of the tab `id`; a command with nothing to close
+    /// is disabled.
+    fn tab_menu(this: &WeakEntity<Self>, id: u64, menu: PopupMenu, cx: &App) -> PopupMenu {
+        let Some(dock) = this.upgrade() else {
+            return menu;
+        };
+        let dock = dock.read(cx);
+        CloseCommand::ALL.into_iter().fold(menu, |menu, command| {
+            let label = match command {
+                CloseCommand::This => t!("dock-tab-close"),
+                CloseCommand::Others => t!("dock-tab-close-others"),
+                CloseCommand::Right => t!("dock-tab-close-right"),
+                CloseCommand::Left => t!("dock-tab-close-left"),
+                CloseCommand::All => t!("dock-tab-close-all"),
+            };
+            let this = this.clone();
+            menu.item(
+                PopupMenuItem::new(label)
+                    .disabled(dock.closed_by(command, id).is_empty())
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |dock, cx| dock.close_by(command, id, cx))
+                            .ok();
+                    }),
+            )
+        })
+    }
+
     /// Shows a tab, expanding the dock.
     pub fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
@@ -451,8 +502,14 @@ impl Dock {
         let theme = cx.theme();
         let summaries = self.summaries.clone();
         let prefs = crate::hotbar::prefs(cx);
+        // The tab a right click landed on, for the menu of the strip: a
+        // tab can't carry a menu of its own inside a `TabBar`. A press on
+        // the strip clears it on its way down and the tab under the
+        // pointer sets it on the way up, before the menu opens.
+        let pressed = Rc::new(Cell::new(None::<u64>));
         let tabs = summaries.into_iter().map(|summary| {
             let id = summary.id;
+            let pressed = pressed.clone();
             let icon = if summary.terminal {
                 IconName::SquareTerminal
             } else {
@@ -478,6 +535,7 @@ impl Dock {
                 }),
             };
             Tab::new()
+                .on_mouse_down(MouseButton::Right, move |_, _, _| pressed.set(Some(id)))
                 .prefix(
                     div()
                         .flex()
@@ -501,6 +559,8 @@ impl Dock {
                 )
         });
         let expanded = self.expanded;
+        let this = cx.entity().downgrade();
+        let (clear, menu_tab) = (pressed.clone(), pressed.clone());
         div()
             .h(DOCK_HEADER_HEIGHT)
             .flex_shrink_0()
@@ -511,16 +571,28 @@ impl Dock {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                div().flex_1().min_w_0().overflow_hidden().child(
-                    TabBar::new("dock-tabs")
-                        .underline()
-                        .xsmall()
-                        .selected_index(self.active)
-                        .on_click(cx.listener(|dock, index: &usize, window, cx| {
-                            dock.select(*index, window, cx)
-                        }))
-                        .children(tabs),
-                ),
+                div()
+                    .id("dock-tab-strip")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .capture_any_mouse_down(move |_, _, _| clear.set(None))
+                    .child(
+                        TabBar::new("dock-tabs")
+                            .underline()
+                            .xsmall()
+                            .selected_index(self.active)
+                            .on_click(cx.listener(|dock, index: &usize, window, cx| {
+                                dock.select(*index, window, cx)
+                            }))
+                            .children(tabs),
+                    )
+                    // Beside the tabs there is no menu: an empty one is
+                    // not shown.
+                    .context_menu(move |menu, _, cx| match menu_tab.get() {
+                        Some(id) => Self::tab_menu(&this, id, menu, cx),
+                        None => menu,
+                    }),
             )
             .child(
                 Button::new("dock-toggle")
